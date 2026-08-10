@@ -2457,6 +2457,22 @@ async fn api_provisional_binds_session_and_upstream_identity() {
     );
     assert!(!row.forward_done);
     assert_eq!(row.deadline_unix, 0);
+    assert!(guard::proxy::GateSink::begin_revert_handoff(&sink, &handle).await);
+    let uncertain = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
+    assert!(uncertain.forward_done);
+    assert_eq!(uncertain.forward_exit, None);
+    assert_eq!(uncertain.status, ProvisionalStatus::NeedsOperatorDecision);
+    let mut actionable = guard::gating::provisional::ProvisionalRegistry::new();
+    actionable.insert(uncertain);
+    assert!(actionable.begin_revert(&handle).is_ok());
+    assert!(!guard::proxy::GateSink::cancel_staged_revert(&sink, &handle).await);
     assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle).await);
     let live = cfg
         .state

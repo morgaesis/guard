@@ -67,15 +67,22 @@ pub trait GateSink: Send + Sync {
     /// durable containment.
     async fn arm_revert(&self, mutation: ApiMutation) -> Option<String>;
 
+    /// Durably record that upstream dispatch is about to begin. The staged
+    /// rollback must become immediately actionable for an uncertain outcome
+    /// before this method reports success.
+    async fn begin_revert_handoff(&self, handle: &str) -> bool;
+
     /// Mark a staged revert as live after successful upstream response headers.
     /// The confirmation window begins only after this durable transition.
-    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
-        true
-    }
+    async fn mark_revert_forwarded(&self, handle: &str) -> bool;
 
-    /// Remove a staged revert after definitive non-success response headers
-    /// prove that the upstream mutation did not succeed.
-    async fn cancel_staged_revert(&self, _handle: &str) {}
+    /// Preserve an actionable rollback and record why the upstream mutation
+    /// outcome is uncertain.
+    async fn mark_revert_indeterminate(&self, handle: &str, reason: &str) -> bool;
+
+    /// Remove a staged revert after a definitive pre-dispatch failure proves
+    /// that no upstream dispatch began.
+    async fn cancel_staged_revert(&self, handle: &str) -> bool;
 
     /// Whether the sink could arm a revert right now (capacity available, and a
     /// body-bearing revert can be persisted safely). The proxy consults this on

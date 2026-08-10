@@ -2639,6 +2639,15 @@ fn provisional_identity(provisional: &Provisional) -> Provisional {
 }
 
 fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> Result<bool> {
+    let api_handoff_activation = previous.api_revert.is_some()
+        && previous.status == ProvisionalStatus::NeedsOperatorDecision
+        && previous.forward_done
+        && previous.forward_exit.is_none()
+        && previous.deadline_unix == 0
+        && next.status == ProvisionalStatus::Armed
+        && next.forward_done
+        && next.forward_exit == Some(0)
+        && next.deadline_unix > next.created_unix;
     if !serialized_eq(&provisional_identity(previous), &provisional_identity(next))?
         || (previous.forward_done && !next.forward_done)
         || !option_only_adds_or_preserves(&previous.decision_trace, &next.decision_trace)?
@@ -2648,6 +2657,7 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
     if previous.forward_done
         && (previous.deadline_unix != next.deadline_unix
             || previous.window_secs != next.window_secs)
+        && !api_handoff_activation
     {
         return Ok(false);
     }
@@ -2678,6 +2688,10 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
             )
             | (
                 ProvisionalStatus::NeedsOperatorDecision,
+                ProvisionalStatus::Armed
+            )
+            | (
+                ProvisionalStatus::NeedsOperatorDecision,
                 ProvisionalStatus::Reverting
             )
             | (
@@ -2702,6 +2716,12 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
             )
     );
     if !legal_status {
+        return Ok(false);
+    }
+    if previous.status == ProvisionalStatus::NeedsOperatorDecision
+        && next.status == ProvisionalStatus::Armed
+        && !api_handoff_activation
+    {
         return Ok(false);
     }
     if previous.status == next.status

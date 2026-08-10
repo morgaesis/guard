@@ -486,6 +486,125 @@ async fn spawn_success_headers_stalled_body() -> String {
     format!("http://{addr}")
 }
 
+async fn spawn_create_status_upstream(
+    status: u16,
+    content_encoding: Option<&'static str>,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let observed_deletes = deletes.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let deletes = observed_deletes.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let deletes = deletes.clone();
+                    async move {
+                        let mut builder =
+                            Response::builder().header("content-type", "application/json");
+                        let response_status = if request.method() == hyper::Method::POST {
+                            status
+                        } else if request.method() == hyper::Method::DELETE {
+                            deletes.fetch_add(1, Ordering::SeqCst);
+                            200
+                        } else {
+                            200
+                        };
+                        if let Some(encoding) = content_encoding {
+                            builder = builder.header("content-encoding", encoding);
+                        }
+                        Ok::<_, Infallible>(
+                            builder
+                                .status(response_status)
+                                .body(Full::new(Bytes::from(created_pod_object().to_string())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), deletes)
+}
+
+async fn spawn_transport_error_upstream() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|_request: Request<Incoming>| async move {
+                    Err::<Response<Full<Bytes>>, _>(std::io::Error::other(
+                        "simulated upstream transport failure",
+                    ))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_policy_barrier_upstream(
+    block_method: hyper::Method,
+) -> (
+    String,
+    Arc<tokio::sync::Semaphore>,
+    Arc<tokio::sync::Semaphore>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let reached = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let observed = reached.clone();
+    let continuation = release.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let reached = observed.clone();
+            let release = continuation.clone();
+            let block_method = block_method.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let reached = reached.clone();
+                    let release = release.clone();
+                    let block_method = block_method.clone();
+                    async move {
+                        if request.method() == block_method {
+                            reached.add_permits(1);
+                            release.acquire().await.unwrap().forget();
+                        }
+                        let status = if request.method() == hyper::Method::POST {
+                            201
+                        } else {
+                            200
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(created_pod_object().to_string())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), reached, release)
+}
+
 #[derive(Clone)]
 struct ArbitrationMock {
     object: Arc<std::sync::Mutex<Value>>,
@@ -893,6 +1012,253 @@ async fn policy_reload_during_arbitration_prevents_mutable_forwarding() {
 
     assert_eq!(request.await.unwrap().status(), 403);
     assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_handoff_linearizes_before_a_queued_policy_deny() {
+    let (upstream_base, read_reached, release_read) =
+        spawn_policy_barrier_upstream(hyper::Method::GET).await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    let allow_policy = "default: allow\n";
+    std::fs::write(&policy_path, allow_policy).unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.clone().serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let url = format!("https://{listen}/api/v1/namespaces/dev/configmaps/cm");
+    let request = tokio::spawn({
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .get(url)
+                .bearer_auth("principal-a")
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    read_reached.acquire().await.unwrap().forget();
+    let deny_policy = "default: deny\n";
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        proxy.policy_fingerprint().await,
+        ApiPolicy::from_yaml(allow_policy)
+            .unwrap()
+            .authority_fingerprint()
+    );
+    release_read.add_permits(1);
+    assert_eq!(request.await.unwrap().status(), 200);
+    wait_for_policy_reload(&proxy, deny_policy).await;
+    assert_eq!(
+        client
+            .get(url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evaluated_read_handoff_linearizes_before_a_queued_policy_deny() {
+    let (upstream_base, read_reached, release_read) =
+        spawn_policy_barrier_upstream(hyper::Method::GET).await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    let evaluate_policy = "default: deny\nrules:\n  - verbs: [get]\n    resources: [configmaps]\n    namespaces: [dev]\n    action: evaluate\n";
+    std::fs::write(&policy_path, evaluate_policy).unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
+    proxy.attach_judge(Arc::new(RecordingJudge::new(vec![judge_allow(
+        Some(1),
+        Some(Reversibility::Reversible),
+    )])));
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.clone().serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let url = format!("https://{listen}/api/v1/namespaces/dev/configmaps/cm");
+    let request = tokio::spawn({
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .get(url)
+                .bearer_auth("principal-a")
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    read_reached.acquire().await.unwrap().forget();
+    let deny_policy = "default: deny\n";
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        proxy.policy_fingerprint().await,
+        ApiPolicy::from_yaml(evaluate_policy)
+            .unwrap()
+            .authority_fingerprint()
+    );
+    release_read.add_permits(1);
+    assert_eq!(request.await.unwrap().status(), 200);
+    wait_for_policy_reload(&proxy, deny_policy).await;
+    assert_eq!(
+        client
+            .get(url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_does_not_queue_behind_reload_waiting_for_a_stalled_mutation() {
+    let (upstream_base, mutation_reached, release_mutation) =
+        spawn_policy_barrier_upstream(hyper::Method::POST).await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    let allow_policy = "default: allow\n";
+    std::fs::write(&policy_path, allow_policy).unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.clone().serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let mutation = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .post(format!("https://{listen}/api/v1/namespaces/dev/pods"))
+                .bearer_auth("principal-a")
+                .body(r#"{"metadata":{"name":"blocked-pod"}}"#)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    mutation_reached.acquire().await.unwrap().forget();
+    let deny_policy = "default: deny\n";
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .get(format!(
+                "https://{listen}/api/v1/namespaces/dev/configmaps/cm"
+            ))
+            .bearer_auth("principal-a")
+            .send(),
+    )
+    .await
+    .expect("read authority does not queue behind mutation reload")
+    .unwrap();
+    assert_eq!(read.status(), 200);
+    release_mutation.add_permits(1);
+    assert_eq!(mutation.await.unwrap().status(), 201);
+    wait_for_policy_reload(&proxy, deny_policy).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn final_denial_releases_policy_authority_before_staged_cleanup() {
+    let (upstream_base, _) = spawn_counting_upstream().await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    let allow_policy = "default: allow\n";
+    std::fs::write(&policy_path, allow_policy).unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
+    let sink = BlockingCancelSink {
+        stage_reached: Arc::new(tokio::sync::Semaphore::new(0)),
+        release_stage: Arc::new(tokio::sync::Semaphore::new(0)),
+        cancel_reached: Arc::new(tokio::sync::Semaphore::new(0)),
+        release_cancel: Arc::new(tokio::sync::Semaphore::new(0)),
+    };
+    proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.clone().serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let request = tokio::spawn(async move {
+        client
+            .post(format!("https://{listen}/api/v1/namespaces/dev/pods"))
+            .bearer_auth("principal-a")
+            .body(r#"{"metadata":{"name":"denied-pod"}}"#)
+            .send()
+            .await
+            .unwrap()
+    });
+    sink.stage_reached.acquire().await.unwrap().forget();
+    let deny_policy = "default: deny\n";
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    wait_for_policy_reload(&proxy, deny_policy).await;
+    sink.release_stage.add_permits(1);
+    sink.cancel_reached.acquire().await.unwrap().forget();
+
+    std::fs::write(&policy_path, allow_policy).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        wait_for_policy_reload(&proxy, allow_policy),
+    )
+    .await
+    .expect("policy reload completes while durable cleanup remains blocked");
+    sink.release_cancel.add_permits(1);
+    assert_eq!(request.await.unwrap().status(), 403);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1616,6 +1982,231 @@ async fn successful_mutation_headers_arm_containment_before_a_stalled_body_times
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutation_handoff_timeout_preserves_an_actionable_provisional() {
+    let (upstream, reached_upstream) = spawn_stalled_upstream().await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with_timeouts(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+        Arc::new(LiveSessionSink),
+        Duration::from_millis(150),
+        Duration::from_secs(2),
+    )
+    .await;
+    let request = tokio::spawn(async move {
+        client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .bearer_auth("live-session")
+            .body(r#"{"metadata":{"name":"timeout-pod"}}"#)
+            .send()
+            .await
+            .unwrap()
+    });
+    reached_upstream.acquire().await.unwrap().forget();
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), 504);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-guard-provisional")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-handle-0")
+    );
+    assert_eq!(sink.handoffs.lock().unwrap().len(), 1);
+    assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutation_transport_error_preserves_an_actionable_provisional() {
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        spawn_transport_error_upstream().await,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"transport-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(response.headers().contains_key("x-guard-provisional"));
+    assert_eq!(sink.handoffs.lock().unwrap().len(), 1);
+    assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_error_preserves_containment_without_create_provenance() {
+    let (upstream, forwarded_deletes) = spawn_create_status_upstream(500, None).await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"failed-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 500);
+    assert!(response.headers().contains_key("x-guard-provisional"));
+    assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+    assert!(sink.activated.lock().unwrap().is_empty());
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+
+    let delete = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/failed-pod"))
+        .bearer_auth("live-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 403);
+    assert_eq!(forwarded_deletes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_create_preserves_containment_without_create_provenance() {
+    let (upstream, forwarded_deletes) = spawn_create_status_upstream(409, None).await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"existing-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert!(response.headers().contains_key("x-guard-provisional"));
+    assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+    assert!(sink.activated.lock().unwrap().is_empty());
+
+    let delete = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/existing-pod"))
+        .bearer_auth("live-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 403);
+    assert_eq!(forwarded_deletes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn encoded_success_keeps_activated_containment() {
+    let (upstream, _) = spawn_create_status_upstream(201, Some("gzip")).await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"encoded-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(response.headers().contains_key("x-guard-provisional"));
+    assert_eq!(sink.activated.lock().unwrap().len(), 1);
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_activation_failure_cannot_return_upstream_success() {
+    let (upstream, _) = spawn_create_status_upstream(201, None).await;
+    let sink = ActivationFailSink::default();
+    let state = sink.state.clone();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"activation-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(response.headers().contains_key("x-guard-provisional"));
+    assert_eq!(state.handoffs.lock().unwrap().len(), 1);
+    assert_eq!(state.activated.lock().unwrap().len(), 1);
+    assert_eq!(state.indeterminate.lock().unwrap().len(), 1);
+    assert!(state.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_mutation_handoff_preserves_containment() {
+    let (upstream, reached_upstream) = spawn_stalled_upstream().await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with_timeouts(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+        Arc::new(LiveSessionSink),
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+    )
+    .await;
+    let request = tokio::spawn(async move {
+        let _ = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .bearer_auth("live-session")
+            .body(r#"{"metadata":{"name":"cancelled-pod"}}"#)
+            .send()
+            .await;
+    });
+    reached_upstream.acquire().await.unwrap().forget();
+    request.abort();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !sink.indeterminate.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled request preserves an actionable provisional");
+    assert_eq!(sink.handoffs.lock().unwrap().len(), 1);
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evaluator_authority_revoked_during_an_approved_hold_prevents_forwarding() {
     let policy = r#"
@@ -1882,7 +2473,10 @@ async fn http2_multiplexes_session_authentication_failures_independently() {
 #[derive(Clone, Default)]
 struct RecordingSink {
     calls: Arc<std::sync::Mutex<Vec<guard::proxy::ApiMutation>>>,
+    handoffs: Arc<std::sync::Mutex<Vec<String>>>,
     activated: Arc<std::sync::Mutex<Vec<String>>>,
+    indeterminate: Arc<std::sync::Mutex<Vec<String>>>,
+    cancelled: Arc<std::sync::Mutex<Vec<String>>>,
     resolved: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -1894,13 +2488,98 @@ impl guard::proxy::GateSink for RecordingSink {
         Some(handle)
     }
 
+    async fn begin_revert_handoff(&self, handle: &str) -> bool {
+        self.handoffs.lock().unwrap().push(handle.to_string());
+        true
+    }
+
     async fn mark_revert_forwarded(&self, handle: &str) -> bool {
         self.activated.lock().unwrap().push(handle.to_string());
         true
     }
 
+    async fn mark_revert_indeterminate(&self, handle: &str, _reason: &str) -> bool {
+        self.indeterminate.lock().unwrap().push(handle.to_string());
+        true
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.cancelled.lock().unwrap().push(handle.to_string());
+        true
+    }
+
     async fn resolve(&self, handle: &str) {
         self.resolved.lock().unwrap().push(handle.to_string());
+    }
+}
+
+#[derive(Clone, Default)]
+struct ActivationFailSink {
+    state: RecordingSink,
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for ActivationFailSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn begin_revert_handoff(&self, handle: &str) -> bool {
+        self.state.begin_revert_handoff(handle).await
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str) -> bool {
+        self.state
+            .activated
+            .lock()
+            .unwrap()
+            .push(handle.to_string());
+        false
+    }
+
+    async fn mark_revert_indeterminate(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_indeterminate(handle, reason).await
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+}
+
+#[derive(Clone)]
+struct BlockingCancelSink {
+    stage_reached: Arc<tokio::sync::Semaphore>,
+    release_stage: Arc<tokio::sync::Semaphore>,
+    cancel_reached: Arc<tokio::sync::Semaphore>,
+    release_cancel: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for BlockingCancelSink {
+    async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.stage_reached.add_permits(1);
+        self.release_stage.acquire().await.ok()?.forget();
+        Some("blocked-cancel-handle".to_string())
+    }
+
+    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        self.cancel_reached.add_permits(1);
+        if self.release_cancel.acquire().await.is_err() {
+            return false;
+        }
+        true
     }
 }
 
@@ -3640,6 +4319,22 @@ impl guard::proxy::GateSink for ApprovingSink {
         None
     }
 
+    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
+    }
+
     async fn hold_request(
         &self,
         _snapshot: &ApiHoldSnapshot,
@@ -3661,6 +4356,22 @@ struct DenyingSink {
 impl guard::proxy::GateSink for DenyingSink {
     async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
         None
+    }
+
+    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
     }
 
     async fn hold_request(
@@ -3926,6 +4637,22 @@ impl GateSink for SnapshotSink {
         None
     }
 
+    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
+    }
+
     async fn hold_request(
         &self,
         snapshot: &ApiHoldSnapshot,
@@ -3943,6 +4670,22 @@ impl GateSink for SnapshotSink {
 impl guard::proxy::GateSink for CountingSink {
     async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
         None
+    }
+
+    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
     }
 
     async fn hold_request(
@@ -4453,6 +5196,22 @@ impl guard::proxy::GateSink for CannotArmSink {
         self.writes_armed
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         None
+    }
+
+    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
     }
 }
 

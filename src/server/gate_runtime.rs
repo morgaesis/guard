@@ -420,7 +420,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let body_file = if let Some(body) = &mutation.revert.body {
             if !self.snapshot_dir_safe {
                 tracing::error!(
-                    "api-proxy: refusing to arm a body-bearing revert because the revert directory is not owner-only; the change is live but will not auto-revert"
+                    "api-proxy: refusing to stage a body-bearing revert because the revert directory is not owner-only; the mutation will not be forwarded without containment"
                 );
                 return None;
             }
@@ -495,6 +495,55 @@ impl guard::proxy::GateSink for DaemonGateSink {
         Some(handle)
     }
 
+    async fn begin_revert_handoff(&self, handle: &str) -> bool {
+        let server = self.server.clone();
+        let handle = handle.to_string();
+        let task = tokio::spawn(async move {
+            let mut registry = server.state.provisional.write().await;
+            let Some(expected) = registry.get(&handle).cloned() else {
+                return false;
+            };
+            if expected.forward_done {
+                return expected.forward_exit.is_none()
+                    && expected.status == ProvisionalStatus::NeedsOperatorDecision;
+            }
+            let mut next = expected.clone();
+            next.forward_done = true;
+            next.forward_exit = None;
+            next.forward_persistence_failed = false;
+            next.deadline_unix = 0;
+            next.window_secs = 0;
+            next.status = ProvisionalStatus::NeedsOperatorDecision;
+            next.revert_detail = Some(
+                "upstream mutation dispatch began; the rollback remains available until the outcome is confirmed"
+                    .to_string(),
+            );
+            let Some(store) = &server.state.session_store else {
+                return false;
+            };
+            if let Err(error) = store
+                .compare_and_swap_provisional(expected, next.clone())
+                .await
+            {
+                tracing::error!("api-proxy mutation handoff was not made durable: {error}");
+                return false;
+            }
+            registry.insert(next.clone());
+            server.emit_event(NotifyEvent {
+                event: "provisional_needs_operator_decision",
+                at_unix: now_unix(),
+                handle: Some(handle),
+                session_fingerprint: next.session_fingerprint,
+                requester_principal: None,
+                reason: next.revert_detail,
+                status: Some("needs_operator_decision".to_string()),
+                behavior: None,
+            });
+            true
+        });
+        task.await.unwrap_or(false)
+    }
+
     async fn mark_revert_forwarded(&self, handle: &str) -> bool {
         let server = self.server.clone();
         let handle = handle.to_string();
@@ -504,12 +553,19 @@ impl guard::proxy::GateSink for DaemonGateSink {
             let Some(expected) = registry.get(&handle).cloned() else {
                 return false;
             };
-            if expected.forward_done {
+            if expected.forward_done && expected.forward_exit == Some(0) {
                 return expected.forward_exit == Some(0)
                     && expected.status == ProvisionalStatus::Armed;
             }
+            if !expected.forward_done
+                || expected.forward_exit.is_some()
+                || expected.status != ProvisionalStatus::NeedsOperatorDecision
+            {
+                return false;
+            }
             let now = now_unix();
             let mut next = expected.clone();
+            next.status = ProvisionalStatus::Armed;
             next.forward_done = true;
             next.forward_exit = Some(0);
             next.forward_persistence_failed = false;
@@ -542,28 +598,78 @@ impl guard::proxy::GateSink for DaemonGateSink {
         task.await.unwrap_or(false)
     }
 
-    async fn cancel_staged_revert(&self, handle: &str) {
+    async fn mark_revert_indeterminate(&self, handle: &str, reason: &str) -> bool {
+        let server = self.server.clone();
+        let handle = handle.to_string();
+        let reason = guard::redact::redact_output_text(reason);
+        let task = tokio::spawn(async move {
+            let mut registry = server.state.provisional.write().await;
+            let Some(expected) = registry.get(&handle).cloned() else {
+                return false;
+            };
+            if expected.status == ProvisionalStatus::Armed
+                && expected.forward_done
+                && expected.forward_exit == Some(0)
+            {
+                return true;
+            }
+            if !expected.forward_done || expected.forward_exit.is_some() {
+                return false;
+            }
+            let mut next = expected.clone();
+            next.status = ProvisionalStatus::NeedsOperatorDecision;
+            next.deadline_unix = 0;
+            next.window_secs = 0;
+            next.revert_detail = Some(reason);
+            let Some(store) = &server.state.session_store else {
+                return false;
+            };
+            if let Err(error) = store
+                .compare_and_swap_provisional(expected, next.clone())
+                .await
+            {
+                tracing::error!("api-proxy uncertain mutation state was not updated: {error}");
+                return false;
+            }
+            registry.insert(next.clone());
+            server.emit_event(NotifyEvent {
+                event: "provisional_needs_operator_decision",
+                at_unix: now_unix(),
+                handle: Some(handle),
+                session_fingerprint: next.session_fingerprint,
+                requester_principal: None,
+                reason: next.revert_detail,
+                status: Some("needs_operator_decision".to_string()),
+                behavior: None,
+            });
+            true
+        });
+        task.await.unwrap_or(false)
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
         let server = self.server.clone();
         let handle = handle.to_string();
         let task = tokio::spawn(async move {
             let mut registry = server.state.provisional.write().await;
             let Some(staged) = registry.get(&handle).cloned() else {
-                return;
+                return true;
             };
             if staged.forward_done {
-                return;
+                return false;
             }
             let Some(store) = &server.state.session_store else {
-                return;
+                return false;
             };
             if let Err(error) = store.delete_provisional(handle.clone()).await {
                 tracing::warn!("api-proxy staged revert cleanup failed: {error}");
-                return;
+                return false;
             }
             registry.remove(&handle);
             remove_revert_body(&staged);
+            true
         });
-        let _ = task.await;
+        task.await.unwrap_or(false)
     }
 
     async fn hold_request(
@@ -3489,6 +3595,7 @@ pub(super) async fn finish_revert(
 #[cfg(test)]
 mod transactional_tests {
     use super::*;
+    use guard::gating::provisional::ProvisionalRegistry;
 
     #[tokio::test]
     async fn api_revert_creation_failure_does_not_arm_memory_only_authority() {
@@ -3529,5 +3636,68 @@ mod transactional_tests {
         assert!(handle.is_none());
         assert!(server.state.provisional.read().await.list().is_empty());
         assert!(store.load_provisionals().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_revert_activation_failure_keeps_durable_operator_authority() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: "fixture-endpoint".to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(
+            &sink,
+            guard::proxy::ApiMutation {
+                label: "fixture mutation".to_string(),
+                revert: guard::proxy::HttpRevert {
+                    method: "DELETE".to_string(),
+                    path: "/fixture".to_string(),
+                    body: None,
+                },
+                session_fingerprint: None,
+                session_revision: None,
+                secret_entitlements: None,
+                upstream_target: "https://fixture.invalid".to_string(),
+                upstream_identity: "fixture-identity".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(guard::proxy::GateSink::begin_revert_handoff(&sink, &handle).await);
+        store.fail_next_write_for_test();
+        assert!(!guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle).await);
+
+        let live = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert!(live.forward_done);
+        assert_eq!(live.forward_exit, None);
+        assert_eq!(live.status, ProvisionalStatus::NeedsOperatorDecision);
+        let durable = store
+            .load_provisionals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.handle == handle)
+            .unwrap();
+        assert_eq!(durable.status, ProvisionalStatus::NeedsOperatorDecision);
+        assert_eq!(durable.forward_exit, None);
+        let mut registry = ProvisionalRegistry::new();
+        registry.insert(durable);
+        assert!(registry.begin_revert(&handle).is_ok());
     }
 }

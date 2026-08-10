@@ -180,10 +180,13 @@ pub struct ApiProxy {
     /// swaps mark the generation odd for their short transition, then publish
     /// the next even value. Routes bind an even generation plus policy digest.
     authority_revision: AtomicU64,
-    /// A policy reload takes the write side; an admitted Kubernetes mutation
-    /// holds the read side from its final authority check through upstream
-    /// dispatch. This closes the check-to-send reload race.
+    /// A policy reload takes the write side after excluding mutations; an
+    /// admitted mutation holds the read side through upstream dispatch.
     mutation_authority_gate: RwLock<()>,
+    /// Read-only requests retain policy authority through response headers on
+    /// a separate lock. Reloaders acquire the mutation lock first, so reads do
+    /// not queue behind a reload waiting for a stalled mutation.
+    read_authority_gate: RwLock<()>,
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
     gate: OnceLock<Arc<dyn GateSink>>,
@@ -233,6 +236,11 @@ struct PendingApiAuthorization {
     requirement: ApiForwardRequirement,
 }
 
+struct StagedRevert {
+    handle: String,
+    created_key: Option<CreatedKey>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ApprovedApiHold;
 
@@ -246,6 +254,84 @@ struct UpstreamSendHandoff {
     request: Option<reqwest::RequestBuilder>,
     timeout: Duration,
     outcome: UpstreamHandoffOutcome,
+    containment: Option<ContainmentLifecycle>,
+}
+
+struct ContainmentLifecycle {
+    gate: Arc<dyn GateSink>,
+    handle: String,
+    created_key: Option<CreatedKey>,
+    handoff_started: bool,
+    armed: bool,
+}
+
+impl ContainmentLifecycle {
+    fn new(gate: Arc<dyn GateSink>, staged: StagedRevert) -> Self {
+        Self {
+            gate,
+            handle: staged.handle,
+            created_key: staged.created_key,
+            handoff_started: false,
+            armed: true,
+        }
+    }
+
+    async fn cancel_pre_send(mut self) {
+        if self.gate.cancel_staged_revert(&self.handle).await {
+            self.armed = false;
+        }
+    }
+
+    async fn preserve_indeterminate(mut self, reason: &str) -> String {
+        let _ = self
+            .gate
+            .mark_revert_indeterminate(&self.handle, reason)
+            .await;
+        self.armed = false;
+        self.handle.clone()
+    }
+
+    async fn activate(mut self) -> Result<(String, Option<CreatedKey>), String> {
+        if self.gate.mark_revert_forwarded(&self.handle).await {
+            self.armed = false;
+            Ok((self.handle.clone(), self.created_key.take()))
+        } else {
+            let _ = self
+                .gate
+                .mark_revert_indeterminate(
+                    &self.handle,
+                    "successful mutation headers were received, but the confirmation window could not be activated",
+                )
+                .await;
+            self.armed = false;
+            Err(self.handle.clone())
+        }
+    }
+}
+
+impl Drop for ContainmentLifecycle {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let gate = self.gate.clone();
+        let handle = self.handle.clone();
+        let handoff_started = self.handoff_started;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if handoff_started {
+                    let _ = gate
+                        .mark_revert_indeterminate(
+                            &handle,
+                            "request handling ended after upstream mutation dispatch began",
+                        )
+                        .await;
+                } else {
+                    let _ = gate.cancel_staged_revert(&handle).await;
+                }
+            });
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -255,6 +341,18 @@ impl ApiForwardHandoff for UpstreamSendHandoff {
             .request
             .take()
             .ok_or_else(|| "upstream handoff was already consumed".to_string())?;
+        if let Some(containment) = self.containment.as_mut() {
+            if !containment
+                .gate
+                .begin_revert_handoff(&containment.handle)
+                .await
+            {
+                return Err(
+                    "durable mutation handoff containment could not be prepared".to_string()
+                );
+            }
+            containment.handoff_started = true;
+        }
         match tokio::time::timeout(self.timeout, request.send()).await {
             Ok(result) => {
                 self.outcome = UpstreamHandoffOutcome::Finished(result);
@@ -512,6 +610,7 @@ impl ApiProxy {
             policy_path,
             authority_revision: AtomicU64::new(0),
             mutation_authority_gate: RwLock::new(()),
+            read_authority_gate: RwLock::new(()),
             gate: OnceLock::new(),
             judge: StdRwLock::new(None),
             judge_builder: OnceLock::new(),
@@ -1775,7 +1874,7 @@ impl ApiProxy {
             Ok(context) => context,
             Err(response) => return response,
         };
-        let provisional_handle = if track_write {
+        let staged_revert = if track_write {
             let operation = op.as_ref().expect("tracked write has operation");
             let handle = self
                 .arm_write_revert(
@@ -1815,7 +1914,7 @@ impl ApiProxy {
                 created_cleanup,
                 route_authority,
                 authorization,
-                provisional_handle,
+                staged_revert,
             )
             .await
         {
@@ -1847,7 +1946,7 @@ impl ApiProxy {
         created_cleanup: Option<CreatedMatch>,
         route_authority: RouteAuthority,
         authorization: Option<PendingApiAuthorization>,
-        provisional_handle: Option<String>,
+        staged_revert: Option<StagedRevert>,
     ) -> Result<Response<ProxyBody>> {
         // A recoverable write is staged durably before its finite upstream
         // handoff. Snapshot acquisition occurs in the caller before its final
@@ -1856,6 +1955,12 @@ impl ApiProxy {
             && op
                 .as_ref()
                 .is_some_and(|o| self.gate.get().is_some() && self.protocol.tracks_write(o));
+        let mut containment = staged_revert.and_then(|staged| {
+            self.gate
+                .get()
+                .cloned()
+                .map(|gate| ContainmentLifecycle::new(gate, staged))
+        });
         let kubernetes_mutation = op
             .as_ref()
             .is_some_and(|operation| self.is_kubernetes_mutation(operation));
@@ -1901,30 +2006,34 @@ impl ApiProxy {
             rb = rb.body(body);
         }
 
-        let policy_authority =
-            match tokio::time::timeout(Duration::from_secs(5), self.mutation_authority_gate.read())
-                .await
-            {
-                Ok(guard) => guard,
-                Err(_) => {
-                    if let (Some(gate), Some(handle)) =
-                        (self.gate.get(), provisional_handle.as_deref())
-                    {
-                        gate.cancel_staged_revert(handle).await;
-                    }
-                    return Ok(self.status_resp(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "guard api-proxy: policy authority lock timed out",
-                        "Timeout",
-                    ));
+        let mutating = op
+            .as_ref()
+            .is_some_and(|operation| !operation.is_read() && !operation.dry_run);
+        let policy_authority = if mutating {
+            tokio::time::timeout(Duration::from_secs(5), self.mutation_authority_gate.read()).await
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), self.read_authority_gate.read()).await
+        };
+        let policy_authority = match policy_authority {
+            Ok(guard) => guard,
+            Err(_) => {
+                if let Some(staged) = containment.take() {
+                    staged.cancel_pre_send().await;
                 }
-            };
+                return Ok(self.status_resp(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "guard api-proxy: policy authority lock timed out",
+                    "Timeout",
+                ));
+            }
+        };
         if let Some(response) = self
             .recheck_final_authority(&route_authority, op.as_ref())
             .await
         {
-            if let (Some(gate), Some(handle)) = (self.gate.get(), provisional_handle.as_deref()) {
-                gate.cancel_staged_revert(handle).await;
+            drop(policy_authority);
+            if let Some(staged) = containment.take() {
+                staged.cancel_pre_send().await;
             }
             return Ok(response);
         }
@@ -1956,6 +2065,7 @@ impl ApiProxy {
             request: Some(rb),
             timeout: self.upstream_handoff_timeout,
             outcome: UpstreamHandoffOutcome::Pending,
+            containment,
         };
         let auth = parts.extensions.get::<SessionAuth>();
         let mut session_handoff = SessionBoundHandoff {
@@ -1972,12 +2082,16 @@ impl ApiProxy {
         } else {
             session_handoff.forward().await
         };
+        let containment = upstream_handoff.containment.take();
+        let upstream_outcome = std::mem::replace(
+            &mut upstream_handoff.outcome,
+            UpstreamHandoffOutcome::Pending,
+        );
         drop(policy_authority);
-        let upstream_resp = match upstream_handoff.outcome {
+        let (upstream_resp, mut containment) = match upstream_outcome {
             UpstreamHandoffOutcome::Pending => {
-                if let (Some(gate), Some(handle)) = (self.gate.get(), provisional_handle.as_deref())
-                {
-                    gate.cancel_staged_revert(handle).await;
+                if let Some(containment) = containment {
+                    containment.cancel_pre_send().await;
                 }
                 let reason = authorization_result.err().unwrap_or_else(|| {
                     "authority provider did not perform the protected handoff".to_string()
@@ -1989,25 +2103,92 @@ impl ApiProxy {
                 ));
             }
             UpstreamHandoffOutcome::TimedOut => {
-                return Ok(self.status_resp(
+                let handle = if let Some(containment) = containment {
+                    Some(
+                        containment
+                            .preserve_indeterminate(
+                                "upstream mutation dispatch timed out before response headers",
+                            )
+                            .await,
+                    )
+                } else {
+                    None
+                };
+                return Ok(self.provisional_status_resp(
                     StatusCode::GATEWAY_TIMEOUT,
                     "guard api-proxy: upstream request handoff timed out",
                     "Timeout",
+                    handle.as_deref(),
                 ));
             }
             UpstreamHandoffOutcome::Finished(response) => {
-                response.context("forward to apiserver")?
+                let response = match response {
+                    Ok(response) => response,
+                    Err(_) => {
+                        let handle = if let Some(containment) = containment {
+                            Some(
+                                containment
+                                    .preserve_indeterminate(
+                                        "upstream mutation dispatch ended with a transport error before response headers",
+                                    )
+                                    .await,
+                            )
+                        } else {
+                            None
+                        };
+                        return Ok(self.provisional_status_resp(
+                            StatusCode::BAD_GATEWAY,
+                            "guard api-proxy: upstream request handoff failed",
+                            "InternalError",
+                            handle.as_deref(),
+                        ));
+                    }
+                };
+                (response, containment)
             }
         };
         let status = upstream_resp.status();
         let upstream_headers = upstream_resp.headers().clone();
         let response_secrets = self.upstream.response_secret_values();
 
+        let mut provisional_handle = None;
+        let mut containment_active = false;
+        if let Some(staged) = containment.take() {
+            if status.is_success() {
+                match staged.activate().await {
+                    Ok((handle, created_key)) => {
+                        if let Some(key) = created_key {
+                            self.created.lock().unwrap().remember(key, handle.clone());
+                        }
+                        provisional_handle = Some(handle);
+                        containment_active = true;
+                    }
+                    Err(handle) => {
+                        return Ok(self.provisional_status_resp(
+                            StatusCode::BAD_GATEWAY,
+                            "guard api-proxy: mutation succeeded but durable containment requires operator action",
+                            "ContainmentError",
+                            Some(&handle),
+                        ));
+                    }
+                }
+            } else {
+                provisional_handle = Some(
+                    staged
+                        .preserve_indeterminate(&format!(
+                            "upstream returned HTTP {status} after mutation dispatch"
+                        ))
+                        .await,
+                );
+            }
+        }
+
         if has_unsupported_content_encoding(&upstream_headers) {
-            return Ok(self.status_resp(
+            return Ok(self.provisional_status_resp(
                 StatusCode::BAD_GATEWAY,
                 "guard api-proxy: refusing an encoded upstream response that cannot be credential-redacted",
                 "InternalError",
+                provisional_handle.as_deref(),
             ));
         }
 
@@ -2125,30 +2306,6 @@ impl ApiProxy {
                 .expect("build redacted response"));
         }
 
-        // Successful mutation headers are the containment linearization point.
-        // Activate the already durable staged revert before reading any body.
-        let mut provisional_handle = provisional_handle;
-        if status.is_success() {
-            if let Some(handle) = provisional_handle.as_deref() {
-                let activated = match self.gate.get() {
-                    Some(gate) => gate.mark_revert_forwarded(handle).await,
-                    None => false,
-                };
-                if !activated {
-                    builder = builder.header("x-guard-provisional", handle);
-                    return Ok(builder
-                        .body(full_body(Bytes::from_static(
-                            b"guard api-proxy: mutation succeeded but durable containment requires operator action\n",
-                        )))
-                        .expect("build containment failure response"));
-                }
-            }
-        } else if let Some(handle) = provisional_handle.take() {
-            if let Some(gate) = self.gate.get() {
-                gate.cancel_staged_revert(&handle).await;
-            }
-        }
-
         // Kubernetes mutation responses are buffered so the returned object can
         // become this same session's next observed version. The body has a
         // separate bound because containment is already armed at this point.
@@ -2156,7 +2313,15 @@ impl ApiProxy {
             let bytes =
                 match tokio::time::timeout(self.upstream_body_timeout, upstream_resp.bytes()).await
                 {
-                    Ok(result) => result.context("read write response")?,
+                    Ok(Ok(bytes)) => bytes,
+                    Ok(Err(_)) => {
+                        return Ok(self.provisional_status_resp(
+                            StatusCode::BAD_GATEWAY,
+                            "guard api-proxy: upstream mutation response body failed",
+                            "InternalError",
+                            provisional_handle.as_deref(),
+                        ));
+                    }
                     Err(_) => {
                         let mut response = self.status_resp(
                         StatusCode::GATEWAY_TIMEOUT,
@@ -2179,16 +2344,18 @@ impl ApiProxy {
                 }
             }
             if let Some(handle) = provisional_handle {
-                // Kubernetes clients surface RFC 7234 Warning headers on
-                // stderr, while X-Guard-Provisional gives automation the exact
-                // durable handle. A successful write must never look final
-                // while Guard still has an auto-revert armed behind it.
-                builder = builder.header("x-guard-provisional", &handle).header(
-                    hyper::header::WARNING,
+                let warning = if containment_active {
                     format!(
                         "299 guard \"change is provisional; confirm with guard confirm {handle}\""
-                    ),
-                );
+                    )
+                } else {
+                    format!(
+                        "299 guard \"mutation outcome is uncertain; inspect provisional {handle}\""
+                    )
+                };
+                builder = builder
+                    .header("x-guard-provisional", &handle)
+                    .header(hyper::header::WARNING, warning);
             }
             let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
             return Ok(builder
@@ -2550,7 +2717,7 @@ impl ApiProxy {
         request_body: &[u8],
         conn_id: u64,
         session_context: Option<ApiSessionContext>,
-    ) -> Option<String> {
+    ) -> Option<StagedRevert> {
         let gate = self.gate.get()?;
         let plan = match self
             .protocol
@@ -2591,13 +2758,11 @@ impl ApiProxy {
             .await
         {
             Some(handle) => {
-                // Record provenance for a created object so a later delete of it
-                // is recognized as guard's own contained cleanup.
-                if let Some(key) = created_key {
-                    self.created.lock().unwrap().remember(key, handle.clone());
-                }
                 tracing::info!(target: "guard::apiproxy", "staged auto-revert {handle} for {label}");
-                Some(handle)
+                Some(StagedRevert {
+                    handle,
+                    created_key,
+                })
             }
             None => {
                 tracing::warn!(
@@ -2722,6 +2887,22 @@ impl ApiProxy {
             .body(full_body(Bytes::from(body)))
             .expect("build status response");
         response.extensions_mut().insert(GuardRejected);
+        response
+    }
+
+    fn provisional_status_resp(
+        &self,
+        code: StatusCode,
+        message: &str,
+        reason: &str,
+        handle: Option<&str>,
+    ) -> Response<ProxyBody> {
+        let mut response = self.status_resp(code, message, reason);
+        if let Some(handle) = handle {
+            if let Ok(value) = HeaderValue::from_str(handle) {
+                response.headers_mut().insert("x-guard-provisional", value);
+            }
+        }
         response
     }
 
@@ -3082,6 +3263,7 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
         match ApiPolicy::load_file(&path) {
             Ok(p) => {
                 let _mutation_authority_guard = proxy.mutation_authority_gate.write().await;
+                let _read_authority_guard = proxy.read_authority_gate.write().await;
                 let old_intent = proxy.policy.read().await.intent.clone();
                 let new_intent = p.intent.clone();
                 proxy.begin_authority_update();
