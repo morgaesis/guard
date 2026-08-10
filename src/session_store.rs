@@ -44,8 +44,10 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 ///
 /// Version 12 sanitizes nested decision traces and persisted explanatory prose,
 /// storing malformed non-authoritative traces as `NULL`. Version 13
-/// canonicalizes the full generated-access proposal envelope.
-const SCHEMA_VERSION: i64 = 13;
+/// canonicalizes the full generated-access proposal envelope. Version 14 adds
+/// the inert pre-handoff provisional state and classifies ambiguous v13 API
+/// dispatch rows before older binaries can interpret their rollback authority.
+const SCHEMA_VERSION: i64 = 14;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
@@ -1020,13 +1022,7 @@ impl SessionStore {
 
     fn init_schema(conn: &Connection) -> Result<()> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > SCHEMA_VERSION {
-            anyhow::bail!(
-                "state database schema version {} is newer than supported version {}",
-                version,
-                SCHEMA_VERSION
-            );
-        }
+        ensure_supported_schema_version(version, SCHEMA_VERSION)?;
         if version == SCHEMA_VERSION {
             Self::validate_current_schema_tables(conn)?;
             Self::validate_authority_row_indexes(conn, true)?;
@@ -1252,6 +1248,9 @@ impl SessionStore {
         // Validate every authority-bearing index before migration sanitization
         // can rewrite redundant columns from JSON and conceal corruption.
         Self::validate_authority_row_indexes(&tx, false)?;
+        if version == 13 {
+            migrate_v13_dispatch_rows(&tx)?;
+        }
         // Apply the idempotent pre-current-schema cleanup before recording the
         // current version. The pass sanitizes prose, retires active sessions
         // whose sensitive exact denies cannot be preserved, removes sensitive
@@ -2092,12 +2091,12 @@ impl SessionStore {
             None => {
                 if !matches!(
                     next.status,
-                    ProvisionalStatus::Armed | ProvisionalStatus::Dispatching
+                    ProvisionalStatus::Armed | ProvisionalStatus::Staged
                 ) {
-                    anyhow::bail!("new provisional must begin armed or dispatching");
+                    anyhow::bail!("new provisional must begin armed or staged");
                 }
-                if next.status == ProvisionalStatus::Dispatching && next.api_revert.is_none() {
-                    anyhow::bail!("only API provisionals may begin dispatching");
+                if next.status == ProvisionalStatus::Staged && next.api_revert.is_none() {
+                    anyhow::bail!("only API provisionals may begin staged");
                 }
                 let next_json = serde_json::to_string(next).context("encode new provisional")?;
                 let changed = tx.execute(
@@ -2551,6 +2550,17 @@ impl SessionStore {
     }
 }
 
+fn ensure_supported_schema_version(version: i64, maximum: i64) -> Result<()> {
+    if version > maximum {
+        anyhow::bail!(
+            "state database schema version {} is newer than supported version {}",
+            version,
+            maximum
+        );
+    }
+    Ok(())
+}
+
 fn serialized_eq<T: serde::Serialize>(left: &T, right: &T) -> Result<bool> {
     Ok(serde_json::to_vec(left)? == serde_json::to_vec(right)?)
 }
@@ -2685,7 +2695,8 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
     }
     let legal_status = matches!(
         (previous.status, next.status),
-        (ProvisionalStatus::Dispatching, ProvisionalStatus::Armed)
+        (ProvisionalStatus::Staged, ProvisionalStatus::Dispatching)
+            | (ProvisionalStatus::Dispatching, ProvisionalStatus::Armed)
             | (
                 ProvisionalStatus::Dispatching,
                 ProvisionalStatus::NeedsOperatorDecision
@@ -2733,7 +2744,8 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
     if previous.status == next.status
         && !matches!(
             previous.status,
-            ProvisionalStatus::Dispatching
+            ProvisionalStatus::Staged
+                | ProvisionalStatus::Dispatching
                 | ProvisionalStatus::Armed
                 | ProvisionalStatus::NeedsOperatorDecision
         )
@@ -2772,6 +2784,20 @@ fn validate_persisted_provisional(provisional: &Provisional) -> Result<()> {
     }
     if let Some(api) = provisional.api_revert.as_ref() {
         if api.requires_uid_precondition
+            && api.create_provenance.as_ref().is_none_or(|value| {
+                value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+            })
+            && matches!(
+                provisional.status,
+                ProvisionalStatus::Staged
+                    | ProvisionalStatus::Dispatching
+                    | ProvisionalStatus::Armed
+                    | ProvisionalStatus::Reverting
+            )
+        {
+            anyhow::bail!("created-resource rollback is missing canonical provenance");
+        }
+        if api.requires_uid_precondition
             && api.resource_uid.is_none()
             && matches!(
                 provisional.status,
@@ -2795,13 +2821,13 @@ fn repair_legacy_create_revert(provisional: &mut Provisional) -> bool {
     };
     if !api.protocol.eq_ignore_ascii_case("kubernetes")
         || !api.method.eq_ignore_ascii_case("DELETE")
-        || api.requires_uid_precondition
+        || (api.requires_uid_precondition && api.create_provenance.is_some())
     {
         return false;
     }
 
     api.requires_uid_precondition = true;
-    if api.resource_uid.is_none()
+    if (api.resource_uid.is_none() || api.create_provenance.is_none())
         && matches!(
             provisional.status,
             ProvisionalStatus::Armed | ProvisionalStatus::Reverting
@@ -2868,6 +2894,58 @@ fn sanitize_grant_request_for_migration(request: GrantRequest) -> GrantRequest {
 /// Rows first move to a fail-closed lifecycle state where necessary, then
 /// literal-sensitive structured commands are removed. New writes enforce the
 /// same invariant before storage.
+fn migrate_v13_dispatch_rows(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT rowid, handle, status, created_unix, json FROM gating_provisional ORDER BY rowid",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (rowid, handle, status, created_unix, json) in rows {
+        let mut provisional = serde_json::from_str::<Provisional>(&json)
+            .with_context(|| format!("decode v13 provisional {handle}"))?;
+        if provisional.handle != handle
+            || provisional.status.as_str() != status
+            || provisional.created_unix != decode_u64(created_unix)?
+        {
+            anyhow::bail!("v13 provisional index disagrees with serialized row for {handle}");
+        }
+        if provisional.status != ProvisionalStatus::Dispatching {
+            continue;
+        }
+        provisional.status = ProvisionalStatus::NeedsOperatorDecision;
+        provisional.forward_done = true;
+        provisional.forward_exit = None;
+        provisional.deadline_unix = 0;
+        provisional.window_secs = 0;
+        provisional.revert_detail = Some(
+            "the API handoff was interrupted; the mutation outcome is indeterminate".to_string(),
+        );
+        provisional.sanitize_explanatory_text();
+        conn.execute(
+            "UPDATE gating_provisional
+             SET json = ?1, status = ?2
+             WHERE rowid = ?3",
+            params![
+                serde_json::to_string(&provisional)?,
+                provisional.status.as_str(),
+                rowid
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
     let exact_authority_changed = repair_sensitive_session_exact_authority(conn)?;
     {
@@ -3041,7 +3119,8 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
             }
             if provisional.contains_sensitive_literals() {
                 match provisional.status {
-                    ProvisionalStatus::Dispatching
+                    ProvisionalStatus::Staged
+                    | ProvisionalStatus::Dispatching
                     | ProvisionalStatus::Armed
                     | ProvisionalStatus::Reverting => {
                         provisional.status = ProvisionalStatus::NeedsOperatorDecision;
@@ -4562,7 +4641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_kubernetes_create_rollback_is_retired_without_uid() {
+    async fn historical_kubernetes_create_rollback_is_retired_without_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let store = SessionStore::open(path.clone(), 3600).await.unwrap();
@@ -4574,12 +4653,29 @@ mod tests {
             upstream_identity: "identity".to_string(),
             method: "DELETE".to_string(),
             path: "/api/v1/namespaces/dev/pods/example".to_string(),
-            requires_uid_precondition: false,
-            resource_uid: None,
+            requires_uid_precondition: true,
+            resource_uid: Some("legacy-uid".to_string()),
+            create_provenance: None,
             body_file: None,
         });
-        store.save_provisional(row).await.unwrap();
         drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO gating_provisional (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    row.handle,
+                    serde_json::to_string(&row).unwrap(),
+                    row.status.as_str(),
+                    encode_u64(row.created_unix).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", 13_i64)
+            .unwrap();
+        drop(connection);
 
         let reopened = SessionStore::open(path, 3600).await.unwrap();
         let rows = reopened.load_provisionals().await.unwrap();
@@ -4587,10 +4683,132 @@ mod tests {
         assert_eq!(rows[0].status, ProvisionalStatus::NeedsOperatorDecision);
         let api = rows[0].api_revert.as_ref().unwrap();
         assert!(api.requires_uid_precondition);
-        assert!(api.resource_uid.is_none());
+        assert!(api.resource_uid.is_some());
+        assert!(api.create_provenance.is_none());
         let mut registry = ProvisionalRegistry::new();
         registry.insert(rows[0].clone());
         assert!(registry.begin_revert("legacy-create").is_err());
+    }
+
+    #[tokio::test]
+    async fn restart_retires_pre_handoff_stage_and_escalates_dispatch_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let api_revert = ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "PUT".to_string(),
+            path: "/api/v1/namespaces/dev/configmaps/example".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
+            body_file: None,
+        };
+        let mut staged = provisional_row("never-dispatched", ProvisionalStatus::Staged);
+        staged.forward_done = false;
+        staged.forward_exit = None;
+        staged.deadline_unix = 0;
+        staged.window_secs = 0;
+        staged.api_revert = Some(api_revert.clone());
+        store.save_provisional(staged.clone()).await.unwrap();
+
+        let mut dispatching = staged.clone();
+        dispatching.handle = "dispatch-evidence".to_string();
+        store.save_provisional(dispatching.clone()).await.unwrap();
+        let mut dispatch_marker = dispatching.clone();
+        dispatch_marker.status = ProvisionalStatus::Dispatching;
+        store
+            .compare_and_swap_provisional(dispatching, dispatch_marker)
+            .await
+            .unwrap();
+        drop(store);
+
+        let reopened = SessionStore::open(path, 3600).await.unwrap();
+        let rows = reopened.load_provisionals().await.unwrap();
+        let (registry, moved, retired) = ProvisionalRegistry::recover_rows(rows);
+        assert_eq!(retired, vec!["never-dispatched".to_string()]);
+        assert_eq!(moved, vec!["dispatch-evidence".to_string()]);
+        assert!(registry.get("never-dispatched").is_none());
+        let recovered = registry.get("dispatch-evidence").unwrap();
+        assert_eq!(recovered.status, ProvisionalStatus::NeedsOperatorDecision);
+        assert!(recovered.forward_done);
+        assert!(recovered.forward_exit.is_none());
+        assert_eq!(recovered.forward_outcome(), "indeterminate");
+    }
+
+    #[tokio::test]
+    async fn schema_v14_migrates_v13_dispatch_to_indeterminate_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        drop(store);
+        let mut row = provisional_row("legacy-dispatch", ProvisionalStatus::Dispatching);
+        row.forward_done = false;
+        row.forward_exit = None;
+        row.deadline_unix = 0;
+        row.window_secs = 0;
+        row.api_revert = Some(ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "PUT".to_string(),
+            path: "/api/v1/namespaces/dev/configmaps/example".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
+            body_file: None,
+        });
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO gating_provisional (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    row.handle,
+                    serde_json::to_string(&row).unwrap(),
+                    row.status.as_str(),
+                    encode_u64(row.created_unix).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", 13_i64)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let migrated = reopened.load_provisionals().await.unwrap();
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].status, ProvisionalStatus::NeedsOperatorDecision);
+        assert!(migrated[0].forward_done);
+        assert_eq!(migrated[0].forward_exit, None);
+        assert_eq!(migrated[0].forward_outcome(), "indeterminate");
+        drop(reopened);
+
+        let first_json: String = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT json FROM gating_provisional", [], |row| row.get(0))
+            .unwrap();
+        drop(SessionStore::open(path.clone(), 3600).await.unwrap());
+        let connection = Connection::open(path).unwrap();
+        let second_json: String = connection
+            .query_row("SELECT json FROM gating_provisional", [], |row| row.get(0))
+            .unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(first_json, second_json);
+        assert_eq!(version, 14);
+    }
+
+    #[test]
+    fn schema_v13_reader_rejects_v14_before_authority_decoding() {
+        let error = ensure_supported_schema_version(14, 13).unwrap_err();
+        assert!(error.to_string().contains("newer than supported"));
     }
 
     #[tokio::test]

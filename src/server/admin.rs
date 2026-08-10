@@ -3738,7 +3738,7 @@ async fn session_status_response(
         .provisional
         .read()
         .await
-        .list()
+        .visible_list()
         .iter()
         .filter(|provisional| {
             provisional.session_fingerprint.as_deref() == Some(fingerprint.as_str())
@@ -4148,7 +4148,7 @@ async fn dispatch_admin_request(
                 .provisional
                 .read()
                 .await
-                .list()
+                .visible_list()
                 .iter()
                 .filter(|provisional| {
                     provisional.session_fingerprint.as_deref() == Some(fingerprint.as_str())
@@ -4539,7 +4539,12 @@ async fn dispatch_admin_request(
                         .map(|path| path.display().to_string()),
                     secret_backend: server.state.secrets.backend_name().to_string(),
                     gate: server.config.gate.as_str().to_string(),
-                    pending_provisionals: server.state.provisional.read().await.outstanding(),
+                    pending_provisionals: server
+                        .state
+                        .provisional
+                        .read()
+                        .await
+                        .visible_outstanding(),
                     pending_approvals: server.state.approvals.read().await.outstanding(),
                     verb_catalog_hash,
                     verb_catalog_changed_unix,
@@ -4561,7 +4566,7 @@ async fn dispatch_admin_request(
                 .provisional
                 .read()
                 .await
-                .list()
+                .visible_list()
                 .iter()
                 .filter(|p| is_daemon || scope_eq(&p.principal, &caller_key))
                 .map(ProvisionalSummary::from_row)

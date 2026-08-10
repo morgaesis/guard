@@ -36,6 +36,9 @@ pub struct ApiMutation {
     /// Whether the revert must be bound to an exact resource UID before it can
     /// become executable.
     pub revert_requires_uid_precondition: bool,
+    /// Guard-generated provenance value already included in the exact create
+    /// body admitted by the evaluator or operator.
+    pub create_provenance: Option<String>,
     /// Session authority that allowed the mutation, represented only by its
     /// audit fingerprint.
     pub session_fingerprint: Option<String>,
@@ -70,6 +73,10 @@ pub trait GateSink: Send + Sync {
     /// durable containment.
     async fn arm_revert(&self, mutation: ApiMutation) -> Option<String>;
 
+    /// Durably mark that the finite upstream handoff may begin. The row remains
+    /// inert until the response-header outcome is classified.
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool;
+
     /// Mark a staged revert as live after successful upstream response headers.
     /// The confirmation window begins only after this durable transition.
     async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool;
@@ -103,8 +110,18 @@ pub trait GateSink: Send + Sync {
     /// created earlier in the session that the workload has now deleted (e.g. a
     /// Helm post-install hook removing its own check resource). Cancels the
     /// pending revert so the sweeper does not later try to delete an object that
-    /// no longer exists. Default: no-op, for sinks that do not track reverts.
-    async fn resolve(&self, _handle: &str) {}
+    /// no longer exists. Returns only after durable resolution is committed.
+    async fn resolve(&self, handle: &str) -> bool;
+
+    /// Revalidate a live create rollback and retain its revocation coordination
+    /// through the finite cleanup request handoff.
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String>;
 
     /// Enqueue a policy-held API request for operator approval and wait for the
     /// decision. The request stays buffered in the proxy while the operator

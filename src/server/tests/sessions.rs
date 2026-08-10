@@ -1256,7 +1256,10 @@ verbs:
         panic!("expected the denied command's access request")
     };
     assert_eq!(initial.state, "pending");
-    assert_eq!(initial.effective_scope, vec!["inspect-limited"]);
+    assert_eq!(initial.effective_scope.len(), 1);
+    let initial_scope_name = initial.effective_scope[0].clone();
+    assert!(initial_scope_name.starts_with("access-generated-"));
+    let initial_intent = initial.intent.clone().unwrap();
 
     let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
@@ -1297,22 +1300,6 @@ verbs:
             .await
             .access_grant_uses(&original_token, &initial_reference),
         Some((Some(4), Some(3)))
-    );
-
-    let varied_execution = execute_command(limited_request("group-b"), &cfg, &worker)
-        .await
-        .into_response();
-    assert!(
-        varied_execution.allowed,
-        "the typed grant must cover another allowed parameter value: {varied_execution:?}"
-    );
-    assert_eq!(
-        cfg.state
-            .sessions
-            .read()
-            .await
-            .access_grant_uses(&original_token, &initial_reference),
-        Some((Some(4), Some(2)))
     );
 
     let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
@@ -1361,7 +1348,7 @@ verbs:
         .is_some());
     assert_eq!(
         sessions.access_grant_uses(&original_token, &initial_reference),
-        Some((Some(4), Some(1)))
+        Some((Some(4), Some(2)))
     );
     assert_eq!(
         sessions.access_grant_uses(&original_token, &extension_reference),
@@ -1384,7 +1371,7 @@ verbs:
     );
     assert_eq!(
         restored.access_grant_uses(&original_token, &initial_reference),
-        Some((Some(4), Some(1)))
+        Some((Some(4), Some(2)))
     );
     assert_eq!(
         restored.access_grant_uses(&original_token, &extension_reference),
@@ -1399,7 +1386,7 @@ verbs:
         .verb_scope_for(&original_token)
         .unwrap()
         .0
-        .contains(&"inspect-limited".to_string()));
+        .contains(&initial_scope_name));
     let restored_requests = cfg
         .state
         .session_store
@@ -1423,7 +1410,7 @@ verbs:
         .find(|item| item.kind == "session")
         .and_then(|item| item.intent.as_deref())
         .expect("the access session projects its approved intents");
-    assert!(session_intent.contains("inspect-limited"));
+    assert!(session_intent.contains(&initial_intent));
     assert!(session_intent.contains("Use inspect-b for this task"));
     let initial_item = items
         .iter()
@@ -1431,8 +1418,11 @@ verbs:
         .expect("the initial approval remains visible");
     assert_eq!(initial_item.state, "approved");
     assert_eq!(initial_item.use_policy, "bounded");
-    assert_eq!(initial_item.remaining_uses, Some(1));
-    assert_eq!(initial_item.effective_scope, vec!["inspect-limited"]);
+    assert_eq!(initial_item.remaining_uses, Some(2));
+    assert_eq!(
+        initial_item.effective_scope,
+        vec![initial_scope_name.clone()]
+    );
     let extension_item = items
         .iter()
         .find(|item| item.reference == extension_reference)
@@ -1446,9 +1436,7 @@ verbs:
         .find(|item| item.kind == "session")
         .expect("the active session remains visible");
     assert_eq!(session_item.state, "active");
-    assert!(session_item
-        .effective_scope
-        .contains(&"inspect-limited".to_string()));
+    assert!(session_item.effective_scope.contains(&initial_scope_name));
     assert!(session_item
         .effective_scope
         .contains(&"inspect-b".to_string()));

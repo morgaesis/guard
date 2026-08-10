@@ -221,7 +221,9 @@ pub(super) async fn forget_proxy_provenance(server: &ServerContext, handle: &str
         .cloned()
         .collect();
     for proxy in proxies {
-        proxy.forget_created_by_handle(handle);
+        if !proxy.forget_created_by_handle(handle).await {
+            tracing::warn!("api-proxy cleanup provenance revocation timed out");
+        }
     }
 }
 
@@ -397,7 +399,7 @@ impl Drop for ProxyHoldOrphanGuard {
 }
 
 /// Bridges the API proxy's synthesized reverts into the daemon's consequence
-/// machinery. Holds a clone of the server server (which shares the provisional
+/// machinery. Holds a clone of the server context (which shares the provisional
 /// registry and state store), and a directory for stored HTTP revert bodies.
 /// The proxy acts as the daemon principal, so the operator manages
 /// proxy-armed provisionals with the same
@@ -477,6 +479,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             path: mutation.revert.path,
             requires_uid_precondition: mutation.revert_requires_uid_precondition,
             resource_uid: None,
+            create_provenance: mutation.create_provenance,
             body_file,
         };
 
@@ -507,7 +510,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             forward_done: false,
             forward_exit: None,
             forward_persistence_failed: false,
-            status: ProvisionalStatus::Dispatching,
+            status: ProvisionalStatus::Staged,
             revert_exit: None,
             revert_detail: None,
             api_revert: Some(api_revert),
@@ -554,13 +557,20 @@ impl guard::proxy::GateSink for DaemonGateSink {
             #[cfg(test)]
             pause_api_containment(&endpoint, "published").await;
             if ready_tx.send(Some(handle.clone())).is_err() || accepted_rx.await.is_err() {
-                let mut registry = server.state.provisional.write().await;
-                if registry.get(&handle).is_some_and(|row| {
-                    row.status == ProvisionalStatus::Dispatching && !row.forward_done
-                }) {
+                let still_staged = server
+                    .state
+                    .provisional
+                    .read()
+                    .await
+                    .get(&handle)
+                    .cloned()
+                    .is_some_and(|row| {
+                        row.status == ProvisionalStatus::Staged && !row.forward_done
+                    });
+                if still_staged {
                     if let Some(store) = &server.state.session_store {
                         if store.delete_provisional(handle.clone()).await.is_ok() {
-                            registry.remove(&handle);
+                            server.state.provisional.write().await.remove(&handle);
                             remove_revert_body(&provisional);
                         }
                     }
@@ -572,6 +582,50 @@ impl guard::proxy::GateSink for DaemonGateSink {
         Some(handle)
     }
 
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        let server = self.server.clone();
+        let handle = handle.to_string();
+        tokio::spawn(async move {
+            let expected = {
+                let registry = server.state.provisional.read().await;
+                let Some(expected) = registry.get(&handle).cloned() else {
+                    return false;
+                };
+                if expected.status == ProvisionalStatus::Dispatching && !expected.forward_done {
+                    return true;
+                }
+                if expected.status != ProvisionalStatus::Staged || expected.forward_done {
+                    return false;
+                }
+                expected
+            };
+            let mut next = expected.clone();
+            next.status = ProvisionalStatus::Dispatching;
+            let Some(store) = &server.state.session_store else {
+                return false;
+            };
+            if let Err(error) = store
+                .compare_and_swap_provisional(expected, next.clone())
+                .await
+            {
+                tracing::error!("api-proxy dispatch marker was not persisted: {error}");
+                return false;
+            }
+            let mut registry = server.state.provisional.write().await;
+            if registry
+                .get(&handle)
+                .is_some_and(|row| row.status == ProvisionalStatus::Staged && !row.forward_done)
+            {
+                registry.insert(next);
+                true
+            } else {
+                false
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
         let server = self.server.clone();
         #[cfg(test)]
@@ -580,8 +634,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let resource_uid = resource_uid.map(str::to_string);
         let window_secs = self.window_secs;
         let task = tokio::spawn(async move {
-            let mut registry = server.state.provisional.write().await;
-            let Some(expected) = registry.get(&handle).cloned() else {
+            let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
                 return false;
             };
             if expected.forward_done && expected.forward_exit == Some(0) {
@@ -615,15 +668,46 @@ impl guard::proxy::GateSink for DaemonGateSink {
                 return false;
             };
             if let Err(error) = store
-                .compare_and_swap_provisional(expected, next.clone())
+                .compare_and_swap_provisional(expected.clone(), next.clone())
                 .await
             {
                 tracing::error!("api-proxy auto-revert activation failed: {error}");
+                let mut uncertain = next;
+                uncertain.status = ProvisionalStatus::NeedsOperatorDecision;
+                uncertain.forward_exit = None;
+                uncertain.deadline_unix = 0;
+                uncertain.window_secs = 0;
+                uncertain.forward_persistence_failed = true;
+                uncertain.revert_detail = Some(
+                    "successful mutation headers were received, but containment state is not durably classified"
+                        .to_string(),
+                );
+                let mut registry = server.state.provisional.write().await;
+                let mut published = None;
+                if registry.get(&handle).is_some_and(|row| {
+                    row.status == ProvisionalStatus::Dispatching && !row.forward_done
+                }) {
+                    registry.insert(uncertain.clone());
+                    published = Some(uncertain);
+                }
+                drop(registry);
+                if let Some(row) = published {
+                    server.emit_event(NotifyEvent {
+                        event: "provisional_needs_operator_decision",
+                        at_unix: now_unix(),
+                        handle: Some(handle),
+                        session_fingerprint: row.session_fingerprint,
+                        requester_principal: None,
+                        reason: row.revert_detail,
+                        status: Some("persistence_failed".to_string()),
+                        behavior: None,
+                    });
+                }
                 return false;
             }
             #[cfg(test)]
             pause_api_containment(&endpoint, "activation_committed").await;
-            registry.insert(next.clone());
+            server.state.provisional.write().await.insert(next.clone());
             server.emit_event(NotifyEvent {
                 event: "provisional_armed",
                 at_unix: now,
@@ -650,8 +734,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let reason = guard::redact::redact_output_text(reason);
         let resource_uid = resource_uid.map(str::to_string);
         let task = tokio::spawn(async move {
-            let mut registry = server.state.provisional.write().await;
-            let Some(expected) = registry.get(&handle).cloned() else {
+            let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
                 return false;
             };
             if expected.status == ProvisionalStatus::Armed
@@ -660,8 +743,11 @@ impl guard::proxy::GateSink for DaemonGateSink {
             {
                 return true;
             }
-            if expected.status != ProvisionalStatus::Dispatching
-                || expected.forward_done
+            if !matches!(
+                expected.status,
+                ProvisionalStatus::Dispatching | ProvisionalStatus::NeedsOperatorDecision
+            ) || (expected.forward_done
+                && expected.status != ProvisionalStatus::NeedsOperatorDecision)
                 || expected.forward_exit.is_some()
             {
                 return false;
@@ -675,19 +761,38 @@ impl guard::proxy::GateSink for DaemonGateSink {
             next.window_secs = 0;
             next.revert_detail = Some(reason);
             if let Some(api) = next.api_revert.as_mut() {
-                api.resource_uid = resource_uid;
+                if resource_uid.is_some() {
+                    api.resource_uid = resource_uid;
+                }
             }
             let Some(store) = &server.state.session_store else {
                 return false;
             };
-            if let Err(error) = store
-                .compare_and_swap_provisional(expected, next.clone())
-                .await
-            {
+            let persisted = if expected.forward_persistence_failed {
+                store.save_provisional(next.clone()).await
+            } else {
+                store
+                    .compare_and_swap_provisional(expected.clone(), next.clone())
+                    .await
+            };
+            if let Err(error) = persisted {
                 tracing::error!("api-proxy uncertain mutation state was not updated: {error}");
+                let mut live = next;
+                live.forward_persistence_failed = true;
+                server.state.provisional.write().await.insert(live.clone());
+                server.emit_event(NotifyEvent {
+                    event: "provisional_needs_operator_decision",
+                    at_unix: now_unix(),
+                    handle: Some(handle),
+                    session_fingerprint: live.session_fingerprint,
+                    requester_principal: None,
+                    reason: live.revert_detail,
+                    status: Some("persistence_failed".to_string()),
+                    behavior: None,
+                });
                 return false;
             }
-            registry.insert(next.clone());
+            server.state.provisional.write().await.insert(next.clone());
             server.emit_event(NotifyEvent {
                 event: "provisional_needs_operator_decision",
                 at_unix: now_unix(),
@@ -707,11 +812,14 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let server = self.server.clone();
         let handle = handle.to_string();
         let task = tokio::spawn(async move {
-            let mut registry = server.state.provisional.write().await;
-            let Some(staged) = registry.get(&handle).cloned() else {
+            let Some(staged) = server.state.provisional.read().await.get(&handle).cloned() else {
                 return true;
             };
-            if staged.status != ProvisionalStatus::Dispatching || staged.forward_done {
+            if !matches!(
+                staged.status,
+                ProvisionalStatus::Staged | ProvisionalStatus::Dispatching
+            ) || staged.forward_done
+            {
                 return false;
             }
             let Some(store) = &server.state.session_store else {
@@ -721,7 +829,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                 tracing::warn!("api-proxy staged revert cleanup failed: {error}");
                 return false;
             }
-            registry.remove(&handle);
+            server.state.provisional.write().await.remove(&handle);
             remove_revert_body(&staged);
             true
         });
@@ -919,20 +1027,29 @@ impl guard::proxy::GateSink for DaemonGateSink {
         }
     }
 
-    async fn resolve(&self, handle: &str) {
+    async fn resolve(&self, handle: &str) -> bool {
         // The created object is already gone by the workload's own action, so the
         // pending create-revert is moot. Confirm it to cancel
         // the timer; the sweeper then never tries to delete an absent object. A
-        // handle that is already terminal is a no-op.
-        let mut registry = self.server.state.provisional.write().await;
-        let Some(expected) = registry.get(handle).cloned() else {
-            return;
-        };
-        let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
-        staged.insert(expected.clone());
-        match staged.confirm(handle) {
-            Ok(p) => {
-                if let Some(store) = &self.server.state.session_store {
+        // missing row is already resolved, while an incompatible live state
+        // fails closed.
+        let server = self.server.clone();
+        #[cfg(test)]
+        let endpoint = self.endpoint.clone();
+        let handle = handle.to_string();
+        tokio::spawn(async move {
+            let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
+                return true;
+            };
+            let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
+            staged.insert(expected.clone());
+            match staged.confirm(&handle) {
+                Ok(p) => {
+                    #[cfg(test)]
+                    pause_api_containment(&endpoint, "resolve_before_persist").await;
+                    let Some(store) = &server.state.session_store else {
+                        return false;
+                    };
                     if let Err(error) = store
                         .compare_and_swap_provisional(expected, p.clone())
                         .await
@@ -942,31 +1059,68 @@ impl guard::proxy::GateSink for DaemonGateSink {
                             handle,
                             error
                         );
-                        return;
+                        return false;
                     }
+                    server.state.provisional.write().await.insert(p.clone());
+                    tracing::info!(
+                        "api-proxy: resolved auto-revert {} (created object deleted by workload)",
+                        handle
+                    );
+                    server.emit_event(NotifyEvent {
+                        event: "decision_made",
+                        at_unix: now_unix(),
+                        handle: Some(handle),
+                        session_fingerprint: p.session_fingerprint.clone(),
+                        requester_principal: None,
+                        reason: Some("workload removed its contained created object".to_string()),
+                        status: Some("confirmed".to_string()),
+                        behavior: None,
+                    });
+                    true
                 }
-                registry.insert(p.clone());
-                drop(registry);
-                tracing::info!(
-                    "api-proxy: resolved auto-revert {} (created object deleted by workload)",
-                    handle
-                );
-                self.server.emit_event(NotifyEvent {
-                    event: "decision_made",
-                    at_unix: now_unix(),
-                    handle: Some(handle.to_string()),
-                    session_fingerprint: p.session_fingerprint.clone(),
-                    requester_principal: None,
-                    reason: Some("workload removed its contained created object".to_string()),
-                    status: Some("confirmed".to_string()),
-                    behavior: None,
-                });
+                Err(e) => {
+                    tracing::debug!("api-proxy: resolve {} was a no-op: {}", handle, e);
+                    false
+                }
             }
-            Err(e) => {
-                drop(registry);
-                tracing::debug!("api-proxy: resolve {} was a no-op: {}", handle, e);
-            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn guard::proxy::ApiForwardHandoff,
+    ) -> Result<(), String> {
+        let registry = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.server.state.provisional.read(),
+        )
+        .await
+        .map_err(|_| "provisional cleanup authority lock timed out".to_string())?;
+        let row = registry
+            .get(handle)
+            .filter(|row| {
+                row.status == ProvisionalStatus::Armed
+                    && row.forward_done
+                    && row.forward_exit == Some(0)
+            })
+            .ok_or_else(|| "provisional cleanup authority was revoked".to_string())?;
+        let api = row
+            .api_revert
+            .as_ref()
+            .filter(|api| {
+                api.resource_uid.as_deref() == Some(resource_uid)
+                    && api.create_provenance.as_deref() == Some(create_provenance)
+            })
+            .ok_or_else(|| "provisional cleanup identity changed".to_string())?;
+        if !api.requires_uid_precondition {
+            return Err("provisional cleanup lacks an exact UID precondition".to_string());
         }
+        handoff.forward().await
     }
 }
 
@@ -3697,6 +3851,7 @@ mod transactional_tests {
                 body: with_body.then(|| b"{}".to_vec()),
             },
             revert_requires_uid_precondition: false,
+            create_provenance: None,
             session_fingerprint: None,
             session_revision: None,
             secret_entitlements: None,
@@ -3761,6 +3916,7 @@ mod transactional_tests {
                     body: None,
                 },
                 revert_requires_uid_precondition: false,
+                create_provenance: None,
                 session_fingerprint: None,
                 session_revision: None,
                 secret_entitlements: None,
@@ -3801,6 +3957,7 @@ mod transactional_tests {
                     body: None,
                 },
                 revert_requires_uid_precondition: false,
+                create_provenance: None,
                 session_fingerprint: None,
                 session_revision: None,
                 secret_entitlements: None,
@@ -3810,8 +3967,65 @@ mod transactional_tests {
         )
         .await
         .unwrap();
+        assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
         store.fail_next_write_for_test();
         assert!(!guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+        let live_after_failure = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            live_after_failure.status,
+            ProvisionalStatus::NeedsOperatorDecision
+        );
+        assert!(live_after_failure.forward_persistence_failed);
+        assert_eq!(
+            store
+                .load_provisionals()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.handle == handle)
+                .unwrap()
+                .status,
+            ProvisionalStatus::Dispatching
+        );
+        store.fail_next_write_for_test();
+        assert!(
+            !guard::proxy::GateSink::mark_revert_indeterminate(
+                &sink,
+                &handle,
+                "upstream handoff outcome is uncertain",
+                None,
+            )
+            .await
+        );
+        let still_live = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert_eq!(still_live.status, ProvisionalStatus::NeedsOperatorDecision);
+        assert!(still_live.forward_persistence_failed);
+        assert_eq!(
+            store
+                .load_provisionals()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.handle == handle)
+                .unwrap()
+                .status,
+            ProvisionalStatus::Dispatching
+        );
+        assert!(converge_forward_persistence_failure(&server, &still_live).await);
         assert!(
             guard::proxy::GateSink::mark_revert_indeterminate(
                 &sink,
@@ -3845,6 +4059,52 @@ mod transactional_tests {
         let mut registry = ProvisionalRegistry::new();
         registry.insert(durable);
         assert!(registry.begin_revert(&handle).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cleanup_resolution_persistence_does_not_hold_the_live_registry_writer() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store);
+        let endpoint = "fixture-resolve".to_string();
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: endpoint.clone(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+        assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+        assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+
+        let (reached, release) = install_api_containment_hook(&endpoint, "resolve_before_persist");
+        let resolving = tokio::spawn({
+            let sink = sink.clone();
+            let handle = handle.clone();
+            async move { guard::proxy::GateSink::resolve(&sink, &handle).await }
+        });
+        reached.acquire().await.unwrap().forget();
+        let unrelated_writer = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.state.provisional.write(),
+        )
+        .await
+        .expect("durable cleanup resolution must not retain the live registry writer");
+        drop(unrelated_writer);
+        release.add_permits(1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), resolving)
+                .await
+                .expect("cleanup resolution completes after persistence resumes")
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3910,6 +4170,10 @@ mod transactional_tests {
         let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
             .await
             .unwrap();
+        assert!(
+            guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await,
+            "staged mutation advances to the dispatch boundary"
+        );
         let (reached, release) = install_api_containment_hook(endpoint, "activation_committed");
         let sink_task = sink.clone();
         let handle_task = handle.clone();

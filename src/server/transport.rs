@@ -561,6 +561,7 @@ mod api_session_event_tests {
             path: "/api/v1/namespaces/dev/configmaps/test".to_string(),
             requires_uid_precondition: false,
             resource_uid: None,
+            create_provenance: None,
             body_file: None,
         });
         let error = provisional_recovery_error(&server, &row)
@@ -819,7 +820,19 @@ impl Server {
                         invalid.push((row.handle.clone(), reason));
                     }
                 }
-                let (mut reg, moved) = ProvisionalRegistry::from_rows(rows);
+                let durable_rows = rows.clone();
+                let (mut reg, moved, retired) = ProvisionalRegistry::recover_rows(rows);
+                for handle in retired {
+                    store
+                        .delete_provisional(handle.clone())
+                        .await
+                        .with_context(|| {
+                            format!("retire inert pre-handoff provisional {handle}")
+                        })?;
+                    if let Some(row) = durable_rows.iter().find(|row| row.handle == handle) {
+                        super::gate_runtime::remove_revert_body(row);
+                    }
+                }
                 let mut escalated = invalid;
                 for handle in moved {
                     let reason = "daemon stopped before the forward outcome or rollback completion was unambiguous"

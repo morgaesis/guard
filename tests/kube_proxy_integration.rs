@@ -31,7 +31,19 @@ use guard::proxy::{
 };
 
 const CREATE_PROVENANCE_ANNOTATION: &str = "guard.morgaesis.dev/provisional";
-type CreateProvenance = Arc<std::sync::Mutex<Option<String>>>;
+#[derive(Clone, Default)]
+struct CreateObservation {
+    provenance: Option<String>,
+    name: Option<String>,
+    namespace: Option<String>,
+    body_sha256: Option<String>,
+}
+
+type CreateProvenance = Arc<std::sync::Mutex<CreateObservation>>;
+
+async fn reject_test_cleanup(_handoff: &mut dyn ApiForwardHandoff) -> Result<(), String> {
+    Err("test cleanup authority is unavailable".to_string())
+}
 
 async fn observe_create_provenance(
     request: Request<Incoming>,
@@ -41,10 +53,9 @@ async fn observe_create_provenance(
     let path = request.uri().path().to_string();
     if method == hyper::Method::POST {
         let body = request.into_body().collect().await.unwrap().to_bytes();
-        let marker = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|value| {
-                value
+        if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+            *provenance.lock().unwrap() = CreateObservation {
+                provenance: value
                     .pointer(&format!(
                         "/metadata/annotations/{}",
                         CREATE_PROVENANCE_ANNOTATION
@@ -52,18 +63,40 @@ async fn observe_create_provenance(
                             .replace('/', "~1")
                     ))
                     .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
-        *provenance.lock().unwrap() = marker;
+                    .map(str::to_string),
+                name: value
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                namespace: value
+                    .pointer("/metadata/namespace")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                body_sha256: Some({
+                    use sha2::Digest;
+                    sha2::Sha256::digest(&body)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect()
+                }),
+            };
+        }
     }
     (method, path)
 }
 
 fn attach_create_provenance(object: &mut Value, provenance: &CreateProvenance) {
-    let Some(marker) = provenance.lock().unwrap().clone() else {
+    let observation = provenance.lock().unwrap().clone();
+    let Some(marker) = observation.provenance else {
         return;
     };
     object["metadata"]["annotations"][CREATE_PROVENANCE_ANNOTATION] = Value::String(marker);
+    if let Some(name) = observation.name {
+        object["metadata"]["name"] = Value::String(name);
+    }
+    if let Some(namespace) = observation.namespace {
+        object["metadata"]["namespace"] = Value::String(namespace);
+    }
 }
 
 async fn authorize_test_session(
@@ -601,6 +634,124 @@ async fn spawn_create_status_upstream(
     (format!("http://{addr}"), deletes)
 }
 
+#[derive(Clone, Copy)]
+enum OversizedBodyKind {
+    Declared,
+    Chunked,
+}
+
+async fn spawn_oversized_body_upstream(kind: OversizedBodyKind) -> String {
+    type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(move |_request: Request<Incoming>| async move {
+                    let body: MockBody = match kind {
+                        OversizedBodyKind::Declared => Full::new(Bytes::from(vec![b'x'; 129]))
+                            .map_err(std::io::Error::other)
+                            .boxed(),
+                        OversizedBodyKind::Chunked => {
+                            let frames = futures::stream::iter([
+                                Ok::<_, std::io::Error>(Frame::data(Bytes::from(vec![b'x'; 65]))),
+                                Ok(Frame::data(Bytes::from(vec![b'y'; 65]))),
+                            ]);
+                            StreamBody::new(frames).boxed()
+                        }
+                    };
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(body)
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_cleanup_oversized_upstream(kind: OversizedBodyKind) -> String {
+    type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, path) = observe_create_provenance(request, &provenance).await;
+                        if method == hyper::Method::DELETE {
+                            let body: MockBody = match kind {
+                                OversizedBodyKind::Declared => {
+                                    Full::new(Bytes::from(vec![b'x'; 513]))
+                                        .map_err(std::io::Error::other)
+                                        .boxed()
+                                }
+                                OversizedBodyKind::Chunked => {
+                                    let frames = futures::stream::iter([
+                                        Ok::<_, std::io::Error>(Frame::data(Bytes::from(vec![
+                                            b'x';
+                                            257
+                                        ]))),
+                                        Ok(Frame::data(Bytes::from(vec![b'y'; 257]))),
+                                    ]);
+                                    StreamBody::new(frames).boxed()
+                                }
+                            };
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/json")
+                                    .body(body)
+                                    .unwrap(),
+                            );
+                        }
+                        let mut object = created_pod_object();
+                        if let Some(name) = path
+                            .rsplit('/')
+                            .next()
+                            .filter(|_| method == hyper::Method::GET)
+                        {
+                            object["metadata"]["name"] = Value::String(name.to_string());
+                        }
+                        attach_create_provenance(&mut object, &provenance);
+                        let status = if method == hyper::Method::POST {
+                            201
+                        } else {
+                            200
+                        };
+                        Ok(Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(
+                                Full::new(Bytes::from(object.to_string()))
+                                    .map_err(std::io::Error::other)
+                                    .boxed(),
+                            )
+                            .unwrap())
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
 async fn spawn_transport_error_upstream() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -676,6 +827,50 @@ async fn spawn_replaceable_create_upstream() -> (String, Arc<AtomicBool>, Arc<At
         }
     });
     (format!("http://{addr}"), replacement, deletes)
+}
+
+async fn spawn_create_without_get_upstream() -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gets = Arc::new(AtomicUsize::new(0));
+    let observed_gets = gets.clone();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let provenance = provenance.clone();
+            let gets = observed_gets.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let provenance = provenance.clone();
+                    let gets = gets.clone();
+                    async move {
+                        let (method, _) = observe_create_provenance(request, &provenance).await;
+                        if method == hyper::Method::GET {
+                            gets.fetch_add(1, Ordering::SeqCst);
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(403)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
+                            );
+                        }
+                        let mut object = created_pod_object();
+                        attach_create_provenance(&mut object, &provenance);
+                        Ok(Response::builder()
+                            .status(201)
+                            .header("content-type", "application/json")
+                            .body(Full::new(Bytes::from(object.to_string())))
+                            .unwrap())
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), gets)
 }
 
 async fn spawn_policy_barrier_upstream(
@@ -1562,6 +1757,32 @@ async fn start_proxy_with_timeouts(
     handoff_timeout: Duration,
     body_timeout: Duration,
 ) -> (String, reqwest::Client) {
+    start_proxy_with_limits(
+        mock_base,
+        policy_yaml,
+        judge,
+        gate,
+        rarity_threshold,
+        session_sink,
+        handoff_timeout,
+        body_timeout,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_proxy_with_limits(
+    mock_base: String,
+    policy_yaml: &str,
+    judge: Option<Arc<dyn ApiJudge>>,
+    gate: Option<Arc<dyn GateSink>>,
+    rarity_threshold: u64,
+    session_sink: Arc<dyn ApiSessionSink>,
+    handoff_timeout: Duration,
+    body_timeout: Duration,
+    body_limit: Option<usize>,
+) -> (String, reqwest::Client) {
     let kubeconfig = kubeconfig_for(&mock_base);
     let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -1572,6 +1793,9 @@ async fn start_proxy_with_timeouts(
         .with_listener_mode(ApiListenerMode::Policy)
         .with_upstream_handoff_timeout(handoff_timeout)
         .with_upstream_body_timeout(body_timeout);
+    if let Some(limit) = body_limit {
+        proxy = proxy.with_upstream_body_limit(limit);
+    }
     if rarity_threshold > 0 {
         proxy = proxy.with_rarity_escalation(rarity_threshold);
     }
@@ -2095,7 +2319,66 @@ async fn stalled_upstream_handoff_times_out_and_releases_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn successful_mutation_headers_arm_containment_before_a_stalled_body_times_out() {
+async fn durable_dispatch_marker_is_committed_at_the_final_send_boundary() {
+    let (upstream, reached_upstream) = spawn_stalled_upstream().await;
+    let sink = BlockingDispatchSink::default();
+    let reached_dispatch = sink.reached.clone();
+    let release_dispatch = sink.release.clone();
+    let state = sink.state.clone();
+    let (base, client) = start_proxy_with_timeouts(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+        Arc::new(LiveSessionSink),
+        Duration::from_millis(200),
+        Duration::from_secs(2),
+    )
+    .await;
+    let request = tokio::spawn(async move {
+        client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(r#"{"metadata":{"name":"dispatch-boundary"}}"#)
+            .send()
+            .await
+            .unwrap()
+    });
+    reached_dispatch.acquire().await.unwrap().forget();
+    assert!(reached_upstream.try_acquire().is_err());
+    release_dispatch.add_permits(1);
+    reached_upstream.acquire().await.unwrap().forget();
+    assert_eq!(request.await.unwrap().status(), 504);
+    assert_eq!(state.dispatching.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_dispatch_marker_cancels_inert_state_without_sending() {
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let sink = DispatchFailSink::default();
+    let state = sink.state.clone();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .body(r#"{"metadata":{"name":"dispatch-failure"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(forwarded.load(Ordering::SeqCst), 0);
+    assert_eq!(state.cancelled.lock().unwrap().len(), 1);
+    assert!(state.indeterminate.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_create_body_preserves_indeterminate_containment_without_uid() {
     let sink = RecordingSink::default();
     let (base, client) = start_proxy_with_timeouts(
         spawn_success_headers_stalled_body().await,
@@ -2119,15 +2402,19 @@ async fn successful_mutation_headers_arm_containment_before_a_stalled_body_times
     .await
     .expect("proxy applies a bounded body timeout")
     .unwrap();
-    assert_eq!(response.status(), 504);
+    assert_eq!(response.status(), 502);
     assert_eq!(sink.calls.lock().unwrap().len(), 1);
-    assert_eq!(sink.activated.lock().unwrap().as_slice(), ["test-handle-0"]);
+    assert!(sink.activated.lock().unwrap().is_empty());
+    assert_eq!(
+        sink.indeterminate.lock().unwrap().as_slice(),
+        ["test-handle-0"]
+    );
     assert!(sink
         .resource_uids
         .lock()
         .unwrap()
         .first()
-        .is_some_and(Option::is_some));
+        .is_some_and(Option::is_none));
     assert_eq!(
         response
             .headers()
@@ -2135,6 +2422,64 @@ async fn successful_mutation_headers_arm_containment_before_a_stalled_body_times
             .and_then(|value| value.to_str().ok()),
         Some("test-handle-0")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutation_identity_buffer_rejects_declared_and_chunked_oversize() {
+    for kind in [OversizedBodyKind::Declared, OversizedBodyKind::Chunked] {
+        let sink = RecordingSink::default();
+        let (base, client) = start_proxy_with_limits(
+            spawn_oversized_body_upstream(kind).await,
+            "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+            None,
+            Some(Arc::new(sink.clone())),
+            0,
+            Arc::new(LiveSessionSink),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(64),
+        )
+        .await;
+        let response = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(r#"{"metadata":{"name":"bounded-pod"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 502);
+        assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+        assert!(sink.activated.lock().unwrap().is_empty());
+        assert!(sink
+            .resource_uids
+            .lock()
+            .unwrap()
+            .first()
+            .is_some_and(Option::is_none));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redacted_read_buffer_rejects_declared_and_chunked_oversize() {
+    for kind in [OversizedBodyKind::Declared, OversizedBodyKind::Chunked] {
+        let (base, client) = start_proxy_with_limits(
+            spawn_oversized_body_upstream(kind).await,
+            "default: deny\nrules:\n  - verbs: [get]\n    resources: [secrets]\n    namespaces: [dev]\n    action: allow\n",
+            None,
+            None,
+            0,
+            Arc::new(LiveSessionSink),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(64),
+        )
+        .await;
+        let response = client
+            .get(format!("{base}/api/v1/namespaces/dev/secrets/example"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 502);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2208,7 +2553,7 @@ async fn mutation_transport_error_preserves_an_actionable_provisional() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn server_error_preserves_containment_without_create_provenance() {
+async fn server_error_preserves_indeterminate_containment_without_uid() {
     let (upstream, forwarded_deletes) = spawn_create_status_upstream(500, None).await;
     let sink = RecordingSink::default();
     let (base, client) = start_proxy_with(
@@ -2234,7 +2579,7 @@ async fn server_error_preserves_containment_without_create_provenance() {
         .lock()
         .unwrap()
         .first()
-        .is_some_and(Option::is_some));
+        .is_some_and(Option::is_none));
     assert!(sink.activated.lock().unwrap().is_empty());
     assert!(sink.cancelled.lock().unwrap().is_empty());
 
@@ -2313,6 +2658,127 @@ async fn replacement_uid_cannot_use_created_resource_cleanup_authority() {
         .unwrap();
     assert_eq!(delete.status(), 403);
     assert_eq!(forwarded_deletes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_response_uid_arms_without_follow_up_get_authority() {
+    let (upstream, gets) = spawn_create_without_get_upstream().await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .body(r#"{"metadata":{"name":"response-authority"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    assert_eq!(gets.load(Ordering::SeqCst), 0);
+    assert_eq!(sink.activated.lock().unwrap().len(), 1);
+    assert!(sink
+        .resource_uids
+        .lock()
+        .unwrap()
+        .first()
+        .is_some_and(Option::is_some));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cleanup_buffer_rejects_declared_and_chunked_oversize_without_resolution() {
+    for kind in [OversizedBodyKind::Declared, OversizedBodyKind::Chunked] {
+        let sink = RecordingSink::default();
+        let (base, client) = start_proxy_with_limits(
+            spawn_cleanup_oversized_upstream(kind).await,
+            "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+            None,
+            Some(Arc::new(sink.clone())),
+            0,
+            Arc::new(LiveSessionSink),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(512),
+        )
+        .await;
+        let create = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(r#"{"metadata":{"name":"cleanup-bounded"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), 201);
+        let cleanup = client
+            .delete(format!("{base}/api/v1/namespaces/dev/pods/cleanup-bounded"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cleanup.status(), 502);
+        assert!(sink.resolved.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cleanup_revocation_linearizes_at_the_final_header_handoff() {
+    for (pause, expected_status, expected_deletes) in [
+        (CleanupLeasePause::BeforeLease, 403, 0),
+        (CleanupLeasePause::AfterLease, 200, 1),
+    ] {
+        let (upstream, _, deletes) = spawn_replaceable_create_upstream().await;
+        let sink = Arc::new(CleanupLeaseSink::new(pause));
+        let (base, client) = start_proxy_with(
+            upstream,
+            "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+            None,
+            Some(sink.clone()),
+            0,
+        )
+        .await;
+        let created = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(r#"{"metadata":{"name":"lease-linearized"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201);
+
+        let cleanup = tokio::spawn(async move {
+            client
+                .delete(format!(
+                    "{base}/api/v1/namespaces/dev/pods/lease-linearized"
+                ))
+                .send()
+                .await
+                .unwrap()
+        });
+        sink.reached.acquire().await.unwrap().forget();
+        let coordination = sink.coordination.clone();
+        let mut revoke = tokio::spawn(async move {
+            *coordination.write().await = false;
+        });
+        tokio::task::yield_now().await;
+        if matches!(pause, CleanupLeasePause::AfterLease) {
+            assert!(!revoke.is_finished());
+        } else {
+            tokio::time::timeout(Duration::from_secs(2), &mut revoke)
+                .await
+                .expect("pre-handoff revocation completes before cleanup send")
+                .unwrap();
+        }
+        sink.release.add_permits(1);
+        assert_eq!(cleanup.await.unwrap().status(), expected_status);
+        if matches!(pause, CleanupLeasePause::AfterLease) {
+            tokio::time::timeout(Duration::from_secs(2), &mut revoke)
+                .await
+                .expect("post-handoff revocation completes after cleanup send")
+                .unwrap();
+        }
+        assert_eq!(deletes.load(Ordering::SeqCst), expected_deletes);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2407,6 +2873,51 @@ async fn cancelled_mutation_handoff_preserves_containment() {
     assert!(sink.cancelled.lock().unwrap().is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_during_uid_transition_keeps_richer_identity() {
+    let (upstream, _) = spawn_create_status_upstream(201, None).await;
+    let sink = BlockingUidTransitionSink::default();
+    let state = sink.state.clone();
+    let reached = sink.reached.clone();
+    let release = sink.release.clone();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let request = tokio::spawn(async move {
+        let _ = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(r#"{"metadata":{"name":"cancel-transition"}}"#)
+            .send()
+            .await;
+    });
+    reached.acquire().await.unwrap().forget();
+    request.abort();
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !state.activated.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached UID transition completes after caller cancellation");
+    assert!(state.indeterminate.lock().unwrap().is_empty());
+    assert!(state.cancelled.lock().unwrap().is_empty());
+    assert!(state
+        .resource_uids
+        .lock()
+        .unwrap()
+        .first()
+        .is_some_and(Option::is_some));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evaluator_authority_revoked_during_an_approved_hold_prevents_forwarding() {
     let policy = r#"
@@ -2430,7 +2941,7 @@ rules:
     .await;
     let response = client
         .post(format!("{base}/api/v1/namespaces/dev/configmaps"))
-        .body("{}")
+        .body(r#"{"metadata":{"name":"held-config"}}"#)
         .send()
         .await
         .unwrap();
@@ -2679,6 +3190,7 @@ struct RecordingSink {
     resource_uids: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     cancelled: Arc<std::sync::Mutex<Vec<String>>>,
     resolved: Arc<std::sync::Mutex<Vec<String>>>,
+    dispatching: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -2687,6 +3199,11 @@ impl guard::proxy::GateSink for RecordingSink {
         let handle = format!("test-handle-{}", self.calls.lock().unwrap().len());
         self.calls.lock().unwrap().push(mutation);
         Some(handle)
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.dispatching.lock().unwrap().push(handle.to_string());
+        true
     }
 
     async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
@@ -2719,8 +3236,43 @@ impl guard::proxy::GateSink for RecordingSink {
         true
     }
 
-    async fn resolve(&self, handle: &str) {
+    async fn resolve(&self, handle: &str) -> bool {
         self.resolved.lock().unwrap().push(handle.to_string());
+        true
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        let index = self
+            .activated
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|active| active == handle)
+            .ok_or_else(|| "test cleanup authority is inactive".to_string())?;
+        if self
+            .resource_uids
+            .lock()
+            .unwrap()
+            .get(index)
+            .and_then(Option::as_deref)
+            != Some(resource_uid)
+            || self
+                .calls
+                .lock()
+                .unwrap()
+                .get(index)
+                .and_then(|mutation| mutation.create_provenance.as_deref())
+                != Some(create_provenance)
+        {
+            return Err("test cleanup authority identity changed".to_string());
+        }
+        handoff.forward().await
     }
 }
 
@@ -2733,6 +3285,10 @@ struct ActivationFailSink {
 impl guard::proxy::GateSink for ActivationFailSink {
     async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
         self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.state.mark_revert_dispatching(handle).await
     }
 
     async fn mark_revert_forwarded(&self, handle: &str, _resource_uid: Option<&str>) -> bool {
@@ -2759,6 +3315,22 @@ impl guard::proxy::GateSink for ActivationFailSink {
     async fn cancel_staged_revert(&self, handle: &str) -> bool {
         self.state.cancel_staged_revert(handle).await
     }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
 }
 
 #[derive(Clone)]
@@ -2769,12 +3341,291 @@ struct BlockingCancelSink {
     release_cancel: Arc<tokio::sync::Semaphore>,
 }
 
+#[derive(Clone)]
+struct BlockingUidTransitionSink {
+    state: RecordingSink,
+    reached: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone)]
+struct BlockingDispatchSink {
+    state: RecordingSink,
+    reached: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone, Default)]
+struct DispatchFailSink {
+    state: RecordingSink,
+}
+
+impl Default for BlockingDispatchSink {
+    fn default() -> Self {
+        Self {
+            state: RecordingSink::default(),
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+impl Default for BlockingUidTransitionSink {
+    fn default() -> Self {
+        Self {
+            state: RecordingSink::default(),
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CleanupLeasePause {
+    BeforeLease,
+    AfterLease,
+}
+
+#[derive(Clone)]
+struct CleanupLeaseSink {
+    state: RecordingSink,
+    coordination: Arc<tokio::sync::RwLock<bool>>,
+    reached: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    pause: CleanupLeasePause,
+}
+
+impl CleanupLeaseSink {
+    fn new(pause: CleanupLeasePause) -> Self {
+        Self {
+            state: RecordingSink::default(),
+            coordination: Arc::new(tokio::sync::RwLock::new(true)),
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            pause,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for CleanupLeaseSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
+        self.state.mark_revert_forwarded(handle, resource_uid).await
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.state
+            .mark_revert_indeterminate(handle, reason, resource_uid)
+            .await
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        if matches!(self.pause, CleanupLeasePause::BeforeLease) {
+            self.reached.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|_| "cleanup test barrier closed".to_string())?
+                .forget();
+        }
+        let active = self.coordination.read().await;
+        if matches!(self.pause, CleanupLeasePause::AfterLease) {
+            self.reached.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|_| "cleanup test barrier closed".to_string())?
+                .forget();
+        }
+        if !*active {
+            return Err("cleanup authority was revoked".to_string());
+        }
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for BlockingUidTransitionSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
+        self.reached.add_permits(1);
+        if self.release.acquire().await.is_err() {
+            return false;
+        }
+        self.state.mark_revert_forwarded(handle, resource_uid).await
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.state
+            .mark_revert_indeterminate(handle, reason, resource_uid)
+            .await
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for BlockingDispatchSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.reached.add_permits(1);
+        let Ok(permit) = self.release.acquire().await else {
+            return false;
+        };
+        permit.forget();
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
+        self.state.mark_revert_forwarded(handle, resource_uid).await
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.state
+            .mark_revert_indeterminate(handle, reason, resource_uid)
+            .await
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for DispatchFailSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
+    }
+}
+
 #[async_trait::async_trait]
 impl guard::proxy::GateSink for BlockingCancelSink {
     async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
         self.stage_reached.add_permits(1);
         self.release_stage.acquire().await.ok()?.forget();
         Some("blocked-cancel-handle".to_string())
+    }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        true
     }
 
     async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
@@ -2796,6 +3647,20 @@ impl guard::proxy::GateSink for BlockingCancelSink {
             return false;
         }
         true
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        _handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        Err("test cleanup authority is unavailable".to_string())
     }
 }
 
@@ -2839,9 +3704,14 @@ async fn write_mock_handler_with_provenance(
 }
 
 async fn spawn_write_mock() -> String {
+    spawn_write_mock_with_observation().await.0
+}
+
+async fn spawn_write_mock_with_observation() -> (String, CreateProvenance) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let provenance = CreateProvenance::default();
+    let observed = provenance.clone();
     tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
@@ -2866,7 +3736,7 @@ async fn spawn_write_mock() -> String {
             });
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), observed)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4687,6 +5557,24 @@ impl guard::proxy::GateSink for ApprovingSink {
         None
     }
 
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
+    }
+
     async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
         false
     }
@@ -4725,6 +5613,24 @@ struct DenyingSink {
 impl guard::proxy::GateSink for DenyingSink {
     async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
         None
+    }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
     }
 
     async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
@@ -4896,7 +5802,7 @@ rules:
 async fn held_request_captures_complete_body_before_approval_and_stalls_fail_closed() {
     use sha2::{Digest, Sha256};
 
-    let mock_base = spawn_mock_upstream().await;
+    let (mock_base, observed_create) = spawn_write_mock_with_observation().await;
     let upstream =
         Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -4920,10 +5826,30 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
         .unwrap();
     let base = format!("https://{listen}");
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
-    let stream = futures::stream::unfold(rx, |mut receiver| async move {
-        receiver.recv().await.map(|item| (item, receiver))
-    });
+    let waiting_for_tail = Arc::new(tokio::sync::Semaphore::new(0));
+    let release_tail = Arc::new(tokio::sync::Semaphore::new(0));
+    let stream = futures::stream::unfold(
+        (0_u8, waiting_for_tail.clone(), release_tail.clone()),
+        |(step, waiting, release)| async move {
+            match step {
+                0 => Some((
+                    Ok::<_, std::io::Error>(Bytes::from_static(
+                        br#"{"metadata":{"name":"held-pod"},"spec":"#,
+                    )),
+                    (1, waiting, release),
+                )),
+                1 => {
+                    waiting.add_permits(1);
+                    release.acquire().await.ok()?.forget();
+                    Some((
+                        Ok(Bytes::from_static(br#"{"replicas":2}}"#)),
+                        (2, waiting, release),
+                    ))
+                }
+                _ => None,
+            }
+        },
+    );
     let request = tokio::spawn({
         let client = client.clone();
         let base = base.clone();
@@ -4937,21 +5863,29 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
                 .unwrap()
         }
     });
-    tx.send(Ok(Bytes::from_static(br#"{"spec":"#)))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(75)).await;
+    waiting_for_tail.acquire().await.unwrap().forget();
     assert!(
         sink.snapshots.lock().unwrap().is_empty(),
         "approval must not be requested while request bytes remain unread"
     );
-    tx.send(Ok(Bytes::from_static(br#"{"replicas":2}}"#)))
-        .await
-        .unwrap();
-    drop(tx);
-    assert_eq!(request.await.unwrap().status(), 200);
-    let body = br#"{"spec":{"replicas":2}}"#;
-    let expected_digest = Sha256::digest(body)
+    release_tail.add_permits(1);
+    assert_eq!(request.await.unwrap().status(), 201);
+    let marker = observed_create
+        .lock()
+        .unwrap()
+        .provenance
+        .clone()
+        .expect("forwarded create carries canonical provenance");
+    let mut approved_body = json!({
+        "metadata": {
+            "name": "held-pod",
+            "annotations": {}
+        },
+        "spec": {"replicas": 2}
+    });
+    approved_body["metadata"]["annotations"][CREATE_PROVENANCE_ANNOTATION] = Value::String(marker);
+    let body = serde_json::to_vec(&approved_body).unwrap();
+    let expected_digest = Sha256::digest(&body)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
@@ -4960,9 +5894,17 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].body_sha256, expected_digest);
         assert_eq!(
-            snapshots[0].redacted_body_shape,
-            "{\"spec\":{\"replicas\":<number>}}"
+            snapshots[0].body_sha256,
+            observed_create
+                .lock()
+                .unwrap()
+                .body_sha256
+                .clone()
+                .expect("upstream observed the approved body")
         );
+        assert!(snapshots[0]
+            .redacted_body_shape
+            .contains(CREATE_PROVENANCE_ANNOTATION));
     }
 
     let before = sink.snapshots.lock().unwrap().len();
@@ -5007,6 +5949,24 @@ impl GateSink for SnapshotSink {
         None
     }
 
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
+    }
+
     async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
         false
     }
@@ -5041,6 +6001,24 @@ impl GateSink for SnapshotSink {
 impl guard::proxy::GateSink for CountingSink {
     async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
         None
+    }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
     }
 
     async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
@@ -5568,6 +6546,24 @@ impl guard::proxy::GateSink for CannotArmSink {
         self.writes_armed
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         None
+    }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
     }
 
     async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {

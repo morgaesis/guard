@@ -23,9 +23,11 @@ use crate::principal::{scope_eq, PrincipalKey};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvisionalStatus {
-    /// A proxy rollback is durable, but the corresponding upstream mutation is
-    /// still before or inside its finite response-header handoff. The row is
-    /// inert until the handoff outcome is durably classified.
+    /// A proxy rollback is durable, but no upstream handoff marker is durable.
+    /// This internal row is inert and is retired on restart.
+    Staged,
+    /// The durable handoff marker was written immediately before the finite
+    /// upstream send. This internal row remains inert while the daemon is live.
     Dispatching,
     /// The forward command is running, or it completed successfully and the
     /// auto-revert timer is counting down. `forward_done` distinguishes them.
@@ -54,7 +56,8 @@ impl ProvisionalStatus {
     pub fn is_outstanding(self) -> bool {
         matches!(
             self,
-            Self::Dispatching
+            Self::Staged
+                | Self::Dispatching
                 | Self::Armed
                 | Self::Reverting
                 | Self::RevertFailed
@@ -68,6 +71,7 @@ impl ProvisionalStatus {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Staged => "staged",
             Self::Dispatching => "dispatching",
             Self::Armed => "armed",
             Self::Reverting => "reverting",
@@ -178,6 +182,15 @@ pub struct Provisional {
 }
 
 impl Provisional {
+    /// Internal pre-classification rows occupy quota but do not appear on
+    /// operator, session, status, or metrics surfaces.
+    pub fn is_operator_visible(&self) -> bool {
+        !matches!(
+            self.status,
+            ProvisionalStatus::Staged | ProvisionalStatus::Dispatching
+        )
+    }
+
     pub fn command_line(&self) -> String {
         crate::redact::redact_command_line(&self.binary, &self.args)
     }
@@ -293,7 +306,9 @@ impl Provisional {
         if self.forward_persistence_failed {
             "persistence_failed"
         } else if !self.forward_done {
-            if self.status == ProvisionalStatus::Dispatching {
+            if self.status == ProvisionalStatus::Staged {
+                "staged"
+            } else if self.status == ProvisionalStatus::Dispatching {
                 "dispatching"
             } else if self.status == ProvisionalStatus::Armed {
                 "running"
@@ -302,11 +317,12 @@ impl Provisional {
             } else {
                 "interrupted"
             }
-        } else if self.forward_exit.is_some_and(|exit| exit != 0)
-            || (self.forward_exit.is_none()
-                && self.status == ProvisionalStatus::NeedsOperatorDecision
-                && self.deadline_unix == 0)
+        } else if self.api_revert.is_some()
+            && self.forward_exit.is_none()
+            && self.status == ProvisionalStatus::NeedsOperatorDecision
         {
+            "indeterminate"
+        } else if self.forward_exit.is_some_and(|exit| exit != 0) {
             "failed"
         } else {
             "completed"
@@ -331,6 +347,10 @@ pub struct ApiRevertPlan {
     pub requires_uid_precondition: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_uid: Option<String>,
+    /// Guard-generated marker carried by the admitted create body and the
+    /// authoritative response object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_provenance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_file: Option<PathBuf>,
 }
@@ -351,17 +371,32 @@ impl ProvisionalRegistry {
     /// due. The daemon applies a startup grace before the sweeper can claim it.
     /// An interrupted rollback or a row persisted before the forward outcome
     /// became known is ambiguous and therefore needs an operator decision.
-    pub fn from_rows(rows: Vec<Provisional>) -> (Self, Vec<String>) {
+    pub fn recover_rows(rows: Vec<Provisional>) -> (Self, Vec<String>, Vec<String>) {
         let mut items = HashMap::new();
         let mut moved = Vec::new();
+        let mut retired = Vec::new();
         for mut row in rows {
             row.sanitize_explanatory_text();
+            if row.status == ProvisionalStatus::Staged {
+                retired.push(row.handle);
+                continue;
+            }
+            let interrupted_api_handoff = row.status == ProvisionalStatus::Dispatching;
             let needs_recovery = row.status == ProvisionalStatus::Reverting
-                || row.status == ProvisionalStatus::Dispatching
+                || interrupted_api_handoff
                 || (row.status == ProvisionalStatus::Armed && !row.forward_done);
             if needs_recovery {
                 row.status = ProvisionalStatus::NeedsOperatorDecision;
-                if !row.forward_done {
+                if interrupted_api_handoff {
+                    row.forward_done = true;
+                    row.forward_exit = None;
+                    row.deadline_unix = 0;
+                    row.window_secs = 0;
+                    row.revert_detail = Some(
+                        "the API handoff was interrupted; the mutation outcome is indeterminate"
+                            .to_string(),
+                    );
+                } else if !row.forward_done {
                     row.deadline_unix = 0;
                     row.revert_detail = Some(
                         "daemon restarted while the forward command was running; outcome unknown"
@@ -373,7 +408,13 @@ impl ProvisionalRegistry {
             items.insert(row.handle.clone(), row);
         }
         moved.sort();
-        (Self { items }, moved)
+        retired.sort();
+        (Self { items }, moved, retired)
+    }
+
+    pub fn from_rows(rows: Vec<Provisional>) -> (Self, Vec<String>) {
+        let (registry, moved, _) = Self::recover_rows(rows);
+        (registry, moved)
     }
 
     pub fn insert(&mut self, mut p: Provisional) {
@@ -411,6 +452,24 @@ impl ProvisionalRegistry {
                 .then(a.handle.cmp(&b.handle))
         });
         v
+    }
+
+    /// Operator-facing rows, newest first. Pre-handoff staging and the finite
+    /// dispatch classification window remain internal implementation state.
+    pub fn visible_list(&self) -> Vec<Provisional> {
+        self.list()
+            .into_iter()
+            .filter(Provisional::is_operator_visible)
+            .collect()
+    }
+
+    /// Outstanding rows that are meaningful on status and metrics surfaces.
+    /// Internal rows still count toward admission quotas via [`Self::outstanding`].
+    pub fn visible_outstanding(&self) -> usize {
+        self.items
+            .values()
+            .filter(|p| p.status.is_outstanding() && p.is_operator_visible())
+            .count()
     }
 
     /// Count of outstanding (non-terminal) provisionals, for the global cap.
@@ -570,10 +629,10 @@ impl ProvisionalRegistry {
             .items
             .get_mut(handle)
             .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
-        if p.api_revert
-            .as_ref()
-            .is_some_and(|api| api.requires_uid_precondition && api.resource_uid.is_none())
-        {
+        if p.api_revert.as_ref().is_some_and(|api| {
+            api.requires_uid_precondition
+                && (api.resource_uid.is_none() || api.create_provenance.is_none())
+        }) {
             return Err(GateError::WrongState {
                 handle: handle.to_string(),
                 detail: "rollback is unavailable until the created resource identity is verified"
@@ -744,6 +803,18 @@ mod tests {
         row.status = ProvisionalStatus::Dispatching;
         row.forward_done = false;
         row.forward_exit = None;
+        row.api_revert = Some(ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "PUT".to_string(),
+            path: "/api/v1/namespaces/dev/configmaps/example".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
+            body_file: None,
+        });
         let mut registry = ProvisionalRegistry::new();
         registry.insert(row.clone());
         assert!(registry.confirm(&row.handle).is_err());
@@ -756,6 +827,62 @@ mod tests {
             recovered.get("dispatching").unwrap().status,
             ProvisionalStatus::NeedsOperatorDecision
         );
+        assert_eq!(
+            recovered.get("dispatching").unwrap().forward_outcome(),
+            "indeterminate"
+        );
+    }
+
+    #[test]
+    fn staged_rows_are_hidden_and_retired_without_becoming_actionable() {
+        let mut row = armed("staged", Some(PrincipalKey::from_uid(1001)), 0);
+        row.status = ProvisionalStatus::Staged;
+        row.forward_done = false;
+        row.forward_exit = None;
+        row.api_revert = Some(ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "PUT".to_string(),
+            path: "/api/v1/namespaces/dev/configmaps/example".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
+            body_file: None,
+        });
+        let mut live = ProvisionalRegistry::new();
+        live.insert(row.clone());
+        assert_eq!(live.outstanding(), 1);
+        assert_eq!(live.visible_outstanding(), 0);
+        assert!(live.visible_list().is_empty());
+        assert!(live.confirm(&row.handle).is_err());
+        assert!(live.begin_revert(&row.handle).is_err());
+
+        let (recovered, moved, retired) = ProvisionalRegistry::recover_rows(vec![row]);
+        assert!(moved.is_empty());
+        assert_eq!(retired, vec!["staged".to_string()]);
+        assert!(recovered.get("staged").is_none());
+    }
+
+    #[test]
+    fn uncertain_api_handoff_is_not_reported_as_a_forward_failure() {
+        let mut row = armed("uncertain", Some(PrincipalKey::from_uid(1001)), 0);
+        row.status = ProvisionalStatus::NeedsOperatorDecision;
+        row.forward_exit = None;
+        row.api_revert = Some(ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "PUT".to_string(),
+            path: "/api/v1/namespaces/dev/configmaps/example".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
+            body_file: None,
+        });
+        assert_eq!(row.forward_outcome(), "indeterminate");
     }
 
     #[test]
@@ -772,6 +899,7 @@ mod tests {
             path: "/api/v1/namespaces/dev/pods/example".to_string(),
             requires_uid_precondition: true,
             resource_uid: None,
+            create_provenance: Some("provenance".to_string()),
             body_file: None,
         });
         let mut registry = ProvisionalRegistry::new();

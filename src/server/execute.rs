@@ -738,18 +738,8 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                 }
             }
         } else {
-            let matching_intent = {
-                let catalog = phase.server.state.verbs.read().await;
-                catalog
-                    .match_command_all(&request.binary, &request.args)
-                    .into_iter()
-                    .find(|matched| !matched.rendered.baseline)
-                    .map(|matched| matched.rendered.name)
-            };
-            let observed_argv = matching_intent
-                .is_none()
-                .then_some((request.binary.as_str(), request.args.as_slice()));
-            let intent = matching_intent.unwrap_or_else(|| durable_command.clone());
+            let observed_argv = Some((request.binary.as_str(), request.args.as_slice()));
+            let intent = durable_command.clone();
             match super::admin::submit_access_request(
                 phase.server,
                 phase.caller,

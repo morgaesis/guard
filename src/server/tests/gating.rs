@@ -2220,6 +2220,7 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
             path: "/repos/o/r/labels".to_string(),
             requires_uid_precondition: false,
             resource_uid: None,
+            create_provenance: None,
             body_file: None,
         }),
         reason: "delete labels/bug in o/r".to_string(),
@@ -2351,6 +2352,7 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
             path: "/repos/o/r/labels".to_string(),
             requires_uid_precondition: false,
             resource_uid: None,
+            create_provenance: None,
             body_file: Some(body_file.clone()),
         }),
         reason: "delete labels/bug in o/r".to_string(),
@@ -2433,6 +2435,7 @@ async fn api_provisional_binds_session_and_upstream_identity() {
                 body: None,
             },
             revert_requires_uid_precondition: false,
+            create_provenance: None,
             session_fingerprint: Some("session-fingerprint".to_string()),
             session_revision: Some("session-revision".to_string()),
             secret_entitlements: Some(vec!["cluster-a/token".to_string()]),
@@ -2462,12 +2465,19 @@ async fn api_provisional_binds_session_and_upstream_identity() {
     );
     assert!(!row.forward_done);
     assert_eq!(row.deadline_unix, 0);
-    assert_eq!(row.status, ProvisionalStatus::Dispatching);
+    assert_eq!(row.status, ProvisionalStatus::Staged);
+    {
+        let live = cfg.state.provisional.read().await;
+        assert!(live.visible_list().is_empty());
+        assert_eq!(live.visible_outstanding(), 0);
+        assert_eq!(live.outstanding(), 1);
+    }
     let mut inert = guard::gating::provisional::ProvisionalRegistry::new();
     inert.insert(row.clone());
     assert!(inert.begin_revert(&handle).is_err());
     assert!(inert.confirm(&handle).is_err());
     assert!(inert.due_handles(u64::MAX).is_empty());
+    assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
     assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
     let live = cfg
         .state
@@ -2524,6 +2534,7 @@ async fn api_dispatch_state_blocks_operator_actions_until_the_handoff_is_uncerta
             body: None,
         },
         revert_requires_uid_precondition: true,
+        create_provenance: Some("provenance".to_string()),
         session_fingerprint: Some("session-fingerprint".to_string()),
         session_revision: Some("session-revision".to_string()),
         secret_entitlements: None,
@@ -2548,6 +2559,8 @@ async fn api_dispatch_state_blocks_operator_actions_until_the_handoff_is_uncerta
     let mut revert_attempt = guard::gating::provisional::ProvisionalRegistry::new();
     revert_attempt.insert(dispatching);
     assert!(revert_attempt.begin_revert(&handle).is_err());
+
+    assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
 
     assert!(
         guard::proxy::GateSink::mark_revert_indeterminate(

@@ -56,6 +56,7 @@ use crate::gating::{decide_gate, GateOutcome};
 /// Cap on a forwarded request body. Manifests are small; this bounds memory by
 /// rejecting an oversized request body.
 const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
+const MAX_UPSTREAM_BODY: usize = 16 * 1024 * 1024;
 const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_BODY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -202,6 +203,9 @@ pub struct ApiProxy {
     /// contained rather than an untracked delete. Entries are scoped to the
     /// creating connection and removed when their revert resolves.
     created: Mutex<CreatedRegistry>,
+    /// Revocable cleanup provenance. Readers cover only the final validation
+    /// and upstream header handoff; resolution takes the writer side first.
+    created_authority: RwLock<()>,
     observations: Mutex<ObservationRegistry>,
     /// Monotonic per-connection id, assigned in the accept loop, so a created
     /// resource's provenance is scoped to the connection that created it.
@@ -223,6 +227,7 @@ pub struct ApiProxy {
     /// Maximum time spent buffering a response body after the finite header
     /// handoff and any durable containment transition have completed.
     upstream_body_timeout: Duration,
+    upstream_body_limit: usize,
     /// How often `policy_path` is checked for changes. Production keeps the
     /// [`POLICY_RELOAD_SECS`] default; tests inject a short interval so they
     /// can observe a reload without a multi-second wait.
@@ -242,6 +247,7 @@ struct StagedRevert {
     handle: String,
     created_key: Option<CreatedKey>,
     created_path: Option<String>,
+    create_provenance: Option<String>,
 }
 
 const CREATE_PROVENANCE_ANNOTATION: &str = "guard.morgaesis.dev/provisional";
@@ -249,8 +255,12 @@ const CREATE_PROVENANCE_ANNOTATION: &str = "guard.morgaesis.dev/provisional";
 #[derive(Debug, Clone, Copy)]
 struct ApprovedApiHold;
 
+#[derive(Debug, Clone)]
+struct PreparedCreateProvenance(String);
+
 enum UpstreamHandoffOutcome {
     Pending,
+    PreparationFailed,
     TimedOut,
     Finished(Result<reqwest::Response, reqwest::Error>),
 }
@@ -258,6 +268,7 @@ enum UpstreamHandoffOutcome {
 enum UpstreamBodyError {
     TimedOut,
     ReadFailed,
+    TooLarge,
 }
 
 struct UpstreamSendHandoff {
@@ -272,7 +283,9 @@ struct ContainmentLifecycle {
     handle: String,
     created_key: Option<CreatedKey>,
     created_path: Option<String>,
+    create_provenance: Option<String>,
     handoff_started: bool,
+    transition_owned: bool,
     armed: bool,
 }
 
@@ -283,13 +296,37 @@ impl ContainmentLifecycle {
             handle: staged.handle,
             created_key: staged.created_key,
             created_path: staged.created_path,
+            create_provenance: staged.create_provenance,
             handoff_started: false,
+            transition_owned: false,
             armed: true,
         }
     }
 
     fn created_resource(&self) -> Option<(&CreatedKey, &str)> {
         Some((self.created_key.as_ref()?, self.created_path.as_deref()?))
+    }
+
+    async fn prepare_dispatch(&mut self) -> bool {
+        let gate = self.gate.clone();
+        let handle = self.handle.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let marked = gate.mark_revert_dispatching(&handle).await;
+            if ready_tx.send(marked).is_err() || (marked && accepted_rx.await.is_err()) {
+                let _ = gate.cancel_staged_revert(&handle).await;
+            }
+        });
+        let marked = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+        if marked {
+            let _ = accepted_tx.send(());
+        }
+        marked
     }
 
     async fn cancel_inert(mut self) {
@@ -305,12 +342,19 @@ impl ContainmentLifecycle {
     }
 
     async fn preserve_indeterminate(mut self, reason: &str, resource_uid: Option<&str>) -> String {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.gate
-                .mark_revert_indeterminate(&self.handle, reason, resource_uid),
-        )
-        .await;
+        self.transition_owned = true;
+        let gate = self.gate.clone();
+        let handle = self.handle.clone();
+        let reason = reason.to_string();
+        let resource_uid = resource_uid.map(str::to_string);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = gate
+                .mark_revert_indeterminate(&handle, &reason, resource_uid.as_deref())
+                .await;
+            let _ = result_tx.send(result);
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(5), result_rx).await;
         self.armed = false;
         self.handle.clone()
     }
@@ -319,25 +363,33 @@ impl ContainmentLifecycle {
         mut self,
         resource_uid: Option<&str>,
     ) -> Result<(String, Option<CreatedKey>), String> {
-        if tokio::time::timeout(
-            Duration::from_secs(5),
-            self.gate.mark_revert_forwarded(&self.handle, resource_uid),
-        )
-        .await
-        .is_ok_and(|activated| activated)
+        self.transition_owned = true;
+        let gate = self.gate.clone();
+        let handle = self.handle.clone();
+        let resource_uid = resource_uid.map(str::to_string);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let activated = gate
+                .mark_revert_forwarded(&handle, resource_uid.as_deref())
+                .await;
+            if !activated {
+                let _ = gate
+                    .mark_revert_indeterminate(
+                        &handle,
+                        "successful mutation response was received, but the confirmation window could not be activated",
+                        resource_uid.as_deref(),
+                    )
+                    .await;
+            }
+            let _ = result_tx.send(activated);
+        });
+        if tokio::time::timeout(Duration::from_secs(5), result_rx)
+            .await
+            .is_ok_and(|result| result.is_ok_and(std::convert::identity))
         {
             self.armed = false;
             Ok((self.handle.clone(), self.created_key.take()))
         } else {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                self.gate.mark_revert_indeterminate(
-                    &self.handle,
-                    "successful mutation headers were received, but the confirmation window could not be activated",
-                    resource_uid,
-                ),
-            )
-            .await;
             self.armed = false;
             Err(self.handle.clone())
         }
@@ -346,7 +398,7 @@ impl ContainmentLifecycle {
 
 impl Drop for ContainmentLifecycle {
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.armed || self.transition_owned {
             return;
         }
         let gate = self.gate.clone();
@@ -384,6 +436,10 @@ impl ApiForwardHandoff for UpstreamSendHandoff {
             .take()
             .ok_or_else(|| "upstream handoff was already consumed".to_string())?;
         if let Some(containment) = self.containment.as_mut() {
+            if !containment.prepare_dispatch().await {
+                self.outcome = UpstreamHandoffOutcome::PreparationFailed;
+                return Err("durable mutation dispatch preparation failed".to_string());
+            }
             containment.handoff_started = true;
         }
         match tokio::time::timeout(self.timeout, request.send()).await {
@@ -404,6 +460,81 @@ struct SessionBoundHandoff<'a> {
     auth: Option<&'a SessionAuth>,
     context: Option<&'a ApiSessionContext>,
     upstream: &'a mut dyn ApiForwardHandoff,
+}
+
+struct CleanupBoundHandoff<'a> {
+    proxy: &'a ApiProxy,
+    created: Option<&'a CreatedMatch>,
+    path: &'a str,
+    upstream: &'a mut dyn ApiForwardHandoff,
+}
+
+#[async_trait::async_trait]
+impl ApiForwardHandoff for CleanupBoundHandoff<'_> {
+    async fn forward(&mut self) -> Result<(), String> {
+        let Some(created) = self.created else {
+            return self.upstream.forward().await;
+        };
+        let gate = self
+            .proxy
+            .gate
+            .get()
+            .ok_or_else(|| "created-resource cleanup gate is unavailable".to_string())?;
+        let mut registry_handoff = CreatedRegistryHandoff {
+            proxy: self.proxy,
+            created,
+            path: self.path,
+            upstream: self.upstream,
+        };
+        gate.authorize_cleanup(
+            &created.handle,
+            &created.resource_uid,
+            &created.create_provenance,
+            &mut registry_handoff,
+        )
+        .await
+    }
+}
+
+struct CreatedRegistryHandoff<'a> {
+    proxy: &'a ApiProxy,
+    created: &'a CreatedMatch,
+    path: &'a str,
+    upstream: &'a mut dyn ApiForwardHandoff,
+}
+
+#[async_trait::async_trait]
+impl ApiForwardHandoff for CreatedRegistryHandoff<'_> {
+    async fn forward(&mut self) -> Result<(), String> {
+        let created = self.created;
+        let lease =
+            tokio::time::timeout(Duration::from_secs(5), self.proxy.created_authority.read())
+                .await
+                .map_err(|_| "created-resource cleanup authority lock timed out".to_string())?;
+        let current = self
+            .proxy
+            .created
+            .lock()
+            .unwrap()
+            .find_record(&created.key)
+            .filter(|record| {
+                record.handle == created.handle
+                    && record.resource_uid == created.resource_uid
+                    && record.create_provenance == created.create_provenance
+            })
+            .ok_or_else(|| "created-resource cleanup authority was revoked".to_string())?;
+        self.proxy
+            .validate_current_created_object(
+                &created.key,
+                self.path,
+                &current.resource_uid,
+                &current.create_provenance,
+            )
+            .await?;
+        let result = self.upstream.forward().await;
+        drop(lease);
+        result
+    }
 }
 
 #[async_trait::async_trait]
@@ -555,12 +686,14 @@ struct CreatedMatch {
     key: CreatedKey,
     handle: String,
     resource_uid: String,
+    create_provenance: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CreatedRecord {
     handle: String,
     resource_uid: String,
+    create_provenance: String,
 }
 
 /// Tracks resources the proxy forwarded a create for (and armed an auto-revert
@@ -572,12 +705,19 @@ struct CreatedRegistry {
 
 impl CreatedRegistry {
     /// Record a created resource against its auto-revert handle.
-    fn remember(&mut self, key: CreatedKey, handle: String, resource_uid: String) {
+    fn remember(
+        &mut self,
+        key: CreatedKey,
+        handle: String,
+        resource_uid: String,
+        create_provenance: String,
+    ) {
         self.items.insert(
             key,
             CreatedRecord {
                 handle,
                 resource_uid,
+                create_provenance,
             },
         );
     }
@@ -598,7 +738,7 @@ impl CreatedRegistry {
         if self
             .items
             .get(key)
-            .is_some_and(|stored| stored.handle == handle)
+            .is_some_and(|record| record.handle == handle)
         {
             self.items.remove(key);
             true
@@ -625,13 +765,45 @@ impl CreatedRegistry {
 impl ApiProxy {
     async fn read_upstream_body(
         &self,
-        response: reqwest::Response,
+        mut response: reqwest::Response,
     ) -> Result<Bytes, UpstreamBodyError> {
-        match tokio::time::timeout(self.upstream_body_timeout, response.bytes()).await {
-            Ok(Ok(bytes)) => Ok(bytes),
-            Ok(Err(_)) => Err(UpstreamBodyError::ReadFailed),
+        let limit = self.upstream_body_limit;
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(UpstreamBodyError::TooLarge);
+        }
+        let read = async move {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| UpstreamBodyError::ReadFailed)?
+            {
+                if bytes.len().saturating_add(chunk.len()) > limit {
+                    return Err(UpstreamBodyError::TooLarge);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Bytes::from(bytes))
+        };
+        match tokio::time::timeout(self.upstream_body_timeout, read).await {
+            Ok(result) => result,
             Err(_) => Err(UpstreamBodyError::TimedOut),
         }
+    }
+
+    async fn take_upstream_body(
+        &self,
+        response: &mut Option<reqwest::Response>,
+        buffered: &mut Option<Bytes>,
+    ) -> Result<Bytes, UpstreamBodyError> {
+        if let Some(bytes) = buffered.take() {
+            return Ok(bytes);
+        }
+        let response = response.take().ok_or(UpstreamBodyError::ReadFailed)?;
+        self.read_upstream_body(response).await
     }
 
     /// Assemble a Kubernetes proxy. `policy_path` (when set) is hot-reloaded
@@ -681,6 +853,7 @@ impl ApiProxy {
             judge: StdRwLock::new(None),
             judge_builder: OnceLock::new(),
             created: Mutex::new(CreatedRegistry::default()),
+            created_authority: RwLock::new(()),
             observations: Mutex::new(ObservationRegistry::default()),
             next_conn: AtomicU64::new(1),
             rarity: RarityTracker::new(0),
@@ -691,6 +864,7 @@ impl ApiProxy {
             request_body_timeout: REQUEST_BODY_READ_TIMEOUT,
             upstream_handoff_timeout: UPSTREAM_HANDOFF_TIMEOUT,
             upstream_body_timeout: UPSTREAM_BODY_TIMEOUT,
+            upstream_body_limit: MAX_UPSTREAM_BODY,
             policy_reload_interval: Duration::from_secs(POLICY_RELOAD_SECS),
             policy_reload_attempt: AtomicU64::new(0),
             policy_reload_notify: tokio::sync::Notify::new(),
@@ -732,6 +906,13 @@ impl ApiProxy {
     #[doc(hidden)]
     pub fn with_upstream_body_timeout(mut self, timeout: Duration) -> Self {
         self.upstream_body_timeout = timeout;
+        self
+    }
+
+    /// Override the response buffer ceiling for deterministic boundary tests.
+    #[doc(hidden)]
+    pub fn with_upstream_body_limit(mut self, limit: usize) -> Self {
+        self.upstream_body_limit = limit;
         self
     }
 
@@ -784,8 +965,15 @@ impl ApiProxy {
     /// Drop provenance for a resolved auto-revert. Called by the daemon when a
     /// proxy-armed create-revert is confirmed or reverted, so a create record
     /// cannot outlive the revert window it was tied to.
-    pub fn forget_created_by_handle(&self, handle: &str) {
+    pub async fn forget_created_by_handle(&self, handle: &str) -> bool {
+        let Ok(lease) =
+            tokio::time::timeout(Duration::from_secs(5), self.created_authority.write()).await
+        else {
+            return false;
+        };
         self.created.lock().unwrap().forget_by_handle(handle);
+        drop(lease);
+        true
     }
 
     /// Attach the daemon's consequence bridge before serving. Idempotent; a
@@ -1210,9 +1398,14 @@ impl ApiProxy {
                     .map(|context| context.fingerprint.as_str()),
             ) {
                 let same_resource = self
-                    .resolve_created_uid(&created.key, &path, &created.handle)
+                    .validate_current_created_object(
+                        &created.key,
+                        &path,
+                        &created.resource_uid,
+                        &created.create_provenance,
+                    )
                     .await
-                    .is_ok_and(|uid| uid == created.resource_uid);
+                    .is_ok();
                 if same_resource {
                     let _ = crate::audit::emit_global(
                         &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
@@ -1332,9 +1525,18 @@ impl ApiProxy {
                 .await;
         };
 
-        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
+        let (mut parts, body) = match collect_request_body(req, self.request_body_timeout).await {
             Ok(buffered) => buffered,
             Err(error) => return self.request_body_error_response(error),
+        };
+        let body = match prepare_create_provenance(
+            &mut parts,
+            body,
+            op,
+            self.gate.get().is_some() && self.protocol.tracks_write(op),
+        ) {
+            Ok(body) => body,
+            Err(reason) => return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid"),
         };
         let route_authority = match self.route_authority_from_parts(&parts) {
             Some(authority) => authority,
@@ -1601,9 +1803,18 @@ impl ApiProxy {
         session_context: Option<&ApiSessionContext>,
     ) -> Response<ProxyBody> {
         let query = req.uri().query().unwrap_or("").to_string();
-        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
+        let (mut parts, body) = match collect_request_body(req, self.request_body_timeout).await {
             Ok(buffered) => buffered,
             Err(error) => return self.request_body_error_response(error),
+        };
+        let body = match prepare_create_provenance(
+            &mut parts,
+            body,
+            op,
+            self.gate.get().is_some() && self.protocol.tracks_write(op),
+        ) {
+            Ok(body) => body,
+            Err(reason) => return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid"),
         };
         let Some(judge) = self.judge.read().unwrap().clone() else {
             return self.status_resp(
@@ -1750,7 +1961,7 @@ impl ApiProxy {
     #[allow(clippy::too_many_arguments)]
     async fn route_hold_buffered(
         &self,
-        parts: Parts,
+        mut parts: Parts,
         body: Bytes,
         path: &str,
         query: &str,
@@ -1759,6 +1970,15 @@ impl ApiProxy {
         conn_id: u64,
         authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
+        let body = match prepare_create_provenance(
+            &mut parts,
+            body,
+            op,
+            self.gate.get().is_some() && self.protocol.tracks_write(op),
+        ) {
+            Ok(body) => body,
+            Err(reason) => return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid"),
+        };
         let label = format!("{} {}", op.verb.as_str(), path);
         let Some(gate) = self.gate.get() else {
             tracing::info!(
@@ -1903,7 +2123,7 @@ impl ApiProxy {
     #[allow(clippy::too_many_arguments)]
     async fn forward_buffered_with_cleanup(
         &self,
-        parts: Parts,
+        mut parts: Parts,
         mut body: Bytes,
         path: &str,
         query: &str,
@@ -1914,6 +2134,21 @@ impl ApiProxy {
         created_cleanup: Option<CreatedMatch>,
         authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
+        if let Some(operation) = op.as_ref() {
+            body = match prepare_create_provenance(
+                &mut parts,
+                body,
+                operation,
+                created_cleanup.is_none()
+                    && self.gate.get().is_some()
+                    && self.protocol.tracks_write(operation),
+            ) {
+                Ok(body) => body,
+                Err(reason) => {
+                    return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid")
+                }
+            };
+        }
         let route_authority = match self.route_authority_from_parts(&parts) {
             Some(authority) => authority,
             None => return self.missing_route_authority_response(),
@@ -1977,6 +2212,10 @@ impl ApiProxy {
                     &body,
                     conn_id,
                     session_context.clone(),
+                    parts
+                        .extensions
+                        .get::<PreparedCreateProvenance>()
+                        .map(|marker| marker.0.clone()),
                 )
                 .await;
             if handle.is_none() && parts.extensions.get::<ApprovedApiHold>().is_none() {
@@ -1996,24 +2235,6 @@ impl ApiProxy {
         } else {
             None
         };
-        if let Some(staged) = staged_revert
-            .as_ref()
-            .filter(|staged| staged.created_key.is_some())
-        {
-            body = match bind_create_provenance(&body, &staged.handle) {
-                Ok(body) => body,
-                Err(reason) => {
-                    if let Some(gate) = self.gate.get() {
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(5),
-                            gate.cancel_staged_revert(&staged.handle),
-                        )
-                        .await;
-                    }
-                    return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid");
-                }
-            };
-        }
         match self
             .forward_inner(
                 parts,
@@ -2180,11 +2401,17 @@ impl ApiProxy {
             containment,
         };
         let auth = parts.extensions.get::<SessionAuth>();
+        let mut cleanup_handoff = CleanupBoundHandoff {
+            proxy: self,
+            created: created_cleanup.as_ref(),
+            path,
+            upstream: &mut upstream_handoff,
+        };
         let mut session_handoff = SessionBoundHandoff {
             sink: self.session_sink.get(),
             auth,
             context: session_context.as_ref(),
-            upstream: &mut upstream_handoff,
+            upstream: &mut cleanup_handoff,
         };
         let authorization_result = if let Some(pending) = authorization {
             pending
@@ -2214,20 +2441,23 @@ impl ApiProxy {
                     "Forbidden",
                 ));
             }
+            UpstreamHandoffOutcome::PreparationFailed => {
+                if let Some(containment) = containment {
+                    containment.cancel_inert().await;
+                }
+                return Ok(self.status_resp(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "guard api-proxy: durable mutation dispatch preparation failed; no mutation was sent",
+                    "ContainmentError",
+                ));
+            }
             UpstreamHandoffOutcome::TimedOut => {
                 let handle = if let Some(containment) = containment {
-                    let resource_uid = if let Some((key, path)) = containment.created_resource() {
-                        self.resolve_created_uid(key, path, &containment.handle)
-                            .await
-                            .ok()
-                    } else {
-                        None
-                    };
                     Some(
                         containment
                             .preserve_indeterminate(
                                 "upstream mutation dispatch timed out before response headers",
-                                resource_uid.as_deref(),
+                                None,
                             )
                             .await,
                     )
@@ -2246,19 +2476,11 @@ impl ApiProxy {
                     Ok(response) => response,
                     Err(_) => {
                         let handle = if let Some(containment) = containment {
-                            let resource_uid =
-                                if let Some((key, path)) = containment.created_resource() {
-                                    self.resolve_created_uid(key, path, &containment.handle)
-                                        .await
-                                        .ok()
-                                } else {
-                                    None
-                                };
                             Some(
                                 containment
                                     .preserve_indeterminate(
                                         "upstream mutation dispatch ended with a transport error before response headers",
-                                        resource_uid.as_deref(),
+                                        None,
                                     )
                                     .await,
                             )
@@ -2279,6 +2501,8 @@ impl ApiProxy {
         let status = upstream_resp.status();
         let upstream_headers = upstream_resp.headers().clone();
         let response_secrets = self.upstream.response_secret_values();
+        let mut upstream_resp = Some(upstream_resp);
+        let mut buffered_upstream_body = None;
 
         let mut provisional_handle = None;
         let mut containment_active = false;
@@ -2289,15 +2513,48 @@ impl ApiProxy {
             }) {
                 staged.cancel_inert().await;
             } else if status.is_success() {
-                let resource_uid = if let Some((key, path)) = staged.created_resource() {
-                    match self.resolve_created_uid(key, path, &staged.handle).await {
-                        Ok(uid) => Some(uid),
+                let resource_uid = if let Some((key, _)) = staged.created_resource() {
+                    let body = match self
+                        .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
+                        .await
+                    {
+                        Ok(body) => body,
+                        Err(error) => {
+                            let detail = match error {
+                                UpstreamBodyError::TimedOut => {
+                                    "create response body timed out before authoritative identity was captured"
+                                }
+                                UpstreamBodyError::TooLarge => {
+                                    "create response body exceeded the identity buffer limit"
+                                }
+                                UpstreamBodyError::ReadFailed => {
+                                    "create response body failed before authoritative identity was captured"
+                                }
+                            };
+                            let handle = staged.preserve_indeterminate(detail, None).await;
+                            return Ok(self.provisional_status_resp(
+                                StatusCode::BAD_GATEWAY,
+                                "guard api-proxy: mutation succeeded but authoritative create identity is unavailable",
+                                "ContainmentIndeterminate",
+                                Some(&handle),
+                            ));
+                        }
+                    };
+                    let provenance = staged
+                        .create_provenance
+                        .as_deref()
+                        .expect("created containment has canonical request provenance");
+                    match authoritative_created_uid(&body, key, provenance) {
+                        Ok(uid) => {
+                            buffered_upstream_body = Some(body);
+                            Some(uid)
+                        }
                         Err(reason) => {
                             let handle = staged.preserve_indeterminate(&reason, None).await;
                             return Ok(self.provisional_status_resp(
                                 StatusCode::BAD_GATEWAY,
-                                "guard api-proxy: mutation succeeded but the created resource identity could not be verified",
-                                "ContainmentError",
+                                "guard api-proxy: mutation succeeded but authoritative create identity is invalid",
+                                "ContainmentIndeterminate",
                                 Some(&handle),
                             ));
                         }
@@ -2305,6 +2562,7 @@ impl ApiProxy {
                 } else {
                     None
                 };
+                let create_provenance = staged.create_provenance.clone();
                 match staged.activate(resource_uid.as_deref()).await {
                     Ok((handle, created_key)) => {
                         if let Some(key) = created_key {
@@ -2312,10 +2570,13 @@ impl ApiProxy {
                                 .as_ref()
                                 .expect("created containment has a verified UID")
                                 .clone();
-                            self.created
-                                .lock()
-                                .unwrap()
-                                .remember(key, handle.clone(), uid);
+                            self.created.lock().unwrap().remember(
+                                key,
+                                handle.clone(),
+                                uid,
+                                create_provenance
+                                    .expect("created containment has canonical provenance"),
+                            );
                         }
                         provisional_handle = Some(handle);
                         containment_active = true;
@@ -2330,18 +2591,11 @@ impl ApiProxy {
                     }
                 }
             } else {
-                let resource_uid = if let Some((key, path)) = staged.created_resource() {
-                    self.resolve_created_uid(key, path, &staged.handle)
-                        .await
-                        .ok()
-                } else {
-                    None
-                };
                 provisional_handle = Some(
                     staged
                         .preserve_indeterminate(
                             &format!("upstream returned HTTP {status} after mutation dispatch"),
-                            resource_uid.as_deref(),
+                            None,
                         )
                         .await,
                 );
@@ -2400,7 +2654,10 @@ impl ApiProxy {
         // response succeeds. A 2xx header followed by a body disconnect keeps
         // the revert armed because the outcome is no longer trustworthy.
         if let Some(created) = created_cleanup {
-            let bytes = match self.read_upstream_body(upstream_resp).await {
+            let bytes = match self
+                .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
+                .await
+            {
                 Ok(bytes) => bytes,
                 Err(UpstreamBodyError::TimedOut) => {
                     return Ok(self.provisional_status_resp(
@@ -2418,18 +2675,32 @@ impl ApiProxy {
                         Some(&created.handle),
                     ));
                 }
+                Err(UpstreamBodyError::TooLarge) => {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: contained cleanup response body exceeded the byte limit",
+                        "ResponseTooLarge",
+                        Some(&created.handle),
+                    ));
+                }
             };
             if status.is_success() {
-                let consumed = self
-                    .created
-                    .lock()
-                    .unwrap()
-                    .take_if_handle(&created.key, &created.handle);
-                if consumed {
-                    if let Some(gate) = self.gate.get() {
-                        gate.resolve(&created.handle).await;
-                    }
+                let resolved = if let Some(gate) = self.gate.get() {
+                    tokio::time::timeout(Duration::from_secs(5), gate.resolve(&created.handle))
+                        .await
+                        .is_ok_and(std::convert::identity)
+                } else {
+                    false
+                };
+                if !resolved {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: cleanup succeeded upstream but durable containment resolution failed",
+                        "ContainmentIndeterminate",
+                        Some(&created.handle),
+                    ));
                 }
+                let _ = self.forget_created_by_handle(&created.handle).await;
             }
             let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
             return Ok(builder
@@ -2443,9 +2714,12 @@ impl ApiProxy {
         // on a successful body whose content-type we cannot parse and redact.
         if redact {
             if !status.is_success() {
-                let bytes = self.read_upstream_body(upstream_resp).await.map_err(|_| {
-                    anyhow::anyhow!("read Secret error response failed or timed out")
-                })?;
+                let bytes = self
+                    .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("read Secret error response failed or timed out")
+                    })?;
                 let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
                 return Ok(builder
                     .body(full_body(bytes))
@@ -2459,7 +2733,7 @@ impl ApiProxy {
                 ));
             }
             let bytes = self
-                .read_upstream_body(upstream_resp)
+                .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
                 .await
                 .map_err(|_| anyhow::anyhow!("read Secret response failed or timed out"))?;
             let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
@@ -2489,7 +2763,10 @@ impl ApiProxy {
         // become this same session's next observed version. The body has a
         // separate bound because containment is already armed at this point.
         if track_write || kubernetes_mutation {
-            let bytes = match self.read_upstream_body(upstream_resp).await {
+            let bytes = match self
+                .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
+                .await
+            {
                 Ok(bytes) => bytes,
                 Err(UpstreamBodyError::ReadFailed) => {
                     return Ok(self.provisional_status_resp(
@@ -2511,6 +2788,14 @@ impl ApiProxy {
                         }
                     }
                     return Ok(response);
+                }
+                Err(UpstreamBodyError::TooLarge) => {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: upstream mutation response body exceeded the byte limit",
+                        "ResponseTooLarge",
+                        provisional_handle.as_deref(),
+                    ));
                 }
             };
             if status.is_success() {
@@ -2551,9 +2836,12 @@ impl ApiProxy {
             })
             && session_context.is_some()
         {
-            let bytes = self.read_upstream_body(upstream_resp).await.map_err(|_| {
-                anyhow::anyhow!("read Kubernetes object response failed or timed out")
-            })?;
+            let bytes = self
+                .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("read Kubernetes object response failed or timed out")
+                })?;
             if let (Some(operation), Some(context)) = (op.as_ref(), session_context.as_ref()) {
                 self.remember_kubernetes_observation(operation, &bytes, context);
             }
@@ -2565,6 +2853,9 @@ impl ApiProxy {
 
         // Stream ordinary response bodies through exact credential redaction
         // while preserving chunked delivery for lists, gets, and watches.
+        let upstream_resp = upstream_resp
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("upstream response body was already consumed"))?;
         let source: ReqwestByteStream = Box::pin(upstream_resp.bytes_stream());
         let redactor = ExactSecretRedactor::new(response_secrets);
         let stream = futures::stream::try_unfold(
@@ -2838,15 +3129,15 @@ impl ApiProxy {
             .map(|bytes| bytes.to_vec()))
     }
 
-    /// Resolve the exact identity of a resource created by the protected
-    /// request. The UID becomes a Kubernetes delete precondition, so a later
-    /// replacement at the same name cannot be removed by this rollback.
-    async fn resolve_created_uid(
+    /// Revalidate that a cleanup still targets the exact object created by the
+    /// admitted request. The retained UID and provenance must both match.
+    async fn validate_current_created_object(
         &self,
         key: &CreatedKey,
         object_path: &str,
-        expected_provisional: &str,
-    ) -> Result<String, String> {
+        expected_uid: &str,
+        expected_provenance: &str,
+    ) -> Result<(), String> {
         let url = format!("{}{}", self.upstream.base(), object_path);
         let mut request = self
             .upstream
@@ -2866,10 +3157,20 @@ impl ApiProxy {
         if !response.status().is_success() {
             return Err("created resource identity is unavailable".to_string());
         }
-        let bytes = tokio::time::timeout(self.upstream_body_timeout, response.bytes())
+        let bytes = self
+            .read_upstream_body(response)
             .await
-            .map_err(|_| "created resource identity response timed out".to_string())?
-            .map_err(|_| "created resource identity response failed".to_string())?;
+            .map_err(|error| match error {
+                UpstreamBodyError::TimedOut => {
+                    "created resource identity response timed out".to_string()
+                }
+                UpstreamBodyError::TooLarge => {
+                    "created resource identity response exceeded the byte limit".to_string()
+                }
+                UpstreamBodyError::ReadFailed => {
+                    "created resource identity response failed".to_string()
+                }
+            })?;
         let object: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|_| "created resource identity response is invalid".to_string())?;
         let metadata = object
@@ -2891,7 +3192,7 @@ impl ApiProxy {
             .and_then(serde_json::Value::as_object)
             .and_then(|annotations| annotations.get(CREATE_PROVENANCE_ANNOTATION))
             .and_then(serde_json::Value::as_str)
-            != Some(expected_provisional)
+            != Some(expected_provenance)
         {
             return Err(
                 "created resource does not carry the admitted operation provenance".to_string(),
@@ -2902,7 +3203,10 @@ impl ApiProxy {
             .and_then(serde_json::Value::as_str)
             .filter(|uid| !uid.is_empty() && uid.len() <= 256 && !uid.chars().any(char::is_control))
             .ok_or_else(|| "created resource UID is missing or invalid".to_string())?;
-        Ok(uid.to_string())
+        if uid != expected_uid {
+            return Err("created resource UID no longer matches the admitted object".to_string());
+        }
+        Ok(())
     }
 
     /// Fetch the prior object and confirm the protocol can plan a revert from
@@ -2965,6 +3269,7 @@ impl ApiProxy {
         request_body: &[u8],
         conn_id: u64,
         session_context: Option<ApiSessionContext>,
+        create_provenance: Option<String>,
     ) -> Option<StagedRevert> {
         let gate = self.gate.get()?;
         let plan = match self
@@ -2988,6 +3293,10 @@ impl ApiProxy {
             name: c.name,
         });
         let created_path = created_key.as_ref().map(|_| plan.revert.path.clone());
+        if created_key.is_some() && create_provenance.is_none() {
+            tracing::warn!(target: "guard::apiproxy", "create containment is missing canonical request provenance");
+            return None;
+        }
         let label = plan.label;
         match tokio::time::timeout(
             Duration::from_secs(5),
@@ -2995,6 +3304,7 @@ impl ApiProxy {
                 label: label.clone(),
                 revert: plan.revert,
                 revert_requires_uid_precondition: created_key.is_some(),
+                create_provenance: create_provenance.clone(),
                 session_fingerprint: session_context
                     .as_ref()
                     .map(|context| context.fingerprint.clone()),
@@ -3010,11 +3320,12 @@ impl ApiProxy {
         .await
         {
             Ok(Some(handle)) => {
-                tracing::info!(target: "guard::apiproxy", "staged auto-revert {handle} for {label}");
+                tracing::debug!(target: "guard::apiproxy", "prepared inert API mutation containment");
                 Some(StagedRevert {
                     handle,
                     created_key,
                     created_path,
+                    create_provenance,
                 })
             }
             Ok(None) | Err(_) => {
@@ -3051,6 +3362,7 @@ impl ApiProxy {
             key,
             handle: record.handle,
             resource_uid: record.resource_uid,
+            create_provenance: record.create_provenance,
         })
     }
 
@@ -3192,6 +3504,62 @@ fn bind_create_provenance(body: &[u8], provisional: &str) -> Result<Bytes, Strin
     serde_json::to_vec(&object)
         .map(Bytes::from)
         .map_err(|_| "Kubernetes create provenance could not be serialized".to_string())
+}
+
+fn authoritative_created_uid(
+    body: &[u8],
+    key: &CreatedKey,
+    expected_provenance: &str,
+) -> Result<String, String> {
+    let object: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| "create response is not a valid object".to_string())?;
+    let metadata = object
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "create response metadata is missing".to_string())?;
+    if metadata.get("name").and_then(serde_json::Value::as_str) != Some(key.name.as_str())
+        || metadata
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            != key.namespace.as_deref()
+    {
+        return Err("create response identity does not match the admitted request".to_string());
+    }
+    if metadata
+        .get("annotations")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|annotations| annotations.get(CREATE_PROVENANCE_ANNOTATION))
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_provenance)
+    {
+        return Err("create response provenance does not match the admitted request".to_string());
+    }
+    metadata
+        .get("uid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|uid| !uid.is_empty() && uid.len() <= 256 && !uid.chars().any(char::is_control))
+        .map(str::to_string)
+        .ok_or_else(|| "create response UID is missing or invalid".to_string())
+}
+
+fn prepare_create_provenance(
+    parts: &mut Parts,
+    body: Bytes,
+    op: &ApiOp,
+    enabled: bool,
+) -> Result<Bytes, String> {
+    if !enabled || op.verb != Verb::Create || op.dry_run {
+        return Ok(body);
+    }
+    if parts.extensions.get::<PreparedCreateProvenance>().is_some() {
+        return Ok(body);
+    }
+    let provenance = format!("{:032x}", rand::random::<u128>());
+    let body = bind_create_provenance(&body, &provenance)?;
+    parts
+        .extensions
+        .insert(PreparedCreateProvenance(provenance));
+    Ok(body)
 }
 
 fn take_guard_session(headers: &mut HeaderMap) -> Result<Option<String>, &'static str> {
@@ -3707,6 +4075,7 @@ mod tests {
             created_key(1, "foo"),
             "handle-A".to_string(),
             "resource-uid".to_string(),
+            "provenance".to_string(),
         );
 
         // Caller B on a different connection deletes the same
@@ -3735,6 +4104,7 @@ mod tests {
             session_created_key(1, "foo", "session-a"),
             "handle-a".to_string(),
             "resource-uid".to_string(),
+            "provenance".to_string(),
         );
 
         assert_eq!(reg.find(&created_key(1, "foo")), None);
@@ -3752,6 +4122,7 @@ mod tests {
             created_key(1, "foo"),
             "handle-A".to_string(),
             "resource-uid".to_string(),
+            "provenance".to_string(),
         );
 
         // The create's auto-revert resolves (operator confirm, or auto/manual
@@ -3897,6 +4268,7 @@ mod tests {
             created_key(1, "foo"),
             "h1".to_string(),
             "resource-uid".to_string(),
+            "provenance".to_string(),
         );
 
         let op = delete_op("foo");
@@ -4060,16 +4432,17 @@ mod tests {
         assert!(!proxy.matches_upstream_identity("kubernetes", "", ""));
     }
 
-    #[test]
-    fn forget_created_by_handle_clears_public_provenance() {
+    #[tokio::test]
+    async fn forget_created_by_handle_clears_public_provenance() {
         let proxy = test_proxy();
         proxy.created.lock().unwrap().remember(
             created_key(1, "foo"),
             "h1".to_string(),
             "resource-uid".to_string(),
+            "provenance".to_string(),
         );
 
-        proxy.forget_created_by_handle("h1");
+        assert!(proxy.forget_created_by_handle("h1").await);
 
         assert!(proxy
             .created_provenance(&delete_op("foo"), 1, None)
