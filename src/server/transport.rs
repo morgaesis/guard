@@ -559,6 +559,8 @@ mod api_session_event_tests {
             upstream_identity: "changed-credential-identity".to_string(),
             method: "DELETE".to_string(),
             path: "/api/v1/namespaces/dev/configmaps/test".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
             body_file: None,
         });
         let error = provisional_recovery_error(&server, &row)

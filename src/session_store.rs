@@ -2090,8 +2090,14 @@ impl SessionStore {
             .optional()?;
         match durable_json {
             None => {
-                if next.status != ProvisionalStatus::Armed {
-                    anyhow::bail!("new provisional must begin armed");
+                if !matches!(
+                    next.status,
+                    ProvisionalStatus::Armed | ProvisionalStatus::Dispatching
+                ) {
+                    anyhow::bail!("new provisional must begin armed or dispatching");
+                }
+                if next.status == ProvisionalStatus::Dispatching && next.api_revert.is_none() {
+                    anyhow::bail!("only API provisionals may begin dispatching");
                 }
                 let next_json = serde_json::to_string(next).context("encode new provisional")?;
                 let changed = tx.execute(
@@ -2232,13 +2238,16 @@ impl SessionStore {
                         "durable provisional index disagrees with serialized row for {handle}"
                     );
                 }
+                let identity_repaired = repair_legacy_create_revert(&mut provisional);
                 validate_persisted_provisional(&provisional)
                     .with_context(|| format!("validate durable provisional {handle}"))?;
-                if provisional.sanitize_explanatory_text() {
+                if provisional.sanitize_explanatory_text() || identity_repaired {
                     let sanitized = serde_json::to_string(&provisional)?;
                     tx.execute(
-                        "UPDATE gating_provisional SET json = ?1 WHERE handle = ?2 AND json = ?3",
-                        params![sanitized, handle, json],
+                        "UPDATE gating_provisional
+                         SET json = ?1, status = ?2
+                         WHERE handle = ?3 AND json = ?4",
+                        params![sanitized, provisional.status.as_str(), handle, json],
                     )?;
                 }
                 out.push(provisional);
@@ -2633,23 +2642,26 @@ fn provisional_identity(provisional: &Provisional) -> Provisional {
     identity.forward_exit = None;
     identity.forward_persistence_failed = false;
     identity.status = ProvisionalStatus::Armed;
+    if let Some(api) = identity.api_revert.as_mut() {
+        api.resource_uid = None;
+    }
     identity.revert_exit = None;
     identity.revert_detail = None;
     identity
 }
 
 fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> Result<bool> {
-    let api_handoff_activation = previous.api_revert.is_some()
-        && previous.status == ProvisionalStatus::NeedsOperatorDecision
-        && previous.forward_done
-        && previous.forward_exit.is_none()
-        && previous.deadline_unix == 0
-        && next.status == ProvisionalStatus::Armed
-        && next.forward_done
-        && next.forward_exit == Some(0)
-        && next.deadline_unix > next.created_unix;
+    let previous_uid = previous
+        .api_revert
+        .as_ref()
+        .and_then(|api| api.resource_uid.as_deref());
+    let next_uid = next
+        .api_revert
+        .as_ref()
+        .and_then(|api| api.resource_uid.as_deref());
     if !serialized_eq(&provisional_identity(previous), &provisional_identity(next))?
         || (previous.forward_done && !next.forward_done)
+        || (previous_uid.is_some() && previous_uid != next_uid)
         || !option_only_adds_or_preserves(&previous.decision_trace, &next.decision_trace)?
     {
         return Ok(false);
@@ -2657,7 +2669,6 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
     if previous.forward_done
         && (previous.deadline_unix != next.deadline_unix
             || previous.window_secs != next.window_secs)
-        && !api_handoff_activation
     {
         return Ok(false);
     }
@@ -2674,7 +2685,12 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
     }
     let legal_status = matches!(
         (previous.status, next.status),
-        (ProvisionalStatus::Armed, ProvisionalStatus::Armed)
+        (ProvisionalStatus::Dispatching, ProvisionalStatus::Armed)
+            | (
+                ProvisionalStatus::Dispatching,
+                ProvisionalStatus::NeedsOperatorDecision
+            )
+            | (ProvisionalStatus::Armed, ProvisionalStatus::Armed)
             | (ProvisionalStatus::Armed, ProvisionalStatus::Reverting)
             | (ProvisionalStatus::Armed, ProvisionalStatus::Confirmed)
             | (ProvisionalStatus::Armed, ProvisionalStatus::Reverted)
@@ -2685,10 +2701,6 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
             | (
                 ProvisionalStatus::NeedsOperatorDecision,
                 ProvisionalStatus::NeedsOperatorDecision
-            )
-            | (
-                ProvisionalStatus::NeedsOperatorDecision,
-                ProvisionalStatus::Armed
             )
             | (
                 ProvisionalStatus::NeedsOperatorDecision,
@@ -2718,16 +2730,12 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
     if !legal_status {
         return Ok(false);
     }
-    if previous.status == ProvisionalStatus::NeedsOperatorDecision
-        && next.status == ProvisionalStatus::Armed
-        && !api_handoff_activation
-    {
-        return Ok(false);
-    }
     if previous.status == next.status
         && !matches!(
             previous.status,
-            ProvisionalStatus::Armed | ProvisionalStatus::NeedsOperatorDecision
+            ProvisionalStatus::Dispatching
+                | ProvisionalStatus::Armed
+                | ProvisionalStatus::NeedsOperatorDecision
         )
     {
         return serialized_eq(previous, next);
@@ -2762,7 +2770,52 @@ fn validate_persisted_provisional(provisional: &Provisional) -> Result<()> {
     if provisional.contains_sensitive_literals() {
         anyhow::bail!("{SENSITIVE_ARGV_REPLAY_GUIDANCE}");
     }
+    if let Some(api) = provisional.api_revert.as_ref() {
+        if api.requires_uid_precondition
+            && api.resource_uid.is_none()
+            && matches!(
+                provisional.status,
+                ProvisionalStatus::Armed | ProvisionalStatus::Reverting
+            )
+        {
+            anyhow::bail!("created-resource rollback is missing its UID precondition");
+        }
+        if api.resource_uid.as_ref().is_some_and(|uid| {
+            uid.is_empty() || uid.len() > 256 || uid.chars().any(char::is_control)
+        }) {
+            anyhow::bail!("created-resource rollback UID is invalid");
+        }
+    }
     Ok(())
+}
+
+fn repair_legacy_create_revert(provisional: &mut Provisional) -> bool {
+    let Some(api) = provisional.api_revert.as_mut() else {
+        return false;
+    };
+    if !api.protocol.eq_ignore_ascii_case("kubernetes")
+        || !api.method.eq_ignore_ascii_case("DELETE")
+        || api.requires_uid_precondition
+    {
+        return false;
+    }
+
+    api.requires_uid_precondition = true;
+    if api.resource_uid.is_none()
+        && matches!(
+            provisional.status,
+            ProvisionalStatus::Armed | ProvisionalStatus::Reverting
+        )
+    {
+        provisional.status = ProvisionalStatus::NeedsOperatorDecision;
+        provisional.deadline_unix = 0;
+        provisional.window_secs = 0;
+        provisional.revert_detail = Some(
+            "created-resource rollback identity is unavailable; automatic rollback is disabled"
+                .to_string(),
+        );
+    }
+    true
 }
 
 pub(crate) fn sanitize_grant_request(mut request: GrantRequest) -> GrantRequest {
@@ -2982,12 +3035,15 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                 continue;
             };
             let prose_changed = provisional.sanitize_explanatory_text();
-            if !prose_changed && !provisional.contains_sensitive_literals() {
+            let identity_repaired = repair_legacy_create_revert(&mut provisional);
+            if !prose_changed && !identity_repaired && !provisional.contains_sensitive_literals() {
                 continue;
             }
             if provisional.contains_sensitive_literals() {
                 match provisional.status {
-                    ProvisionalStatus::Armed | ProvisionalStatus::Reverting => {
+                    ProvisionalStatus::Dispatching
+                    | ProvisionalStatus::Armed
+                    | ProvisionalStatus::Reverting => {
                         provisional.status = ProvisionalStatus::NeedsOperatorDecision;
                         provisional.revert_detail =
                             Some(SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string());
@@ -3637,6 +3693,7 @@ fn decode_exec_status(value: &str) -> rusqlite::Result<SessionExecStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use guard::gating::provisional::{ApiRevertPlan, ProvisionalRegistry};
     use guard::gating::verb::Verb;
 
     #[cfg(unix)]
@@ -4502,6 +4559,38 @@ mod tests {
         let restored = registry.get("restart-trace").unwrap();
         assert_eq!(restored.status, ProvisionalStatus::Armed);
         assert_eq!(restored.decision_trace.as_ref(), Some(&trace));
+    }
+
+    #[tokio::test]
+    async fn historical_kubernetes_create_rollback_is_retired_without_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut row = provisional_row("legacy-create", ProvisionalStatus::Armed);
+        row.api_revert = Some(ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "DELETE".to_string(),
+            path: "/api/v1/namespaces/dev/pods/example".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            body_file: None,
+        });
+        store.save_provisional(row).await.unwrap();
+        drop(store);
+
+        let reopened = SessionStore::open(path, 3600).await.unwrap();
+        let rows = reopened.load_provisionals().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ProvisionalStatus::NeedsOperatorDecision);
+        let api = rows[0].api_revert.as_ref().unwrap();
+        assert!(api.requires_uid_precondition);
+        assert!(api.resource_uid.is_none());
+        let mut registry = ProvisionalRegistry::new();
+        registry.insert(rows[0].clone());
+        assert!(registry.begin_revert("legacy-create").is_err());
     }
 
     #[tokio::test]

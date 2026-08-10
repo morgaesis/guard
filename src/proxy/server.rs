@@ -227,6 +227,8 @@ pub struct ApiProxy {
     /// [`POLICY_RELOAD_SECS`] default; tests inject a short interval so they
     /// can observe a reload without a multi-second wait.
     policy_reload_interval: Duration,
+    policy_reload_attempt: AtomicU64,
+    policy_reload_notify: tokio::sync::Notify,
 }
 
 #[derive(Clone)]
@@ -239,7 +241,10 @@ struct PendingApiAuthorization {
 struct StagedRevert {
     handle: String,
     created_key: Option<CreatedKey>,
+    created_path: Option<String>,
 }
+
+const CREATE_PROVENANCE_ANNOTATION: &str = "guard.morgaesis.dev/provisional";
 
 #[derive(Debug, Clone, Copy)]
 struct ApprovedApiHold;
@@ -248,6 +253,11 @@ enum UpstreamHandoffOutcome {
     Pending,
     TimedOut,
     Finished(Result<reqwest::Response, reqwest::Error>),
+}
+
+enum UpstreamBodyError {
+    TimedOut,
+    ReadFailed,
 }
 
 struct UpstreamSendHandoff {
@@ -261,6 +271,7 @@ struct ContainmentLifecycle {
     gate: Arc<dyn GateSink>,
     handle: String,
     created_key: Option<CreatedKey>,
+    created_path: Option<String>,
     handoff_started: bool,
     armed: bool,
 }
@@ -271,38 +282,62 @@ impl ContainmentLifecycle {
             gate,
             handle: staged.handle,
             created_key: staged.created_key,
+            created_path: staged.created_path,
             handoff_started: false,
             armed: true,
         }
     }
 
-    async fn cancel_pre_send(mut self) {
-        if self.gate.cancel_staged_revert(&self.handle).await {
+    fn created_resource(&self) -> Option<(&CreatedKey, &str)> {
+        Some((self.created_key.as_ref()?, self.created_path.as_deref()?))
+    }
+
+    async fn cancel_inert(mut self) {
+        if tokio::time::timeout(
+            Duration::from_secs(5),
+            self.gate.cancel_staged_revert(&self.handle),
+        )
+        .await
+        .is_ok_and(|cancelled| cancelled)
+        {
             self.armed = false;
         }
     }
 
-    async fn preserve_indeterminate(mut self, reason: &str) -> String {
-        let _ = self
-            .gate
-            .mark_revert_indeterminate(&self.handle, reason)
-            .await;
+    async fn preserve_indeterminate(mut self, reason: &str, resource_uid: Option<&str>) -> String {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.gate
+                .mark_revert_indeterminate(&self.handle, reason, resource_uid),
+        )
+        .await;
         self.armed = false;
         self.handle.clone()
     }
 
-    async fn activate(mut self) -> Result<(String, Option<CreatedKey>), String> {
-        if self.gate.mark_revert_forwarded(&self.handle).await {
+    async fn activate(
+        mut self,
+        resource_uid: Option<&str>,
+    ) -> Result<(String, Option<CreatedKey>), String> {
+        if tokio::time::timeout(
+            Duration::from_secs(5),
+            self.gate.mark_revert_forwarded(&self.handle, resource_uid),
+        )
+        .await
+        .is_ok_and(|activated| activated)
+        {
             self.armed = false;
             Ok((self.handle.clone(), self.created_key.take()))
         } else {
-            let _ = self
-                .gate
-                .mark_revert_indeterminate(
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.gate.mark_revert_indeterminate(
                     &self.handle,
                     "successful mutation headers were received, but the confirmation window could not be activated",
-                )
-                .await;
+                    resource_uid,
+                ),
+            )
+            .await;
             self.armed = false;
             Err(self.handle.clone())
         }
@@ -320,14 +355,21 @@ impl Drop for ContainmentLifecycle {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 if handoff_started {
-                    let _ = gate
-                        .mark_revert_indeterminate(
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        gate.mark_revert_indeterminate(
                             &handle,
                             "request handling ended after upstream mutation dispatch began",
-                        )
-                        .await;
+                            None,
+                        ),
+                    )
+                    .await;
                 } else {
-                    let _ = gate.cancel_staged_revert(&handle).await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        gate.cancel_staged_revert(&handle),
+                    )
+                    .await;
                 }
             });
         }
@@ -342,15 +384,6 @@ impl ApiForwardHandoff for UpstreamSendHandoff {
             .take()
             .ok_or_else(|| "upstream handoff was already consumed".to_string())?;
         if let Some(containment) = self.containment.as_mut() {
-            if !containment
-                .gate
-                .begin_revert_handoff(&containment.handle)
-                .await
-            {
-                return Err(
-                    "durable mutation handoff containment could not be prepared".to_string()
-                );
-            }
             containment.handoff_started = true;
         }
         match tokio::time::timeout(self.timeout, request.send()).await {
@@ -521,30 +554,52 @@ struct CreatedKey {
 struct CreatedMatch {
     key: CreatedKey,
     handle: String,
+    resource_uid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreatedRecord {
+    handle: String,
+    resource_uid: String,
 }
 
 /// Tracks resources the proxy forwarded a create for (and armed an auto-revert
 /// on), each mapped to its auto-revert handle. Pure: no clock, no I/O.
 #[derive(Debug, Default)]
 struct CreatedRegistry {
-    items: HashMap<CreatedKey, String>,
+    items: HashMap<CreatedKey, CreatedRecord>,
 }
 
 impl CreatedRegistry {
     /// Record a created resource against its auto-revert handle.
-    fn remember(&mut self, key: CreatedKey, handle: String) {
-        self.items.insert(key, handle);
+    fn remember(&mut self, key: CreatedKey, handle: String, resource_uid: String) {
+        self.items.insert(
+            key,
+            CreatedRecord {
+                handle,
+                resource_uid,
+            },
+        );
     }
 
     /// Consume and return the auto-revert handle for a created resource, if the
     /// delete's key (connection included) matches a recorded create. Consuming
     /// ensures a resource is only ever contained-deleted once.
+    #[cfg(test)]
     fn find(&self, key: &CreatedKey) -> Option<String> {
+        self.items.get(key).map(|record| record.handle.clone())
+    }
+
+    fn find_record(&self, key: &CreatedKey) -> Option<CreatedRecord> {
         self.items.get(key).cloned()
     }
 
     fn take_if_handle(&mut self, key: &CreatedKey, handle: &str) -> bool {
-        if self.items.get(key).is_some_and(|stored| stored == handle) {
+        if self
+            .items
+            .get(key)
+            .is_some_and(|stored| stored.handle == handle)
+        {
             self.items.remove(key);
             true
         } else {
@@ -558,7 +613,7 @@ impl CreatedRegistry {
     /// still match a stale entry and skip the standard policy checks. Dropping
     /// the record on resolution keeps the shortcut scoped to a live revert.
     fn forget_by_handle(&mut self, handle: &str) {
-        self.items.retain(|_, h| h != handle);
+        self.items.retain(|_, record| record.handle != handle);
     }
 
     #[cfg(test)]
@@ -568,6 +623,17 @@ impl CreatedRegistry {
 }
 
 impl ApiProxy {
+    async fn read_upstream_body(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<Bytes, UpstreamBodyError> {
+        match tokio::time::timeout(self.upstream_body_timeout, response.bytes()).await {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(_)) => Err(UpstreamBodyError::ReadFailed),
+            Err(_) => Err(UpstreamBodyError::TimedOut),
+        }
+    }
+
     /// Assemble a Kubernetes proxy. `policy_path` (when set) is hot-reloaded
     /// while serving; when unset, `policy` is used as-is (typically a
     /// default-deny).
@@ -626,6 +692,8 @@ impl ApiProxy {
             upstream_handoff_timeout: UPSTREAM_HANDOFF_TIMEOUT,
             upstream_body_timeout: UPSTREAM_BODY_TIMEOUT,
             policy_reload_interval: Duration::from_secs(POLICY_RELOAD_SECS),
+            policy_reload_attempt: AtomicU64::new(0),
+            policy_reload_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -680,6 +748,22 @@ impl ApiProxy {
     /// hot-reload of `policy_path` has taken effect.
     pub async fn policy_fingerprint(&self) -> String {
         self.policy.read().await.authority_fingerprint()
+    }
+
+    #[doc(hidden)]
+    pub fn policy_reload_attempt(&self) -> u64 {
+        self.policy_reload_attempt.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
+    pub async fn wait_for_policy_reload_attempt_after(&self, baseline: u64) {
+        loop {
+            let notified = self.policy_reload_notify.notified();
+            if self.policy_reload_attempt() > baseline {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn attach_session_sink(&self, sink: Arc<dyn ApiSessionSink>) {
@@ -1125,18 +1209,28 @@ impl ApiProxy {
                     .as_ref()
                     .map(|context| context.fingerprint.as_str()),
             ) {
-                let _ = crate::audit::emit_global(
-                    &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
-                        .handle(&created.handle)
-                        .reason(
-                            "contained: guard-created this session, auto-revert remains armed                              until delete succeeds",
-                        )
-                        .field("decision", "allow")
-                        .field("label", &label),
-                );
-                return self
-                    .forward_contained_cleanup(req, &path, &query, op, conn_id, created)
-                    .await;
+                let same_resource = self
+                    .resolve_created_uid(&created.key, &path, &created.handle)
+                    .await
+                    .is_ok_and(|uid| uid == created.resource_uid);
+                if same_resource {
+                    let _ = crate::audit::emit_global(
+                        &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
+                            .handle(&created.handle)
+                            .reason(
+                                "contained: guard-created this session, auto-revert remains armed until delete succeeds",
+                            )
+                            .field("decision", "allow")
+                            .field("label", &label),
+                    );
+                    return self
+                        .forward_contained_cleanup(req, &path, &query, op, conn_id, created)
+                        .await;
+                }
+                self.created
+                    .lock()
+                    .unwrap()
+                    .take_if_handle(&created.key, &created.handle);
             }
         }
 
@@ -1902,6 +1996,24 @@ impl ApiProxy {
         } else {
             None
         };
+        if let Some(staged) = staged_revert
+            .as_ref()
+            .filter(|staged| staged.created_key.is_some())
+        {
+            body = match bind_create_provenance(&body, &staged.handle) {
+                Ok(body) => body,
+                Err(reason) => {
+                    if let Some(gate) = self.gate.get() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            gate.cancel_staged_revert(&staged.handle),
+                        )
+                        .await;
+                    }
+                    return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid");
+                }
+            };
+        }
         match self
             .forward_inner(
                 parts,
@@ -2018,7 +2130,7 @@ impl ApiProxy {
             Ok(guard) => guard,
             Err(_) => {
                 if let Some(staged) = containment.take() {
-                    staged.cancel_pre_send().await;
+                    staged.cancel_inert().await;
                 }
                 return Ok(self.status_resp(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2033,7 +2145,7 @@ impl ApiProxy {
         {
             drop(policy_authority);
             if let Some(staged) = containment.take() {
-                staged.cancel_pre_send().await;
+                staged.cancel_inert().await;
             }
             return Ok(response);
         }
@@ -2091,7 +2203,7 @@ impl ApiProxy {
         let (upstream_resp, mut containment) = match upstream_outcome {
             UpstreamHandoffOutcome::Pending => {
                 if let Some(containment) = containment {
-                    containment.cancel_pre_send().await;
+                    containment.cancel_inert().await;
                 }
                 let reason = authorization_result.err().unwrap_or_else(|| {
                     "authority provider did not perform the protected handoff".to_string()
@@ -2104,10 +2216,18 @@ impl ApiProxy {
             }
             UpstreamHandoffOutcome::TimedOut => {
                 let handle = if let Some(containment) = containment {
+                    let resource_uid = if let Some((key, path)) = containment.created_resource() {
+                        self.resolve_created_uid(key, path, &containment.handle)
+                            .await
+                            .ok()
+                    } else {
+                        None
+                    };
                     Some(
                         containment
                             .preserve_indeterminate(
                                 "upstream mutation dispatch timed out before response headers",
+                                resource_uid.as_deref(),
                             )
                             .await,
                     )
@@ -2126,10 +2246,19 @@ impl ApiProxy {
                     Ok(response) => response,
                     Err(_) => {
                         let handle = if let Some(containment) = containment {
+                            let resource_uid =
+                                if let Some((key, path)) = containment.created_resource() {
+                                    self.resolve_created_uid(key, path, &containment.handle)
+                                        .await
+                                        .ok()
+                                } else {
+                                    None
+                                };
                             Some(
                                 containment
                                     .preserve_indeterminate(
                                         "upstream mutation dispatch ended with a transport error before response headers",
+                                        resource_uid.as_deref(),
                                     )
                                     .await,
                             )
@@ -2154,11 +2283,39 @@ impl ApiProxy {
         let mut provisional_handle = None;
         let mut containment_active = false;
         if let Some(staged) = containment.take() {
-            if status.is_success() {
-                match staged.activate().await {
+            if op.as_ref().is_some_and(|operation| {
+                self.protocol
+                    .definitively_rejects_mutation(operation, status.as_u16())
+            }) {
+                staged.cancel_inert().await;
+            } else if status.is_success() {
+                let resource_uid = if let Some((key, path)) = staged.created_resource() {
+                    match self.resolve_created_uid(key, path, &staged.handle).await {
+                        Ok(uid) => Some(uid),
+                        Err(reason) => {
+                            let handle = staged.preserve_indeterminate(&reason, None).await;
+                            return Ok(self.provisional_status_resp(
+                                StatusCode::BAD_GATEWAY,
+                                "guard api-proxy: mutation succeeded but the created resource identity could not be verified",
+                                "ContainmentError",
+                                Some(&handle),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                match staged.activate(resource_uid.as_deref()).await {
                     Ok((handle, created_key)) => {
                         if let Some(key) = created_key {
-                            self.created.lock().unwrap().remember(key, handle.clone());
+                            let uid = resource_uid
+                                .as_ref()
+                                .expect("created containment has a verified UID")
+                                .clone();
+                            self.created
+                                .lock()
+                                .unwrap()
+                                .remember(key, handle.clone(), uid);
                         }
                         provisional_handle = Some(handle);
                         containment_active = true;
@@ -2173,11 +2330,19 @@ impl ApiProxy {
                     }
                 }
             } else {
+                let resource_uid = if let Some((key, path)) = staged.created_resource() {
+                    self.resolve_created_uid(key, path, &staged.handle)
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
                 provisional_handle = Some(
                     staged
-                        .preserve_indeterminate(&format!(
-                            "upstream returned HTTP {status} after mutation dispatch"
-                        ))
+                        .preserve_indeterminate(
+                            &format!("upstream returned HTTP {status} after mutation dispatch"),
+                            resource_uid.as_deref(),
+                        )
                         .await,
                 );
             }
@@ -2235,10 +2400,25 @@ impl ApiProxy {
         // response succeeds. A 2xx header followed by a body disconnect keeps
         // the revert armed because the outcome is no longer trustworthy.
         if let Some(created) = created_cleanup {
-            let bytes = upstream_resp
-                .bytes()
-                .await
-                .context("read contained cleanup response")?;
+            let bytes = match self.read_upstream_body(upstream_resp).await {
+                Ok(bytes) => bytes,
+                Err(UpstreamBodyError::TimedOut) => {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "guard api-proxy: contained cleanup response body timed out",
+                        "Timeout",
+                        Some(&created.handle),
+                    ));
+                }
+                Err(UpstreamBodyError::ReadFailed) => {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: contained cleanup response body failed",
+                        "InternalError",
+                        Some(&created.handle),
+                    ));
+                }
+            };
             if status.is_success() {
                 let consumed = self
                     .created
@@ -2263,10 +2443,9 @@ impl ApiProxy {
         // on a successful body whose content-type we cannot parse and redact.
         if redact {
             if !status.is_success() {
-                let bytes = upstream_resp
-                    .bytes()
-                    .await
-                    .context("read Secret error response")?;
+                let bytes = self.read_upstream_body(upstream_resp).await.map_err(|_| {
+                    anyhow::anyhow!("read Secret error response failed or timed out")
+                })?;
                 let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
                 return Ok(builder
                     .body(full_body(bytes))
@@ -2279,10 +2458,10 @@ impl ApiProxy {
                     "InternalError",
                 ));
             }
-            let bytes = upstream_resp
-                .bytes()
+            let bytes = self
+                .read_upstream_body(upstream_resp)
                 .await
-                .context("read Secret response for redaction")?;
+                .map_err(|_| anyhow::anyhow!("read Secret response failed or timed out"))?;
             let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 // Fail closed: never pass an unparsed Secret body through.
@@ -2310,32 +2489,30 @@ impl ApiProxy {
         // become this same session's next observed version. The body has a
         // separate bound because containment is already armed at this point.
         if track_write || kubernetes_mutation {
-            let bytes =
-                match tokio::time::timeout(self.upstream_body_timeout, upstream_resp.bytes()).await
-                {
-                    Ok(Ok(bytes)) => bytes,
-                    Ok(Err(_)) => {
-                        return Ok(self.provisional_status_resp(
-                            StatusCode::BAD_GATEWAY,
-                            "guard api-proxy: upstream mutation response body failed",
-                            "InternalError",
-                            provisional_handle.as_deref(),
-                        ));
-                    }
-                    Err(_) => {
-                        let mut response = self.status_resp(
+            let bytes = match self.read_upstream_body(upstream_resp).await {
+                Ok(bytes) => bytes,
+                Err(UpstreamBodyError::ReadFailed) => {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: upstream mutation response body failed",
+                        "InternalError",
+                        provisional_handle.as_deref(),
+                    ));
+                }
+                Err(UpstreamBodyError::TimedOut) => {
+                    let mut response = self.status_resp(
                         StatusCode::GATEWAY_TIMEOUT,
                         "guard api-proxy: upstream response body timed out after mutation handoff",
                         "Timeout",
                     );
-                        if let Some(handle) = provisional_handle.as_deref() {
-                            if let Ok(value) = hyper::header::HeaderValue::from_str(handle) {
-                                response.headers_mut().insert("x-guard-provisional", value);
-                            }
+                    if let Some(handle) = provisional_handle.as_deref() {
+                        if let Ok(value) = hyper::header::HeaderValue::from_str(handle) {
+                            response.headers_mut().insert("x-guard-provisional", value);
                         }
-                        return Ok(response);
                     }
-                };
+                    return Ok(response);
+                }
+            };
             if status.is_success() {
                 if let Some(o) = op.as_ref() {
                     if let Some(context) = session_context.as_ref() {
@@ -2374,10 +2551,9 @@ impl ApiProxy {
             })
             && session_context.is_some()
         {
-            let bytes = upstream_resp
-                .bytes()
-                .await
-                .context("read Kubernetes object response for observation")?;
+            let bytes = self.read_upstream_body(upstream_resp).await.map_err(|_| {
+                anyhow::anyhow!("read Kubernetes object response failed or timed out")
+            })?;
             if let (Some(operation), Some(context)) = (op.as_ref(), session_context.as_ref()) {
                 self.remember_kubernetes_observation(operation, &bytes, context);
             }
@@ -2648,13 +2824,85 @@ impl ApiProxy {
         } else if let Some((user, pass)) = self.upstream.basic_auth() {
             rb = rb.basic_auth(user, Some(pass));
         }
-        let Ok(resp) = rb.send().await else {
+        let Ok(Ok(resp)) = tokio::time::timeout(self.upstream_handoff_timeout, rb.send()).await
+        else {
             return Ok(None);
         };
         if !resp.status().is_success() {
             return Ok(None);
         }
-        Ok(resp.bytes().await.ok().map(|b| b.to_vec()))
+        Ok(self
+            .read_upstream_body(resp)
+            .await
+            .ok()
+            .map(|bytes| bytes.to_vec()))
+    }
+
+    /// Resolve the exact identity of a resource created by the protected
+    /// request. The UID becomes a Kubernetes delete precondition, so a later
+    /// replacement at the same name cannot be removed by this rollback.
+    async fn resolve_created_uid(
+        &self,
+        key: &CreatedKey,
+        object_path: &str,
+        expected_provisional: &str,
+    ) -> Result<String, String> {
+        let url = format!("{}{}", self.upstream.base(), object_path);
+        let mut request = self
+            .upstream
+            .client()
+            .get(url)
+            .header(header::ACCEPT, "application/json")
+            .header(header::ACCEPT_ENCODING, "identity");
+        if let Some(token) = self.upstream.bearer() {
+            request = request.bearer_auth(token);
+        } else if let Some((user, pass)) = self.upstream.basic_auth() {
+            request = request.basic_auth(user, Some(pass));
+        }
+        let response = tokio::time::timeout(self.upstream_handoff_timeout, request.send())
+            .await
+            .map_err(|_| "created resource identity lookup timed out".to_string())?
+            .map_err(|_| "created resource identity lookup failed".to_string())?;
+        if !response.status().is_success() {
+            return Err("created resource identity is unavailable".to_string());
+        }
+        let bytes = tokio::time::timeout(self.upstream_body_timeout, response.bytes())
+            .await
+            .map_err(|_| "created resource identity response timed out".to_string())?
+            .map_err(|_| "created resource identity response failed".to_string())?;
+        let object: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "created resource identity response is invalid".to_string())?;
+        let metadata = object
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "created resource identity metadata is missing".to_string())?;
+        if metadata.get("name").and_then(serde_json::Value::as_str) != Some(key.name.as_str())
+            || metadata
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                != key.namespace.as_deref()
+        {
+            return Err(
+                "created resource identity does not match the admitted operation".to_string(),
+            );
+        }
+        if metadata
+            .get("annotations")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|annotations| annotations.get(CREATE_PROVENANCE_ANNOTATION))
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_provisional)
+        {
+            return Err(
+                "created resource does not carry the admitted operation provenance".to_string(),
+            );
+        }
+        let uid = metadata
+            .get("uid")
+            .and_then(serde_json::Value::as_str)
+            .filter(|uid| !uid.is_empty() && uid.len() <= 256 && !uid.chars().any(char::is_control))
+            .ok_or_else(|| "created resource UID is missing or invalid".to_string())?;
+        Ok(uid.to_string())
     }
 
     /// Fetch the prior object and confirm the protocol can plan a revert from
@@ -2739,11 +2987,14 @@ impl ApiProxy {
             namespace: c.namespace,
             name: c.name,
         });
+        let created_path = created_key.as_ref().map(|_| plan.revert.path.clone());
         let label = plan.label;
-        match gate
-            .arm_revert(ApiMutation {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            gate.arm_revert(ApiMutation {
                 label: label.clone(),
                 revert: plan.revert,
+                revert_requires_uid_precondition: created_key.is_some(),
                 session_fingerprint: session_context
                     .as_ref()
                     .map(|context| context.fingerprint.clone()),
@@ -2754,17 +3005,19 @@ impl ApiProxy {
                     .and_then(|context| context.secret_entitlements),
                 upstream_target: self.upstream.base().to_string(),
                 upstream_identity: self.upstream_identity_fingerprint(),
-            })
-            .await
+            }),
+        )
+        .await
         {
-            Some(handle) => {
+            Ok(Some(handle)) => {
                 tracing::info!(target: "guard::apiproxy", "staged auto-revert {handle} for {label}");
                 Some(StagedRevert {
                     handle,
                     created_key,
+                    created_path,
                 })
             }
-            None => {
+            Ok(None) | Err(_) => {
                 tracing::warn!(
                     target: "guard::apiproxy",
                     "could not arm auto-revert for {label} (capacity)"
@@ -2793,8 +3046,12 @@ impl ApiProxy {
             namespace: op.namespace.clone(),
             name,
         };
-        let handle = self.created.lock().unwrap().find(&key)?;
-        Some(CreatedMatch { key, handle })
+        let record = self.created.lock().unwrap().find_record(&key)?;
+        Some(CreatedMatch {
+            key,
+            handle: record.handle,
+            resource_uid: record.resource_uid,
+        })
     }
 
     pub fn upstream_identity_fingerprint(&self) -> String {
@@ -2914,6 +3171,27 @@ impl ApiProxy {
         *self.judge.write().unwrap() = judge;
         tracing::info!(target: "guard::apiproxy", "rebuilt api evaluator for policy intent change");
     }
+}
+
+fn bind_create_provenance(body: &[u8], provisional: &str) -> Result<Bytes, String> {
+    let mut object: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| "Kubernetes create body is not valid JSON".to_string())?;
+    let metadata = object
+        .get_mut("metadata")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "Kubernetes create body has no metadata object".to_string())?;
+    let annotations = metadata
+        .entry("annotations")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "Kubernetes create metadata annotations must be an object".to_string())?;
+    annotations.insert(
+        CREATE_PROVENANCE_ANNOTATION.to_string(),
+        serde_json::Value::String(provisional.to_string()),
+    );
+    serde_json::to_vec(&object)
+        .map(Bytes::from)
+        .map_err(|_| "Kubernetes create provenance could not be serialized".to_string())
 }
 
 fn take_guard_session(headers: &mut HeaderMap) -> Result<Option<String>, &'static str> {
@@ -3262,6 +3540,8 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
         last = modified;
         match ApiPolicy::load_file(&path) {
             Ok(p) => {
+                proxy.policy_reload_attempt.fetch_add(1, Ordering::AcqRel);
+                proxy.policy_reload_notify.notify_waiters();
                 let _mutation_authority_guard = proxy.mutation_authority_gate.write().await;
                 let _read_authority_guard = proxy.read_authority_gate.write().await;
                 let old_intent = proxy.policy.read().await.intent.clone();
@@ -3423,7 +3703,11 @@ mod tests {
         // Caller A (connection 1) creates a resource; the proxy records its
         // auto-revert handle keyed to that connection.
         let mut reg = CreatedRegistry::default();
-        reg.remember(created_key(1, "foo"), "handle-A".to_string());
+        reg.remember(
+            created_key(1, "foo"),
+            "handle-A".to_string(),
+            "resource-uid".to_string(),
+        );
 
         // Caller B on a different connection deletes the same
         // group/resource/namespace/name: no provenance match, so the delete
@@ -3450,6 +3734,7 @@ mod tests {
         reg.remember(
             session_created_key(1, "foo", "session-a"),
             "handle-a".to_string(),
+            "resource-uid".to_string(),
         );
 
         assert_eq!(reg.find(&created_key(1, "foo")), None);
@@ -3463,7 +3748,11 @@ mod tests {
     #[test]
     fn provenance_is_dropped_when_its_revert_resolves() {
         let mut reg = CreatedRegistry::default();
-        reg.remember(created_key(1, "foo"), "handle-A".to_string());
+        reg.remember(
+            created_key(1, "foo"),
+            "handle-A".to_string(),
+            "resource-uid".to_string(),
+        );
 
         // The create's auto-revert resolves (operator confirm, or auto/manual
         // revert): the daemon drops the provenance by handle.
@@ -3474,6 +3763,21 @@ mod tests {
         // outside guard) no longer matches the stale entry and goes through
         // normal policy.
         assert_eq!(reg.find(&created_key(1, "foo")), None);
+    }
+
+    #[test]
+    fn create_provenance_is_bound_into_the_forwarded_object() {
+        let body = bind_create_provenance(
+            br#"{"metadata":{"name":"example","annotations":{"fixture":"kept"}},"spec":{}}"#,
+            "provisional-handle",
+        )
+        .unwrap();
+        let object: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            object["metadata"]["annotations"][CREATE_PROVENANCE_ANNOTATION],
+            "provisional-handle"
+        );
+        assert_eq!(object["metadata"]["annotations"]["fixture"], "kept");
     }
 
     fn test_proxy() -> ApiProxy {
@@ -3589,11 +3893,11 @@ mod tests {
     #[test]
     fn created_provenance_matches_without_consuming() {
         let proxy = test_proxy();
-        proxy
-            .created
-            .lock()
-            .unwrap()
-            .remember(created_key(1, "foo"), "h1".to_string());
+        proxy.created.lock().unwrap().remember(
+            created_key(1, "foo"),
+            "h1".to_string(),
+            "resource-uid".to_string(),
+        );
 
         let op = delete_op("foo");
         // A delete on a different connection does not match.
@@ -3759,11 +4063,11 @@ mod tests {
     #[test]
     fn forget_created_by_handle_clears_public_provenance() {
         let proxy = test_proxy();
-        proxy
-            .created
-            .lock()
-            .unwrap()
-            .remember(created_key(1, "foo"), "h1".to_string());
+        proxy.created.lock().unwrap().remember(
+            created_key(1, "foo"),
+            "h1".to_string(),
+            "resource-uid".to_string(),
+        );
 
         proxy.forget_created_by_handle("h1");
 

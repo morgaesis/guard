@@ -30,6 +30,42 @@ use guard::proxy::{
     ProxyTls, Upstream,
 };
 
+const CREATE_PROVENANCE_ANNOTATION: &str = "guard.morgaesis.dev/provisional";
+type CreateProvenance = Arc<std::sync::Mutex<Option<String>>>;
+
+async fn observe_create_provenance(
+    request: Request<Incoming>,
+    provenance: &CreateProvenance,
+) -> (hyper::Method, String) {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    if method == hyper::Method::POST {
+        let body = request.into_body().collect().await.unwrap().to_bytes();
+        let marker = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer(&format!(
+                        "/metadata/annotations/{}",
+                        CREATE_PROVENANCE_ANNOTATION
+                            .replace('~', "~0")
+                            .replace('/', "~1")
+                    ))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        *provenance.lock().unwrap() = marker;
+    }
+    (method, path)
+}
+
+fn attach_create_provenance(object: &mut Value, provenance: &CreateProvenance) {
+    let Some(marker) = provenance.lock().unwrap().clone() else {
+        return;
+    };
+    object["metadata"]["annotations"][CREATE_PROVENANCE_ANNOTATION] = Value::String(marker);
+}
+
 async fn authorize_test_session(
     sink: &(impl ApiSessionSink + ?Sized),
     token: &str,
@@ -463,19 +499,41 @@ async fn spawn_success_headers_stalled_body() -> String {
     type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
+            let provenance = provenance.clone();
             tokio::spawn(async move {
-                let service = service_fn(|_request: Request<Incoming>| async move {
-                    let frames = futures::stream::pending::<Result<Frame<Bytes>, std::io::Error>>();
-                    Ok::<Response<MockBody>, Infallible>(
-                        Response::builder()
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, path) = observe_create_provenance(request, &provenance).await;
+                        if method == hyper::Method::GET {
+                            let mut object = created_pod_object();
+                            if let Some(name) = path.rsplit('/').next() {
+                                object["metadata"]["name"] = Value::String(name.to_string());
+                            }
+                            attach_create_provenance(&mut object, &provenance);
+                            let body = Full::new(Bytes::from(object.to_string()))
+                                .map_err(std::io::Error::other)
+                                .boxed();
+                            return Ok::<Response<MockBody>, Infallible>(
+                                Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/json")
+                                    .body(body)
+                                    .unwrap(),
+                            );
+                        }
+                        let frames =
+                            futures::stream::pending::<Result<Frame<Bytes>, std::io::Error>>();
+                        Ok(Response::builder()
                             .status(201)
                             .header("content-type", "application/json")
                             .body(StreamBody::new(frames).boxed())
-                            .unwrap(),
-                    )
+                            .unwrap())
+                    }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -494,19 +552,23 @@ async fn spawn_create_status_upstream(
     let addr = listener.local_addr().unwrap();
     let deletes = Arc::new(AtomicUsize::new(0));
     let observed_deletes = deletes.clone();
+    let provenance = CreateProvenance::default();
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let deletes = observed_deletes.clone();
+            let provenance = provenance.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |request: Request<Incoming>| {
                     let deletes = deletes.clone();
+                    let provenance = provenance.clone();
                     async move {
+                        let (method, path) = observe_create_provenance(request, &provenance).await;
                         let mut builder =
                             Response::builder().header("content-type", "application/json");
-                        let response_status = if request.method() == hyper::Method::POST {
+                        let response_status = if method == hyper::Method::POST {
                             status
-                        } else if request.method() == hyper::Method::DELETE {
+                        } else if method == hyper::Method::DELETE {
                             deletes.fetch_add(1, Ordering::SeqCst);
                             200
                         } else {
@@ -515,10 +577,17 @@ async fn spawn_create_status_upstream(
                         if let Some(encoding) = content_encoding {
                             builder = builder.header("content-encoding", encoding);
                         }
+                        let mut object = created_pod_object();
+                        if method == hyper::Method::GET {
+                            if let Some(name) = path.rsplit('/').next() {
+                                object["metadata"]["name"] = Value::String(name.to_string());
+                            }
+                        }
+                        attach_create_provenance(&mut object, &provenance);
                         Ok::<_, Infallible>(
                             builder
                                 .status(response_status)
-                                .body(Full::new(Bytes::from(created_pod_object().to_string())))
+                                .body(Full::new(Bytes::from(object.to_string())))
                                 .unwrap(),
                         )
                     }
@@ -553,6 +622,62 @@ async fn spawn_transport_error_upstream() -> String {
     format!("http://{addr}")
 }
 
+async fn spawn_replaceable_create_upstream() -> (String, Arc<AtomicBool>, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let replacement = Arc::new(AtomicBool::new(false));
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let state = replacement.clone();
+    let observed_deletes = deletes.clone();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let replacement = state.clone();
+            let deletes = observed_deletes.clone();
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let replacement = replacement.clone();
+                    let deletes = deletes.clone();
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, path) = observe_create_provenance(request, &provenance).await;
+                        if method == hyper::Method::DELETE {
+                            deletes.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let mut object = created_pod_object();
+                        if let Some(name) = path.rsplit('/').next() {
+                            object["metadata"]["name"] = Value::String(name.to_string());
+                        }
+                        attach_create_provenance(&mut object, &provenance);
+                        if replacement.load(Ordering::SeqCst) {
+                            object["metadata"]["uid"] =
+                                Value::String("replacement-resource-uid".to_string());
+                        }
+                        let status = if method == hyper::Method::POST {
+                            201
+                        } else {
+                            200
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(object.to_string())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), replacement, deletes)
+}
+
 async fn spawn_policy_barrier_upstream(
     block_method: hyper::Method,
 ) -> (
@@ -566,32 +691,38 @@ async fn spawn_policy_barrier_upstream(
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let observed = reached.clone();
     let continuation = release.clone();
+    let provenance = CreateProvenance::default();
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let reached = observed.clone();
             let release = continuation.clone();
             let block_method = block_method.clone();
+            let provenance = provenance.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |request: Request<Incoming>| {
                     let reached = reached.clone();
                     let release = release.clone();
                     let block_method = block_method.clone();
+                    let provenance = provenance.clone();
                     async move {
-                        if request.method() == block_method {
+                        let (method, _) = observe_create_provenance(request, &provenance).await;
+                        if method == block_method {
                             reached.add_permits(1);
                             release.acquire().await.unwrap().forget();
                         }
-                        let status = if request.method() == hyper::Method::POST {
+                        let status = if method == hyper::Method::POST {
                             201
                         } else {
                             200
                         };
+                        let mut object = created_pod_object();
+                        attach_create_provenance(&mut object, &provenance);
                         Ok::<_, Infallible>(
                             Response::builder()
                                 .status(status)
                                 .header("content-type", "application/json")
-                                .body(Full::new(Bytes::from(created_pod_object().to_string())))
+                                .body(Full::new(Bytes::from(object.to_string())))
                                 .unwrap(),
                         )
                     }
@@ -1054,8 +1185,14 @@ async fn read_handoff_linearizes_before_a_queued_policy_deny() {
     });
     read_reached.acquire().await.unwrap().forget();
     let deny_policy = "default: deny\n";
+    let reload_baseline = proxy.policy_reload_attempt();
     std::fs::write(&policy_path, deny_policy).unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.wait_for_policy_reload_attempt_after(reload_baseline),
+    )
+    .await
+    .expect("policy reloader reaches authority coordination");
     assert_eq!(
         proxy.policy_fingerprint().await,
         ApiPolicy::from_yaml(allow_policy)
@@ -1121,8 +1258,14 @@ async fn evaluated_read_handoff_linearizes_before_a_queued_policy_deny() {
     });
     read_reached.acquire().await.unwrap().forget();
     let deny_policy = "default: deny\n";
+    let reload_baseline = proxy.policy_reload_attempt();
     std::fs::write(&policy_path, deny_policy).unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.wait_for_policy_reload_attempt_after(reload_baseline),
+    )
+    .await
+    .expect("policy reloader reaches authority coordination");
     assert_eq!(
         proxy.policy_fingerprint().await,
         ApiPolicy::from_yaml(evaluate_policy)
@@ -1183,8 +1326,14 @@ async fn read_does_not_queue_behind_reload_waiting_for_a_stalled_mutation() {
     });
     mutation_reached.acquire().await.unwrap().forget();
     let deny_policy = "default: deny\n";
+    let reload_baseline = proxy.policy_reload_attempt();
     std::fs::write(&policy_path, deny_policy).unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.wait_for_policy_reload_attempt_after(reload_baseline),
+    )
+    .await
+    .expect("policy reloader reaches authority coordination");
     let read = tokio::time::timeout(
         Duration::from_secs(2),
         client
@@ -1973,6 +2122,12 @@ async fn successful_mutation_headers_arm_containment_before_a_stalled_body_times
     assert_eq!(response.status(), 504);
     assert_eq!(sink.calls.lock().unwrap().len(), 1);
     assert_eq!(sink.activated.lock().unwrap().as_slice(), ["test-handle-0"]);
+    assert!(sink
+        .resource_uids
+        .lock()
+        .unwrap()
+        .first()
+        .is_some_and(Option::is_some));
     assert_eq!(
         response
             .headers()
@@ -1983,7 +2138,7 @@ async fn successful_mutation_headers_arm_containment_before_a_stalled_body_times
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mutation_handoff_timeout_preserves_an_actionable_provisional() {
+async fn mutation_handoff_timeout_preserves_operator_decision_without_an_unsafe_uid() {
     let (upstream, reached_upstream) = spawn_stalled_upstream().await;
     let sink = RecordingSink::default();
     let (base, client) = start_proxy_with_timeouts(
@@ -2018,6 +2173,12 @@ async fn mutation_handoff_timeout_preserves_an_actionable_provisional() {
     );
     assert_eq!(sink.handoffs.lock().unwrap().len(), 1);
     assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+    assert!(sink
+        .resource_uids
+        .lock()
+        .unwrap()
+        .first()
+        .is_some_and(Option::is_none));
     assert!(sink.cancelled.lock().unwrap().is_empty());
 }
 
@@ -2068,6 +2229,12 @@ async fn server_error_preserves_containment_without_create_provenance() {
     assert_eq!(response.status(), 500);
     assert!(response.headers().contains_key("x-guard-provisional"));
     assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+    assert!(sink
+        .resource_uids
+        .lock()
+        .unwrap()
+        .first()
+        .is_some_and(Option::is_some));
     assert!(sink.activated.lock().unwrap().is_empty());
     assert!(sink.cancelled.lock().unwrap().is_empty());
 
@@ -2082,7 +2249,7 @@ async fn server_error_preserves_containment_without_create_provenance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rejected_create_preserves_containment_without_create_provenance() {
+async fn rejected_create_cancels_inert_containment_without_create_provenance() {
     let (upstream, forwarded_deletes) = spawn_create_status_upstream(409, None).await;
     let sink = RecordingSink::default();
     let (base, client) = start_proxy_with(
@@ -2101,12 +2268,45 @@ async fn rejected_create_preserves_containment_without_create_provenance() {
         .await
         .unwrap();
     assert_eq!(response.status(), 409);
-    assert!(response.headers().contains_key("x-guard-provisional"));
-    assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+    assert!(!response.headers().contains_key("x-guard-provisional"));
+    assert!(sink.indeterminate.lock().unwrap().is_empty());
     assert!(sink.activated.lock().unwrap().is_empty());
+    assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
 
     let delete = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/existing-pod"))
+        .bearer_auth("live-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 403);
+    assert_eq!(forwarded_deletes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_uid_cannot_use_created_resource_cleanup_authority() {
+    let (upstream, replacement, forwarded_deletes) = spawn_replaceable_create_upstream().await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let created = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"replaceable-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    replacement.store(true, Ordering::SeqCst);
+
+    let delete = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/replaceable-pod"))
         .bearer_auth("live-session")
         .send()
         .await
@@ -2162,7 +2362,7 @@ async fn explicit_activation_failure_cannot_return_upstream_success() {
         .unwrap();
     assert_eq!(response.status(), 502);
     assert!(response.headers().contains_key("x-guard-provisional"));
-    assert_eq!(state.handoffs.lock().unwrap().len(), 1);
+    assert_eq!(state.handoffs.lock().unwrap().len(), 2);
     assert_eq!(state.activated.lock().unwrap().len(), 1);
     assert_eq!(state.indeterminate.lock().unwrap().len(), 1);
     assert!(state.cancelled.lock().unwrap().is_empty());
@@ -2476,6 +2676,7 @@ struct RecordingSink {
     handoffs: Arc<std::sync::Mutex<Vec<String>>>,
     activated: Arc<std::sync::Mutex<Vec<String>>>,
     indeterminate: Arc<std::sync::Mutex<Vec<String>>>,
+    resource_uids: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     cancelled: Arc<std::sync::Mutex<Vec<String>>>,
     resolved: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -2488,18 +2689,28 @@ impl guard::proxy::GateSink for RecordingSink {
         Some(handle)
     }
 
-    async fn begin_revert_handoff(&self, handle: &str) -> bool {
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
         self.handoffs.lock().unwrap().push(handle.to_string());
-        true
-    }
-
-    async fn mark_revert_forwarded(&self, handle: &str) -> bool {
         self.activated.lock().unwrap().push(handle.to_string());
+        self.resource_uids
+            .lock()
+            .unwrap()
+            .push(resource_uid.map(str::to_string));
         true
     }
 
-    async fn mark_revert_indeterminate(&self, handle: &str, _reason: &str) -> bool {
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        _reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.handoffs.lock().unwrap().push(handle.to_string());
         self.indeterminate.lock().unwrap().push(handle.to_string());
+        self.resource_uids
+            .lock()
+            .unwrap()
+            .push(resource_uid.map(str::to_string));
         true
     }
 
@@ -2524,11 +2735,8 @@ impl guard::proxy::GateSink for ActivationFailSink {
         self.state.arm_revert(mutation).await
     }
 
-    async fn begin_revert_handoff(&self, handle: &str) -> bool {
-        self.state.begin_revert_handoff(handle).await
-    }
-
-    async fn mark_revert_forwarded(&self, handle: &str) -> bool {
+    async fn mark_revert_forwarded(&self, handle: &str, _resource_uid: Option<&str>) -> bool {
+        self.state.handoffs.lock().unwrap().push(handle.to_string());
         self.state
             .activated
             .lock()
@@ -2537,8 +2745,15 @@ impl guard::proxy::GateSink for ActivationFailSink {
         false
     }
 
-    async fn mark_revert_indeterminate(&self, handle: &str, reason: &str) -> bool {
-        self.state.mark_revert_indeterminate(handle, reason).await
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.state
+            .mark_revert_indeterminate(handle, reason, resource_uid)
+            .await
     }
 
     async fn cancel_staged_revert(&self, handle: &str) -> bool {
@@ -2562,15 +2777,16 @@ impl guard::proxy::GateSink for BlockingCancelSink {
         Some("blocked-cancel-handle".to_string())
     }
 
-    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
         false
     }
 
-    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
-        false
-    }
-
-    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
         false
     }
 
@@ -2586,10 +2802,19 @@ impl guard::proxy::GateSink for BlockingCancelSink {
 /// Mock apiserver for the write path: returns a created Pod for POST, and a
 /// Deployment (with resourceVersion) for the snapshot GET and the PATCH.
 async fn write_mock_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    let is_create = req.method() == hyper::Method::POST;
-    let (code, body) = if is_create {
+    write_mock_handler_with_provenance(req, &CreateProvenance::default()).await
+}
+
+async fn write_mock_handler_with_provenance(
+    req: Request<Incoming>,
+    provenance: &CreateProvenance,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let (method, path) = observe_create_provenance(req, provenance).await;
+    let is_create = method == hyper::Method::POST;
+    let is_created_pod = path.ends_with("/pods/web-123");
+    let (code, mut body) = if is_create || is_created_pod {
         (
-            201,
+            if is_create { 201 } else { 200 },
             json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "web-123", "namespace": "dev", "uid": "pod-uid", "resourceVersion": "40"}}),
         )
     } else {
@@ -2603,6 +2828,9 @@ async fn write_mock_handler(req: Request<Incoming>) -> Result<Response<Full<Byte
             }),
         )
     };
+    if is_create || is_created_pod {
+        attach_create_provenance(&mut body, provenance);
+    }
     Ok(Response::builder()
         .status(code)
         .header("content-type", "application/json")
@@ -2613,17 +2841,28 @@ async fn write_mock_handler(req: Request<Incoming>) -> Result<Response<Full<Byte
 async fn spawn_write_mock() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
     tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            let provenance = provenance.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service_fn(write_mock_handler))
-                    .await;
+                let _ =
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            service_fn(move |request| {
+                                let provenance = provenance.clone();
+                                async move {
+                                    write_mock_handler_with_provenance(request, &provenance).await
+                                }
+                            }),
+                        )
+                        .await;
             });
         }
     });
@@ -2720,6 +2959,9 @@ async fn proxy_arms_auto_revert_for_writes() {
             && call.upstream_target == mock_base
             && call.upstream_identity.len() == 64
     }));
+    let resource_uids = sink.resource_uids.lock().unwrap();
+    assert!(resource_uids.first().is_some_and(Option::is_some));
+    assert!(resource_uids.get(1).is_some_and(Option::is_none));
 
     // The create armed a DELETE for the server-assigned object name.
     assert_eq!(calls[0].revert.method, "DELETE");
@@ -3498,8 +3740,10 @@ async fn proxy_self_access_review_carries_upstream_credential() {
 /// `check-pod`; a DELETE returns a success Status (the object removed).
 async fn create_delete_mock_handler(
     req: Request<Incoming>,
+    provenance: CreateProvenance,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let (code, body) = match *req.method() {
+    let (method, _) = observe_create_provenance(req, &provenance).await;
+    let (code, mut body) = match method {
         hyper::Method::POST => (201, created_pod_object()),
         hyper::Method::GET => (200, created_pod_object()),
         hyper::Method::DELETE => (
@@ -3511,6 +3755,9 @@ async fn create_delete_mock_handler(
             json!({"kind": "Status", "apiVersion": "v1", "status": "Success"}),
         ),
     };
+    if matches!(method, hyper::Method::POST | hyper::Method::GET) {
+        attach_create_provenance(&mut body, &provenance);
+    }
     Ok(Response::builder()
         .status(code)
         .header("content-type", "application/json")
@@ -3535,16 +3782,23 @@ fn created_pod_object() -> Value {
 async fn spawn_create_delete_mock() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
     tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            let provenance = provenance.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service_fn(create_delete_mock_handler))
+                    .serve_connection(
+                        io,
+                        service_fn(move |request| {
+                            create_delete_mock_handler(request, provenance.clone())
+                        }),
+                    )
                     .await;
             });
         }
@@ -3556,6 +3810,7 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
     let outcomes = Arc::new(std::sync::Mutex::new(outcomes));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
     tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
@@ -3563,13 +3818,17 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
                 Err(_) => continue,
             };
             let outcomes = outcomes.clone();
+            let provenance = provenance.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req: Request<Incoming>| {
                     let outcomes = outcomes.clone();
+                    let provenance = provenance.clone();
                     async move {
-                        if req.method() == hyper::Method::POST {
-                            let body = created_pod_object();
+                        let (method, _) = observe_create_provenance(req, &provenance).await;
+                        if method == hyper::Method::POST {
+                            let mut body = created_pod_object();
+                            attach_create_provenance(&mut body, &provenance);
                             return Ok::<_, std::io::Error>(
                                 Response::builder()
                                     .status(201)
@@ -3578,7 +3837,7 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
                                     .unwrap(),
                             );
                         }
-                        if req.method() == hyper::Method::DELETE {
+                        if method == hyper::Method::DELETE {
                             let outcome = outcomes.lock().unwrap().pop_front().unwrap_or(Some(200));
                             let Some(status) = outcome else {
                                 return Err(std::io::Error::other("simulated upstream disconnect"));
@@ -3591,10 +3850,12 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
                                 )))
                                 .unwrap());
                         }
+                        let mut body = created_pod_object();
+                        attach_create_provenance(&mut body, &provenance);
                         Ok(Response::builder()
                             .status(200)
                             .header("content-type", "application/json")
-                            .body(Full::new(Bytes::from(created_pod_object().to_string())))
+                            .body(Full::new(Bytes::from(body.to_string())))
                             .unwrap())
                     }
                 });
@@ -3611,44 +3872,106 @@ async fn spawn_truncated_cleanup_mock() -> String {
     type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
+            let provenance = provenance.clone();
             tokio::spawn(async move {
-                let service = service_fn(|req: Request<Incoming>| async move {
-                    let response: Response<MockBody> = if req.method() == hyper::Method::POST {
-                        let body = created_pod_object().to_string();
-                        Response::builder()
-                            .status(201)
-                            .header("content-type", "application/json")
-                            .body(
-                                Full::new(Bytes::from(body))
-                                    .map_err(|never| match never {})
-                                    .boxed(),
-                            )
-                            .unwrap()
-                    } else if req.method() == hyper::Method::DELETE {
-                        let frames = futures::stream::iter([
-                            Ok(Frame::data(Bytes::from_static(b"{"))),
-                            Err(std::io::Error::other("simulated body disconnect")),
-                        ]);
-                        Response::builder()
-                            .status(200)
-                            .header("content-type", "application/json")
-                            .body(StreamBody::new(frames).boxed())
-                            .unwrap()
-                    } else {
-                        Response::builder()
-                            .status(200)
-                            .header("content-type", "application/json")
-                            .body(
-                                Full::new(Bytes::from(created_pod_object().to_string()))
-                                    .map_err(|never| match never {})
-                                    .boxed(),
-                            )
-                            .unwrap()
-                    };
-                    Ok::<_, Infallible>(response)
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, _) = observe_create_provenance(req, &provenance).await;
+                        let response: Response<MockBody> = if method == hyper::Method::POST {
+                            let mut body = created_pod_object();
+                            attach_create_provenance(&mut body, &provenance);
+                            let body = body.to_string();
+                            Response::builder()
+                                .status(201)
+                                .header("content-type", "application/json")
+                                .body(
+                                    Full::new(Bytes::from(body))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap()
+                        } else if method == hyper::Method::DELETE {
+                            let frames = futures::stream::iter([
+                                Ok(Frame::data(Bytes::from_static(b"{"))),
+                                Err(std::io::Error::other("simulated body disconnect")),
+                            ]);
+                            Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(StreamBody::new(frames).boxed())
+                                .unwrap()
+                        } else {
+                            let mut body = created_pod_object();
+                            attach_create_provenance(&mut body, &provenance);
+                            Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(
+                                    Full::new(Bytes::from(body.to_string()))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap()
+                        };
+                        Ok::<_, Infallible>(response)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_stalled_cleanup_body_mock() -> String {
+    type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, _) = observe_create_provenance(req, &provenance).await;
+                        let response: Response<MockBody> = if method == hyper::Method::DELETE {
+                            let frames =
+                                futures::stream::pending::<Result<Frame<Bytes>, std::io::Error>>();
+                            Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(StreamBody::new(frames).boxed())
+                                .unwrap()
+                        } else {
+                            let status = if method == hyper::Method::POST {
+                                201
+                            } else {
+                                200
+                            };
+                            let mut body = created_pod_object();
+                            attach_create_provenance(&mut body, &provenance);
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(
+                                    Full::new(Bytes::from(body.to_string()))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap()
+                        };
+                        Ok::<_, Infallible>(response)
+                    }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -3663,6 +3986,14 @@ async fn start_provenance_proxy(
     mock_base: String,
     session_sink: Option<Arc<dyn ApiSessionSink>>,
 ) -> (SingleConnectionClient, RecordingSink) {
+    start_provenance_proxy_with_body_timeout(mock_base, session_sink, Duration::from_secs(10)).await
+}
+
+async fn start_provenance_proxy_with_body_timeout(
+    mock_base: String,
+    session_sink: Option<Arc<dyn ApiSessionSink>>,
+    body_timeout: Duration,
+) -> (SingleConnectionClient, RecordingSink) {
     let upstream =
         Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -3671,7 +4002,8 @@ async fn start_provenance_proxy(
     let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(
         ApiProxy::new(listen, tls, upstream, policy, None)
-            .with_listener_mode(ApiListenerMode::Policy),
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_upstream_body_timeout(body_timeout),
     );
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
@@ -3965,6 +4297,42 @@ async fn contained_delete_retains_revert_when_a_2xx_body_disconnects() {
         sink.resolved.lock().unwrap().is_empty(),
         "a truncated 2xx cleanup response must retain its revert"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contained_delete_body_stall_is_bounded_and_retains_revert() {
+    let (mut client, sink) = start_provenance_proxy_with_body_timeout(
+        spawn_stalled_cleanup_body_mock().await,
+        None,
+        Duration::from_millis(150),
+    )
+    .await;
+
+    assert_eq!(
+        client
+            .request(
+                hyper::Method::POST,
+                "/api/v1/namespaces/dev/pods",
+                Some("live-session"),
+                Some(r#"{"metadata":{"name":"check-pod"}}"#),
+            )
+            .await,
+        201
+    );
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.request(
+            hyper::Method::DELETE,
+            "/api/v1/namespaces/dev/pods/check-pod",
+            Some("live-session"),
+            None,
+        ),
+    )
+    .await
+    .expect("contained cleanup body has a finite timeout");
+    assert_eq!(status, 504);
+    assert!(sink.resolved.lock().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4319,15 +4687,16 @@ impl guard::proxy::GateSink for ApprovingSink {
         None
     }
 
-    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
         false
     }
 
-    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
-        false
-    }
-
-    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
         false
     }
 
@@ -4358,15 +4727,16 @@ impl guard::proxy::GateSink for DenyingSink {
         None
     }
 
-    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
         false
     }
 
-    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
-        false
-    }
-
-    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
         false
     }
 
@@ -4637,15 +5007,16 @@ impl GateSink for SnapshotSink {
         None
     }
 
-    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
         false
     }
 
-    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
-        false
-    }
-
-    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
         false
     }
 
@@ -4672,15 +5043,16 @@ impl guard::proxy::GateSink for CountingSink {
         None
     }
 
-    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
         false
     }
 
-    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
-        false
-    }
-
-    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
         false
     }
 
@@ -5198,15 +5570,16 @@ impl guard::proxy::GateSink for CannotArmSink {
         None
     }
 
-    async fn begin_revert_handoff(&self, _handle: &str) -> bool {
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
         false
     }
 
-    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
-        false
-    }
-
-    async fn mark_revert_indeterminate(&self, _handle: &str, _reason: &str) -> bool {
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
         false
     }
 

@@ -2218,6 +2218,8 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
             upstream_identity: String::new(),
             method: "POST".to_string(),
             path: "/repos/o/r/labels".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
             body_file: None,
         }),
         reason: "delete labels/bug in o/r".to_string(),
@@ -2347,6 +2349,8 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
             upstream_identity,
             method: "POST".to_string(),
             path: "/repos/o/r/labels".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
             body_file: Some(body_file.clone()),
         }),
         reason: "delete labels/bug in o/r".to_string(),
@@ -2428,6 +2432,7 @@ async fn api_provisional_binds_session_and_upstream_identity() {
                 path: "/apis/apps/v1/namespaces/dev/deployments/api".to_string(),
                 body: None,
             },
+            revert_requires_uid_precondition: false,
             session_fingerprint: Some("session-fingerprint".to_string()),
             session_revision: Some("session-revision".to_string()),
             secret_entitlements: Some(vec!["cluster-a/token".to_string()]),
@@ -2457,23 +2462,13 @@ async fn api_provisional_binds_session_and_upstream_identity() {
     );
     assert!(!row.forward_done);
     assert_eq!(row.deadline_unix, 0);
-    assert!(guard::proxy::GateSink::begin_revert_handoff(&sink, &handle).await);
-    let uncertain = cfg
-        .state
-        .provisional
-        .read()
-        .await
-        .get(&handle)
-        .cloned()
-        .unwrap();
-    assert!(uncertain.forward_done);
-    assert_eq!(uncertain.forward_exit, None);
-    assert_eq!(uncertain.status, ProvisionalStatus::NeedsOperatorDecision);
-    let mut actionable = guard::gating::provisional::ProvisionalRegistry::new();
-    actionable.insert(uncertain);
-    assert!(actionable.begin_revert(&handle).is_ok());
-    assert!(!guard::proxy::GateSink::cancel_staged_revert(&sink, &handle).await);
-    assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle).await);
+    assert_eq!(row.status, ProvisionalStatus::Dispatching);
+    let mut inert = guard::gating::provisional::ProvisionalRegistry::new();
+    inert.insert(row.clone());
+    assert!(inert.begin_revert(&handle).is_err());
+    assert!(inert.confirm(&handle).is_err());
+    assert!(inert.due_handles(u64::MAX).is_empty());
+    assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
     let live = cfg
         .state
         .provisional
@@ -2502,6 +2497,96 @@ async fn api_provisional_binds_session_and_upstream_identity() {
     assert_eq!(api.endpoint, "cluster-a");
     assert_eq!(api.upstream_target, "https://cluster-a.invalid");
     assert_eq!(api.upstream_identity, "identity-fingerprint");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn api_dispatch_state_blocks_operator_actions_until_the_handoff_is_uncertain() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .expect("open store");
+    let (mut cfg, _operator, _agent) = gating_config(7017, 1000);
+    cfg.state.session_store = Some(store.clone());
+    let sink = DaemonGateSink {
+        server: cfg.clone(),
+        endpoint: "cluster-a".to_string(),
+        protocol: "kubernetes".to_string(),
+        snapshot_dir: state.path().to_path_buf(),
+        snapshot_dir_safe: true,
+        window_secs: 60,
+    };
+    let mutation = || guard::proxy::ApiMutation {
+        label: "create pods/example".to_string(),
+        revert: guard::proxy::HttpRevert {
+            method: "DELETE".to_string(),
+            path: "/api/v1/namespaces/dev/pods/example".to_string(),
+            body: None,
+        },
+        revert_requires_uid_precondition: true,
+        session_fingerprint: Some("session-fingerprint".to_string()),
+        session_revision: Some("session-revision".to_string()),
+        secret_entitlements: None,
+        upstream_target: "https://cluster-a.invalid".to_string(),
+        upstream_identity: "identity-fingerprint".to_string(),
+    };
+
+    let handle = guard::proxy::GateSink::arm_revert(&sink, mutation())
+        .await
+        .expect("stage rollback");
+    let dispatching = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
+    let mut confirm_attempt = guard::gating::provisional::ProvisionalRegistry::new();
+    confirm_attempt.insert(dispatching.clone());
+    assert!(confirm_attempt.confirm(&handle).is_err());
+    let mut revert_attempt = guard::gating::provisional::ProvisionalRegistry::new();
+    revert_attempt.insert(dispatching);
+    assert!(revert_attempt.begin_revert(&handle).is_err());
+
+    assert!(
+        guard::proxy::GateSink::mark_revert_indeterminate(
+            &sink,
+            &handle,
+            "upstream handoff timed out",
+            Some("resource-uid"),
+        )
+        .await
+    );
+    let uncertain = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
+    let mut actionable = guard::gating::provisional::ProvisionalRegistry::new();
+    actionable.insert(uncertain);
+    assert!(actionable.begin_revert(&handle).is_ok());
+
+    let rejected_handle = guard::proxy::GateSink::arm_revert(&sink, mutation())
+        .await
+        .expect("stage rejected rollback");
+    assert!(guard::proxy::GateSink::cancel_staged_revert(&sink, &rejected_handle).await);
+    assert!(cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&rejected_handle)
+        .is_none());
+    assert!(store
+        .load_provisionals()
+        .await
+        .unwrap()
+        .iter()
+        .all(|row| row.handle != rejected_handle));
 }
 
 /// A recoverable command whose free-form `--revert` cannot be affirmed is

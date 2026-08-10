@@ -23,6 +23,10 @@ use crate::principal::{scope_eq, PrincipalKey};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvisionalStatus {
+    /// A proxy rollback is durable, but the corresponding upstream mutation is
+    /// still before or inside its finite response-header handoff. The row is
+    /// inert until the handoff outcome is durably classified.
+    Dispatching,
     /// The forward command is running, or it completed successfully and the
     /// auto-revert timer is counting down. `forward_done` distinguishes them.
     Armed,
@@ -50,7 +54,11 @@ impl ProvisionalStatus {
     pub fn is_outstanding(self) -> bool {
         matches!(
             self,
-            Self::Armed | Self::Reverting | Self::RevertFailed | Self::NeedsOperatorDecision
+            Self::Dispatching
+                | Self::Armed
+                | Self::Reverting
+                | Self::RevertFailed
+                | Self::NeedsOperatorDecision
         )
     }
 
@@ -60,6 +68,7 @@ impl ProvisionalStatus {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Dispatching => "dispatching",
             Self::Armed => "armed",
             Self::Reverting => "reverting",
             Self::Confirmed => "confirmed",
@@ -284,7 +293,9 @@ impl Provisional {
         if self.forward_persistence_failed {
             "persistence_failed"
         } else if !self.forward_done {
-            if self.status == ProvisionalStatus::Armed {
+            if self.status == ProvisionalStatus::Dispatching {
+                "dispatching"
+            } else if self.status == ProvisionalStatus::Armed {
                 "running"
             } else if self.status == ProvisionalStatus::Reverted {
                 "not_executed"
@@ -314,6 +325,12 @@ pub struct ApiRevertPlan {
     pub upstream_identity: String,
     pub method: String,
     pub path: String,
+    /// A create rollback is executable only after the proxy binds it to the
+    /// exact resource UID returned or resolved after the create handoff.
+    #[serde(default)]
+    pub requires_uid_precondition: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_uid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_file: Option<PathBuf>,
 }
@@ -340,6 +357,7 @@ impl ProvisionalRegistry {
         for mut row in rows {
             row.sanitize_explanatory_text();
             let needs_recovery = row.status == ProvisionalStatus::Reverting
+                || row.status == ProvisionalStatus::Dispatching
                 || (row.status == ProvisionalStatus::Armed && !row.forward_done);
             if needs_recovery {
                 row.status = ProvisionalStatus::NeedsOperatorDecision;
@@ -552,6 +570,16 @@ impl ProvisionalRegistry {
             .items
             .get_mut(handle)
             .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if p.api_revert
+            .as_ref()
+            .is_some_and(|api| api.requires_uid_precondition && api.resource_uid.is_none())
+        {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: "rollback is unavailable until the created resource identity is verified"
+                    .to_string(),
+            });
+        }
         if p.status == ProvisionalStatus::Armed && !p.forward_done {
             return Err(GateError::WrongState {
                 handle: handle.to_string(),
@@ -708,6 +736,51 @@ mod tests {
         assert_eq!(p.status, ProvisionalStatus::Confirmed);
         // A confirmed provisional is never due.
         assert!(r.take_due(9999).is_empty());
+    }
+
+    #[test]
+    fn dispatching_rows_are_inert_until_the_handoff_is_classified() {
+        let mut row = armed("dispatching", Some(PrincipalKey::from_uid(1001)), 0);
+        row.status = ProvisionalStatus::Dispatching;
+        row.forward_done = false;
+        row.forward_exit = None;
+        let mut registry = ProvisionalRegistry::new();
+        registry.insert(row.clone());
+        assert!(registry.confirm(&row.handle).is_err());
+        assert!(registry.begin_revert(&row.handle).is_err());
+        assert!(registry.due_handles(u64::MAX).is_empty());
+
+        let (recovered, moved) = ProvisionalRegistry::from_rows(vec![row]);
+        assert_eq!(moved, vec!["dispatching".to_string()]);
+        assert_eq!(
+            recovered.get("dispatching").unwrap().status,
+            ProvisionalStatus::NeedsOperatorDecision
+        );
+    }
+
+    #[test]
+    fn created_resource_revert_is_inert_without_an_exact_uid() {
+        let mut row = armed("created", Some(PrincipalKey::from_uid(1001)), 0);
+        row.status = ProvisionalStatus::NeedsOperatorDecision;
+        row.forward_exit = None;
+        row.api_revert = Some(ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "DELETE".to_string(),
+            path: "/api/v1/namespaces/dev/pods/example".to_string(),
+            requires_uid_precondition: true,
+            resource_uid: None,
+            body_file: None,
+        });
+        let mut registry = ProvisionalRegistry::new();
+        registry.insert(row.clone());
+        assert!(registry.begin_revert(&row.handle).is_err());
+
+        row.api_revert.as_mut().unwrap().resource_uid = Some("resource-uid".to_string());
+        registry.insert(row.clone());
+        assert!(registry.begin_revert(&row.handle).is_ok());
     }
 
     #[test]

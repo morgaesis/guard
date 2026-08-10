@@ -33,6 +33,9 @@ pub struct ApiMutation {
     /// The HTTP request that undoes the mutation, executed through the
     /// protocol's upstream with the daemon's credential.
     pub revert: HttpRevert,
+    /// Whether the revert must be bound to an exact resource UID before it can
+    /// become executable.
+    pub revert_requires_uid_precondition: bool,
     /// Session authority that allowed the mutation, represented only by its
     /// audit fingerprint.
     pub session_fingerprint: Option<String>,
@@ -67,21 +70,21 @@ pub trait GateSink: Send + Sync {
     /// durable containment.
     async fn arm_revert(&self, mutation: ApiMutation) -> Option<String>;
 
-    /// Durably record that upstream dispatch is about to begin. The staged
-    /// rollback must become immediately actionable for an uncertain outcome
-    /// before this method reports success.
-    async fn begin_revert_handoff(&self, handle: &str) -> bool;
-
     /// Mark a staged revert as live after successful upstream response headers.
     /// The confirmation window begins only after this durable transition.
-    async fn mark_revert_forwarded(&self, handle: &str) -> bool;
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool;
 
     /// Preserve an actionable rollback and record why the upstream mutation
     /// outcome is uncertain.
-    async fn mark_revert_indeterminate(&self, handle: &str, reason: &str) -> bool;
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool;
 
-    /// Remove a staged revert after a definitive pre-dispatch failure proves
-    /// that no upstream dispatch began.
+    /// Remove an inert staged revert after a pre-dispatch failure or a
+    /// protocol response that definitively proves the mutation did not apply.
     async fn cancel_staged_revert(&self, handle: &str) -> bool;
 
     /// Whether the sink could arm a revert right now (capacity available, and a

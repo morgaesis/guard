@@ -393,6 +393,13 @@ impl ProtocolConfig for KubernetesProtocol {
             )
     }
 
+    fn definitively_rejects_mutation(&self, _op: &ApiOp, status: u16) -> bool {
+        matches!(
+            status,
+            400 | 401 | 403 | 404 | 405 | 406 | 409 | 410 | 411 | 413 | 414 | 415 | 422 | 429
+        )
+    }
+
     fn wants_prior_snapshot(&self, op: &ApiOp) -> bool {
         matches!(op.verb, Verb::Update | Verb::Patch | Verb::Delete) && op.name.is_some()
     }
@@ -861,5 +868,19 @@ mod tests {
                 b"{}"
             )
             .is_err());
+    }
+
+    #[test]
+    fn only_definitive_client_rejections_retire_inert_containment() {
+        let protocol = KubernetesProtocol;
+        let create = op("POST", "/api/v1/namespaces/dev/pods");
+        for status in [
+            400, 401, 403, 404, 405, 406, 409, 410, 411, 413, 414, 415, 422, 429,
+        ] {
+            assert!(protocol.definitively_rejects_mutation(&create, status));
+        }
+        for status in [201, 408, 500, 502, 503, 504] {
+            assert!(!protocol.definitively_rejects_mutation(&create, status));
+        }
     }
 }

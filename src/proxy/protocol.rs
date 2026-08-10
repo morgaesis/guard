@@ -105,6 +105,12 @@ pub trait ProtocolConfig: Send + Sync {
     /// auto-revert envelope when the consequence gate is active.
     fn tracks_write(&self, op: &ApiOp) -> bool;
 
+    /// Whether response headers prove that a forwarded mutation did not apply.
+    /// The safe default treats every post-dispatch response as ambiguous.
+    fn definitively_rejects_mutation(&self, _op: &ApiOp, _status: u16) -> bool {
+        false
+    }
+
     /// Whether the server should fetch the object's current state before
     /// forwarding a tracked write, so [`Self::plan_revert`] can build a
     /// restore-style revert from it.
