@@ -87,7 +87,8 @@ use crate::learned_rules::{
     LearningWriteOutcome,
 };
 use crate::redact::{
-    command_contains_sensitive_literals, flattened_command_contains_sensitive_literals,
+    command_contains_sensitive_literals, command_metadata,
+    flattened_command_contains_sensitive_literals, scrub_flattened_command_metadata,
 };
 
 /// Evidence samples kept per observation bucket: enough to see whether more
@@ -224,6 +225,9 @@ impl AllowPromotionStore {
                 let sanitized = sanitize_learning_text(&observation.last_reason);
                 changed |= sanitized != observation.last_reason;
                 observation.last_reason = sanitized;
+                let metadata = scrub_flattened_command_metadata(&observation.last_command);
+                changed |= metadata != observation.last_command;
+                observation.last_command = metadata;
             }
             let content = changed
                 .then(|| serde_yaml_ng::to_string(&data))
@@ -309,6 +313,7 @@ impl AllowPromotionStore {
         if command_contains_sensitive_literals(binary, args) {
             return Ok(None);
         }
+        let metadata = command_metadata(binary, args);
         if !self.config.enabled {
             return Ok(None);
         }
@@ -371,7 +376,7 @@ impl AllowPromotionStore {
                 max_risk_seen: risk_val,
                 first_seen_unix: now,
                 last_seen_unix: now,
-                last_command: command.to_string(),
+                last_command: metadata.clone(),
                 last_reason: reason.clone(),
                 last_attempt_at_approvals: 0,
             });
@@ -379,7 +384,7 @@ impl AllowPromotionStore {
         observation.approvals = observation.approvals.saturating_add(1);
         observation.max_risk_seen = observation.max_risk_seen.max(risk_val);
         observation.last_seen_unix = now;
-        observation.last_command = command.to_string();
+        observation.last_command = metadata;
         observation.last_reason = reason.clone();
         match observation.class_seen {
             None => observation.class_seen = Some(class),
@@ -486,6 +491,7 @@ impl AllowPromotionStore {
         let mut data = data.clone();
         for observation in data.observations.values_mut() {
             observation.last_reason = sanitize_learning_text(&observation.last_reason);
+            observation.last_command = scrub_flattened_command_metadata(&observation.last_command);
         }
         Ok(serde_yaml_ng::to_string(&data)?)
     }
@@ -937,6 +943,11 @@ mod tests {
                 "safe",
             )
             .unwrap();
+        assert!(store
+            .data
+            .observations
+            .values()
+            .all(|observation| observation.last_command.contains("[argv-sha256:")));
         let safe_bytes = std::fs::read(&path).unwrap();
         let value = ["q", "7"].concat();
         assert!(store
@@ -953,6 +964,10 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), safe_bytes);
 
         let mut contaminated = store.data.clone();
+        contaminated
+            .observations
+            .values_mut()
+            .for_each(|observation| observation.last_command = "kubectl get pods".to_string());
         let mut observation = contaminated.observations.values().next().unwrap().clone();
         observation.binary = "redis-cli".to_string();
         observation.samples = vec![vec!["-a".to_string(), value.clone()]];
@@ -965,6 +980,13 @@ mod tests {
 
         let loaded = AllowPromotionStore::load(config.clone()).unwrap();
         assert_eq!(loaded.data.observations.len(), 1);
+        assert!(loaded
+            .data
+            .observations
+            .values()
+            .all(|observation| observation
+                .last_command
+                .starts_with("[legacy-command-sha256:")));
         let sanitized = std::fs::read(&path).unwrap();
         assert!(!sanitized
             .windows(value.len())

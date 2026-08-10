@@ -90,8 +90,11 @@ pub trait GateSink: Send + Sync {
         resource_uid: Option<&str>,
     ) -> bool;
 
-    /// Remove an inert staged revert after a pre-dispatch failure or a
-    /// protocol response that definitively proves the mutation did not apply.
+    /// Retire a dispatch marker after response headers definitively prove the
+    /// upstream rejected the mutation before applying it.
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool;
+
+    /// Remove an exact inert staged revert after a pre-dispatch failure.
     async fn cancel_staged_revert(&self, handle: &str) -> bool;
 
     /// Whether the sink could arm a revert right now (capacity available, and a
@@ -198,7 +201,13 @@ pub struct ApiRequestSummary {
     pub name: Option<String>,
     pub dry_run: bool,
     pub authority_selectors: BTreeMap<String, String>,
+    /// Stable caller-authored shape used for durable coverage identity. Guard
+    /// preconditions may change `redacted_body_shape` without changing this
+    /// bucket.
+    pub coverage_body_shape: String,
     pub redacted_body_shape: String,
+    /// Digest of the exact, fully transformed bytes authorized for handoff.
+    pub authorized_body_sha256: String,
     pub revert_constructible: RevertConstructible,
     pub rarity: bool,
     pub endpoint: String,
@@ -229,6 +238,7 @@ impl ApiRequestSummary {
                 "dry_run: {}\n",
                 "authority_selectors: {}\n",
                 "body_shape: {}\n",
+                "body_sha256: {}\n",
                 "revert_constructible: {}\n",
                 "rarity: {}",
                 "\nendpoint: {}\nsession: {}\nsession_revision: {}\nsession_intent: {}\ncredential_ref: {}"
@@ -262,6 +272,7 @@ impl ApiRequestSummary {
                     .join(",")
             },
             self.redacted_body_shape,
+            self.authorized_body_sha256,
             self.revert_constructible.as_str(),
             self.rarity,
             self.endpoint,

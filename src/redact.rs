@@ -1250,13 +1250,60 @@ pub fn redact_command_line(binary: &str, args: &[String]) -> String {
     command_line(&binary, &args)
 }
 
+/// Derive command learning metadata without retaining the binary or literal argv.
+///
+/// Learning stores use the digest only to distinguish observations. It is not
+/// matcher authority and cannot be reversed into the original arguments.
+pub fn command_metadata(binary: &str, args: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let encoded =
+        serde_json::to_vec(&(binary, args)).expect("structured command metadata always serializes");
+    format!(
+        "[argv-sha256:{}]",
+        Sha256::digest(encoded)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+/// Scrub a historical flattened command field without trying to recover argv
+/// boundaries. Existing canonical metadata is left byte-for-byte unchanged.
+pub fn scrub_flattened_command_metadata(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    static CANONICAL: OnceLock<Regex> = OnceLock::new();
+    let canonical = CANONICAL.get_or_init(|| {
+        Regex::new(r"^\[(?:argv|legacy-command)-sha256:[0-9a-f]{64}\]$")
+            .expect("valid metadata regex")
+    });
+    if canonical.is_match(value) {
+        return value.to_string();
+    }
+    format!(
+        "[legacy-command-sha256:{}]",
+        Sha256::digest(value.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
 /// Redact exact secret values from output. This catches cases the regex patterns miss,
 /// like bare `env` output or `echo $VAR` where there's no `KEY=` prefix.
 pub fn redact_exact_secrets(text: &str, secrets: &[&str]) -> String {
     let mut result = text.to_string();
-    for secret in secrets {
-        if secret.len() >= 8 && result.contains(*secret) {
-            result = result.replace(*secret, "[REDACTED]");
+    let mut literals = secrets
+        .iter()
+        .copied()
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    literals.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    literals.dedup();
+    for secret in literals {
+        if result.contains(secret) {
+            result = result.replace(secret, "[REDACTED]");
         }
     }
     result
@@ -2252,5 +2299,27 @@ mod tests {
         let input = "PORT=8080 \nCOUNT=42 \n";
         let output = redact_output(input);
         assert_eq!(output, input, "numeric values should not be redacted");
+    }
+
+    #[test]
+    fn trusted_exact_literals_redact_even_when_short_and_bare() {
+        let value = ['q', '7'].iter().collect::<String>();
+        let longer = format!("{value}x");
+        let output = redact_exact_secrets(
+            &format!("prefix {value} {longer} suffix"),
+            &[&value, &longer],
+        );
+        assert!(!output.contains(&value));
+        assert_eq!(output, "prefix [REDACTED] [REDACTED] suffix");
+    }
+
+    #[test]
+    fn command_metadata_never_retains_literal_argv_and_is_boundary_sensitive() {
+        let opaque = ["opaque", " value"].concat();
+        let joined = command_metadata("tool", std::slice::from_ref(&opaque));
+        let split = command_metadata("tool", &["opaque".to_string(), "value".to_string()]);
+        assert!(!joined.contains(&opaque));
+        assert_ne!(joined, split);
+        assert_eq!(scrub_flattened_command_metadata(&joined), joined);
     }
 }

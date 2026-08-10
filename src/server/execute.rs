@@ -997,6 +997,39 @@ pub(super) fn pause_command_initiation_for_test(server: &ServerContext) -> Comma
     (reached, release)
 }
 
+#[cfg(all(test, unix))]
+fn command_started_hooks() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<usize, std::sync::Arc<tokio::sync::Semaphore>>,
+> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<usize, std::sync::Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn observe_command_started_for_test(
+    server: &ServerContext,
+) -> std::sync::Arc<tokio::sync::Semaphore> {
+    let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    command_started_hooks().lock().unwrap().insert(
+        std::sync::Arc::as_ptr(&server.state.verbs) as usize,
+        reached.clone(),
+    );
+    reached
+}
+
+#[cfg(all(test, unix))]
+fn signal_command_started_for_test(server: &ServerContext) {
+    if let Some(reached) = command_started_hooks()
+        .lock()
+        .unwrap()
+        .remove(&(std::sync::Arc::as_ptr(&server.state.verbs) as usize))
+    {
+        reached.add_permits(1);
+    }
+}
+
 async fn acquire_command_initiation_lease(
     server: &ServerContext,
     request: &ExecuteRequest,
@@ -3333,6 +3366,8 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         }
     };
     drop(initiation_lease);
+    #[cfg(all(test, unix))]
+    signal_command_started_for_test(server);
     let process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
@@ -3412,6 +3447,8 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         }
     };
     drop(initiation_lease);
+    #[cfg(all(test, unix))]
+    signal_command_started_for_test(server);
     let mut process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));

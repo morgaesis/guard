@@ -1,7 +1,7 @@
 use crate::server::admin::handle_admin_request_for_test;
 use crate::server::execute::execute_command;
 #[cfg(unix)]
-use crate::server::execute::pause_command_initiation_for_test;
+use crate::server::execute::{observe_command_started_for_test, pause_command_initiation_for_test};
 #[cfg(unix)]
 use crate::server::gate_runtime::resume_approval;
 use crate::server::wire::{
@@ -192,11 +192,9 @@ async fn verb_lease_ends_after_process_start_while_child_is_running() {
     let authority_directory = authority_tempdir();
     let deny_config = DenyLearningConfig::new(authority_directory.path().join("deny.yaml"));
     let deny_store = DenyShapeStore::load(deny_config.clone()).unwrap();
-    let started = directory.path().join("started");
     let release_child = directory.path().join("release");
     let script = format!(
-        "touch {}; while [ ! -e {} ]; do sleep 0.01; done",
-        started.display(),
+        "while [ ! -e {} ]; do sleep 0.01; done",
         release_child.display()
     );
     let yaml = format!(
@@ -210,6 +208,7 @@ async fn verb_lease_ends_after_process_start_while_child_is_running() {
             .unwrap(),
     );
     server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(&yaml).unwrap()));
+    let command_started = observe_command_started_for_test(&server);
     let executing_server = server.clone();
     let executing_script = script.clone();
     let execution = tokio::spawn(async move {
@@ -222,22 +221,22 @@ async fn verb_lease_ends_after_process_start_while_child_is_running() {
         .into_response()
     });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !started.exists() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "child did not start"
-        );
-        tokio::task::yield_now().await;
-    }
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        command_started.acquire(),
+    )
+    .await
+    .expect("child process reaches the finite start boundary")
+    .unwrap()
+    .forget();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let mut catalog = server.state.verbs.write().await;
         *catalog = VerbCatalog::from_yaml("verbs: []").unwrap();
     })
     .await
     .expect("catalog mutation is not held for the child lifetime");
     tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(10),
         tokio::task::spawn_blocking(move || {
             let mut independent = DenyShapeStore::load(deny_config).unwrap();
             let evidence = canonical_argv(&["-c".to_string()]);

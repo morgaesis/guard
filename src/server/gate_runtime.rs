@@ -35,6 +35,9 @@ use super::{
     SWEEPER_GRACE_SECS, SWEEPER_TICK_SECS,
 };
 
+const STAGED_CLEANUP_RETRY_SECS: u64 = 30;
+const DISPATCH_CLASSIFICATION_RETRY_SECS: u64 = 90;
+
 // ===========================================================================
 // Consequence gating: routing of LLM-approved commands by reversibility.
 // ===========================================================================
@@ -177,7 +180,6 @@ async fn try_persist_provisional(server: &ServerContext, p: &Provisional) -> Res
 /// Complete the safe transition from the live post-forward persistence-loss
 /// row to durable state before an operator decision is applied. The detailed
 /// store error is kept in local diagnostics only.
-#[cfg(test)]
 pub(super) async fn converge_forward_persistence_failure(
     server: &ServerContext,
     provisional: &Provisional,
@@ -192,8 +194,28 @@ pub(super) async fn converge_forward_persistence_failure(
         );
         return false;
     };
-    match store.save_provisional(provisional.clone()).await {
-        Ok(()) => true,
+    let mut durable = provisional.clone();
+    durable.forward_persistence_failed = false;
+    let _transition = server.state.provisional_transition_gate.lock().await;
+    if server
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&provisional.handle)
+        != Some(provisional)
+    {
+        return false;
+    }
+    match store.save_provisional(durable.clone()).await {
+        Ok(()) => {
+            let mut registry = server.state.provisional.write().await;
+            if registry.get(&provisional.handle) != Some(provisional) {
+                return false;
+            }
+            registry.insert(durable);
+            true
+        }
         Err(error) => {
             tracing::error!(
                 "cannot converge provisional {} after forward persistence failure: {}",
@@ -236,6 +258,10 @@ pub(super) async fn persist_provisional_transition(
             .compare_and_swap_provisional(expected.clone(), next.clone())
             .await
             .map_err(|error| format!("failed to persist provisional transition: {error}"))?;
+        #[cfg(test)]
+        if let Some(api) = expected.api_revert.as_ref() {
+            pause_api_containment(&api.endpoint, "provisional_transition_committed").await;
+        }
         let mut registry = server.state.provisional.write().await;
         if registry.get(&expected.handle) == Some(&expected) {
             registry.insert(next);
@@ -248,6 +274,58 @@ pub(super) async fn persist_provisional_transition(
     })
     .await
     .map_err(|error| format!("provisional transition task failed: {error}"))?
+}
+
+/// Cancel one exact inert API row under the same coordinator used by dispatch
+/// publication. Once a dispatch transition commits, this operation cannot
+/// match either durable or live state.
+async fn cancel_exact_staged_provisional(server: &ServerContext, handle: &str) -> bool {
+    let server = server.clone();
+    let handle = handle.to_string();
+    tokio::spawn(async move {
+        let _transition = server.state.provisional_transition_gate.lock().await;
+        let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
+            return true;
+        };
+        if expected.status != ProvisionalStatus::Staged || expected.forward_done {
+            return false;
+        }
+        let Some(store) = &server.state.session_store else {
+            return false;
+        };
+        if let Err(error) = store.compare_and_delete_provisional(expected.clone()).await {
+            tracing::warn!("api-proxy staged revert cleanup failed: {error}");
+            let mut cleanup_pending = expected.clone();
+            cleanup_pending.revert_detail = Some(
+                "pre-dispatch containment cleanup is pending a bounded durable retry".to_string(),
+            );
+            if store
+                .compare_and_swap_provisional(expected.clone(), cleanup_pending.clone())
+                .await
+                .is_ok()
+            {
+                let mut registry = server.state.provisional.write().await;
+                if registry.get(&handle) == Some(&expected) {
+                    registry.insert(cleanup_pending);
+                }
+            }
+            return false;
+        }
+        let mut registry = server.state.provisional.write().await;
+        if registry.get(&handle) != Some(&expected) {
+            return false;
+        }
+        registry.remove(&handle);
+        drop(registry);
+        remove_revert_body(&expected);
+        #[cfg(test)]
+        if let Some(api) = expected.api_revert.as_ref() {
+            pause_api_containment(&api.endpoint, "staging_cleanup_completed").await;
+        }
+        true
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Drop any API-proxy delete-provenance tied to a now-resolved auto-revert
@@ -340,6 +418,52 @@ fn api_containment_hooks(
 }
 
 #[cfg(test)]
+pub(super) struct ApprovalLifecycleTestHook {
+    pub(super) enqueued: std::sync::Arc<tokio::sync::Semaphore>,
+    pub(super) retired: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+fn approval_lifecycle_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<usize, ApprovalLifecycleTestHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<usize, ApprovalLifecycleTestHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(super) fn observe_approval_lifecycle_for_test(
+    server: &ServerContext,
+) -> ApprovalLifecycleTestHook {
+    let hook = ApprovalLifecycleTestHook {
+        enqueued: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        retired: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+    };
+    approval_lifecycle_hooks().lock().unwrap().insert(
+        std::sync::Arc::as_ptr(&server.state.approvals) as usize,
+        ApprovalLifecycleTestHook {
+            enqueued: hook.enqueued.clone(),
+            retired: hook.retired.clone(),
+        },
+    );
+    hook
+}
+
+#[cfg(test)]
+fn signal_approval_lifecycle(server: &ServerContext, retired: bool) {
+    let hooks = approval_lifecycle_hooks().lock().unwrap();
+    let Some(hook) = hooks.get(&(std::sync::Arc::as_ptr(&server.state.approvals) as usize)) else {
+        return;
+    };
+    if retired {
+        hook.retired.add_permits(1);
+    } else {
+        hook.enqueued.add_permits(1);
+    }
+}
+
+#[cfg(test)]
 fn install_api_containment_hook(endpoint: &str, phase: &'static str) -> ApiContainmentHook {
     let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
@@ -407,6 +531,8 @@ impl Drop for ProxyHoldOrphanGuard {
                 if let Some(a) = server.state.approvals.read().await.get(&handle).cloned() {
                     let session_fingerprint = a.snapshot.session_fingerprint.clone();
                     let _ = persist_approval(&server, &a).await;
+                    #[cfg(test)]
+                    signal_approval_lifecycle(&server, true);
                     session_fingerprint
                 } else {
                     None
@@ -504,6 +630,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         }
         let handle = new_handle();
         let now = now_unix();
+
         let revert_body = mutation.revert.body.clone();
         let body_file = if revert_body.is_some() {
             if !self.snapshot_dir_safe {
@@ -603,24 +730,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             #[cfg(test)]
             pause_api_containment(&endpoint, "published").await;
             if ready_tx.send(Some(handle.clone())).is_err() || accepted_rx.await.is_err() {
-                let still_staged = server
-                    .state
-                    .provisional
-                    .read()
-                    .await
-                    .get(&handle)
-                    .cloned()
-                    .is_some_and(|row| {
-                        row.status == ProvisionalStatus::Staged && !row.forward_done
-                    });
-                if still_staged {
-                    if let Some(store) = &server.state.session_store {
-                        if store.delete_provisional(handle.clone()).await.is_ok() {
-                            server.state.provisional.write().await.remove(&handle);
-                            remove_revert_body(&provisional);
-                        }
-                    }
-                }
+                let _ = cancel_exact_staged_provisional(&server, &handle).await;
             }
         });
         let handle = ready_rx.await.ok().flatten()?;
@@ -647,25 +757,12 @@ impl guard::proxy::GateSink for DaemonGateSink {
             };
             let mut next = expected.clone();
             next.status = ProvisionalStatus::Dispatching;
-            let Some(store) = &server.state.session_store else {
-                return false;
-            };
-            if let Err(error) = store
-                .compare_and_swap_provisional(expected, next.clone())
-                .await
-            {
-                tracing::error!("api-proxy dispatch marker was not persisted: {error}");
-                return false;
-            }
-            let mut registry = server.state.provisional.write().await;
-            if registry
-                .get(&handle)
-                .is_some_and(|row| row.status == ProvisionalStatus::Staged && !row.forward_done)
-            {
-                registry.insert(next);
-                true
-            } else {
-                false
+            match persist_provisional_transition(&server, expected, next).await {
+                Ok(published) => published,
+                Err(error) => {
+                    tracing::error!("api-proxy dispatch marker was not persisted: {error}");
+                    false
+                }
             }
         })
         .await
@@ -680,12 +777,17 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let resource_uid = resource_uid.map(str::to_string);
         let window_secs = self.window_secs;
         let task = tokio::spawn(async move {
+            let _transition = server.state.provisional_transition_gate.lock().await;
             let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
                 return false;
             };
             if expected.forward_done && expected.forward_exit == Some(0) {
-                return expected.forward_exit == Some(0)
-                    && expected.status == ProvisionalStatus::Armed;
+                return expected.status == ProvisionalStatus::Armed
+                    && resource_uid.as_deref()
+                        == expected
+                            .api_revert
+                            .as_ref()
+                            .and_then(|api| api.resource_uid.as_deref());
             }
             if expected.forward_done
                 || expected.forward_exit.is_some()
@@ -718,37 +820,6 @@ impl guard::proxy::GateSink for DaemonGateSink {
                 .await
             {
                 tracing::error!("api-proxy auto-revert activation failed: {error}");
-                let mut uncertain = next;
-                uncertain.status = ProvisionalStatus::NeedsOperatorDecision;
-                uncertain.forward_exit = None;
-                uncertain.deadline_unix = 0;
-                uncertain.window_secs = 0;
-                uncertain.forward_persistence_failed = true;
-                uncertain.revert_detail = Some(
-                    "successful mutation headers were received, but containment state is not durably classified"
-                        .to_string(),
-                );
-                let mut registry = server.state.provisional.write().await;
-                let mut published = None;
-                if registry.get(&handle).is_some_and(|row| {
-                    row.status == ProvisionalStatus::Dispatching && !row.forward_done
-                }) {
-                    registry.insert(uncertain.clone());
-                    published = Some(uncertain);
-                }
-                drop(registry);
-                if let Some(row) = published {
-                    server.emit_event(NotifyEvent {
-                        event: "provisional_needs_operator_decision",
-                        at_unix: now_unix(),
-                        handle: Some(handle),
-                        session_fingerprint: row.session_fingerprint,
-                        requester_principal: None,
-                        reason: row.revert_detail,
-                        status: Some("persistence_failed".to_string()),
-                        behavior: None,
-                    });
-                }
                 return false;
             }
             #[cfg(test)]
@@ -764,6 +835,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
                 status: Some("armed".to_string()),
                 behavior: None,
             });
+            #[cfg(test)]
+            pause_api_containment(&endpoint, "activation_published").await;
             true
         });
         task.await.unwrap_or(false)
@@ -780,6 +853,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let reason = guard::redact::redact_output_text(reason);
         let resource_uid = resource_uid.map(str::to_string);
         let task = tokio::spawn(async move {
+            let _transition = server.state.provisional_transition_gate.lock().await;
             let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
                 return false;
             };
@@ -823,19 +897,6 @@ impl guard::proxy::GateSink for DaemonGateSink {
             };
             if let Err(error) = persisted {
                 tracing::error!("api-proxy uncertain mutation state was not updated: {error}");
-                let mut live = next;
-                live.forward_persistence_failed = true;
-                server.state.provisional.write().await.insert(live.clone());
-                server.emit_event(NotifyEvent {
-                    event: "provisional_needs_operator_decision",
-                    at_unix: now_unix(),
-                    handle: Some(handle),
-                    session_fingerprint: live.session_fingerprint,
-                    requester_principal: None,
-                    reason: live.revert_detail,
-                    status: Some("persistence_failed".to_string()),
-                    behavior: None,
-                });
                 return false;
             }
             server.state.provisional.write().await.insert(next.clone());
@@ -854,32 +915,39 @@ impl guard::proxy::GateSink for DaemonGateSink {
         task.await.unwrap_or(false)
     }
 
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        let Some(expected) = self
+            .server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(handle)
+            .cloned()
+        else {
+            return false;
+        };
+        if expected.status != ProvisionalStatus::Dispatching || expected.forward_done {
+            return false;
+        }
+        let mut next = expected.clone();
+        next.status = ProvisionalStatus::Reverted;
+        next.revert_detail = Some(guard::redact::redact_output_text(reason));
+        match persist_provisional_transition(&self.server, expected, next.clone()).await {
+            Ok(true) => {
+                remove_revert_body(&next);
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!("api-proxy rejected mutation retirement failed: {error}");
+                false
+            }
+        }
+    }
+
     async fn cancel_staged_revert(&self, handle: &str) -> bool {
-        let server = self.server.clone();
-        let handle = handle.to_string();
-        let task = tokio::spawn(async move {
-            let Some(staged) = server.state.provisional.read().await.get(&handle).cloned() else {
-                return true;
-            };
-            if !matches!(
-                staged.status,
-                ProvisionalStatus::Staged | ProvisionalStatus::Dispatching
-            ) || staged.forward_done
-            {
-                return false;
-            }
-            let Some(store) = &server.state.session_store else {
-                return false;
-            };
-            if let Err(error) = store.delete_provisional(handle.clone()).await {
-                tracing::warn!("api-proxy staged revert cleanup failed: {error}");
-                return false;
-            }
-            server.state.provisional.write().await.remove(&handle);
-            remove_revert_body(&staged);
-            true
-        });
-        task.await.unwrap_or(false)
+        cancel_exact_staged_provisional(&self.server, handle).await
     }
 
     async fn hold_request(
@@ -973,6 +1041,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .write()
             .await
             .enqueue(approval.clone());
+        #[cfg(test)]
+        signal_approval_lifecycle(&self.server, false);
         self.server.emit_audit_ungated(
             AuditEvent::new(AuditKind::Held)
                 .handle(&handle)
@@ -2382,6 +2452,8 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         .write()
         .await
         .enqueue(approval.clone());
+    #[cfg(test)]
+    signal_approval_lifecycle(server, false);
     server.emit_audit_ungated(
         AuditEvent::new(AuditKind::Held)
             .handle(&handle)
@@ -3122,6 +3194,64 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
     loop {
         tick.tick().await;
         let now = now_unix();
+
+        // Staging is inert and hidden, but a failed request-side cleanup must
+        // not occupy admission capacity forever. Retry only exact Staged rows;
+        // a concurrent dispatch CAS makes cancellation fail closed.
+        let stale_staged = server
+            .state
+            .provisional
+            .read()
+            .await
+            .staged_cleanup_due_handles(now, STAGED_CLEANUP_RETRY_SECS);
+        for handle in stale_staged {
+            if !cancel_exact_staged_provisional(&server, &handle).await {
+                tracing::warn!("staged API containment cleanup remains pending");
+            }
+        }
+
+        let stale_dispatches = server
+            .state
+            .provisional
+            .read()
+            .await
+            .dispatch_classification_due_handles(now, DISPATCH_CLASSIFICATION_RETRY_SECS);
+        for handle in stale_dispatches {
+            let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
+                continue;
+            };
+            if expected.status != ProvisionalStatus::Dispatching || expected.forward_done {
+                continue;
+            }
+            let mut next = expected.clone();
+            next.status = ProvisionalStatus::NeedsOperatorDecision;
+            next.forward_done = true;
+            next.forward_exit = None;
+            next.deadline_unix = 0;
+            next.window_secs = 0;
+            next.revert_detail = Some(
+                "upstream mutation dispatch completed without a durable outcome classification"
+                    .to_string(),
+            );
+            if let Err(error) = persist_provisional_transition(&server, expected, next).await {
+                tracing::warn!("mutation containment classification retry failed: {error}");
+            }
+        }
+
+        let failed_classifications = server
+            .state
+            .provisional
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .filter(|row| row.forward_persistence_failed)
+            .collect::<Vec<_>>();
+        for row in failed_classifications {
+            if !converge_forward_persistence_failure(&server, &row).await {
+                tracing::warn!("mutation containment classification remains pending");
+            }
+        }
 
         // Expire unattended holds FIRST (fail-closed deny on a timer). Doing this
         // before the reverts guarantees the fail-closed promise is met every tick
@@ -3866,34 +3996,6 @@ mod transactional_tests {
         }
     }
 
-    async fn wait_for_empty_api_stage(
-        server: &ServerContext,
-        store: &crate::session_store::SessionStore,
-        snapshot_dir: &std::path::Path,
-    ) {
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                if server.state.provisional.read().await.list().is_empty()
-                    && store.load_provisionals().await.unwrap().is_empty()
-                    && std::fs::read_dir(snapshot_dir)
-                        .unwrap()
-                        .filter_map(|entry| entry.ok())
-                        .all(|entry| {
-                            !entry
-                                .file_name()
-                                .to_string_lossy()
-                                .starts_with("api-revert-")
-                        })
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled staging converges without restart");
-    }
-
     #[tokio::test]
     async fn api_revert_creation_failure_does_not_arm_memory_only_authority() {
         let mut server = crate::server::tests::config_for_proposal_test();
@@ -3984,11 +4086,8 @@ mod transactional_tests {
             .get(&handle)
             .cloned()
             .unwrap();
-        assert_eq!(
-            live_after_failure.status,
-            ProvisionalStatus::NeedsOperatorDecision
-        );
-        assert!(live_after_failure.forward_persistence_failed);
+        assert_eq!(live_after_failure.status, ProvisionalStatus::Dispatching);
+        assert!(!live_after_failure.forward_persistence_failed);
         assert_eq!(
             store
                 .load_provisionals()
@@ -4018,8 +4117,8 @@ mod transactional_tests {
             .get(&handle)
             .cloned()
             .unwrap();
-        assert_eq!(still_live.status, ProvisionalStatus::NeedsOperatorDecision);
-        assert!(still_live.forward_persistence_failed);
+        assert_eq!(still_live.status, ProvisionalStatus::Dispatching);
+        assert!(!still_live.forward_persistence_failed);
         assert_eq!(
             store
                 .load_provisionals()
@@ -4031,7 +4130,6 @@ mod transactional_tests {
                 .status,
             ProvisionalStatus::Dispatching
         );
-        assert!(converge_forward_persistence_failure(&server, &still_live).await);
         assert!(
             guard::proxy::GateSink::mark_revert_indeterminate(
                 &sink,
@@ -4175,6 +4273,106 @@ mod transactional_tests {
     }
 
     #[tokio::test]
+    async fn staged_cancel_cannot_cross_a_committed_dispatch_transition() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let endpoint = "fixture-dispatch-cancel";
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: endpoint.to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+        let (committed, publish) =
+            install_api_containment_hook(endpoint, "provisional_transition_committed");
+        let dispatch = tokio::spawn({
+            let sink = sink.clone();
+            let handle = handle.clone();
+            async move { guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await }
+        });
+        committed.acquire().await.unwrap().forget();
+
+        let (cancel_started, cancel_entered) = tokio::sync::oneshot::channel();
+        let cancel = tokio::spawn({
+            let sink = sink.clone();
+            let handle = handle.clone();
+            async move {
+                let _ = cancel_started.send(());
+                guard::proxy::GateSink::cancel_staged_revert(&sink, &handle).await
+            }
+        });
+        cancel_entered.await.unwrap();
+        assert!(server.state.provisional_transition_gate.try_lock().is_err());
+
+        publish.add_permits(1);
+        assert!(dispatch.await.unwrap());
+        assert!(!cancel.await.unwrap());
+        assert_eq!(
+            server
+                .state
+                .provisional
+                .read()
+                .await
+                .get(&handle)
+                .unwrap()
+                .status,
+            ProvisionalStatus::Dispatching
+        );
+        assert_eq!(
+            store
+                .load_provisionals()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.handle == handle)
+                .unwrap()
+                .status,
+            ProvisionalStatus::Dispatching
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_staged_cleanup_is_visible_and_retryable() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: "fixture-cleanup-retry".to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+
+        store.fail_next_provisional_delete_for_test();
+        assert!(!guard::proxy::GateSink::cancel_staged_revert(&sink, &handle).await);
+        let visible = server.state.provisional.read().await.visible_list();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].forward_outcome(), "cleanup_pending");
+        assert_eq!(store.load_provisionals().await.unwrap(), visible);
+
+        assert!(guard::proxy::GateSink::cancel_staged_revert(&sink, &handle).await);
+        assert!(server.state.provisional.read().await.list().is_empty());
+        assert!(store.load_provisionals().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn cancelled_api_revert_staging_finishes_cleanup_after_body_and_publication() {
         for phase in ["body_written", "published"] {
             let mut server = crate::server::tests::config_for_proposal_test();
@@ -4196,13 +4394,17 @@ mod transactional_tests {
                 window_secs: 60,
             };
             let (reached, release) = install_api_containment_hook(&endpoint, phase);
+            let (cleanup_completed, cleanup_release) =
+                install_api_containment_hook(&endpoint, "staging_cleanup_completed");
             let task = tokio::spawn(async move {
                 guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(true)).await
             });
             reached.acquire().await.unwrap().forget();
             task.abort();
             release.add_permits(1);
-            wait_for_empty_api_stage(&server, &store, state.path()).await;
+            cleanup_completed.acquire().await.unwrap().forget();
+            assert!(server.state.provisional.read().await.list().is_empty());
+            assert!(store.load_provisionals().await.unwrap().is_empty());
             let body_count = std::fs::read_dir(state.path())
                 .unwrap()
                 .filter_map(Result::ok)
@@ -4214,6 +4416,7 @@ mod transactional_tests {
                 })
                 .count();
             assert_eq!(body_count, 0);
+            cleanup_release.add_permits(1);
         }
     }
 
@@ -4242,6 +4445,8 @@ mod transactional_tests {
             "staged mutation advances to the dispatch boundary"
         );
         let (reached, release) = install_api_containment_hook(endpoint, "activation_committed");
+        let (published, published_release) =
+            install_api_containment_hook(endpoint, "activation_published");
         let sink_task = sink.clone();
         let handle_task = handle.clone();
         let task = tokio::spawn(async move {
@@ -4250,29 +4455,17 @@ mod transactional_tests {
         reached.acquire().await.unwrap().forget();
         task.abort();
         release.add_permits(1);
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                let live = server.state.provisional.read().await.get(&handle).cloned();
-                let durable = store
-                    .load_provisionals()
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .find(|row| row.handle == handle);
-                if live
-                    .as_ref()
-                    .is_some_and(|row| row.status == ProvisionalStatus::Armed)
-                    && durable
-                        .as_ref()
-                        .is_some_and(|row| row.status == ProvisionalStatus::Armed)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled activation publishes committed state");
+        published.acquire().await.unwrap().forget();
+        let live = server.state.provisional.read().await.get(&handle).cloned();
+        let durable = store
+            .load_provisionals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.handle == handle);
+        assert!(live.is_some_and(|row| row.status == ProvisionalStatus::Armed));
+        assert!(durable.is_some_and(|row| row.status == ProvisionalStatus::Armed));
+        published_release.add_permits(1);
     }
 
     #[test]

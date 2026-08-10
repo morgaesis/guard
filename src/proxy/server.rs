@@ -244,6 +244,12 @@ struct PendingApiAuthorization {
     requirement: ApiForwardRequirement,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedMutation {
+    prior_snapshot: Option<Vec<u8>>,
+    body_sha256: String,
+}
+
 struct StagedRevert {
     handle: String,
     created_key: Option<CreatedKey>,
@@ -279,6 +285,8 @@ struct UpstreamSendHandoff {
     timeout: Duration,
     outcome: UpstreamHandoffOutcome,
     containment: Option<ContainmentLifecycle>,
+    actual_body_sha256: String,
+    authorized_body_sha256: Option<String>,
 }
 
 struct ContainmentLifecycle {
@@ -318,7 +326,17 @@ impl ContainmentLifecycle {
         tokio::spawn(async move {
             let marked = gate.mark_revert_dispatching(&handle).await;
             if ready_tx.send(marked).is_err() || (marked && accepted_rx.await.is_err()) {
-                let _ = gate.cancel_staged_revert(&handle).await;
+                if marked {
+                    let _ = gate
+                        .mark_revert_indeterminate(
+                            &handle,
+                            "request handling ended after durable dispatch preparation",
+                            None,
+                        )
+                        .await;
+                } else {
+                    let _ = gate.cancel_staged_revert(&handle).await;
+                }
             }
         });
         let marked = tokio::time::timeout(Duration::from_secs(5), ready_rx)
@@ -327,12 +345,13 @@ impl ContainmentLifecycle {
             .and_then(Result::ok)
             .unwrap_or(false);
         if marked {
+            self.handoff_started = true;
             let _ = accepted_tx.send(());
         }
         marked
     }
 
-    async fn cancel_inert(mut self) {
+    async fn cancel_inert(mut self) -> bool {
         if tokio::time::timeout(
             Duration::from_secs(5),
             self.gate.cancel_staged_revert(&self.handle),
@@ -341,10 +360,17 @@ impl ContainmentLifecycle {
         .is_ok_and(|cancelled| cancelled)
         {
             self.armed = false;
+            true
+        } else {
+            false
         }
     }
 
-    async fn preserve_indeterminate(mut self, reason: &str, resource_uid: Option<&str>) -> String {
+    async fn preserve_indeterminate(
+        mut self,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> Option<String> {
         self.transition_owned = true;
         let gate = self.gate.clone();
         let handle = self.handle.clone();
@@ -357,44 +383,84 @@ impl ContainmentLifecycle {
                 .await;
             let _ = result_tx.send(result);
         });
-        let _ = tokio::time::timeout(Duration::from_secs(5), result_rx).await;
+        let committed = tokio::time::timeout(Duration::from_secs(5), result_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
         self.armed = false;
-        self.handle.clone()
+        committed.then(|| self.handle.clone())
     }
 
     async fn activate(
         mut self,
         resource_uid: Option<&str>,
-    ) -> Result<(String, Option<CreatedKey>), String> {
+    ) -> Result<(String, Option<CreatedKey>), Option<String>> {
         self.transition_owned = true;
         let gate = self.gate.clone();
         let handle = self.handle.clone();
         let resource_uid = resource_uid.map(str::to_string);
+        let transition_uid = resource_uid.clone();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let activated = gate
-                .mark_revert_forwarded(&handle, resource_uid.as_deref())
+                .mark_revert_forwarded(&handle, transition_uid.as_deref())
                 .await;
-            if !activated {
-                let _ = gate
+            let recovered = if activated {
+                false
+            } else {
+                gate
                     .mark_revert_indeterminate(
                         &handle,
                         "successful mutation response was received, but the confirmation window could not be activated",
-                        resource_uid.as_deref(),
+                        transition_uid.as_deref(),
                     )
-                    .await;
-            }
-            let _ = result_tx.send(activated);
+                    .await
+            };
+            let _ = result_tx.send((activated, recovered));
         });
-        if tokio::time::timeout(Duration::from_secs(5), result_rx)
+        let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
             .await
-            .is_ok_and(|result| result.is_ok_and(std::convert::identity))
-        {
-            self.armed = false;
-            Ok((self.handle.clone(), self.created_key.take()))
-        } else {
-            self.armed = false;
-            Err(self.handle.clone())
+            .ok()
+            .and_then(Result::ok);
+        self.armed = false;
+        match result {
+            Some((true, _)) => Ok((self.handle.clone(), self.created_key.take())),
+            Some((false, true)) => Err(Some(self.handle.clone())),
+            Some((false, false)) | None => Err(None),
+        }
+    }
+
+    async fn retire_rejected(mut self, reason: &str) -> Result<(), Option<String>> {
+        self.transition_owned = true;
+        let gate = self.gate.clone();
+        let handle = self.handle.clone();
+        let reason = reason.to_string();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let retired = gate.mark_revert_rejected(&handle, &reason).await;
+            let fallback = if retired {
+                None
+            } else {
+                gate.mark_revert_indeterminate(
+                    &handle,
+                    "the upstream rejected the request, but containment retirement did not converge",
+                    None,
+                )
+                .await
+                .then_some(handle)
+            };
+            let _ = result_tx.send((retired, fallback));
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        self.armed = false;
+        match result {
+            Some((true, _)) => Ok(()),
+            Some((false, fallback)) => Err(fallback),
+            None => Err(None),
         }
     }
 }
@@ -434,6 +500,13 @@ impl Drop for ContainmentLifecycle {
 #[async_trait::async_trait]
 impl ApiForwardHandoff for UpstreamSendHandoff {
     async fn forward(&mut self) -> Result<(), String> {
+        if self
+            .authorized_body_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &self.actual_body_sha256)
+        {
+            return Err("final request bytes changed after authorization".to_string());
+        }
         let request = self
             .request
             .take()
@@ -443,7 +516,6 @@ impl ApiForwardHandoff for UpstreamSendHandoff {
                 self.outcome = UpstreamHandoffOutcome::PreparationFailed;
                 return Err("durable mutation dispatch preparation failed".to_string());
             }
-            containment.handoff_started = true;
         }
         match tokio::time::timeout(self.timeout, request.send()).await {
             Ok(result) => {
@@ -1532,7 +1604,8 @@ impl ApiProxy {
             Ok(buffered) => buffered,
             Err(error) => return self.request_body_error_response(error),
         };
-        let body = match prepare_create_provenance(
+        let coverage_body_shape = redacted_body_shape(&body);
+        let mut body = match prepare_create_provenance(
             &mut parts,
             body,
             op,
@@ -1545,11 +1618,36 @@ impl ApiProxy {
             Some(authority) => authority,
             None => return self.missing_route_authority_response(),
         };
-        let body_shape = redacted_body_shape(&body);
-        let prepared = match self.prepare_revert(op, path, &route_authority).await {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
+        let prepared_mutation = if self.is_kubernetes_mutation(op) {
+            match self
+                .arbitrate_kubernetes_mutation(&parts, &body, path, op, &route_authority, None)
+                .await
+            {
+                Ok((guarded_body, snapshot)) => {
+                    body = guarded_body;
+                    Some(PreparedMutation {
+                        prior_snapshot: snapshot,
+                        body_sha256: body_sha256(&body),
+                    })
+                }
+                Err(response) => return response,
+            }
+        } else {
+            None
         };
+        let prepared = if self.is_kubernetes_mutation(op) {
+            self.revert_constructibility_from_prepared(op, prepared_mutation.as_ref())
+        } else {
+            match self.prepare_revert(op, path, &route_authority).await {
+                Ok(prepared) => prepared,
+                Err(response) => return response,
+            }
+        };
+        if let Some(prepared) = prepared_mutation.as_ref() {
+            parts.extensions.insert(prepared.clone());
+        }
+        let final_body_shape = redacted_body_shape(&body);
+        let authorized_body_sha256 = body_sha256(&body);
         let summary = ApiRequestSummary {
             protocol: self.protocol.name().to_string(),
             verb: op.verb.as_str().to_string(),
@@ -1563,7 +1661,9 @@ impl ApiProxy {
             name: op.name.clone(),
             dry_run: op.dry_run,
             authority_selectors: op.authority_selectors.clone(),
-            redacted_body_shape: body_shape,
+            coverage_body_shape,
+            redacted_body_shape: final_body_shape,
+            authorized_body_sha256,
             revert_constructible: prepared,
             rarity,
             endpoint: self.endpoint.clone(),
@@ -1677,7 +1777,7 @@ impl ApiProxy {
                             redact,
                             Some(op.clone()),
                             conn_id,
-                            None,
+                            prepared_mutation,
                             Some(pending_authorization),
                         )
                         .await
@@ -1728,12 +1828,17 @@ impl ApiProxy {
                                 )
                                 .await;
                         }
-                        let snapshot = if self.protocol.wants_prior_snapshot(op) {
+                        let forward_prepared = if prepared_mutation.is_some() {
+                            prepared_mutation
+                        } else if self.protocol.wants_prior_snapshot(op) {
                             match self
                                 .fetch_validated_snapshot(op, path, &route_authority)
                                 .await
                             {
-                                Ok(Some(s)) => Some(Some(s)),
+                                Ok(Some(snapshot)) => Some(PreparedMutation {
+                                    prior_snapshot: Some(snapshot),
+                                    body_sha256: body_sha256(&body),
+                                }),
                                 Ok(None) => {
                                     return self
                                         .route_hold_buffered(
@@ -1770,7 +1875,7 @@ impl ApiProxy {
                             redact,
                             Some(op.clone()),
                             conn_id,
-                            snapshot,
+                            forward_prepared,
                             Some(pending_authorization),
                         )
                         .await
@@ -1810,7 +1915,8 @@ impl ApiProxy {
             Ok(buffered) => buffered,
             Err(error) => return self.request_body_error_response(error),
         };
-        let body = match prepare_create_provenance(
+        let coverage_body_shape = redacted_body_shape(&body);
+        let mut body = match prepare_create_provenance(
             &mut parts,
             body,
             op,
@@ -1826,6 +1932,30 @@ impl ApiProxy {
                 "Forbidden",
             );
         };
+        let route_authority = match self.route_authority_from_parts(&parts) {
+            Some(authority) => authority,
+            None => return self.missing_route_authority_response(),
+        };
+        let prepared_mutation = if self.is_kubernetes_mutation(op) {
+            match self
+                .arbitrate_kubernetes_mutation(&parts, &body, path, op, &route_authority, None)
+                .await
+            {
+                Ok((guarded_body, snapshot)) => {
+                    body = guarded_body;
+                    Some(PreparedMutation {
+                        prior_snapshot: snapshot,
+                        body_sha256: body_sha256(&body),
+                    })
+                }
+                Err(response) => return response,
+            }
+        } else {
+            None
+        };
+        if let Some(prepared) = prepared_mutation.as_ref() {
+            parts.extensions.insert(prepared.clone());
+        }
         let summary = ApiRequestSummary {
             protocol: self.protocol.name().to_string(),
             verb: op.verb.as_str().to_string(),
@@ -1839,7 +1969,9 @@ impl ApiProxy {
             name: op.name.clone(),
             dry_run: op.dry_run,
             authority_selectors: op.authority_selectors.clone(),
+            coverage_body_shape,
             redacted_body_shape: redacted_body_shape(&body),
+            authorized_body_sha256: body_sha256(&body),
             revert_constructible: RevertConstructible::None,
             rarity,
             endpoint: self.endpoint.clone(),
@@ -1890,7 +2022,7 @@ impl ApiProxy {
                     redact,
                     Some(op.clone()),
                     conn_id,
-                    None,
+                    prepared_mutation,
                     Some(pending_authorization),
                 )
                 .await
@@ -2003,16 +2135,19 @@ impl ApiProxy {
             Some(authority) => authority,
             None => return self.missing_route_authority_response(),
         };
-        let mut prepared_snapshot = None;
+        let mut prepared_mutation = parts.extensions.get::<PreparedMutation>().cloned();
         let mut preparation_error = None;
-        if self.is_kubernetes_mutation(op) {
+        if prepared_mutation.is_none() && self.is_kubernetes_mutation(op) {
             match self
                 .arbitrate_kubernetes_mutation(&parts, &body, path, op, &route_authority, None)
                 .await
             {
                 Ok((guarded_body, snapshot)) => {
                     body = guarded_body;
-                    prepared_snapshot = Some(snapshot);
+                    prepared_mutation = Some(PreparedMutation {
+                        prior_snapshot: snapshot,
+                        body_sha256: body_sha256(&body),
+                    });
                 }
                 // A request that is denied by the hold never reaches the
                 // upstream, so an unavailable concurrency snapshot must not
@@ -2023,6 +2158,7 @@ impl ApiProxy {
         }
         if let Some(pending) = authorization.as_mut() {
             pending.summary.redacted_body_shape = redacted_body_shape(&body);
+            pending.summary.authorized_body_sha256 = body_sha256(&body);
         }
         tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
         let snapshot = api_hold_snapshot(label.clone(), query, op, &body);
@@ -2057,7 +2193,7 @@ impl ApiProxy {
                                 redact,
                                 Some(op.clone()),
                                 conn_id,
-                                prepared_snapshot,
+                                prepared_mutation,
                                 authorization,
                             )
                             .await;
@@ -2136,7 +2272,7 @@ impl ApiProxy {
         redact: bool,
         op: Option<ApiOp>,
         conn_id: u64,
-        prepared_snapshot: Option<Option<Vec<u8>>>,
+        prepared_mutation: Option<PreparedMutation>,
         authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
         self.forward_buffered_with_cleanup(
@@ -2147,7 +2283,7 @@ impl ApiProxy {
             redact,
             op,
             conn_id,
-            prepared_snapshot,
+            prepared_mutation,
             None,
             authorization,
         )
@@ -2164,7 +2300,7 @@ impl ApiProxy {
         redact: bool,
         op: Option<ApiOp>,
         conn_id: u64,
-        mut prepared_snapshot: Option<Option<Vec<u8>>>,
+        prepared_mutation: Option<PreparedMutation>,
         created_cleanup: Option<CreatedMatch>,
         authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
@@ -2187,8 +2323,17 @@ impl ApiProxy {
             Some(authority) => authority,
             None => return self.missing_route_authority_response(),
         };
-        let mut arbitration_snapshot = None;
-        if let Some(operation) = op
+        let mut prepared_mutation =
+            prepared_mutation.or_else(|| parts.extensions.get::<PreparedMutation>().cloned());
+        if let Some(prepared) = prepared_mutation.as_ref() {
+            if prepared.body_sha256 != body_sha256(&body) {
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: prepared request bytes changed before forwarding",
+                    "Forbidden",
+                );
+            }
+        } else if let Some(operation) = op
             .as_ref()
             .filter(|operation| self.is_kubernetes_mutation(operation))
         {
@@ -2199,15 +2344,16 @@ impl ApiProxy {
                     path,
                     operation,
                     &route_authority,
-                    prepared_snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.as_deref()),
+                    None,
                 )
                 .await
             {
                 Ok((guarded_body, snapshot)) => {
                     body = guarded_body;
-                    arbitration_snapshot = snapshot;
+                    prepared_mutation = Some(PreparedMutation {
+                        prior_snapshot: snapshot,
+                        body_sha256: body_sha256(&body),
+                    });
                 }
                 Err(response) => return response,
             }
@@ -2228,17 +2374,17 @@ impl ApiProxy {
             && op
                 .as_ref()
                 .is_some_and(|op| self.gate.get().is_some() && self.protocol.tracks_write(op));
-        if prepared_snapshot.is_none() {
-            prepared_snapshot = arbitration_snapshot.map(Some);
-        }
-        if prepared_snapshot.is_none()
+        if prepared_mutation.is_none()
             && track_write
             && self
                 .protocol
                 .wants_prior_snapshot(op.as_ref().expect("tracked write has operation"))
         {
-            prepared_snapshot = match self.fetch_prior_object(path, &route_authority).await {
-                Ok(snapshot) => Some(snapshot),
+            prepared_mutation = match self.fetch_prior_object(path, &route_authority).await {
+                Ok(snapshot) => Some(PreparedMutation {
+                    prior_snapshot: snapshot,
+                    body_sha256: body_sha256(&body),
+                }),
                 Err(response) => return response,
             };
         }
@@ -2251,7 +2397,9 @@ impl ApiProxy {
             let handle = self
                 .arm_write_revert(
                     operation,
-                    prepared_snapshot.clone().flatten(),
+                    prepared_mutation
+                        .as_ref()
+                        .and_then(|prepared| prepared.prior_snapshot.clone()),
                     &body,
                     conn_id,
                     session_context.clone(),
@@ -2347,6 +2495,16 @@ impl ApiProxy {
             format!("{}{}?{}", self.upstream.base(), path, query)
         };
 
+        let actual_body_sha256 = body_sha256(&body);
+        let authorized_body_sha256 = authorization
+            .as_ref()
+            .map(|pending| pending.summary.authorized_body_sha256.clone())
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<ApprovedApiHold>()
+                    .map(|approved| approved.body_sha256.clone())
+            });
         let mut rb = self.upstream.client().request(parts.method.clone(), &url);
         for (name, value) in parts.headers.iter() {
             if is_hop_by_hop(name)
@@ -2394,7 +2552,9 @@ impl ApiProxy {
             Ok(guard) => guard,
             Err(_) => {
                 if let Some(staged) = containment.take() {
-                    staged.cancel_inert().await;
+                    if !staged.cancel_inert().await {
+                        return Ok(self.staged_cleanup_failure_response());
+                    }
                 }
                 return Ok(self.status_resp(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2409,7 +2569,9 @@ impl ApiProxy {
         {
             drop(policy_authority);
             if let Some(staged) = containment.take() {
-                staged.cancel_inert().await;
+                if !staged.cancel_inert().await {
+                    return Ok(self.staged_cleanup_failure_response());
+                }
             }
             return Ok(response);
         }
@@ -2442,6 +2604,8 @@ impl ApiProxy {
             timeout: self.upstream_handoff_timeout,
             outcome: UpstreamHandoffOutcome::Pending,
             containment,
+            actual_body_sha256,
+            authorized_body_sha256,
         };
         let auth = parts.extensions.get::<SessionAuth>();
         let mut cleanup_handoff = CleanupBoundHandoff {
@@ -2473,7 +2637,9 @@ impl ApiProxy {
         let (upstream_resp, mut containment) = match upstream_outcome {
             UpstreamHandoffOutcome::Pending => {
                 if let Some(containment) = containment {
-                    containment.cancel_inert().await;
+                    if !containment.cancel_inert().await {
+                        return Ok(self.staged_cleanup_failure_response());
+                    }
                 }
                 let reason = authorization_result.err().unwrap_or_else(|| {
                     "authority provider did not perform the protected handoff".to_string()
@@ -2486,7 +2652,9 @@ impl ApiProxy {
             }
             UpstreamHandoffOutcome::PreparationFailed => {
                 if let Some(containment) = containment {
-                    containment.cancel_inert().await;
+                    if !containment.cancel_inert().await {
+                        return Ok(self.staged_cleanup_failure_response());
+                    }
                 }
                 return Ok(self.status_resp(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2496,14 +2664,12 @@ impl ApiProxy {
             }
             UpstreamHandoffOutcome::TimedOut => {
                 let handle = if let Some(containment) = containment {
-                    Some(
-                        containment
-                            .preserve_indeterminate(
-                                "upstream mutation dispatch timed out before response headers",
-                                None,
-                            )
-                            .await,
-                    )
+                    containment
+                        .preserve_indeterminate(
+                            "upstream mutation dispatch timed out before response headers",
+                            None,
+                        )
+                        .await
                 } else {
                     None
                 };
@@ -2519,14 +2685,12 @@ impl ApiProxy {
                     Ok(response) => response,
                     Err(_) => {
                         let handle = if let Some(containment) = containment {
-                            Some(
-                                containment
-                                    .preserve_indeterminate(
-                                        "upstream mutation dispatch ended with a transport error before response headers",
-                                        None,
-                                    )
-                                    .await,
-                            )
+                            containment
+                                .preserve_indeterminate(
+                                    "upstream mutation dispatch ended with a transport error before response headers",
+                                    None,
+                                )
+                                .await
                         } else {
                             None
                         };
@@ -2554,7 +2718,19 @@ impl ApiProxy {
                 self.protocol
                     .definitively_rejects_mutation(operation, status.as_u16())
             }) {
-                staged.cancel_inert().await;
+                if let Err(handle) = staged
+                    .retire_rejected(&format!(
+                        "upstream definitively rejected mutation with HTTP {status}"
+                    ))
+                    .await
+                {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: mutation rejection was received but containment retirement did not converge",
+                        "ContainmentError",
+                        handle.as_deref(),
+                    ));
+                }
             } else if status.is_success() {
                 let resource_uid = if let Some((key, _)) = staged.created_resource() {
                     let body = match self
@@ -2579,7 +2755,7 @@ impl ApiProxy {
                                 StatusCode::BAD_GATEWAY,
                                 "guard api-proxy: mutation succeeded but authoritative create identity is unavailable",
                                 "ContainmentIndeterminate",
-                                Some(&handle),
+                                handle.as_deref(),
                             ));
                         }
                     };
@@ -2598,7 +2774,7 @@ impl ApiProxy {
                                 StatusCode::BAD_GATEWAY,
                                 "guard api-proxy: mutation succeeded but authoritative create identity is invalid",
                                 "ContainmentIndeterminate",
-                                Some(&handle),
+                                handle.as_deref(),
                             ));
                         }
                     }
@@ -2629,19 +2805,17 @@ impl ApiProxy {
                             StatusCode::BAD_GATEWAY,
                             "guard api-proxy: mutation succeeded but durable containment requires operator action",
                             "ContainmentError",
-                            Some(&handle),
+                            handle.as_deref(),
                         ));
                     }
                 }
             } else {
-                provisional_handle = Some(
-                    staged
-                        .preserve_indeterminate(
-                            &format!("upstream returned HTTP {status} after mutation dispatch"),
-                            None,
-                        )
-                        .await,
-                );
+                provisional_handle = staged
+                    .preserve_indeterminate(
+                        &format!("upstream returned HTTP {status} after mutation dispatch"),
+                        None,
+                    )
+                    .await;
             }
         }
 
@@ -3079,6 +3253,7 @@ impl ApiProxy {
     }
 
     fn kubernetes_conflict(&self, reason: &str) -> Response<ProxyBody> {
+        tracing::warn!(target: "guard::apiproxy", reason, "Kubernetes mutation arbitration failed");
         self.status_resp(
             StatusCode::CONFLICT,
             &format!("guard api-proxy: {reason}"),
@@ -3304,6 +3479,30 @@ impl ApiProxy {
         Ok(RevertConstructible::DeleteCreated)
     }
 
+    fn revert_constructibility_from_prepared(
+        &self,
+        op: &ApiOp,
+        prepared: Option<&PreparedMutation>,
+    ) -> RevertConstructible {
+        if self.gate.get().is_none() || !self.protocol.tracks_write(op) {
+            return RevertConstructible::None;
+        }
+        if !self.protocol.wants_prior_snapshot(op) {
+            return RevertConstructible::DeleteCreated;
+        }
+        let Some(snapshot) = prepared.and_then(|prepared| prepared.prior_snapshot.as_deref())
+        else {
+            return RevertConstructible::None;
+        };
+        if self.protocol.plan_revert(op, Some(snapshot), &[]).is_err() {
+            return RevertConstructible::None;
+        }
+        match op.verb {
+            Verb::Delete => RevertConstructible::RecreateFromSnapshot,
+            _ => RevertConstructible::RestorePriorState,
+        }
+    }
+
     /// Durably stage an auto-revert envelope before a tracked write is sent.
     async fn arm_write_revert(
         &self,
@@ -3516,6 +3715,14 @@ impl ApiProxy {
             }
         }
         response
+    }
+
+    fn staged_cleanup_failure_response(&self) -> Response<ProxyBody> {
+        self.status_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "guard api-proxy: mutation was not sent, but durable staged-containment cleanup remains pending",
+            "ContainmentCleanupPending",
+        )
     }
 
     fn rebuild_judge_for_intent_during_update(&self, intent: Option<String>) {
@@ -3944,18 +4151,45 @@ fn sanitize_shape_key(key: &str) -> String {
     out
 }
 
-/// Reload the policy file when its mtime changes (the operator slow clock). A
-/// parse error keeps the last good policy in force and is logged.
+/// Reload the policy file when its content changes. A parse error keeps the
+/// last good policy in force and is logged.
 async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
-    let mut last = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    use sha2::{Digest, Sha256};
+
+    let digest = |bytes: &[u8]| Sha256::digest(bytes).to_vec();
+    // The task can start after an operator has already replaced the file. The
+    // first read is therefore compared with the loaded policy, rather than
+    // treated as an unquestioned baseline that could miss that replacement.
+    let mut last = None;
     loop {
         tokio::time::sleep(proxy.policy_reload_interval).await;
-        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        if modified == last {
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::error!(
+                    target: "guard::apiproxy",
+                    "cannot read api-policy {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let observed = digest(&bytes);
+        if last.as_ref() == Some(&observed) {
             continue;
         }
-        match ApiPolicy::load_file(&path) {
+        let parsed = std::str::from_utf8(&bytes)
+            .map_err(|error| error.to_string())
+            .and_then(|yaml| ApiPolicy::from_yaml(yaml).map_err(|error| error.to_string()));
+        match parsed {
             Ok(p) => {
+                if last.is_none()
+                    && p.authority_fingerprint()
+                        == proxy.policy.read().await.authority_fingerprint()
+                {
+                    last = Some(observed);
+                    continue;
+                }
                 proxy.policy_reload_attempt.fetch_add(1, Ordering::AcqRel);
                 proxy.policy_reload_notify.notify_waiters();
                 let _mutation_authority_guard = proxy.mutation_authority_gate.write().await;
@@ -3975,11 +4209,17 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
                 }
                 *policy = p;
                 proxy.finish_authority_update();
-                last = modified;
+                last = Some(observed);
+                // Wake observers again after publication. The earlier signal
+                // marks entry into authority coordination for contention
+                // tests; this one prevents a waiter from parking after seeing
+                // that attempt but before the new fingerprint becomes live.
+                proxy.policy_reload_attempt.fetch_add(1, Ordering::AcqRel);
+                proxy.policy_reload_notify.notify_waiters();
                 tracing::info!(target: "guard::apiproxy", "reloaded api-policy from {}", path.display());
             }
             Err(e) => {
-                last = modified;
+                last = Some(observed);
                 tracing::error!(
                     target: "guard::apiproxy",
                     "api-policy reload failed ({}); keeping previous policy: {e}",

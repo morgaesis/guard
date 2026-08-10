@@ -1115,6 +1115,7 @@ impl ProvisionalSummary {
                 "interrupted" => "interrupted".to_string(),
                 "failed" => "forward_failed".to_string(),
                 "indeterminate" => "indeterminate".to_string(),
+                "cleanup_pending" => "cleanup_pending".to_string(),
                 "persistence_failed" if p.status == ProvisionalStatus::NeedsOperatorDecision => {
                     "persistence_failed".to_string()
                 }

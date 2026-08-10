@@ -3613,11 +3613,12 @@ impl LearnedRuleStore {
         if command_contains_sensitive_literals(binary, args) {
             return Ok(None);
         }
+        let command_metadata = crate::redact::command_metadata(binary, args);
         let risk = risk.unwrap_or(5);
         if risk > self.config.max_risk {
             return Ok(Some(LearningOutcome {
                 service: binary.to_string(),
-                pattern: command.to_string(),
+                pattern: command_metadata,
                 approvals: 0,
                 required_approvals: self.config.min_approvals,
                 is_candidate: false,
@@ -3631,7 +3632,7 @@ impl LearnedRuleStore {
         if looks_dangerous_for_learned_allow(command) {
             return Ok(Some(LearningOutcome {
                 service: binary.to_string(),
-                pattern: command.to_string(),
+                pattern: command_metadata,
                 approvals: 0,
                 required_approvals: self.config.min_approvals,
                 is_candidate: false,
@@ -3656,7 +3657,7 @@ impl LearnedRuleStore {
                 max_risk_seen: risk,
                 first_seen_unix: now,
                 last_seen_unix: now,
-                last_command: command.to_string(),
+                last_command: command_metadata.clone(),
                 last_reason: reason.clone(),
                 shim: candidate.shim.clone(),
             });
@@ -3664,7 +3665,7 @@ impl LearnedRuleStore {
         observation.approvals = observation.approvals.saturating_add(1);
         observation.max_risk_seen = observation.max_risk_seen.max(risk);
         observation.last_seen_unix = now;
-        observation.last_command = command.to_string();
+        observation.last_command = command_metadata;
         observation.last_reason = reason.clone();
         observation.shim = candidate.shim.clone();
         observation.equivalent_patterns = candidate.equivalent_patterns.clone();
@@ -3791,17 +3792,44 @@ fn sanitize_learned_rules_prose(data: &mut LearnedRulesFile) -> bool {
     let mut changed = false;
     for observation in data.observations.values_mut() {
         changed |= sanitize(&mut observation.last_reason);
+        let pattern = crate::redact::scrub_flattened_command_metadata(&observation.pattern);
+        changed |= replace_if_changed(&mut observation.pattern, pattern);
+        let last_command =
+            crate::redact::scrub_flattened_command_metadata(&observation.last_command);
+        changed |= replace_if_changed(&mut observation.last_command, last_command);
+        for equivalent in &mut observation.equivalent_patterns {
+            changed |= replace_if_changed(
+                equivalent,
+                crate::redact::scrub_flattened_command_metadata(equivalent),
+            );
+        }
         if let Some(shim) = observation.shim.as_mut() {
             changed |= sanitize(&mut shim.description);
         }
     }
     for rule in &mut data.rules {
         changed |= sanitize(&mut rule.last_reason);
+        let pattern = crate::redact::scrub_flattened_command_metadata(&rule.pattern);
+        changed |= replace_if_changed(&mut rule.pattern, pattern);
+        for equivalent in &mut rule.equivalent_patterns {
+            changed |= replace_if_changed(
+                equivalent,
+                crate::redact::scrub_flattened_command_metadata(equivalent),
+            );
+        }
         if let Some(shim) = rule.shim.as_mut() {
             changed |= sanitize(&mut shim.description);
         }
     }
     changed
+}
+
+fn replace_if_changed(value: &mut String, replacement: String) -> bool {
+    if *value == replacement {
+        return false;
+    }
+    *value = replacement;
+    true
 }
 
 fn learned_shim_contains_sensitive_literals(shim: &LearnedShim) -> bool {
@@ -3842,11 +3870,12 @@ struct RuleCandidate {
 }
 
 impl RuleCandidate {
-    fn from_command(binary: &str, args: &[String], command: &str) -> Self {
+    fn from_command(binary: &str, args: &[String], _command: &str) -> Self {
+        let command = crate::redact::command_metadata(binary, args);
         if binary.eq_ignore_ascii_case("ssh") {
             if let Some(ssh) = parse_ssh_command(args) {
                 let service = infer_ssh_service(&ssh.host, &ssh.remote_args);
-                let pattern = command.to_string();
+                let pattern = command.clone();
                 let shim = ssh.remote_args.first().and_then(|remote_tool| {
                     let name = infer_shim_name(&service, remote_tool);
                     if name == binary || !is_valid_shim_name(&name) {
@@ -3871,7 +3900,7 @@ impl RuleCandidate {
                         let mut parts = Vec::with_capacity(remote_tail.len() + 1);
                         parts.push(shim.name.clone());
                         parts.extend(remote_tail.iter().cloned());
-                        vec![parts.join(" ")]
+                        vec![crate::redact::command_metadata(&parts[0], &parts[1..])]
                     })
                     .unwrap_or_default();
                 return Self {
@@ -3884,7 +3913,7 @@ impl RuleCandidate {
         }
 
         let service = infer_service_from_binary(binary);
-        let pattern = command.to_string();
+        let pattern = command;
         Self {
             service,
             pattern,
@@ -4618,7 +4647,9 @@ mod tests {
             auto_shim: AutoShimMode::Off,
         };
         let store = Arc::new(RwLock::new(LearnedRuleStore::load(config.clone()).unwrap()));
-        let (committed, release) = pause_post_commit_adoption_for_test("async-race");
+        let hook_identity =
+            crate::redact::command_metadata("fixturectl", &["async-race".to_string()]);
+        let (committed, release) = pause_post_commit_adoption_for_test(&hook_identity);
         let first_store = store.clone();
         let first = tokio::spawn(async move {
             run_async_durable_store_operation(
@@ -4682,7 +4713,9 @@ mod tests {
             auto_shim: AutoShimMode::Off,
         };
         let store = Arc::new(RwLock::new(LearnedRuleStore::load(config.clone()).unwrap()));
-        let (committed, release) = pause_post_commit_adoption_for_test("cancel-race");
+        let hook_identity =
+            crate::redact::command_metadata("fixturectl", &["cancel-race".to_string()]);
+        let (committed, release) = pause_post_commit_adoption_for_test(&hook_identity);
         let first_store = store.clone();
         let first = tokio::spawn(async move {
             run_async_durable_store_operation(
@@ -5385,10 +5418,16 @@ mod tests {
         let candidate =
             RuleCandidate::from_command("ssh", &args, "ssh firewall configctl system status");
         assert_eq!(candidate.service, "opnsense-api");
-        assert_eq!(candidate.pattern, "ssh firewall configctl system status");
+        assert_eq!(
+            candidate.pattern,
+            crate::redact::command_metadata("ssh", &args)
+        );
         assert_eq!(
             candidate.equivalent_patterns,
-            vec!["opnsense-api system status".to_string()]
+            vec![crate::redact::command_metadata(
+                "opnsense-api",
+                &["system".to_string(), "status".to_string()]
+            )]
         );
         assert_eq!(
             candidate.shim.as_ref().map(|shim| shim.name.as_str()),
@@ -5479,6 +5518,11 @@ mod tests {
         store
             .record_approval("fixturectl", &safe_args, "fixturectl status", Some(1), "ok")
             .unwrap();
+        assert!(store
+            .data
+            .observations
+            .values()
+            .all(|observation| observation.last_command.contains("[argv-sha256:")));
         let safe_bytes = std::fs::read(&path).unwrap();
         let value = ["q", "7"].concat();
         assert!(store
@@ -5494,6 +5538,11 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), safe_bytes);
 
         let mut contaminated = store.data.clone();
+        for observation in contaminated.observations.values_mut() {
+            observation.pattern = "fixturectl status".to_string();
+            observation.last_command = "fixturectl status".to_string();
+        }
+        contaminated.rules[0].pattern = "fixturectl status".to_string();
         let mut observation = contaminated.observations.values().next().unwrap().clone();
         observation.pattern = format!("curl -u {value}");
         observation.last_command = observation.pattern.clone();
@@ -5509,6 +5558,16 @@ mod tests {
         let loaded = LearnedRuleStore::load(config.clone()).unwrap();
         assert_eq!(loaded.data.observations.len(), 1);
         assert_eq!(loaded.data.rules.len(), 1);
+        assert!(loaded.data.rules[0]
+            .pattern
+            .starts_with("[legacy-command-sha256:"));
+        assert!(loaded
+            .data
+            .observations
+            .values()
+            .all(|observation| observation
+                .last_command
+                .starts_with("[legacy-command-sha256:")));
         let sanitized = std::fs::read(&path).unwrap();
         assert!(!sanitized
             .windows(value.len())
@@ -5673,7 +5732,9 @@ mod tests {
         };
         let mut first = LearnedRuleStore::load(config.clone()).unwrap();
         let mut successor = LearnedRuleStore::load(config.clone()).unwrap();
-        let (committed, release) = pause_post_commit_adoption_for_test("post-commit-race");
+        let hook_identity =
+            crate::redact::command_metadata("fixturectl", &["post-commit-race".to_string()]);
+        let (committed, release) = pause_post_commit_adoption_for_test(&hook_identity);
 
         let first_thread = std::thread::spawn(move || {
             let args = ["post-commit-race".to_string()];

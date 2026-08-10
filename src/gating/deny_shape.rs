@@ -35,8 +35,9 @@ use crate::learned_rules::{
     LearningFileSnapshot, LearningWriteOutcome,
 };
 use crate::redact::{
-    command_contains_sensitive_literals, flattened_args_contain_sensitive_literals,
-    flattened_command_contains_sensitive_literals, text_contains_sensitive_literals,
+    command_contains_sensitive_literals, command_metadata,
+    flattened_args_contain_sensitive_literals, flattened_command_contains_sensitive_literals,
+    scrub_flattened_command_metadata, text_contains_sensitive_literals,
 };
 
 /// Canary strings a synthesized args pattern must NOT match. Each canary
@@ -266,6 +267,11 @@ impl DenyShapeStore {
                 changed = true;
             }
             for observation in data.observations.values_mut() {
+                let metadata = scrub_flattened_command_metadata(&observation.last_command);
+                changed |= metadata != observation.last_command;
+                observation.last_command = metadata;
+            }
+            for observation in data.observations.values_mut() {
                 let sanitized = sanitize_learning_text(&observation.last_reason);
                 changed |= sanitized != observation.last_reason;
                 observation.last_reason = sanitized;
@@ -367,12 +373,13 @@ impl DenyShapeStore {
         &mut self,
         binary: &str,
         args: &[String],
-        command: &str,
+        _command: &str,
         reason: &str,
     ) -> Result<Option<DenyLearningOutcome>> {
         if command_contains_sensitive_literals(binary, args) {
             return Ok(None);
         }
+        let metadata = command_metadata(binary, args);
         if !self.config.enabled {
             return Ok(None);
         }
@@ -405,14 +412,14 @@ impl DenyShapeStore {
                 denials: 0,
                 first_seen_unix: now,
                 last_seen_unix: now,
-                last_command: command.to_string(),
+                last_command: metadata.clone(),
                 last_reason: reason.clone(),
                 last_attempt_at_denials: 0,
             });
 
         observation.denials = observation.denials.saturating_add(1);
         observation.last_seen_unix = now;
-        observation.last_command = command.to_string();
+        observation.last_command = metadata;
         observation.last_reason = reason.clone();
         if !observation.evidence_args.contains(&encoded_args)
             && observation.evidence_args.len() < MAX_EVIDENCE_PER_OBSERVATION
@@ -541,6 +548,7 @@ impl DenyShapeStore {
         let mut data = data.clone();
         for observation in data.observations.values_mut() {
             observation.last_reason = sanitize_learning_text(&observation.last_reason);
+            observation.last_command = scrub_flattened_command_metadata(&observation.last_command);
         }
         for shape in &mut data.shapes {
             shape.last_reason = sanitize_learning_text(&shape.last_reason);
@@ -764,6 +772,11 @@ mod tests {
         store
             .record_denial("kubectl", &safe_args, "kubectl delete pod", "denied")
             .unwrap();
+        assert!(store
+            .data
+            .observations
+            .values()
+            .all(|observation| observation.last_command.contains("[argv-sha256:")));
         store
             .promote_shape(
                 "kubernetes",
@@ -798,6 +811,10 @@ mod tests {
             .is_err());
 
         let mut contaminated = store.data.clone();
+        contaminated
+            .observations
+            .values_mut()
+            .for_each(|observation| observation.last_command = "kubectl delete pod".to_string());
         let mut observation = contaminated.observations.values().next().unwrap().clone();
         observation.binary = "docker".to_string();
         observation.evidence_args = vec![format!("login -p {value}")];
@@ -815,6 +832,13 @@ mod tests {
         let loaded = DenyShapeStore::load(config.clone()).unwrap();
         assert_eq!(loaded.data.observations.len(), 1);
         assert_eq!(loaded.data.shapes.len(), 1);
+        assert!(loaded
+            .data
+            .observations
+            .values()
+            .all(|observation| observation
+                .last_command
+                .starts_with("[legacy-command-sha256:")));
         let sanitized = std::fs::read(&path).unwrap();
         assert!(!sanitized
             .windows(value.len())

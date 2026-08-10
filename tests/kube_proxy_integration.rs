@@ -1017,7 +1017,21 @@ async fn arbitration_mock_handler(
     let expected_uid = object["metadata"]["uid"].as_str().unwrap();
     let expected_version = object["metadata"]["resourceVersion"].as_str().unwrap();
     let guarded = match method {
-        hyper::Method::PUT | hyper::Method::PATCH => {
+        hyper::Method::PUT => {
+            body["metadata"]["resourceVersion"].as_str() == Some(expected_version)
+        }
+        hyper::Method::PATCH if body.is_array() => body.as_array().is_some_and(|operations| {
+            operations.first().is_some_and(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/uid"
+                    && operation["value"] == expected_uid
+            }) && operations.get(1).is_some_and(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/resourceVersion"
+                    && operation["value"] == expected_version
+            })
+        }),
+        hyper::Method::PATCH => {
             body["metadata"]["resourceVersion"].as_str() == Some(expected_version)
         }
         hyper::Method::DELETE => {
@@ -1299,6 +1313,11 @@ async fn held_kubernetes_mutations_approve_the_exact_guarded_bytes() {
             Some("application/merge-patch+json"),
             Some(r#"{"spec":{"replicas":3}}"#),
         ),
+        (
+            reqwest::Method::PATCH,
+            Some("application/json-patch+json"),
+            Some(r#"[{"op":"replace","path":"/spec/replicas","value":3}]"#),
+        ),
         (reqwest::Method::DELETE, None, None),
     ];
     for (method, content_type, body) in cases {
@@ -1335,19 +1354,199 @@ async fn held_kubernetes_mutations_approve_the_exact_guarded_bytes() {
                 .status(),
             200
         );
-        let mut request = client.request(method, &url).bearer_auth("principal-a");
+        let mut request = client
+            .request(method.clone(), &url)
+            .bearer_auth("principal-a");
         if let Some(content_type) = content_type {
             request = request.header("content-type", content_type);
         }
         if let Some(body) = body {
             request = request.body(body);
         }
-        assert!(request.send().await.unwrap().status().is_success());
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let detail = response.text().await.unwrap();
+        assert!(
+            status.is_success(),
+            "{method} ({content_type:?}) approval returned {status}: {detail}"
+        );
         let snapshots = sink.snapshots.lock().unwrap();
         let digests = mock.mutation_digests.lock().unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(digests.len(), 1);
         assert_eq!(snapshots[0].body_sha256, digests[0]);
+    }
+}
+
+fn guarded_mutation_cases() -> Vec<(reqwest::Method, Option<&'static str>, Option<&'static str>)> {
+    vec![
+        (
+            reqwest::Method::PUT,
+            Some("application/json"),
+            Some(r#"{"metadata":{"name":"api","namespace":"dev"},"spec":{"replicas":3}}"#),
+        ),
+        (
+            reqwest::Method::PATCH,
+            Some("application/merge-patch+json"),
+            Some(r#"{"spec":{"replicas":3}}"#),
+        ),
+        (
+            reqwest::Method::PATCH,
+            Some("application/json-patch+json"),
+            Some(r#"[{"op":"replace","path":"/spec/replicas","value":3}]"#),
+        ),
+        (reqwest::Method::DELETE, None, None),
+    ]
+}
+
+async fn send_guarded_mutation(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    method: reqwest::Method,
+    content_type: Option<&str>,
+    body: Option<&str>,
+) -> reqwest::StatusCode {
+    let url = format!("{base}/apis/apps/v1/namespaces/dev/deployments/api");
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let mut request = client.request(method, url).bearer_auth(token);
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    if let Some(body) = body {
+        request = request.body(body.to_string());
+    }
+    request.send().await.unwrap().status()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evaluator_consequence_holds_bind_every_guarded_mutation_byte() {
+    let policy = "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [update, patch, delete]\n    resources: [deployments]\n    namespaces: [dev]\n    action: evaluate\n";
+    for (method, content_type, body) in guarded_mutation_cases() {
+        let (upstream, mock) = spawn_arbitration_mock().await;
+        let judge = RecordingJudge::new(vec![judge_allow(
+            Some(9),
+            Some(Reversibility::Irreversible),
+        )]);
+        let summaries = judge.summaries.clone();
+        let sink = SnapshotSink::default();
+        let (base, client) = start_proxy_with(
+            upstream,
+            policy,
+            Some(Arc::new(judge)),
+            Some(Arc::new(sink.clone())),
+            0,
+        )
+        .await;
+        assert!(
+            send_guarded_mutation(&client, &base, "live-session", method, content_type, body)
+                .await
+                .is_success()
+        );
+        let digest = mock.mutation_digests.lock().unwrap()[0].clone();
+        assert_eq!(summaries.lock().unwrap()[0].authorized_body_sha256, digest);
+        assert_eq!(sink.snapshots.lock().unwrap()[0].body_sha256, digest);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_evaluator_paths_bind_the_final_guarded_bytes() {
+    let policy = "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: evaluate\n";
+    for verdict in [
+        judge_allow(Some(1), Some(Reversibility::Reversible)),
+        judge_allow(Some(4), Some(Reversibility::Recoverable)),
+    ] {
+        let (upstream, mock) = spawn_arbitration_mock().await;
+        let judge = RecordingJudge::new(vec![verdict]);
+        let summaries = judge.summaries.clone();
+        let sink = RecordingSink::default();
+        let (base, client) = start_proxy_with(
+            upstream,
+            policy,
+            Some(Arc::new(judge)),
+            Some(Arc::new(sink)),
+            0,
+        )
+        .await;
+        assert!(send_guarded_mutation(
+            &client,
+            &base,
+            "live-session",
+            reqwest::Method::PATCH,
+            Some("application/json-patch+json"),
+            Some(r#"[{"op":"replace","path":"/spec/replicas","value":3}]"#),
+        )
+        .await
+        .is_success());
+        assert_eq!(
+            summaries.lock().unwrap()[0].authorized_body_sha256,
+            mock.mutation_digests.lock().unwrap()[0]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rarity_and_coverage_holds_bind_every_guarded_mutation_byte() {
+    type CoverageCase = (
+        Option<Arc<dyn ApiJudge>>,
+        u64,
+        Arc<dyn ApiSessionSink>,
+        &'static str,
+    );
+    let allow_policy = "default: deny\nrules:\n  - verbs: [get, update, patch, delete]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n";
+    for coverage in [false, true] {
+        for (method, content_type, body) in guarded_mutation_cases() {
+            let (upstream, mock) = spawn_arbitration_mock().await;
+            let sink = SnapshotSink::default();
+            let coverage_judge = HeldCoverageJudge::default();
+            let summaries = coverage_judge.summaries.clone();
+            let (judge, rarity, session_sink, token): CoverageCase = if coverage {
+                (
+                    Some(Arc::new(coverage_judge)),
+                    0,
+                    Arc::new(ModeSessionSink),
+                    "readonly",
+                )
+            } else {
+                (None, 1, Arc::new(LiveSessionSink), "live-session")
+            };
+            let (base, client) = start_proxy_with_session_sink(
+                upstream,
+                allow_policy,
+                judge,
+                Some(Arc::new(sink.clone())),
+                rarity,
+                session_sink,
+            )
+            .await;
+            assert!(
+                send_guarded_mutation(&client, &base, token, method, content_type, body)
+                    .await
+                    .is_success()
+            );
+            let digest = mock.mutation_digests.lock().unwrap()[0].clone();
+            assert_eq!(
+                sink.snapshots.lock().unwrap().last().unwrap().body_sha256,
+                digest
+            );
+            if coverage {
+                let summaries = summaries.lock().unwrap();
+                assert_eq!(summaries[0].authorized_body_sha256, digest);
+                assert_ne!(
+                    summaries[0].coverage_body_shape, summaries[0].redacted_body_shape,
+                    "guard preconditions must be excluded from coverage identity"
+                );
+            }
+        }
     }
 }
 
@@ -1784,33 +1983,25 @@ async fn reserve_listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
     (listener, addr)
 }
 
-/// Poll until `condition` holds, panicking after a generous deadline. Replaces
-/// fixed settle sleeps for asynchronous post-response bookkeeping (revert
-/// arming, hold accounting) that has no completion signal of its own.
-async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    let start = std::time::Instant::now();
-    while !condition() {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// Poll until the proxy's hot-reloader has published the policy in `yaml`.
+/// Wait for the proxy's reload generation signal until `yaml` is published.
 async fn wait_for_policy_reload(proxy: &ApiProxy, yaml: &str) {
     let expected = ApiPolicy::from_yaml(yaml)
         .expect("reloaded policy parses")
         .authority_fingerprint();
-    let start = std::time::Instant::now();
-    while proxy.policy_fingerprint().await != expected {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "policy reload was not observed within 10s"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if proxy.policy_fingerprint().await == expected {
+                return;
+            }
+            let baseline = proxy.policy_reload_attempt();
+            if proxy.policy_fingerprint().await == expected {
+                return;
+            }
+            proxy.wait_for_policy_reload_attempt_after(baseline).await;
+        }
+    })
+    .await
+    .expect("policy reload was not observed within the bounded deadline");
 }
 
 fn kubeconfig_for(mock_base: &str) -> String {
@@ -2022,6 +2213,39 @@ struct ModeCoverageJudge {
 
 struct SkippedHandoffCoverageJudge;
 
+#[derive(Clone, Default)]
+struct HeldCoverageJudge {
+    summaries: Arc<std::sync::Mutex<Vec<ApiRequestSummary>>>,
+}
+
+#[async_trait::async_trait]
+impl ApiJudge for HeldCoverageJudge {
+    fn evaluator_enabled(&self) -> bool {
+        false
+    }
+
+    async fn coverage(&self, summary: &ApiRequestSummary) -> ApiCoverageVerdict {
+        self.summaries.lock().unwrap().push(summary.clone());
+        ApiCoverageVerdict::Allow {
+            risk: 9,
+            reversibility: Reversibility::Irreversible,
+        }
+    }
+
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        _requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        handoff.forward().await
+    }
+
+    async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+        ApiJudgeVerdict::Error("unexpected evaluator call".to_string())
+    }
+}
+
 #[async_trait::async_trait]
 impl ApiJudge for SkippedHandoffCoverageJudge {
     async fn coverage(&self, _summary: &ApiRequestSummary) -> ApiCoverageVerdict {
@@ -2052,7 +2276,7 @@ impl ApiJudge for ModeCoverageJudge {
             && summary.session_revision.as_deref() == Some("readonly-revision")
             && summary.verb == "create"
             && summary.resource == "pods"
-            && summary.redacted_body_shape == "{}"
+            && summary.coverage_body_shape == "{}"
         {
             ApiCoverageVerdict::Allow {
                 risk: 1,
@@ -2395,8 +2619,7 @@ async fn session_lease_linearizes_at_the_finite_upstream_handoff() {
     let revoke = tokio::spawn(async move {
         *live.write().await = None;
     });
-    tokio::task::yield_now().await;
-    assert!(!revoke.is_finished());
+    assert!(session.live.try_write().is_err());
     session.release_handoff.add_permits(1);
 
     assert_eq!(request.await.unwrap().status(), 200);
@@ -2437,9 +2660,8 @@ async fn stalled_upstream_handoff_times_out_and_releases_authority() {
         let _guard = judge_for_revoke.coordination.write().await;
         judge_for_revoke.active.store(false, Ordering::SeqCst);
     });
-    tokio::task::yield_now().await;
-    assert!(!revoke.is_finished());
-    assert!(!coverage_revoke.is_finished());
+    assert!(session.live.try_write().is_err());
+    assert!(judge.coordination.try_write().is_err());
 
     assert_eq!(request.await.unwrap().status(), 504);
     tokio::time::timeout(Duration::from_secs(2), revoke)
@@ -2728,7 +2950,7 @@ async fn server_error_preserves_indeterminate_containment_without_uid() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rejected_create_cancels_inert_containment_without_create_provenance() {
+async fn rejected_create_retires_dispatch_without_create_provenance() {
     let (upstream, forwarded_deletes) = spawn_create_status_upstream(409, None).await;
     let sink = RecordingSink::default();
     let (base, client) = start_proxy_with(
@@ -2750,7 +2972,8 @@ async fn rejected_create_cancels_inert_containment_without_create_provenance() {
     assert!(!response.headers().contains_key("x-guard-provisional"));
     assert!(sink.indeterminate.lock().unwrap().is_empty());
     assert!(sink.activated.lock().unwrap().is_empty());
-    assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+    assert_eq!(sink.rejected.lock().unwrap().len(), 1);
 
     let delete = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/existing-pod"))
@@ -2894,9 +3117,8 @@ async fn cleanup_revocation_linearizes_at_the_final_header_handoff() {
         let mut revoke = tokio::spawn(async move {
             *coordination.write().await = false;
         });
-        tokio::task::yield_now().await;
         if matches!(pause, CleanupLeasePause::AfterLease) {
-            assert!(!revoke.is_finished());
+            assert!(sink.coordination.try_write().is_err());
         } else {
             tokio::time::timeout(Duration::from_secs(2), &mut revoke)
                 .await
@@ -2969,6 +3191,33 @@ async fn explicit_activation_failure_cannot_return_upstream_success() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_containment_classification_never_advertises_an_uncommitted_handle() {
+    let (upstream, _) = spawn_create_status_upstream(201, None).await;
+    let sink = ClassificationFailSink::default();
+    let state = sink.state.clone();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"classification-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(!response.headers().contains_key("x-guard-provisional"));
+    assert!(state.activated.lock().unwrap().is_empty());
+    assert!(state.indeterminate.lock().unwrap().is_empty());
+    assert!(state.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_mutation_handoff_preserves_containment() {
     let (upstream, reached_upstream) = spawn_stalled_upstream().await;
     let sink = RecordingSink::default();
@@ -2993,16 +3242,11 @@ async fn cancelled_mutation_handoff_preserves_containment() {
     });
     reached_upstream.acquire().await.unwrap().forget();
     request.abort();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if !sink.indeterminate.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("cancelled request preserves an actionable provisional");
+    tokio::time::timeout(Duration::from_secs(3), sink.indeterminate_signal.acquire())
+        .await
+        .expect("cancelled request preserves an actionable provisional")
+        .unwrap()
+        .forget();
     assert_eq!(sink.handoffs.lock().unwrap().len(), 1);
     assert!(sink.cancelled.lock().unwrap().is_empty());
 }
@@ -3032,16 +3276,11 @@ async fn cancellation_during_uid_transition_keeps_richer_identity() {
     reached.acquire().await.unwrap().forget();
     request.abort();
     release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if !state.activated.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("detached UID transition completes after caller cancellation");
+    tokio::time::timeout(Duration::from_secs(2), state.activated_signal.acquire())
+        .await
+        .expect("detached UID transition completes after caller cancellation")
+        .unwrap()
+        .forget();
     assert!(state.indeterminate.lock().unwrap().is_empty());
     assert!(state.cancelled.lock().unwrap().is_empty());
     assert!(state
@@ -3315,7 +3554,7 @@ async fn http2_multiplexes_session_authentication_failures_independently() {
 
 /// Records the reverts the proxy synthesizes, standing in for the daemon's
 /// consequence machinery.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct RecordingSink {
     calls: Arc<std::sync::Mutex<Vec<guard::proxy::ApiMutation>>>,
     handoffs: Arc<std::sync::Mutex<Vec<String>>>,
@@ -3325,6 +3564,29 @@ struct RecordingSink {
     cancelled: Arc<std::sync::Mutex<Vec<String>>>,
     resolved: Arc<std::sync::Mutex<Vec<String>>>,
     dispatching: Arc<std::sync::Mutex<Vec<String>>>,
+    rejected: Arc<std::sync::Mutex<Vec<String>>>,
+    activated_signal: Arc<tokio::sync::Semaphore>,
+    indeterminate_signal: Arc<tokio::sync::Semaphore>,
+    resolved_signal: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for RecordingSink {
+    fn default() -> Self {
+        Self {
+            calls: Arc::default(),
+            handoffs: Arc::default(),
+            activated: Arc::default(),
+            indeterminate: Arc::default(),
+            resource_uids: Arc::default(),
+            cancelled: Arc::default(),
+            resolved: Arc::default(),
+            dispatching: Arc::default(),
+            rejected: Arc::default(),
+            activated_signal: Arc::new(tokio::sync::Semaphore::new(0)),
+            indeterminate_signal: Arc::new(tokio::sync::Semaphore::new(0)),
+            resolved_signal: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -3347,6 +3609,7 @@ impl guard::proxy::GateSink for RecordingSink {
             .lock()
             .unwrap()
             .push(resource_uid.map(str::to_string));
+        self.activated_signal.add_permits(1);
         true
     }
 
@@ -3362,6 +3625,7 @@ impl guard::proxy::GateSink for RecordingSink {
             .lock()
             .unwrap()
             .push(resource_uid.map(str::to_string));
+        self.indeterminate_signal.add_permits(1);
         true
     }
 
@@ -3370,8 +3634,15 @@ impl guard::proxy::GateSink for RecordingSink {
         true
     }
 
+    async fn mark_revert_rejected(&self, handle: &str, _reason: &str) -> bool {
+        self.handoffs.lock().unwrap().push(handle.to_string());
+        self.rejected.lock().unwrap().push(handle.to_string());
+        true
+    }
+
     async fn resolve(&self, handle: &str) -> bool {
         self.resolved.lock().unwrap().push(handle.to_string());
+        self.resolved_signal.add_permits(1);
         true
     }
 
@@ -3415,6 +3686,59 @@ struct ActivationFailSink {
     state: RecordingSink,
 }
 
+#[derive(Clone, Default)]
+struct ClassificationFailSink {
+    state: RecordingSink,
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for ClassificationFailSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+}
+
 #[async_trait::async_trait]
 impl guard::proxy::GateSink for ActivationFailSink {
     async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
@@ -3448,6 +3772,10 @@ impl guard::proxy::GateSink for ActivationFailSink {
 
     async fn cancel_staged_revert(&self, handle: &str) -> bool {
         self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_rejected(handle, reason).await
     }
 
     async fn resolve(&self, handle: &str) -> bool {
@@ -3570,6 +3898,10 @@ impl guard::proxy::GateSink for CleanupLeaseSink {
         self.state.cancel_staged_revert(handle).await
     }
 
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_rejected(handle, reason).await
+    }
+
     async fn resolve(&self, handle: &str) -> bool {
         self.state.resolve(handle).await
     }
@@ -3640,6 +3972,10 @@ impl guard::proxy::GateSink for BlockingUidTransitionSink {
         self.state.cancel_staged_revert(handle).await
     }
 
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_rejected(handle, reason).await
+    }
+
     async fn resolve(&self, handle: &str) -> bool {
         self.state.resolve(handle).await
     }
@@ -3691,6 +4027,10 @@ impl guard::proxy::GateSink for BlockingDispatchSink {
         self.state.cancel_staged_revert(handle).await
     }
 
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_rejected(handle, reason).await
+    }
+
     async fn resolve(&self, handle: &str) -> bool {
         self.state.resolve(handle).await
     }
@@ -3733,6 +4073,10 @@ impl guard::proxy::GateSink for DispatchFailSink {
 
     async fn cancel_staged_revert(&self, handle: &str) -> bool {
         self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
     }
 
     async fn resolve(&self, _handle: &str) -> bool {
@@ -3781,6 +4125,10 @@ impl guard::proxy::GateSink for BlockingCancelSink {
             return false;
         }
         true
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
     }
 
     async fn resolve(&self, _handle: &str) -> bool {
@@ -3839,6 +4187,38 @@ async fn write_mock_handler_with_provenance(
 
 async fn spawn_write_mock() -> String {
     spawn_write_mock_with_observation().await.0
+}
+
+async fn spawn_counted_write_mock(writes: Arc<AtomicUsize>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let writes = writes.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |request| {
+                            let writes = writes.clone();
+                            async move {
+                                if request.method() != hyper::Method::GET {
+                                    writes.fetch_add(1, Ordering::SeqCst);
+                                }
+                                write_mock_handler(request).await
+                            }
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
 }
 
 async fn spawn_write_mock_with_observation() -> (String, CreateProvenance) {
@@ -3952,10 +4332,7 @@ async fn proxy_arms_auto_revert_for_writes() {
 
     // Both response headers prove the reverts were durable before success was
     // returned; the sink records the same handles for lifecycle assertions.
-    wait_until("both writes to arm a revert", || {
-        sink.calls.lock().unwrap().len() == 2
-    })
-    .await;
+    assert_eq!(sink.calls.lock().unwrap().len(), 2);
 
     let calls = sink.calls.lock().unwrap();
     assert!(calls.iter().all(|call| {
@@ -4436,16 +4813,15 @@ async fn session_expansion_is_revalidated_immediately_before_forward() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
-    let gets = Arc::new(AtomicUsize::new(0));
     let writes = Arc::new(AtomicUsize::new(0));
-    let (mock_base, _) = spawn_flaky_snapshot_mock(gets, writes.clone()).await;
+    let mock_base = spawn_counted_write_mock(writes.clone()).await;
     let upstream =
         Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let temp = tempfile::tempdir().unwrap();
     let policy_path = temp.path().join("api-policy.yaml");
-    let evaluate_policy = "default: deny\nrules:\n  - verbs: [patch]\n    resources: [pods]\n    namespaces: [dev]\n    action: evaluate\n";
+    let evaluate_policy = "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: evaluate\n";
     std::fs::write(&policy_path, evaluate_policy).unwrap();
     let policy = ApiPolicy::load_file(&policy_path).unwrap();
     let (listener, listen) = reserve_listener().await;
@@ -4465,9 +4841,23 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!(
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let request = tokio::spawn(async move {
         client
-            .patch(format!("https://{listen}/api/v1/namespaces/dev/pods/web"))
+            .patch(format!(
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
             .bearer_auth("live-session")
             .body("{}")
             .send()
@@ -4475,7 +4865,7 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
             .unwrap()
     });
     started.notified().await;
-    let deny_policy = "default: deny\nrules:\n  - verbs: [patch]\n    resources: [pods]\n    namespaces: [dev]\n    action: deny\n";
+    let deny_policy = "default: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: deny\n";
     std::fs::write(&policy_path, deny_policy).unwrap();
     wait_for_policy_reload(&proxy, deny_policy).await;
     release.notify_one();
@@ -5117,10 +5507,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         )
         .await;
     assert_eq!(status, 201, "create forwarded");
-    wait_until("the create to arm exactly one revert", || {
-        sink.calls.lock().unwrap().len() == 1
-    })
-    .await;
+    assert_eq!(sink.calls.lock().unwrap().len(), 1);
 
     // Deleting that same resource is now contained cleanup: allowed and forwarded.
     let status = client
@@ -5137,10 +5524,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
     );
 
     // The now-moot auto-revert for the create was resolved.
-    wait_until("the create's auto-revert to resolve", || {
-        sink.resolved.lock().unwrap().len() == 1
-    })
-    .await;
+    assert_eq!(sink.resolved.lock().unwrap().len(), 1);
     assert_eq!(
         sink.calls.lock().unwrap().len(),
         1,
@@ -5374,8 +5758,6 @@ async fn created_provenance_never_overrides_an_explicit_policy_deny() {
         .unwrap();
     assert_eq!(created.status(), 201);
     created.bytes().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     let denied = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
         .bearer_auth("live-session")
@@ -5572,8 +5954,6 @@ rules:
         409,
         "an eviction that cannot carry object preconditions fails closed"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // No auto-revert was armed for the rejected subresource write, so no
     // provenance exists.
     assert_eq!(
@@ -5726,6 +6106,10 @@ impl guard::proxy::GateSink for ApprovingSink {
         false
     }
 
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
     async fn hold_request(
         &self,
         _snapshot: &ApiHoldSnapshot,
@@ -5781,6 +6165,10 @@ impl guard::proxy::GateSink for DenyingSink {
     }
 
     async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
         false
     }
 
@@ -6139,6 +6527,10 @@ impl GateSink for BlockingSnapshotSink {
         self.state.cancel_staged_revert(handle).await
     }
 
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_rejected(handle, reason).await
+    }
+
     async fn hold_request(
         &self,
         snapshot: &ApiHoldSnapshot,
@@ -6195,6 +6587,10 @@ impl GateSink for SnapshotSink {
         false
     }
 
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
     async fn hold_request(
         &self,
         snapshot: &ApiHoldSnapshot,
@@ -6246,6 +6642,10 @@ impl guard::proxy::GateSink for CountingSink {
     }
 
     async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
         false
     }
 
@@ -6314,11 +6714,7 @@ async fn proxy_rarity_escalation_holds_only_rare_shapes() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    wait_until(
-        "2 holds for the first shape's rare window + 1 for the new-namespace shape",
-        || *sink.holds.lock().unwrap() == 3,
-    )
-    .await;
+    assert_eq!(*sink.holds.lock().unwrap(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6479,11 +6875,7 @@ rules:
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "recoverable with snapshot forwards");
-    wait_until(
-        "recoverable evaluate allow to arm a containment revert",
-        || sink.calls.lock().unwrap().len() == 1,
-    )
-    .await;
+    assert_eq!(sink.calls.lock().unwrap().len(), 1);
 
     let judge = RecordingJudge::new(vec![judge_allow(Some(4), Some(Reversibility::Recoverable))]);
     let (base, client) = start_proxy_with(
@@ -6494,11 +6886,24 @@ rules:
         0,
     )
     .await;
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
         ))
         .header("content-type", "application/merge-patch+json")
+        .bearer_auth("live-session")
         .body(r#"{"spec":{"replicas":5}}"#)
         .send()
         .await
@@ -6692,10 +7097,14 @@ async fn flaky_snapshot_handler(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_evaluate_holds_when_contained_revert_cannot_be_reestablished() {
+async fn evaluator_is_not_called_when_final_guard_cannot_be_materialized() {
     let policy = r#"
 default: deny
 rules:
+  - verbs: [get]
+    resources: [deployments]
+    namespaces: [dev]
+    action: allow
   - verbs: [patch]
     resources: [deployments]
     namespaces: [dev]
@@ -6704,12 +7113,8 @@ rules:
     let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (mock_base, _) = spawn_flaky_snapshot_mock(gets.clone(), writes.clone()).await;
-    // Recoverable + mid risk: decide_gate returns Contain only because a revert
-    // is promised. A gate is attached (so the write is tracked and the marker is
-    // constructible at judge time), can_arm_revert is true, but the forward-time
-    // snapshot re-fetch 404s, so containment cannot be re-established and the
-    // write must be held (RecordingSink's default hold denies → 403).
     let judge = RecordingJudge::new(vec![judge_allow(Some(5), Some(Reversibility::Recoverable))]);
+    let observed_judge = judge.clone();
     let sink = RecordingSink::default();
     let (base, client) = start_proxy_with(
         mock_base,
@@ -6719,21 +7124,34 @@ rules:
         0,
     )
     .await;
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
         ))
         .header("content-type", "application/merge-patch+json")
+        .bearer_auth("live-session")
         .body(r#"{"spec":{"replicas":9}}"#)
         .send()
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
-        403,
-        "a contained write whose revert cannot be re-established must be held, not forwarded"
+        409,
+        "a final guard that cannot be materialized must fail before evaluation"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(observed_judge.summaries.lock().unwrap().is_empty());
     assert_eq!(
         writes.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -6790,6 +7208,10 @@ impl guard::proxy::GateSink for CannotArmSink {
         false
     }
 
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
     async fn cancel_staged_revert(&self, _handle: &str) -> bool {
         false
     }
@@ -6800,6 +7222,10 @@ async fn proxy_evaluate_holds_when_sink_cannot_arm() {
     let policy = r#"
 default: deny
 rules:
+  - verbs: [get]
+    resources: [deployments]
+    namespaces: [dev]
+    action: allow
   - verbs: [patch]
     resources: [deployments]
     namespaces: [dev]
@@ -6819,11 +7245,24 @@ rules:
         0,
     )
     .await;
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
         ))
         .header("content-type", "application/merge-patch+json")
+        .bearer_auth("live-session")
         .body(r#"{"spec":{"replicas":9}}"#)
         .send()
         .await
@@ -6833,7 +7272,6 @@ rules:
         403,
         "a contained write must be held when the sink cannot arm a revert"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         armed.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -6920,14 +7358,7 @@ rules:
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    // The object is fetched once for the caller's observation, then twice on
-    // the evaluate path: once before the
-    // judge to decide whether a revert is constructible (an input to the
-    // verdict), and again at forward time so the armed revert restores state as
-    // it was at the write, not as it was before the evaluator round trip.
-    wait_until(
-        "evaluate path to validate constructibility, then re-fetch fresh for arming",
-        || gets.load(std::sync::atomic::Ordering::SeqCst) == 3,
-    )
-    .await;
+    // The caller's observation and one pre-evaluator arbitration fetch are the
+    // only reads. The prepared snapshot and final bytes are reused at handoff.
+    assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 2);
 }

@@ -2457,13 +2457,14 @@ async fn caller_env_cannot_override_daemon_child_env() {
 async fn redaction_covers_effective_tool_child_and_request_env_values() {
     let (mut cfg, _) = make_test_config();
     cfg.config.redact = true;
+    let short_exact = ['q', '7'].iter().collect::<String>();
     let _restore = EnvRestore::capture("GUARD_CHILD_SECRET");
     std::env::set_var("GUARD_CHILD_SECRET", "daemon-child-secret-value");
     cfg.config.extra_child_env = vec!["GUARD_CHILD_SECRET".to_string()];
     let tools = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         tools.path(),
-        "tools:\n  sh:\n    env:\n      TOOL_SECRET: guard-tool-secret-value\n",
+        format!("tools:\n  sh:\n    env:\n      TOOL_SECRET: {short_exact}\n"),
     )
     .unwrap();
     *cfg.state.tool_registry.write().await =
@@ -2510,10 +2511,7 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
     match result.exec {
         ExecOutcome::Completed { stdout, .. } => {
             let stdout = stdout.unwrap_or_default();
-            assert!(
-                !stdout.contains("guard-tool-secret-value"),
-                "stdout={stdout}"
-            );
+            assert!(!stdout.contains(&short_exact));
             assert!(
                 !stdout.contains("daemon-child-secret-value"),
                 "stdout={stdout}"

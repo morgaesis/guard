@@ -182,13 +182,14 @@ pub struct Provisional {
 }
 
 impl Provisional {
-    /// Internal pre-classification rows occupy quota but do not appear on
-    /// operator, session, status, or metrics surfaces.
+    /// Internal pre-classification rows stay hidden. A staged row becomes
+    /// visible, but remains inert, when durable cleanup needs a bounded retry.
     pub fn is_operator_visible(&self) -> bool {
-        !matches!(
-            self.status,
-            ProvisionalStatus::Staged | ProvisionalStatus::Dispatching
-        )
+        (self.status == ProvisionalStatus::Staged && self.revert_detail.is_some())
+            || !matches!(
+                self.status,
+                ProvisionalStatus::Staged | ProvisionalStatus::Dispatching
+            )
     }
 
     pub fn command_line(&self) -> String {
@@ -307,7 +308,11 @@ impl Provisional {
             "persistence_failed"
         } else if !self.forward_done {
             if self.status == ProvisionalStatus::Staged {
-                "staged"
+                if self.revert_detail.is_some() {
+                    "cleanup_pending"
+                } else {
+                    "staged"
+                }
             } else if self.status == ProvisionalStatus::Dispatching {
                 "dispatching"
             } else if self.status == ProvisionalStatus::Armed {
@@ -454,8 +459,9 @@ impl ProvisionalRegistry {
         v
     }
 
-    /// Operator-facing rows, newest first. Pre-handoff staging and the finite
-    /// dispatch classification window remain internal implementation state.
+    /// Operator-facing rows, newest first. Ordinary pre-handoff staging and
+    /// the finite dispatch classification window remain internal; unresolved
+    /// staged cleanup is visible as inert recovery state.
     pub fn visible_list(&self) -> Vec<Provisional> {
         self.list()
             .into_iter()
@@ -673,6 +679,41 @@ impl ProvisionalRegistry {
         due
     }
 
+    /// Inert staging rows whose bounded cleanup retry is due. Dispatch markers
+    /// are excluded because they may represent an upstream side effect.
+    pub fn staged_cleanup_due_handles(&self, now: u64, max_age_secs: u64) -> Vec<String> {
+        let mut due = self
+            .items
+            .values()
+            .filter(|p| {
+                p.status == ProvisionalStatus::Staged
+                    && !p.forward_done
+                    && now.saturating_sub(p.created_unix) >= max_age_secs
+            })
+            .map(|p| p.handle.clone())
+            .collect::<Vec<_>>();
+        due.sort();
+        due
+    }
+
+    /// Dispatch markers older than the finite upstream handoff bound need a
+    /// durable indeterminate classification. They are never cancelled because
+    /// the upstream may have accepted the mutation.
+    pub fn dispatch_classification_due_handles(&self, now: u64, max_age_secs: u64) -> Vec<String> {
+        let mut due = self
+            .items
+            .values()
+            .filter(|p| {
+                p.status == ProvisionalStatus::Dispatching
+                    && !p.forward_done
+                    && now.saturating_sub(p.created_unix) >= max_age_secs
+            })
+            .map(|p| p.handle.clone())
+            .collect::<Vec<_>>();
+        due.sort();
+        due
+    }
+
     /// Sweeper tick: claim every `Armed` provisional whose forward command has
     /// run and whose deadline has passed, transitioning each to `Reverting`, and
     /// return them so the daemon can run their reverts. The startup grace is the
@@ -820,6 +861,13 @@ mod tests {
         assert!(registry.confirm(&row.handle).is_err());
         assert!(registry.begin_revert(&row.handle).is_err());
         assert!(registry.due_handles(u64::MAX).is_empty());
+        assert!(registry
+            .dispatch_classification_due_handles(189, 90)
+            .is_empty());
+        assert_eq!(
+            registry.dispatch_classification_due_handles(190, 90),
+            vec![row.handle.clone()]
+        );
 
         let (recovered, moved) = ProvisionalRegistry::from_rows(vec![row]);
         assert_eq!(moved, vec!["dispatching".to_string()]);
@@ -858,6 +906,11 @@ mod tests {
         assert!(live.visible_list().is_empty());
         assert!(live.confirm(&row.handle).is_err());
         assert!(live.begin_revert(&row.handle).is_err());
+        assert!(live.staged_cleanup_due_handles(129, 30).is_empty());
+        assert_eq!(
+            live.staged_cleanup_due_handles(130, 30),
+            vec![row.handle.clone()]
+        );
 
         let (recovered, moved, retired) = ProvisionalRegistry::recover_rows(vec![row]);
         assert!(moved.is_empty());

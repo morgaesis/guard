@@ -2023,7 +2023,7 @@ impl SessionStore {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn fail_next_provisional_delete_for_test(&self) {
         self.fail_next_provisional_delete
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2201,6 +2201,41 @@ impl SessionStore {
         })
         .await
         .context("delete_provisional task failed")?
+    }
+
+    /// Delete only the exact inert document observed by the caller. A durable
+    /// dispatch transition makes the predicate false, so cleanup cannot erase
+    /// evidence after upstream handoff becomes possible.
+    pub async fn compare_and_delete_provisional(&self, mut expected: Provisional) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_provisional_delete
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated provisional-delete failure");
+        }
+        expected.sanitize_explanatory_text();
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            if expected.status != ProvisionalStatus::Staged || expected.forward_done {
+                anyhow::bail!("only an exact inert staged provisional may be cancelled");
+            }
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let expected_json =
+                serde_json::to_string(&expected).context("encode staged provisional")?;
+            let changed = conn.execute(
+                "DELETE FROM gating_provisional
+                 WHERE handle = ?1 AND status = ?2 AND json = ?3",
+                params![expected.handle, expected.status.as_str(), expected_json],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("durable provisional changed before staged cancellation");
+            }
+            Ok(())
+        })
+        .await
+        .context("cancel staged provisional task failed")?
     }
 
     pub async fn load_provisionals(&self) -> Result<Vec<Provisional>> {
@@ -2695,12 +2730,14 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
     }
     let legal_status = matches!(
         (previous.status, next.status),
-        (ProvisionalStatus::Staged, ProvisionalStatus::Dispatching)
+        (ProvisionalStatus::Staged, ProvisionalStatus::Staged)
+            | (ProvisionalStatus::Staged, ProvisionalStatus::Dispatching)
             | (ProvisionalStatus::Dispatching, ProvisionalStatus::Armed)
             | (
                 ProvisionalStatus::Dispatching,
                 ProvisionalStatus::NeedsOperatorDecision
             )
+            | (ProvisionalStatus::Dispatching, ProvisionalStatus::Reverted)
             | (ProvisionalStatus::Armed, ProvisionalStatus::Armed)
             | (ProvisionalStatus::Armed, ProvisionalStatus::Reverting)
             | (ProvisionalStatus::Armed, ProvisionalStatus::Confirmed)

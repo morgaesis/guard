@@ -193,7 +193,7 @@ impl ApiShape {
             subresource: summary.subresource.clone(),
             namespace: summary.namespace.clone(),
             authority_selectors: summary.authority_selectors.clone(),
-            body_shape: summary.redacted_body_shape.clone(),
+            body_shape: summary.coverage_body_shape.clone(),
         }
     }
 
@@ -1034,7 +1034,9 @@ mod tests {
             name: Some(name.to_string()),
             dry_run: false,
             authority_selectors: BTreeMap::new(),
+            coverage_body_shape: "{\"spec\":{\"replicas\":<number>}}".to_string(),
             redacted_body_shape: "{\"spec\":{\"replicas\":<number>}}".to_string(),
+            authorized_body_sha256: "digest".to_string(),
             revert_constructible: RevertConstructible::RestorePriorState,
             rarity: false,
             endpoint: "default".to_string(),
@@ -1575,8 +1577,28 @@ mod tests {
 
         // Same verb/resource/namespace, different body structure: not covered.
         let mut other = summary("api");
+        other.coverage_body_shape = "{\"spec\":{\"image\":<string>}}".to_string();
         other.redacted_body_shape = "{\"spec\":{\"image\":<string>}}".to_string();
         assert!(store.learned_allow(&other, "").is_none());
+    }
+
+    #[test]
+    fn guard_preconditions_do_not_change_the_stable_coverage_bucket() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let mut store =
+            ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
+        let base = summary("api");
+        for _ in 0..2 {
+            store
+                .record_allow(&base, Some(1), Some(Reversibility::Reversible), "ok", "")
+                .unwrap();
+        }
+        let mut guarded = base.clone();
+        guarded.redacted_body_shape =
+            "{\"metadata\":{\"resourceVersion\":<string>},\"spec\":{\"replicas\":<number>}}"
+                .to_string();
+        guarded.authorized_body_sha256 = "different-final-digest".to_string();
+        assert!(store.learned_allow(&guarded, "").is_some());
     }
 
     #[test]
