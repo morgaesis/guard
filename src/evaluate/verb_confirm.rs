@@ -1,10 +1,16 @@
 //! Verb-promotion confirmation: LLM vetting and naming of mechanically derived verb templates.
 
-use super::client::{provider_error_excerpt, sanitize_provider_error};
+use super::client::{
+    bounded_response_text, parse_provider_json, provider_error_excerpt, sanitize_provider_error,
+    truncate,
+};
 use super::redact::redact_for_llm;
 use super::Evaluator;
 use crate::gating::allow_promotion::{self, AllowPromotionOutcome};
-use crate::gating::verb::{validate_auto_promoted_verb_safety, ParamSpec, Verb, VerbCommand};
+use crate::gating::verb::{
+    canonical_auto_promoted_consequence, validate_auto_promoted_verb_safety, ParamSpec, Verb,
+    VerbCommand,
+};
 use crate::gating::Reversibility;
 use crate::learned_rules::run_async_durable_store_operation;
 use anyhow::{bail, Result};
@@ -103,8 +109,8 @@ impl Evaluator {
     /// literal bucket (no varying position) needs no model judgment and is
     /// built directly. Otherwise the model is consulted once, purely to name
     /// the verb, write its description, confirm the generalization is
-    /// coherent for this binary, and -- for a `Recoverable` outcome -- propose
-    /// a revert. The result is re-validated from scratch by
+    /// coherent for this binary. Rollbacks are never accepted as unattended
+    /// promotion authority. The result is re-validated from scratch by
     /// `validate_auto_promoted_verb_safety` regardless of what the model
     /// returned. Returns `Ok(None)` when the model declined or nothing
     /// changed (not an error: the bucket keeps accumulating for next time).
@@ -205,7 +211,7 @@ impl Evaluator {
             if outcome.class == Reversibility::Recoverable && revert.is_none() {
                 // The model didn't propose a revert for a recoverable shape;
                 // nothing safe to promote without one.
-                return Ok(None);
+                bail!("a recoverable verb may not be auto-promoted without a validated revert");
             }
             // A reversible shape has no use for a revert (it executes
             // immediately regardless -- see `decide_gate`); discard one if
@@ -239,6 +245,17 @@ impl Evaluator {
             )
         };
 
+        // Promotion authority must not be created from a model's consequence
+        // label. The local matcher classifier is deliberately fail-closed:
+        // only a statically read-only command can skip live evaluation. A
+        // mutating command remains under operator review, and a model-proposed
+        // rollback is never granted unattended authority.
+        if outcome.class == Reversibility::Recoverable {
+            validate_auto_promoted_verb_safety(&verb, &outcome.samples)?;
+        }
+        if canonical_auto_promoted_consequence(&verb) != outcome.class {
+            return Ok(None);
+        }
         validate_auto_promoted_verb_safety(&verb, &outcome.samples)?;
         Ok(Some(verb))
     }
@@ -259,8 +276,7 @@ impl Evaluator {
             .await
             .map_err(|e| anyhow::anyhow!("transport error: {e}"))?;
         let status = response.status();
-        let text = response
-            .text()
+        let text = bounded_response_text(response)
             .await
             .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
         if !status.is_success() {
@@ -270,16 +286,20 @@ impl Evaluator {
                 provider_error_excerpt(&text, 200)
             );
         }
-        let parsed: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
+        let parsed = parse_provider_json(&text)
+            .map_err(|e| anyhow::anyhow!("non-JSON response: {}", truncate(&e, 4096)))?;
         let args_str = parsed
             .pointer("/choices/0/message/tool_calls/0/function/arguments")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 anyhow::anyhow!("model did not return a confirm_verb_promotion tool call")
             })?;
-        let args: serde_json::Value = serde_json::from_str(args_str)
-            .map_err(|e| anyhow::anyhow!("tool-call arguments were not valid JSON: {e}"))?;
+        let args = parse_provider_json(args_str).map_err(|e| {
+            anyhow::anyhow!(
+                "tool-call arguments were not valid JSON: {}",
+                truncate(&e, 4096)
+            )
+        })?;
         let confident = args
             .get("confident")
             .and_then(|v| v.as_bool())

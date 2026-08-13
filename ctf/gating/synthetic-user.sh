@@ -3,6 +3,9 @@
 set -euo pipefail
 
 SOCKET=/scenario/run/guard.sock
+PROTECTED_CATALOG_DIR=/scenario/journey/protected-catalog
+PROTECTED_CATALOG="$PROTECTED_CATALOG_DIR/verbs.yaml"
+PROTECTED_CATALOG_LOCK="$PROTECTED_CATALOG_DIR/.verbs.yaml.learning-lock"
 SCENARIO="${2:-}"
 RAW="/scenario/raw/$SCENARIO.log"
 PRINCIPAL_ROOT="/scenario/principals/$(id -u)"
@@ -85,8 +88,39 @@ EOF
   chmod 0755 /scenario/bin/*
 }
 
+assert_protected_catalog_as_daemon() {
+  local replacement marker
+  [ "$(id -u)" -eq 1000 ]
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_DIR")" = '0:555' ]
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG")" = '0:644' ]
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_LOCK")" = '1000:600' ]
+
+  replacement=/tmp/protected-catalog-replacement
+  marker=/tmp/protected-catalog-lock-marker
+  printf 'replacement must not install\n' > "$replacement"
+  rm -f "$marker"
+  if printf blocked > "$PROTECTED_CATALOG" \
+    || rm -f "$PROTECTED_CATALOG" \
+    || mv "$replacement" "$PROTECTED_CATALOG" \
+    || mkdir "$PROTECTED_CATALOG_DIR/unauthorized" \
+    || rmdir "$PROTECTED_CATALOG_DIR" \
+    || mv "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG_DIR-replaced"; then
+    rm -f "$replacement" "$marker"
+    echo 'protected catalog preflight accepted an unauthorized mutation' >&2
+    return 1
+  fi
+  [ -f "$PROTECTED_CATALOG" ]
+  exec 9>"$PROTECTED_CATALOG_LOCK"
+  flock -n 9
+  printf lock-opened > "$marker"
+  [ "$(cat "$marker")" = lock-opened ]
+  exec 9>&-
+  rm -f "$replacement" "$marker"
+}
+
 daemon() {
   setup_fixture
+  assert_protected_catalog_as_daemon
   export HOME=/scenario/home
   export XDG_CONFIG_HOME=/scenario/config
   export XDG_DATA_HOME=/scenario/data
@@ -107,7 +141,7 @@ daemon() {
     "${evaluator_args[@]}" \
     --gate consequence \
     --socket "$SOCKET" \
-    --verbs /etc/guard/verbs.yaml \
+    --verbs "$PROTECTED_CATALOG" \
     --state-db /scenario/data/state.db \
     --audit-log /scenario/data/audit.jsonl \
     --history-retention 3600 \
@@ -406,7 +440,7 @@ private_daemon_start() {
       --no-llm \
       --gate consequence \
       --socket "$PRIVATE_SOCKET" \
-      --verbs /etc/guard/verbs.yaml \
+      --verbs "$PROTECTED_CATALOG" \
       --state-db "$PRIVATE_ROOT/data/state.db" \
       --audit-log "$PRIVATE_ROOT/data/audit.jsonl" \
       --history-retention 3600 \
@@ -457,7 +491,7 @@ phase_su13() {
   case "$phase" in
     request)
       [ "$(id -u)" -eq 1001 ]
-      sha256sum /etc/guard/verbs.yaml | awk '{print $1}' > /scenario/journey/catalog.before
+      sha256sum "$PROTECTED_CATALOG" | awk '{print $1}' > /scenario/journey/catalog.before
       save_request synthesized 'Run the isolated novel diagnostic'
       grep -q 'novelctl' /scenario/journey/synthesized-request.out
       ;;
@@ -533,7 +567,7 @@ phase_su13() {
       ;;
     verify)
       [ "$(id -u)" -eq 1000 ]
-      sha256sum /etc/guard/verbs.yaml | awk '{print $1}' > /scenario/journey/catalog.after
+      sha256sum "$PROTECTED_CATALOG" | awk '{print $1}' > /scenario/journey/catalog.after
       cmp /scenario/journey/catalog.before /scenario/journey/catalog.after
       run_test_filter synthesized_verbs_default_to_session_scope
       run_test_filter legacy_session_revision_fixture_is_stable
@@ -1301,7 +1335,7 @@ phase_su22() {
         timeout 5 "$PRIVATE_ROOT/current" server start --no-llm \
           --gate consequence \
           --socket "$PRIVATE_ROOT/not-a-directory/guard.sock" \
-          --verbs /etc/guard/verbs.yaml \
+          --verbs "$PROTECTED_CATALOG" \
           --state-db "$PRIVATE_ROOT/data/state.db" \
           --audit-log "$PRIVATE_ROOT/data/audit.jsonl" \
           --users 1001,1002 \
@@ -1488,6 +1522,23 @@ prepare_principals() {
   chown -R 1000:1000 /scenario/home /scenario/config /scenario/data /scenario/raw \
     /scenario/fixtures /scenario/bin /scenario/ansible /scenario/run
   chown 1000:1000 /scenario
+
+  # Keep the operator catalog immutable while giving DestinationLock a
+  # daemon-owned writable sidecar on the mounted scenario volume.
+  mkdir -p "$PROTECTED_CATALOG_DIR"
+  cp /etc/guard/verbs.yaml "$PROTECTED_CATALOG"
+  chown 0:0 "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG"
+  chmod 0644 "$PROTECTED_CATALOG"
+  install -m 0600 /dev/null "$PROTECTED_CATALOG_LOCK"
+  chown 1000:1000 "$PROTECTED_CATALOG_LOCK"
+  chmod 0555 "$PROTECTED_CATALOG_DIR"
+
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_DIR")" = '0:555' ]
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG")" = '0:644' ]
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_LOCK")" = '1000:600' ]
+  [ "$(stat -c '%u:%a' /scenario/journey)" = '0:1777' ]
+  [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
+    "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
 }
 
 collect_phase() {

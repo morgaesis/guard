@@ -308,24 +308,38 @@ async fn stop_test_daemon(mut daemon: DaemonGuard, socket_path: &std::path::Path
 }
 
 async fn restart_output(tmp: &TempDir, socket_path: &std::path::Path) -> std::process::Output {
-    timeout(
-        Duration::from_secs(10),
-        Command::new(GUARD_BIN)
-            .args(["server", "start", "--no-llm", "--policy"])
-            .arg(tmp.path().join("policy.yaml"))
-            .arg("--socket")
-            .arg(socket_path)
-            .arg("--state-db")
-            .arg(tmp.path().join("state.db"))
-            .arg("--verbs")
-            .arg(tmp.path().join("verbs.yaml"))
-            .env("HOME", tmp.path())
-            .env("XDG_CONFIG_HOME", tmp.path())
-            .output(),
-    )
-    .await
-    .expect("daemon restart validation timed out")
-    .expect("run daemon restart")
+    let mut child = Command::new(GUARD_BIN)
+        .args(["server", "start", "--no-llm", "--policy"])
+        .arg(tmp.path().join("policy.yaml"))
+        .arg("--socket")
+        .arg(socket_path)
+        .arg("--state-db")
+        .arg(tmp.path().join("state.db"))
+        .arg("--verbs")
+        .arg(tmp.path().join("verbs.yaml"))
+        .env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn daemon restart");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("poll daemon restart").is_some() {
+            return child
+                .wait_with_output()
+                .await
+                .expect("collect daemon restart output");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            panic!("daemon restart validation timed out");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

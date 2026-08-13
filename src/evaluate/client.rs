@@ -15,6 +15,11 @@ use std::time::Duration;
 /// Per-attempt backoff schedule (seconds). Index = attempt number (0 = first retry).
 /// The initial attempt is not delayed.
 const BACKOFF_SECONDS: [f64; 3] = [0.5, 1.5, 4.5];
+pub(super) const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_PROVIDER_JSON_DEPTH: usize = 32;
+pub(super) const MAX_PROVIDER_CONTAINER_ITEMS: usize = 1024;
+pub(super) const MAX_PROVIDER_STRING_BYTES: usize = 64 * 1024;
+pub(super) const MAX_PROVIDER_DIAGNOSTIC_BYTES: usize = 4096;
 
 /// Classifies why a single LLM attempt failed, so the retry loop can decide
 /// whether to retry at all and whether to downgrade from function-calling to
@@ -119,7 +124,7 @@ impl Evaluator {
             }
             Ok(resp) => {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+                let body = bounded_response_text(resp).await.unwrap_or_default();
                 tracing::warn!(
                     "LLM API returned {}: {}",
                     status,
@@ -374,10 +379,9 @@ impl Evaluator {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
 
-        let response_text = response
-            .text()
+        let response_text = bounded_response_text(response)
             .await
-            .map_err(|e| AttemptError::Transport(e.to_string()))?;
+            .map_err(AttemptError::Transport)?;
 
         if status.as_u16() == 429 {
             return Err(AttemptError::RateLimited { retry_after });
@@ -415,8 +419,9 @@ impl Evaluator {
             )));
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| AttemptError::ParseError(format!("non-JSON response: {}", e)))?;
+        let parsed = parse_provider_json(&response_text).map_err(|error| {
+            AttemptError::ParseError(truncate(&error, MAX_PROVIDER_DIAGNOSTIC_BYTES))
+        })?;
 
         let usage = extract_usage(&parsed);
 
@@ -430,7 +435,10 @@ impl Evaluator {
         }
 
         let decision = parse_decision_response(&parsed, use_function_calling).map_err(|e| {
-            AttemptError::ParseError(format!("{}; {}", e, response_shape_summary(&parsed)))
+            AttemptError::ParseError(truncate(
+                &format!("{}; {}", e, response_shape_summary(&parsed)),
+                MAX_PROVIDER_DIAGNOSTIC_BYTES,
+            ))
         })?;
 
         Ok((decision, usage))
@@ -503,9 +511,117 @@ pub(super) fn provider_error_excerpt(body: &str, max: usize) -> String {
     truncate(&sanitize_provider_error(body), max)
 }
 
+pub(super) async fn bounded_response_text(
+    mut response: reqwest::Response,
+) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+    {
+        return Err("provider response exceeded the bounded byte limit".to_string());
+    }
+    let mut bytes = Vec::with_capacity(MAX_PROVIDER_RESPONSE_BYTES.min(8192));
+    while let Some(chunk) = response.chunk().await.map_err(sanitize_provider_error)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err("provider response exceeded the bounded byte limit".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| "provider response was not valid UTF-8 within the byte limit".to_string())
+}
+
+pub(super) fn parse_provider_json(text: &str) -> Result<serde_json::Value, String> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let mut quoted = false;
+    for byte in text.bytes() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                if depth > MAX_PROVIDER_JSON_DEPTH {
+                    return Err(
+                        "provider response JSON nesting exceeded the structure limit".to_string(),
+                    );
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if quoted || depth != 0 {
+        return Err("provider response JSON was incomplete".to_string());
+    }
+    let value = serde_json::from_str(text)
+        .map_err(|error| format!("provider response JSON was invalid: {error}"))?;
+    validate_provider_json_shape(&value, 0)?;
+    Ok(value)
+}
+
+fn validate_provider_json_shape(value: &serde_json::Value, depth: usize) -> Result<(), String> {
+    if depth > MAX_PROVIDER_JSON_DEPTH {
+        return Err("provider response JSON nesting exceeded the structure limit".to_string());
+    }
+    match value {
+        serde_json::Value::Array(values) => {
+            if values.len() > MAX_PROVIDER_CONTAINER_ITEMS {
+                return Err("provider response JSON array exceeded the structure limit".to_string());
+            }
+            for value in values {
+                validate_provider_json_shape(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if values.len() > MAX_PROVIDER_CONTAINER_ITEMS {
+                return Err(
+                    "provider response JSON object exceeded the structure limit".to_string()
+                );
+            }
+            for (key, value) in values {
+                if key.len() > MAX_PROVIDER_STRING_BYTES {
+                    return Err(
+                        "provider response JSON key exceeded the structure limit".to_string()
+                    );
+                }
+                validate_provider_json_shape(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::String(value) if value.len() > MAX_PROVIDER_STRING_BYTES => {
+            return Err("provider response JSON string exceeded the structure limit".to_string());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{parse_provider_json, MAX_PROVIDER_STRING_BYTES};
     use crate::evaluate::{EvalConfig, EvalResult, Evaluator};
+
+    #[test]
+    fn provider_json_shape_limits_string_and_container_growth() {
+        let oversized = serde_json::json!({
+            "choices": [{"message": {"content": "x".repeat(MAX_PROVIDER_STRING_BYTES + 1)}}]
+        });
+        assert!(parse_provider_json(&oversized.to_string()).is_err());
+
+        let many = serde_json::json!({
+            "items": (0..=1024).collect::<Vec<_>>()
+        });
+        assert!(parse_provider_json(&many.to_string()).is_err());
+    }
 
     // --- Retry loop tests using a mock HTTP server ---
 

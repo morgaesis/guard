@@ -1,6 +1,9 @@
 //! Tolerant parsing of provider responses into decisions.
 
-use super::client::{provider_error_excerpt, sanitize_provider_error, truncate};
+use super::client::{
+    provider_error_excerpt, sanitize_provider_error, truncate, MAX_PROVIDER_DIAGNOSTIC_BYTES,
+    MAX_PROVIDER_STRING_BYTES,
+};
 use super::result::LlmResponse;
 use crate::gating::Reversibility;
 use anyhow::{bail, Context, Result};
@@ -68,7 +71,7 @@ pub fn provider_refusal_response(parsed: &serde_json::Value) -> Option<LlmRespon
 pub fn response_shape_summary(parsed: &serde_json::Value) -> String {
     let top_keys = parsed
         .as_object()
-        .map(|obj| obj.keys().cloned().collect::<Vec<_>>().join(","))
+        .map(bounded_key_list)
         .unwrap_or_else(|| "<non-object>".to_string());
     let choice_count = parsed
         .get("choices")
@@ -78,11 +81,12 @@ pub fn response_shape_summary(parsed: &serde_json::Value) -> String {
     let finish_reason = parsed
         .pointer("/choices/0/finish_reason")
         .and_then(|v| v.as_str())
-        .unwrap_or("<none>");
+        .map(|value| truncate(value, 128))
+        .unwrap_or_else(|| "<none>".to_string());
     let message_keys = parsed
         .pointer("/choices/0/message")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.keys().cloned().collect::<Vec<_>>().join(","))
+        .map(bounded_key_list)
         .unwrap_or_else(|| "<none>".to_string());
     let content_kind = match parsed.pointer("/choices/0/message/content") {
         Some(value) if value.is_null() => "null",
@@ -96,10 +100,30 @@ pub fn response_shape_summary(parsed: &serde_json::Value) -> String {
         .and_then(|v| v.as_array())
         .map(Vec::len)
         .unwrap_or(0);
-    format!(
+    truncate(&format!(
         "response_shape=top_keys:[{}] choices:{} finish_reason:{} message_keys:[{}] content:{} tool_calls:{}",
         top_keys, choice_count, finish_reason, message_keys, content_kind, tool_call_count
-    )
+    ), MAX_PROVIDER_DIAGNOSTIC_BYTES)
+}
+
+fn bounded_key_list(object: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut output = String::new();
+    for key in object.keys() {
+        let key = truncate(key, 128);
+        let separator = if output.is_empty() { "" } else { "," };
+        if output
+            .len()
+            .saturating_add(separator.len())
+            .saturating_add(key.len())
+            > MAX_PROVIDER_DIAGNOSTIC_BYTES
+        {
+            output.push_str(",<truncated>");
+            break;
+        }
+        output.push_str(separator);
+        output.push_str(&key);
+    }
+    output
 }
 
 /// Compact summary of a provider-embedded `error` object (an HTTP-200 body
@@ -113,12 +137,17 @@ pub fn provider_error_summary(parsed: &serde_json::Value) -> String {
     let code = parsed
         .pointer("/error/code")
         .and_then(|v| v.as_str())
-        .unwrap_or("<none>");
+        .map(|value| truncate(value, 128))
+        .unwrap_or_else(|| "<none>".to_string());
     let error_type = parsed
         .pointer("/error/type")
         .and_then(|v| v.as_str())
-        .unwrap_or("<none>");
-    sanitize_provider_error(format!("{} (code={}, type={})", message, code, error_type))
+        .map(|value| truncate(value, 128))
+        .unwrap_or_else(|| "<none>".to_string());
+    truncate(
+        &sanitize_provider_error(format!("{} (code={}, type={})", message, code, error_type)),
+        MAX_PROVIDER_DIAGNOSTIC_BYTES,
+    )
 }
 
 /// Parse a function-calling response: `choices[0].message.tool_calls[0].function.arguments`
@@ -138,6 +167,10 @@ fn parse_tool_call(parsed: &serde_json::Value) -> Result<LlmResponse> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    if fn_name.len() > MAX_PROVIDER_STRING_BYTES {
+        bail!("tool call name exceeded the provider field limit");
+    }
+
     if fn_name != "decide" {
         bail!("unexpected tool call: {}", fn_name);
     }
@@ -146,6 +179,9 @@ fn parse_tool_call(parsed: &serde_json::Value) -> Result<LlmResponse> {
         .pointer("/function/arguments")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("no arguments in tool call"))?;
+    if args_str.len() > MAX_PROVIDER_STRING_BYTES {
+        bail!("tool call arguments exceeded the provider field limit");
+    }
 
     // Tool-call arguments are always a JSON string in the OpenAI protocol; parse
     // strictly first, fall back to lax for small model deviations.
@@ -184,6 +220,9 @@ fn parse_json_content(parsed: &serde_json::Value) -> Result<LlmResponse> {
 /// parts holding text as bare strings, `{"text": ...}`, or `{"content": ...}`.
 fn message_content_to_text(value: &serde_json::Value) -> Result<String> {
     if let Some(s) = value.as_str() {
+        if s.len() > MAX_PROVIDER_STRING_BYTES {
+            bail!("message content exceeded the provider field limit");
+        }
         return Ok(s.to_string());
     }
 
@@ -191,14 +230,23 @@ fn message_content_to_text(value: &serde_json::Value) -> Result<String> {
         let mut text = String::new();
         for part in parts {
             if let Some(s) = part.as_str() {
+                if text.len().saturating_add(s.len()) > MAX_PROVIDER_STRING_BYTES {
+                    bail!("message content exceeded the provider field limit");
+                }
                 text.push_str(s);
                 continue;
             }
             if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
+                if text.len().saturating_add(s.len()) > MAX_PROVIDER_STRING_BYTES {
+                    bail!("message content exceeded the provider field limit");
+                }
                 text.push_str(s);
                 continue;
             }
             if let Some(s) = part.get("content").and_then(|v| v.as_str()) {
+                if text.len().saturating_add(s.len()) > MAX_PROVIDER_STRING_BYTES {
+                    bail!("message content exceeded the provider field limit");
+                }
                 text.push_str(s);
             }
         }
@@ -216,6 +264,9 @@ fn decision_from_value(value: &serde_json::Value) -> Result<LlmResponse> {
         .get("decision")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'decision' field"))?;
+    if decision_raw.len() > MAX_PROVIDER_STRING_BYTES {
+        bail!("decision value exceeded the provider field limit");
+    }
     let decision = match decision_raw.trim().to_ascii_uppercase().as_str() {
         "APPROVE" => "APPROVE".to_string(),
         "DENY" => "DENY".to_string(),
@@ -227,6 +278,7 @@ fn decision_from_value(value: &serde_json::Value) -> Result<LlmResponse> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let reason = truncate(&reason, MAX_PROVIDER_DIAGNOSTIC_BYTES);
 
     // Provider-controlled authorization input must be range-checked before
     // narrowing. Missing, non-integral, negative, and oversized scores all
@@ -245,6 +297,7 @@ fn decision_from_value(value: &serde_json::Value) -> Result<LlmResponse> {
     let reversibility = value
         .get("reversibility")
         .and_then(|v| v.as_str())
+        .filter(|value| value.len() <= MAX_PROVIDER_STRING_BYTES)
         .and_then(Reversibility::parse_lenient);
 
     Ok(LlmResponse {
@@ -416,6 +469,18 @@ mod tests {
             provider_error_summary(&resp),
             "Forbidden (code=forbidden, type=upstream_error)"
         );
+    }
+
+    #[test]
+    fn provider_parser_rejects_oversized_fields_before_decision_use() {
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": format!("{{\"decision\":\"APPROVE\",\"reason\":\"{}\"}}", "x".repeat(super::MAX_PROVIDER_STRING_BYTES + 1))
+                }
+            }]
+        });
+        assert!(parse_json_content(&response).is_err());
     }
 
     #[test]

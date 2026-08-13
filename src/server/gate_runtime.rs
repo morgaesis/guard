@@ -608,7 +608,8 @@ async fn converge_terminal_revert_body_cleanup(
     else {
         return false;
     };
-    if current.status != expected.status
+    if !current.status.is_lifecycle_final()
+        || current.status != expected.status
         || current
             .api_revert
             .as_ref()
@@ -650,7 +651,7 @@ pub(super) async fn persist_terminal_provisional_with_body_cleanup(
     expected: Provisional,
     mut next: Provisional,
 ) -> Result<bool, String> {
-    if !next.status.is_terminal() {
+    if !next.status.is_lifecycle_final() {
         return Err("rollback-body cleanup requires a terminal provisional".to_string());
     }
     mark_revert_body_cleanup_pending(&mut next);
@@ -1406,7 +1407,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         handoff: &mut dyn guard::proxy::ApiForwardHandoff,
     ) -> Result<(), String> {
         let transition_gate = self.server.provisional_transition_gate(handle);
-        let transition =
+        let _transition =
             tokio::time::timeout(std::time::Duration::from_secs(5), transition_gate.lock())
                 .await
                 .map_err(|_| "provisional cleanup authority lock timed out".to_string())?;
@@ -1432,10 +1433,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
             return Err("provisional cleanup lacks an exact UID precondition".to_string());
         }
         // This exact row/UID/provenance comparison is the cleanup admission
-        // point. The per-handle coordinator is released before network I/O;
-        // later revocation applies to later cleanup attempts and publication
-        // still revalidates the created-resource registry.
-        drop(transition);
+        // point. Keep the per-handle coordinator through the finite upstream
+        // handoff so confirm, revert, and resolution cannot retire this exact
+        // cleanup authority before the request is initiated. The lock is
+        // handle-scoped and is never held while streaming the response body.
         handoff.forward().await
     }
 }
@@ -3448,7 +3449,7 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
             .list()
             .into_iter()
             .filter(|row| {
-                row.status.is_terminal()
+                row.status.is_lifecycle_final()
                     && row
                         .revert_detail
                         .as_deref()
@@ -4152,18 +4153,26 @@ pub(super) async fn finish_revert(
         reg.get(&p.handle).cloned()
     };
     if let Some(u) = &updated {
-        if !persist_terminal_provisional_with_body_cleanup(server, p.clone(), u.clone())
-            .await
-            .unwrap_or(false)
-        {
+        let persistence =
+            persist_terminal_provisional_with_body_cleanup(server, p.clone(), u.clone()).await;
+        let persistence_failure = match persistence {
+            Ok(true) => None,
+            Ok(false) => Some(
+                "live provisional state changed before the terminal transition committed"
+                    .to_string(),
+            ),
+            Err(error) => Some(bounded_persistence_diagnostic(&error)),
+        };
+        if let Some(diagnostic) = persistence_failure {
             tracing::error!(
-                "rollback for provisional {} completed but its terminal state was not durable",
-                p.handle
+                "rollback for provisional {} completed but its terminal state was not durable: {}",
+                p.handle,
+                diagnostic
             );
             return (
                 format!(
-                    "provisional {} rollback completed but its terminal state could not be recorded",
-                    p.handle
+                    "provisional {} rollback completed but its terminal state could not be recorded: {}",
+                    p.handle, diagnostic
                 ),
                 exit,
             );
@@ -4223,6 +4232,20 @@ pub(super) async fn finish_revert(
             exit,
         )
     }
+}
+
+const MAX_PERSISTENCE_DIAGNOSTIC_CHARS: usize = 512;
+
+fn bounded_persistence_diagnostic(error: &str) -> String {
+    let redacted = guard::redact::redact_output_text(error);
+    let mut diagnostic = redacted
+        .chars()
+        .take(MAX_PERSISTENCE_DIAGNOSTIC_CHARS)
+        .collect::<String>();
+    if redacted.chars().count() > MAX_PERSISTENCE_DIAGNOSTIC_CHARS {
+        diagnostic.push('…');
+    }
+    diagnostic
 }
 
 #[cfg(test)]

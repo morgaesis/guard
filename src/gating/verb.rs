@@ -1904,6 +1904,16 @@ pub fn canonical_generated_access_consequence(verb: &Verb) -> Reversibility {
     }
 }
 
+/// Derive the only consequence an automatically promoted command may carry.
+/// Auto-promoted verbs also contain coverage metadata for display, but that
+/// metadata is not executable matcher authority and must not make a command
+/// appear safer than its binary and argv shape prove.
+pub fn canonical_auto_promoted_consequence(verb: &Verb) -> Reversibility {
+    let mut matcher = verb.clone();
+    matcher.coverage.clear();
+    canonical_generated_access_consequence(&matcher)
+}
+
 /// Every concrete argv a generated matcher's template admits, or `None` when
 /// a referenced parameter pattern is not a plain literal enumeration or the
 /// combination space exceeds the bound.
@@ -2683,9 +2693,7 @@ pub fn parse_normalized_generated_access_verb(value: &serde_json::Value) -> Resu
     if normalized.name != generated_access_verb_name(&normalized) {
         bail!("generated access coverage name does not match its matcher digest");
     }
-    if canonical_generated_access_consequence(&normalized) == Reversibility::Reversible
-        && normalized.consequence != Reversibility::Reversible
-    {
+    if canonical_generated_access_consequence(&normalized) != normalized.consequence {
         bail!(
             "generated access coverage consequence does not match the locally derived matcher consequence"
         );
@@ -2743,10 +2751,9 @@ pub fn gate_rejection_guidance(reason: &str) -> Option<&'static str> {
 ///   for operator approval regardless of `trusted`, so promoting one buys no
 ///   latency and only discards the per-instance LLM reasoning a human would
 ///   otherwise see in the hold queue.
-/// - A `Recoverable` verb must carry a `revert`, and the revert's binary is
-///   held to the same shell/interpreter denylist as the forward command --
-///   the auto-revert envelope is what makes trusting a recoverable shape
-///   defensible, so an unverified or shell-based revert defeats the point.
+/// - Model-generated rollback authority is never auto-promoted. Recoverable
+///   commands remain under live inverse assessment or operator review; this
+///   keeps a model-proposed revert from becoming a preauthorized action.
 /// - Every parameter pattern must be a plain alternation of the exact,
 ///   regex-escaped values observed in `evidence` (never a model-authored
 ///   regex) and every evidence sample must re-match its own template -- this
@@ -2761,6 +2768,11 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
             "an irreversible verb may never be auto-promoted: it always holds for operator \
              approval regardless of `trusted`, so promoting it only discards the per-instance \
              LLM reasoning a human reviewer would otherwise see"
+        );
+    }
+    if verb.consequence == Reversibility::Recoverable {
+        bail!(
+            "a recoverable verb may not be auto-promoted; its rollback requires live assessment or operator review"
         );
     }
     if verb
@@ -2783,19 +2795,7 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
     for (pname, spec) in &verb.params {
         validate_param_not_overbroad(pname, spec, "auto-promoted verb")?;
     }
-    match verb.consequence {
-        Reversibility::Recoverable => {
-            let Some(revert) = &verb.revert else {
-                bail!("a recoverable verb may not be auto-promoted without a validated revert");
-            };
-            validate_binary_not_shell(&revert.binary, "auto-promoted verb revert")?;
-            if command_contains_sensitive_literals(&revert.binary, &revert.args) {
-                bail!("an auto-promoted verb revert may not contain literal credential argv");
-            }
-        }
-        Reversibility::Reversible => {}
-        Reversibility::Irreversible => unreachable!("rejected above"),
-    }
+    debug_assert_eq!(verb.consequence, Reversibility::Reversible);
     // Re-render every evidence sample against the verb's own template and
     // confirm it reproduces exactly that sample -- never trust that the
     // caller-supplied template and params actually correspond to the
@@ -4495,6 +4495,19 @@ verbs:
         verb.name = generated_access_verb_name(&verb);
         let mut serialized = serde_json::to_value(canonical_generated_access_verb(verb)).unwrap();
         serialized["consequence"] = serde_json::json!("irreversible");
+        assert!(parse_normalized_generated_access_verb(&serialized)
+            .unwrap_err()
+            .to_string()
+            .contains("locally derived matcher consequence"));
+
+        let mut destructive = synth_verb("kubectl", None, false, "access-generated-fixture");
+        destructive.baseline = false;
+        destructive.args = args_vec(&["delete", "pods"]);
+        destructive.consequence = Reversibility::Reversible;
+        destructive.name = generated_access_verb_name(&destructive);
+        let mut serialized =
+            serde_json::to_value(canonical_generated_access_verb(destructive)).unwrap();
+        serialized["consequence"] = serde_json::json!("reversible");
         assert!(parse_normalized_generated_access_verb(&serialized)
             .unwrap_err()
             .to_string()

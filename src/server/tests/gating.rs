@@ -2296,6 +2296,132 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
         .contains("no running api-proxy for protocol 'github'"));
 }
 
+/// A failed rollback is lifecycle-final but remains outstanding so an operator
+/// can query and resolve the mutation. Its durable row, live registry, audit,
+/// and notification must all record the same failed outcome.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_revert_is_durable_queryable_and_notifies_operator() {
+    let state = tempfile::tempdir().expect("state tempdir");
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .expect("open store");
+    let (mut cfg, _operator, agent) = gating_config(7_015, 1_000);
+    cfg.state.session_store = Some(store.clone());
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    let event_path = state.path().join("notify-event.json");
+    cfg.state.notify_hook = crate::server::runtime::NotifyHook::new(
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("cat > '{}'", event_path.display()),
+        ],
+        5,
+    );
+
+    let mut sink = tokio::io::sink();
+    let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        contain_request("true", &[], RevertSpec::new("false", Vec::new())),
+        agent.principal(),
+        "failed rollback fixture".to_string(),
+        None,
+    )
+    .await;
+    let handle = match result.exec {
+        ExecOutcome::Provisional { handle, .. } => handle,
+        other => panic!("expected provisional, got {other:?}"),
+    };
+    let claimed = cfg
+        .state
+        .provisional
+        .write()
+        .await
+        .begin_revert(&handle)
+        .expect("claim provisional for revert");
+    let durable_armed = store
+        .load_provisionals()
+        .await
+        .expect("load armed provisional")
+        .into_iter()
+        .find(|row| row.handle == handle)
+        .expect("armed provisional row");
+    store
+        .compare_and_swap_provisional(durable_armed, claimed.clone())
+        .await
+        .expect("persist reverting claim");
+
+    let (message, exit) = finish_revert(&cfg, &claimed, &CallerIdentity::Unknown, "auto").await;
+    assert_eq!(exit, Some(1));
+    assert!(message.contains("REVERT FAILED"), "got: {message}");
+
+    let live = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .expect("live failed revert");
+    assert_eq!(live.status, ProvisionalStatus::RevertFailed);
+    assert!(live.status.is_outstanding());
+    assert!(!live.status.is_terminal());
+    assert!(live.status.is_lifecycle_final());
+
+    let durable = store
+        .load_provisionals()
+        .await
+        .expect("load failed revert")
+        .into_iter()
+        .find(|row| row.handle == handle)
+        .expect("durable failed revert");
+    assert_eq!(durable.status, ProvisionalStatus::RevertFailed);
+    assert_eq!(durable.revert_exit, Some(1));
+
+    cfg.state.session_store = None;
+    drop(store);
+    let reopened = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .expect("reopen store");
+    let reloaded = reopened
+        .load_provisionals()
+        .await
+        .expect("reload failed revert")
+        .into_iter()
+        .find(|row| row.handle == handle)
+        .expect("reloaded failed revert");
+    assert_eq!(reloaded.status, ProvisionalStatus::RevertFailed);
+
+    let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl"))
+        .expect("read audit log");
+    assert!(audit.contains("REVERT_FAILED"), "audit: {audit}");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if event_path.exists() {
+                break std::fs::read_to_string(&event_path).expect("read notification event");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("revert notification event timed out");
+    assert!(
+        event.contains("\"event\":\"decision_made\""),
+        "event: {event}"
+    );
+    assert!(
+        event.contains("\"status\":\"revert_failed\""),
+        "event: {event}"
+    );
+}
+
 /// The sweeper executes a due API revert as an HTTP request through the
 /// registered proxy's upstream, carrying the daemon's bearer credential and
 /// the persisted body. This is the success half of the fail-loud test above.

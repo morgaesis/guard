@@ -300,11 +300,17 @@ async fn acquire_durable_store_read_permit(path: &Path) -> Result<OwnedRwLockRea
 }
 
 /// An immutable generation-bound authority snapshot. Acquisition validates the
-/// durable bytes and live epoch under coordination, then releases every
-/// process-wide lock before the caller performs external I/O.
+/// durable bytes and live epoch under coordination, then retains the exact
+/// read coordination until the caller's finite side-effect handoff returns.
+/// This prevents an allow removal or deny insertion from landing between the
+/// authority decision and upstream initiation. The proxy releases the lease
+/// before it streams the response body.
 #[doc(hidden)]
 pub struct AuthorityUseLease<S> {
     snapshot: S,
+    _store_guard: OwnedRwLockReadGuard<S>,
+    _destination_lock: Option<DestinationLock>,
+    _permit: Option<OwnedRwLockReadGuard<()>>,
 }
 
 impl<S> std::ops::Deref for AuthorityUseLease<S> {
@@ -411,10 +417,12 @@ where
             anyhow::bail!("{task} authority changed before its use boundary")
         }
         let snapshot = guard.clone();
-        drop(guard);
-        drop(destination_lock);
-        drop(permit);
-        Ok(AuthorityUseLease { snapshot })
+        Ok(AuthorityUseLease {
+            snapshot,
+            _store_guard: guard,
+            _destination_lock: destination_lock,
+            _permit: permit,
+        })
     })
     .await
     .map_err(|error| anyhow::anyhow!("{task} coordination task failed: {error}"))?

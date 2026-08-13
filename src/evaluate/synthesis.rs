@@ -1,6 +1,9 @@
 //! Auxiliary LLM synthesis: verbs from operator prose and learned deny shapes.
 
-use super::client::{provider_error_excerpt, sanitize_provider_error};
+use super::client::{
+    bounded_response_text, parse_provider_json, provider_error_excerpt, sanitize_provider_error,
+    truncate,
+};
 use super::redact::redact_for_llm;
 use super::Evaluator;
 use crate::gating::deny_shape::DenyLearningOutcome;
@@ -201,8 +204,7 @@ impl Evaluator {
             .await
             .map_err(|e| anyhow::anyhow!("transport error: {e}"))?;
         let status = response.status();
-        let text = response
-            .text()
+        let text = bounded_response_text(response)
             .await
             .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
         if !status.is_success() {
@@ -212,14 +214,18 @@ impl Evaluator {
                 provider_error_excerpt(&text, 200)
             );
         }
-        let parsed: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
+        let parsed = parse_provider_json(&text)
+            .map_err(|e| anyhow::anyhow!("non-JSON response: {}", truncate(&e, 4096)))?;
         let args_str = parsed
             .pointer("/choices/0/message/tool_calls/0/function/arguments")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("model did not return a create_verb tool call"))?;
-        let args: serde_json::Value = serde_json::from_str(args_str)
-            .map_err(|e| anyhow::anyhow!("tool-call arguments were not valid JSON: {e}"))?;
+        let args = parse_provider_json(args_str).map_err(|e| {
+            anyhow::anyhow!(
+                "tool-call arguments were not valid JSON: {}",
+                truncate(&e, 4096)
+            )
+        })?;
         let verb: Verb = serde_json::from_value(args)
             .map_err(|e| anyhow::anyhow!("model output did not match the verb schema: {e}"))?;
         Ok(verb)
@@ -289,8 +295,7 @@ impl Evaluator {
             .await
             .map_err(|e| anyhow::anyhow!("transport error: {e}"))?;
         let status = response.status();
-        let text = response
-            .text()
+        let text = bounded_response_text(response)
             .await
             .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
         if !status.is_success() {
@@ -300,14 +305,18 @@ impl Evaluator {
                 provider_error_excerpt(&text, 200)
             );
         }
-        let parsed: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
+        let parsed = parse_provider_json(&text)
+            .map_err(|e| anyhow::anyhow!("non-JSON response: {}", truncate(&e, 4096)))?;
         let args_str = parsed
             .pointer("/choices/0/message/tool_calls/0/function/arguments")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("model did not return a create_deny_shape tool call"))?;
-        let args: serde_json::Value = serde_json::from_str(args_str)
-            .map_err(|e| anyhow::anyhow!("tool-call arguments were not valid JSON: {e}"))?;
+        let args = parse_provider_json(args_str).map_err(|e| {
+            anyhow::anyhow!(
+                "tool-call arguments were not valid JSON: {}",
+                truncate(&e, 4096)
+            )
+        })?;
         let confident = args
             .get("confident")
             .and_then(|v| v.as_bool())

@@ -1258,13 +1258,13 @@ mod tests {
             independent.clear_generated().unwrap()
         });
         writer_started.acquire().await.unwrap().forget();
-        let cleared = writer.await.unwrap();
         release.add_permits(1);
 
         assert!(matches!(
             decision.await.unwrap(),
             ApiCoverageVerdict::Allow { .. }
         ));
+        let cleared = writer.await.unwrap();
         assert_eq!(cleared, 1);
         assert!(matches!(
             lookup_api_coverage(&store, "", &summary).await,
@@ -1322,13 +1322,13 @@ mod tests {
                 .unwrap()
         });
         writer_started.acquire().await.unwrap().forget();
-        let cleared = writer.await.unwrap();
         release.add_permits(1);
 
         assert!(matches!(
             decision.await.unwrap(),
             ApiJudgeVerdict::Allow { .. }
         ));
+        let cleared = writer.await.unwrap();
         assert_eq!(cleared, 1);
     }
 

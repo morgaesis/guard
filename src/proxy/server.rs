@@ -683,19 +683,20 @@ struct ShapeKey {
 /// Counts request shapes seen over the proxy's lifetime and reports whether a
 /// shape is still under the escalation threshold. `threshold` is the number of
 /// occurrences that must accrue before a shape stops being escalated; 0
-/// disables escalation entirely (the common case). The map is unbounded by
-/// design: the shape space is the operator's own API surface (verb x resource
-/// x namespace) and excludes object names, so it is naturally small.
+/// disables escalation entirely (the common case). The finite FIFO bounds
+/// memory even when an attacker supplies an unbounded stream of distinct
+/// selectors or namespaces.
+const MAX_RARITY_SHAPES: usize = 4096;
 struct RarityTracker {
     threshold: u64,
-    seen: Mutex<HashMap<ShapeKey, u64>>,
+    state: Mutex<(HashMap<ShapeKey, u64>, VecDeque<ShapeKey>)>,
 }
 
 impl RarityTracker {
     fn new(threshold: u64) -> Self {
         Self {
             threshold,
-            seen: Mutex::new(HashMap::new()),
+            state: Mutex::new((HashMap::new(), VecDeque::new())),
         }
     }
 
@@ -711,7 +712,16 @@ impl RarityTracker {
         if !self.enabled() {
             return false;
         }
-        let mut seen = self.seen.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let (seen, order) = &mut *state;
+        if !seen.contains_key(&key) {
+            if seen.len() >= MAX_RARITY_SHAPES {
+                if let Some(oldest) = order.pop_front() {
+                    seen.remove(&oldest);
+                }
+            }
+            order.push_back(key.clone());
+        }
         let count = seen.entry(key).or_insert(0);
         let rare = *count < self.threshold;
         *count = count.saturating_add(1);
@@ -4662,6 +4672,24 @@ mod tests {
             authority_selectors: Default::default(),
         };
         assert!(!t.observe_is_rare(key));
+    }
+
+    #[test]
+    fn rarity_tracker_evicts_distinct_attacker_shapes_at_a_finite_bound() {
+        let t = RarityTracker::new(1);
+        for index in 0..(MAX_RARITY_SHAPES + 100) {
+            let key = ShapeKey {
+                protocol: "kubernetes".to_string(),
+                verb: "get",
+                group: String::new(),
+                resource: format!("resource-{index}"),
+                subresource: None,
+                namespace: Some(format!("namespace-{index}")),
+                authority_selectors: Default::default(),
+            };
+            assert!(t.observe_is_rare(key));
+        }
+        assert!(t.state.lock().unwrap().0.len() <= MAX_RARITY_SHAPES);
     }
 
     #[test]

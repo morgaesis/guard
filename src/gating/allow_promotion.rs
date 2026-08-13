@@ -34,15 +34,10 @@
 //!   deny-shape synthesis, which both trust the model to propose a pattern
 //!   and merely validate it. Nothing here for a model (or a caller nudging
 //!   one through many approved requests) to widen.
-//! - **Which consequence classes are eligible.** Reversible and Recoverable
-//!   only. Irreversible is never even attempted: it always holds for
-//!   operator approval regardless of `trusted` (see `decide_gate`), so
-//!   promoting one buys no latency and only discards the per-instance LLM
-//!   reasoning a human would otherwise see in the hold queue. A Recoverable
-//!   verb may be promoted only with a validated revert, so the auto-revert
-//!   envelope -- not the model's word -- is what absorbs the residual risk
-//!   that a not-yet-observed parameter value behaves differently than the
-//!   evidence.
+//! - **Which consequence classes are eligible.** Only locally proven
+//!   read-only commands are eligible. Irreversible and Recoverable commands
+//!   remain under operator review or live inverse assessment; a model label or
+//!   model-generated rollback never creates unattended authority.
 //! - **Consistency across evidence.** Every approval folded into a bucket
 //!   must agree on the same reversibility class; a bucket that ever saw a
 //!   mixed or irreversible classification is permanently disqualified
@@ -56,8 +51,7 @@
 //! The LLM is still consulted once per promotion attempt with at least one
 //! varying position, but only to name the verb, write its description, judge
 //! whether generalizing over these *specific* varying positions is coherent
-//! for this binary, and -- for a Recoverable verb -- propose a revert. It
-//! never chooses the binary, the args template, the parameter patterns, or
+//! for this binary. It never chooses the binary, the args template, the parameter patterns, or
 //! the consequence class; those are derived here from evidence and re-
 //! validated from scratch regardless of what the model returns (see
 //! `gating::verb::validate_auto_promoted_verb_safety`). A fully literal

@@ -2877,7 +2877,7 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
 }
 
 fn terminal_body_cleanup_transition(previous: &Provisional, next: &Provisional) -> Result<bool> {
-    if previous.status != next.status || !previous.status.is_terminal() {
+    if previous.status != next.status || !previous.status.is_lifecycle_final() {
         return Ok(false);
     }
     let Some(detail) = previous
@@ -3232,17 +3232,13 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
         }
     }
     {
-        let mut stmt = conn.prepare("SELECT rowid, name, json FROM saved_grants")?;
+        let mut stmt = conn.prepare("SELECT rowid, json FROM saved_grants")?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (rowid, name, json) in rows {
+        for (rowid, json) in rows {
             let Ok(grant) = serde_json::from_str::<SavedGrant>(&json) else {
                 continue;
             };
@@ -3256,11 +3252,11 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                     )?;
                 }
             } else {
-                conn.execute("DELETE FROM saved_grants WHERE rowid = ?1", params![rowid])?;
-                conn.execute(
-                    "INSERT OR REPLACE INTO saved_grant_tombstones (name, deleted_unix) VALUES (?1, ?2)",
-                    params![name, encode_u64(guard::env::now_unix())?],
-                )?;
+                // Keep invalid authority-bearing rows visible to the
+                // transactional index validator below. Deleting them here
+                // would turn durable corruption into an apparently valid
+                // startup and would incorrectly create a user deletion
+                // tombstone.
             }
         }
     }
@@ -5282,6 +5278,46 @@ mod tests {
 
         let error = SessionStore::open(path, 3600).await.unwrap_err();
         assert!(format!("{error:#}").contains("saved-grant index disagrees"));
+    }
+
+    #[tokio::test]
+    async fn invalid_current_saved_grant_remains_visible_to_startup_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO saved_grants (name, json, updated_unix)
+             VALUES (?1, ?2, 0)",
+            params!["indexed-name", r#"{"name":"serialized-name"}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = SessionStore::open(path.clone(), 3600).await.unwrap_err();
+        assert!(format!("{error:#}").contains("saved-grant index disagrees"));
+
+        let conn = Connection::open(path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM saved_grants WHERE name = ?1",
+                params!["indexed-name"],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM saved_grant_tombstones WHERE name = ?1",
+                params!["indexed-name"],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[cfg(unix)]

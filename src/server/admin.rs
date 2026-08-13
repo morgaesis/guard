@@ -13,8 +13,8 @@ use crate::session::{
 };
 use guard::audit::{AuditEvent, AuditKind};
 use guard::gating::verb::{
-    generated_access_matcher_digest, generated_access_matcher_shape, generated_access_verb_name,
-    Verb, VerbCatalog,
+    canonical_generated_access_consequence, generated_access_matcher_digest,
+    generated_access_matcher_shape, generated_access_verb_name, Verb, VerbCatalog,
 };
 #[cfg(test)]
 use guard::gating::verb::{CoverageAction, CoverageProbe, CoverageProvenance, VerbCoverageCell};
@@ -998,6 +998,11 @@ async fn reduce_generated_access_candidate(
     candidate.trusted = false;
     candidate = guard::gating::verb::normalize_generated_access_verb(candidate)
         .map_err(|error| format!("synthesized access coverage was rejected: {error}"))?;
+    // A pending request must carry the fail-closed consequence derived from
+    // the generated matcher alone. Operator coverage can refine the class
+    // when approved and installed, but must not make an unreviewed proposal
+    // look safer than its own executable shape proves.
+    candidate.consequence = canonical_generated_access_consequence(&candidate);
 
     let catalog = server
         .refresh_and_lease_verb_catalog_for_use("generated access proposal validation")
@@ -1032,9 +1037,6 @@ async fn reduce_generated_access_candidate(
         return access_reduction(vec![reused.clone()]);
     }
     candidate.name = generated_access_verb_name(&candidate);
-    candidate = catalog
-        .canonical_generated_access_verb(candidate)
-        .map_err(|error| format!("synthesized access coverage was rejected: {error}"))?;
     catalog
         .validate_candidate(&candidate)
         .map_err(|error| format!("invalid non-baseline access coverage: {error}"))?;

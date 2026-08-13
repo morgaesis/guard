@@ -72,6 +72,12 @@ impl ProvisionalStatus {
         matches!(self, Self::Confirmed | Self::Reverted)
     }
 
+    /// Whether this status is final for lifecycle persistence. Failed reverts
+    /// remain outstanding and queryable, so they are not prunable terminals.
+    pub fn is_lifecycle_final(self) -> bool {
+        matches!(self, Self::Confirmed | Self::Reverted | Self::RevertFailed)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Staged => "staged",

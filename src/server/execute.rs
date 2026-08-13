@@ -3482,7 +3482,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             return ExecuteResult::exec_failed(
@@ -3495,12 +3495,47 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
     drop(initiation_lease);
     #[cfg(all(test, unix))]
     signal_command_started_for_test(server);
-    let process_guard = child
+    let mut process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
     audit_secret_exposure(server, caller, &request, &exposed_secret_refs);
-    let output = match child.wait_with_output().await {
-        Ok(output) => output,
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let exact_secrets = server
+        .config
+        .redact_secrets
+        .iter()
+        .chain(exact_output_secrets.iter())
+        .map(|secret| secret.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let (stdout_result, stderr_result) = tokio::join!(
+        async {
+            match stdout_pipe {
+                Some(pipe) => read_bounded_redacted_output(pipe, exact_secrets.clone()).await,
+                None => Ok(Vec::new()),
+            }
+        },
+        async {
+            match stderr_pipe {
+                Some(pipe) => read_bounded_redacted_output(pipe, exact_secrets.clone()).await,
+                None => Ok(Vec::new()),
+            }
+        }
+    );
+    if stdout_result.is_err() || stderr_result.is_err() {
+        if let Some(guard) = process_guard.take() {
+            guard.terminate();
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return ExecuteResult::exec_failed_after_start(
+            allow_reason,
+            "command output exceeded the bounded byte limit".to_string(),
+        )
+        .with_exposed_secret_refs(exposed_secret_refs);
+    }
+    let status = match child.wait().await {
+        Ok(status) => status,
         Err(e) => {
             return ExecuteResult::exec_failed_after_start(
                 allow_reason,
@@ -3513,38 +3548,40 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         guard.complete();
     }
 
-    let stdout = if output.stdout.is_empty() {
+    let stdout_bytes = stdout_result.expect("checked above");
+    let stderr_bytes = stderr_result.expect("checked above");
+    let stdout = if stdout_bytes.is_empty() {
         None
     } else {
         let mut redacted = redact_command_text(
             server,
             &redaction_env,
             &exact_output_secrets,
-            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&stdout_bytes).to_string(),
         );
         truncate_utf8_bytes(&mut redacted, MAX_OUTPUT_BYTES);
         Some(redacted)
     };
 
-    let mut stderr = if output.stderr.is_empty() {
+    let mut stderr = if stderr_bytes.is_empty() {
         None
     } else {
         let mut redacted = redact_command_text(
             server,
             &redaction_env,
             &exact_output_secrets,
-            String::from_utf8_lossy(&output.stderr).to_string(),
+            String::from_utf8_lossy(&stderr_bytes).to_string(),
         );
         truncate_utf8_bytes(&mut redacted, MAX_OUTPUT_BYTES);
         Some(redacted)
     };
 
-    let mut exit_code = output.status.code();
+    let mut exit_code = status.code();
     if let Some(mut diagnostics) =
         AnsibleInventoryDiagnostics::for_command(&request.binary, &request.args)
     {
-        diagnostics.observe(&String::from_utf8_lossy(&output.stdout));
-        diagnostics.observe(&String::from_utf8_lossy(&output.stderr));
+        diagnostics.observe(&String::from_utf8_lossy(&stdout_bytes));
+        diagnostics.observe(&String::from_utf8_lossy(&stderr_bytes));
         if diagnostics.normalizes_success_to_failure(exit_code) {
             exit_code = Some(1);
             stderr = append_bounded_diagnostic(stderr, ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC);
@@ -3565,6 +3602,28 @@ fn truncate_utf8_bytes(value: &mut String, limit: usize) {
         end -= 1;
     }
     value.truncate(end);
+}
+
+async fn read_bounded_redacted_output<R>(
+    mut reader: R,
+    exact_secrets: Vec<Vec<u8>>,
+) -> Result<Vec<u8>, ()>
+where
+    R: AsyncRead + Unpin,
+{
+    const CHUNK_BYTES: usize = 8 * 1024;
+    let mut redactor =
+        ExactSecretStreamRedactor::new(exact_secrets, MAX_OUTPUT_BYTES).map_err(|_| ())?;
+    let mut output = Vec::new();
+    let mut buffer = vec![0_u8; CHUNK_BYTES];
+    loop {
+        let read = reader.read(&mut buffer).await.map_err(|_| ())?;
+        if read == 0 {
+            output.extend(redactor.finish().map_err(|_| ())?);
+            return Ok(output);
+        }
+        output.extend(redactor.push(&buffer[..read]).map_err(|_| ())?);
+    }
 }
 
 #[derive(Debug)]
@@ -4097,6 +4156,15 @@ mod decision_trace_feature_tests {
         task.await.unwrap();
         assert!(limited);
         assert!(retained <= MAX_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn buffered_child_output_is_bounded_before_collection() {
+        let reader =
+            tokio::io::AsyncReadExt::take(tokio::io::repeat(b'x'), (MAX_OUTPUT_BYTES + 1) as u64);
+        assert!(read_bounded_redacted_output(reader, Vec::new())
+            .await
+            .is_err());
     }
 
     #[test]

@@ -440,7 +440,6 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
         if self.context_from_registry(&registry, token).as_ref() != Some(expected) {
             return Err("session expired, was revoked, or changed".to_string());
         }
-        drop(registry);
         handoff.forward().await
     }
 
