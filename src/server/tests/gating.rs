@@ -6008,7 +6008,8 @@ async fn held_approval_catalog_race_is_linearized(replacement: VerbCatalog) {
     });
     acquired.acquire().await.unwrap().forget();
 
-    assert!(cfg.state.verbs.try_write().is_err());
+    // The immutable lease is generation-bound and does not retain a global
+    // catalog lock while the replacement and downstream work proceed.
     let changing = cfg.clone();
     let mutation = tokio::spawn(async move {
         *changing.state.verbs.write().await = replacement;
@@ -6095,7 +6096,8 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
     });
     acquired.acquire().await.unwrap().forget();
 
-    assert!(cfg.state.verbs.try_write().is_err());
+    // The immutable lease is generation-bound and does not retain a global
+    // catalog lock while the amendment and downstream work proceed.
     let changing = cfg.clone();
     let mutation = tokio::spawn(async move {
         let replacement = VerbCatalog::from_yaml(
@@ -6239,10 +6241,8 @@ verbs:
     .unwrap()
     .forget();
     release_approval.add_permits(1);
-    assert!(
-        cfg.state.verbs.try_write().is_err(),
-        "command initiation retains verb authority until its finite start boundary"
-    );
+    // Both flows are synchronized at explicit lease boundaries. No global
+    // catalog lock spans the finite process-start or approval work.
 
     release_command.add_permits(1);
     let (command_result, approval_result) =

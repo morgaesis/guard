@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn cache_ttl_expires_entry() {
-        let mut cache = EvalCache::new(4, Duration::from_millis(10));
+        let mut cache = EvalCache::new(4, Duration::ZERO);
         cache.insert(
             "ls".to_string(),
             CachedResult::Allow {
@@ -151,7 +151,6 @@ mod tests {
                 reversibility: None,
             },
         );
-        std::thread::sleep(Duration::from_millis(20));
         assert!(cache.get("ls").is_none(), "entry should have expired");
     }
 
@@ -166,7 +165,6 @@ mod tests {
                 reversibility: None,
             },
         );
-        std::thread::sleep(Duration::from_millis(2));
         cache.insert(
             "b".into(),
             CachedResult::Allow {
@@ -175,7 +173,11 @@ mod tests {
                 reversibility: None,
             },
         );
-        std::thread::sleep(Duration::from_millis(2));
+        cache
+            .entries
+            .get_mut("a")
+            .expect("oldest cache entry")
+            .inserted_at -= Duration::from_secs(1);
         cache.insert(
             "c".into(),
             CachedResult::Allow {
