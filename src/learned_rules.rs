@@ -299,28 +299,27 @@ async fn acquire_durable_store_read_permit(path: &Path) -> Result<OwnedRwLockRea
     .map_err(|_| authority_lock_timeout("in-process"))
 }
 
-/// A linearizable read of one durable authority store. The in-process
-/// coordinator, cross-process destination lock, and store read guard remain
-/// held until this value is dropped. Callers retain the lease through the use
-/// boundary so a selected matcher cannot be revoked or amended first.
+/// An immutable generation-bound authority snapshot. Acquisition validates the
+/// durable bytes and live epoch under coordination, then releases every
+/// process-wide lock before the caller performs external I/O.
 #[doc(hidden)]
 pub struct AuthorityUseLease<S> {
-    guard: OwnedRwLockReadGuard<S>,
-    _permit: Option<OwnedRwLockReadGuard<()>>,
-    _destination_lock: Option<DestinationLock>,
+    snapshot: S,
 }
 
 impl<S> std::ops::Deref for AuthorityUseLease<S> {
     type Target = S;
 
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        &self.snapshot
     }
 }
 
 fn acquire_locked_authority_snapshot(
     path: PathBuf,
 ) -> Result<(DestinationLock, LearningFileSnapshot)> {
+    #[cfg(test)]
+    signal_authority_snapshot_attempt_for_test(&path);
     let mut lock = DestinationLock::acquire_shared(&path)?;
     lock.verify_parent_binding()?;
     if !transaction_artifacts(lock.destination())?.is_empty() {
@@ -338,6 +337,39 @@ fn acquire_locked_authority_snapshot(
     }
     let snapshot = read_learning_file_snapshot_locked(&lock)?;
     Ok((lock, snapshot))
+}
+
+#[cfg(test)]
+fn authority_snapshot_attempt_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<PathBuf, std::sync::mpsc::SyncSender<()>>>
+{
+    static HOOKS: OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<PathBuf, std::sync::mpsc::SyncSender<()>>>,
+    > = OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn signal_authority_snapshot_attempt_for_test(path: &Path) {
+    if let Some(sender) = authority_snapshot_attempt_hooks()
+        .lock()
+        .unwrap()
+        .remove(path)
+    {
+        let _ = sender.try_send(());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_authority_snapshot_attempt_for_test(
+    path: PathBuf,
+) -> std::sync::mpsc::Receiver<()> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    authority_snapshot_attempt_hooks()
+        .lock()
+        .unwrap()
+        .insert(path, sender);
+    receiver
 }
 
 /// Acquire a bounded read lease for a previously refreshed store. A durable
@@ -378,11 +410,11 @@ where
         {
             anyhow::bail!("{task} authority changed before its use boundary")
         }
-        Ok(AuthorityUseLease {
-            guard,
-            _permit: permit,
-            _destination_lock: destination_lock,
-        })
+        let snapshot = guard.clone();
+        drop(guard);
+        drop(destination_lock);
+        drop(permit);
+        Ok(AuthorityUseLease { snapshot })
     })
     .await
     .map_err(|error| anyhow::anyhow!("{task} coordination task failed: {error}"))?
@@ -740,6 +772,8 @@ impl DestinationLock {
     }
 
     fn acquire_with_mode(path: &Path, exclusive: bool) -> Result<Self> {
+        #[cfg(test)]
+        signal_authority_snapshot_attempt_for_test(path);
         ensure_destination_parent(path)?;
         let destination = canonical_destination(path)?;
         let canonical_parent = destination

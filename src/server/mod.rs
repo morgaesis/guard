@@ -261,6 +261,9 @@ impl Default for ServerConfig {
 /// shared, so cloning the state clones handles, not contents.
 #[derive(Clone)]
 struct ServerState {
+    /// Keeps daemon-configured exact literals registered only for this daemon
+    /// instance. Per-command values remain scoped to their execution context.
+    _trusted_exact_secret_scope: guard::redact::TrustedExactSecretScope,
     evaluator: Arc<Evaluator>,
     secrets: Arc<SecretManager>,
     tool_registry: Arc<RwLock<ToolRegistry>>,
@@ -337,6 +340,7 @@ impl ServerState {
         session_store: Option<SessionStore>,
     ) -> Self {
         Self {
+            _trusted_exact_secret_scope: guard::redact::TrustedExactSecretScope::default(),
             evaluator: Arc::new(evaluator),
             secrets: Arc::new(secrets),
             tool_registry: Arc::new(RwLock::new(tool_registry)),

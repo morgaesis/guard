@@ -1976,18 +1976,13 @@ async fn wait_for_policy_reload(proxy: &ApiProxy, yaml: &str) {
     let expected = ApiPolicy::from_yaml(yaml)
         .expect("reloaded policy parses")
         .authority_fingerprint();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if proxy.policy_fingerprint().await == expected {
-                return;
-            }
-            let baseline = proxy.policy_reload_attempt();
-            if proxy.policy_fingerprint().await == expected {
-                return;
-            }
-            proxy.wait_for_policy_reload_attempt_after(baseline).await;
-        }
-    })
+    if proxy.policy_fingerprint().await == expected {
+        return;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        proxy.wait_for_policy_fingerprint(&expected),
+    )
     .await
     .expect("policy reload was not observed within the bounded deadline");
 }

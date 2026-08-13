@@ -4,10 +4,8 @@ use crate::session::{
     SessionInteraction, SessionOwner, SessionRegistry,
 };
 use crate::session_store::SessionStore;
-use crate::tool_config::ResolvedToolEnv;
-#[cfg(unix)]
-use anyhow::Context;
-use anyhow::{bail, Result};
+use crate::tool_config::{ResolvedToolEnv, ToolRegistry};
+use anyhow::{bail, Context, Result};
 use guard::gating::coverage::{
     baseline_override_applies, resolve_scoped_matches, ScopedCoverageMatch, VerbDecision,
     VerbResolution,
@@ -992,6 +990,11 @@ struct CommandInitiationLease {
     _learned_deny: Option<guard::evaluate::LearnedDenyUseLease>,
     _verb: Option<guard::learned_rules::AuthorityUseLease<VerbCatalog>>,
     _session: Option<tokio::sync::OwnedRwLockReadGuard<SessionRegistry>>,
+}
+
+struct ProcessInitiationLeases {
+    command: CommandInitiationLease,
+    tool_mapping: ToolMappingSpawnLease,
 }
 
 #[cfg(all(test, unix))]
@@ -2324,7 +2327,7 @@ pub(super) async fn resolve_current_tool_env(
     binary: &str,
     principal: Option<&guard::principal::PrincipalKey>,
     user_key: Option<&str>,
-) -> Result<ResolvedToolEnv> {
+) -> Result<ResolvedCurrentToolEnv> {
     let snapshot = {
         let mut registry = server.state.tool_registry.write().await;
         registry.reload_if_stale()?;
@@ -2341,7 +2344,60 @@ pub(super) async fn resolve_current_tool_env(
     if !current {
         bail!("tool environment authority changed during secret resolution");
     }
-    Ok(resolved)
+    Ok(ResolvedCurrentToolEnv {
+        resolved,
+        authority: snapshot,
+    })
+}
+
+pub(super) struct ResolvedCurrentToolEnv {
+    resolved: ResolvedToolEnv,
+    authority: ToolRegistry,
+}
+
+impl std::fmt::Debug for ResolvedCurrentToolEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedCurrentToolEnv")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvedCurrentToolEnv {
+    pub(super) fn into_resolved(self) -> ResolvedToolEnv {
+        self.resolved
+    }
+}
+
+impl std::ops::Deref for ResolvedCurrentToolEnv {
+    type Target = ResolvedToolEnv;
+
+    fn deref(&self) -> &Self::Target {
+        &self.resolved
+    }
+}
+
+struct ToolMappingSpawnLease {
+    _registry: tokio::sync::OwnedRwLockWriteGuard<ToolRegistry>,
+}
+
+async fn acquire_tool_mapping_spawn_lease(
+    server: &ServerContext,
+    expected: &ToolRegistry,
+) -> Result<ToolMappingSpawnLease> {
+    let mut registry = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.state.tool_registry.clone().write_owned(),
+    )
+    .await
+    .context("timed out acquiring tool mapping authority")?;
+    registry.reload_if_stale()?;
+    if !registry.same_authority(expected) {
+        bail!("tool environment authority changed before process start");
+    }
+    Ok(ToolMappingSpawnLease {
+        _registry: registry,
+    })
 }
 
 /// Validate access authority at the execution-admission boundary and consume
@@ -3020,6 +3076,10 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             return ExecuteResult::exec_failed(allow_reason, format!("tool config error: {}", e));
         }
     };
+    let ResolvedCurrentToolEnv {
+        resolved: tool_env,
+        authority: tool_authority,
+    } = tool_env;
     let mut exact_output_secrets = tool_env
         .secret_sources
         .keys()
@@ -3207,8 +3267,6 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             secret_file_values.push((env_var.clone(), value));
         }
     }
-    guard::redact::register_trusted_exact_secrets(&exact_output_secrets);
-
     let daemon_child_env: HashMap<String, String> = server
         .config
         .extra_child_env
@@ -3388,6 +3446,14 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         Ok(lease) => lease,
         Err(reason) => return ExecuteResult::denied(reason),
     };
+    let tool_mapping_lease = match acquire_tool_mapping_spawn_lease(server, &tool_authority).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            return ExecuteResult::denied(format!(
+                "tool mapping authority is unavailable before process start: {error}"
+            ))
+        }
+    };
 
     if context.stream_output {
         let result = execute_spawn_streaming(
@@ -3404,7 +3470,10 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                 exposed_secret_refs,
             },
             &mut *context.stream_writer,
-            initiation_lease,
+            ProcessInitiationLeases {
+                command: initiation_lease,
+                tool_mapping: tool_mapping_lease,
+            },
         )
         .await;
         drop(secret_file_lease);
@@ -3422,6 +3491,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             );
         }
     };
+    drop(tool_mapping_lease);
     drop(initiation_lease);
     #[cfg(all(test, unix))]
     signal_command_started_for_test(server);
@@ -3508,6 +3578,7 @@ struct OutputRedactionContext<'a> {
     exact_secrets: &'a [String],
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     mut cmd: Command,
     allow_reason: String,
@@ -3515,7 +3586,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     redaction: OutputRedactionContext<'_>,
     audit: SpawnAuditContext<'_>,
     writer: &mut W,
-    initiation_lease: CommandInitiationLease,
+    leases: ProcessInitiationLeases,
 ) -> ExecuteResult {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -3529,7 +3600,8 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
             );
         }
     };
-    drop(initiation_lease);
+    drop(leases.tool_mapping);
+    drop(leases.command);
     #[cfg(all(test, unix))]
     signal_command_started_for_test(server);
     let mut process_guard = child
@@ -3573,8 +3645,25 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         .chain(redaction.exact_secrets)
         .map(|secret| secret.as_bytes().to_vec())
         .collect::<Vec<_>>();
-    let mut stdout_exact = ExactSecretStreamRedactor::new(exact_secrets.clone(), MAX_OUTPUT_BYTES);
-    let mut stderr_exact = ExactSecretStreamRedactor::new(exact_secrets, MAX_OUTPUT_BYTES);
+    let mut stdout_exact =
+        match ExactSecretStreamRedactor::new(exact_secrets.clone(), MAX_OUTPUT_BYTES) {
+            Ok(redactor) => redactor,
+            Err(_) => {
+                if let Some(guard) = process_guard.take() {
+                    guard.terminate();
+                } else {
+                    let _ = child.kill().await;
+                }
+                let _ = child.wait().await;
+                return ExecuteResult::exec_failed_after_start(
+                    allow_reason,
+                    "command redaction context exceeded its resource limit".to_string(),
+                )
+                .with_exposed_secret_refs(audit.exposed_secret_refs);
+            }
+        };
+    let mut stderr_exact = ExactSecretStreamRedactor::new(exact_secrets, MAX_OUTPUT_BYTES)
+        .expect("the same bounded redaction context was already validated");
     let mut emitted_total = 0usize;
     let mut ansible_diagnostics =
         AnsibleInventoryDiagnostics::for_command(&audit.request.binary, &audit.request.args);
@@ -4140,6 +4229,47 @@ mod transactional_access_tests {
         assert!(error
             .to_string()
             .contains("authority changed during secret resolution"));
+    }
+
+    #[tokio::test]
+    async fn final_tool_mapping_lease_rejects_post_resolution_replacement() {
+        let server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("tools.yaml");
+        let mut registry = crate::tool_config::ToolRegistry::load(path).unwrap();
+        registry
+            .set(
+                "fixture-tool",
+                crate::tool_config::ToolConfig {
+                    env: HashMap::from([("FIXTURE_MODE".to_string(), "first".to_string())]),
+                    ..crate::tool_config::ToolConfig::default()
+                },
+            )
+            .unwrap();
+        *server.state.tool_registry.write().await = registry;
+
+        let resolved = resolve_current_tool_env(&server, "fixture-tool", None, None)
+            .await
+            .unwrap();
+        server
+            .state
+            .tool_registry
+            .write()
+            .await
+            .set(
+                "fixture-tool",
+                crate::tool_config::ToolConfig {
+                    env: HashMap::from([("FIXTURE_MODE".to_string(), "second".to_string())]),
+                    ..crate::tool_config::ToolConfig::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            acquire_tool_mapping_spawn_lease(&server, &resolved.authority)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

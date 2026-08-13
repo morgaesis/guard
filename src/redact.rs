@@ -1,34 +1,142 @@
 use regex::Regex;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::{OnceLock, RwLock};
 
-/// Process-wide exact literals supplied by the daemon's trusted configuration.
-///
-/// Registration is monotonic because a daemon may discover credentials before
-/// or during startup, while removing a literal would make older durable and
-/// audit projections unsafe. Callers never receive the registered values.
-fn trusted_exact_secrets() -> &'static RwLock<Vec<String>> {
-    static SECRETS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
-    SECRETS.get_or_init(|| RwLock::new(Vec::new()))
+/// Hard resource limits for daemon-scoped exact literals. These bounds cap the
+/// work of every prose scan and the carry retained by every stream redactor.
+const MAX_TRUSTED_EXACT_SECRET_SCOPES: usize = 64;
+const MAX_TRUSTED_EXACT_SECRET_ENTRIES: usize = 256;
+const MAX_TRUSTED_EXACT_SECRET_BYTES: usize = 64 * 1024;
+const MAX_TRUSTED_EXACT_SECRET_LITERAL_BYTES: usize = 4 * 1024;
+const MAX_EXACT_REDACTION_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EXACT_REDACTION_COMPARISONS: usize = 4 * 1024 * 1024 * 1024;
+
+#[derive(Default)]
+struct TrustedExactSecretRegistry {
+    next_scope: u64,
+    scopes: BTreeMap<u64, Vec<String>>,
+    references: BTreeMap<String, usize>,
+    total_bytes: usize,
 }
 
-pub fn register_trusted_exact_secrets(secrets: &[String]) {
-    let mut registered = trusted_exact_secrets()
-        .write()
-        .expect("trusted exact-secret registry is not poisoned");
-    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-        if !registered.iter().any(|known| known == secret) {
-            registered.push(secret.clone());
+fn trusted_exact_secrets() -> &'static RwLock<TrustedExactSecretRegistry> {
+    static SECRETS: OnceLock<RwLock<TrustedExactSecretRegistry>> = OnceLock::new();
+    SECRETS.get_or_init(|| RwLock::new(TrustedExactSecretRegistry::default()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedExactSecretLimitExceeded;
+
+impl std::fmt::Display for TrustedExactSecretLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("trusted exact-secret resource limit exceeded")
+    }
+}
+
+impl std::error::Error for TrustedExactSecretLimitExceeded {}
+
+/// Lifetime token for one bounded exact-secret set. Clones share ownership;
+/// the plaintext leaves the process registry when the final owner is dropped.
+#[derive(Clone, Default)]
+pub struct TrustedExactSecretScope {
+    _registration: Option<std::sync::Arc<TrustedExactSecretRegistration>>,
+}
+
+struct TrustedExactSecretRegistration {
+    scope: u64,
+}
+
+impl Drop for TrustedExactSecretRegistration {
+    fn drop(&mut self) {
+        let mut registered = trusted_exact_secrets()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(secrets) = registered.scopes.remove(&self.scope) {
+            for secret in secrets {
+                let remove = registered.references.get_mut(&secret).is_some_and(|count| {
+                    *count -= 1;
+                    *count == 0
+                });
+                if remove {
+                    registered.references.remove(&secret);
+                    registered.total_bytes = registered.total_bytes.saturating_sub(secret.len());
+                }
+            }
         }
     }
-    registered.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+}
+
+/// Register daemon-lifetime exact literals. Per-operation credentials stay in
+/// the caller's explicit redaction context and are never registered here.
+pub fn register_trusted_exact_secrets(
+    secrets: &[String],
+) -> Result<TrustedExactSecretScope, TrustedExactSecretLimitExceeded> {
+    let mut scope_secrets = secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    scope_secrets.sort();
+    scope_secrets.dedup();
+    if scope_secrets
+        .iter()
+        .any(|secret| secret.len() > MAX_TRUSTED_EXACT_SECRET_LITERAL_BYTES)
+    {
+        return Err(TrustedExactSecretLimitExceeded);
+    }
+    if scope_secrets.is_empty() {
+        return Ok(TrustedExactSecretScope::default());
+    }
+    let mut registered = trusted_exact_secrets()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let new_entries = scope_secrets
+        .iter()
+        .filter(|secret| !registered.references.contains_key(*secret))
+        .count();
+    let new_bytes = scope_secrets
+        .iter()
+        .filter(|secret| !registered.references.contains_key(*secret))
+        .map(String::len)
+        .sum::<usize>();
+    if registered.scopes.len() >= MAX_TRUSTED_EXACT_SECRET_SCOPES
+        || registered.references.len().saturating_add(new_entries)
+            > MAX_TRUSTED_EXACT_SECRET_ENTRIES
+        || registered.total_bytes.saturating_add(new_bytes) > MAX_TRUSTED_EXACT_SECRET_BYTES
+    {
+        return Err(TrustedExactSecretLimitExceeded);
+    }
+    let scope = registered.next_scope;
+    let next_scope = registered
+        .next_scope
+        .checked_add(1)
+        .ok_or(TrustedExactSecretLimitExceeded)?;
+    registered.next_scope = next_scope;
+    for secret in &scope_secrets {
+        if !registered.references.contains_key(secret) {
+            registered.total_bytes += secret.len();
+        }
+        *registered.references.entry(secret.clone()).or_default() += 1;
+    }
+    registered.scopes.insert(scope, scope_secrets);
+    Ok(TrustedExactSecretScope {
+        _registration: Some(std::sync::Arc::new(TrustedExactSecretRegistration {
+            scope,
+        })),
+    })
 }
 
 fn with_trusted_exact_secret_refs<T>(operation: impl FnOnce(&[&str]) -> T) -> T {
-    let registered = trusted_exact_secrets()
+    let mut references = trusted_exact_secrets()
         .read()
-        .expect("trusted exact-secret registry is not poisoned");
-    let references = registered.iter().map(String::as_str).collect::<Vec<_>>();
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .references
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    references.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    let references = references.iter().map(String::as_str).collect::<Vec<_>>();
     operation(&references)
 }
 
@@ -1419,6 +1527,14 @@ pub fn redact_exact_secrets(text: &str, secrets: &[&str]) -> String {
         .collect::<Vec<_>>();
     literals.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
     literals.dedup();
+    if text.len() > MAX_EXACT_REDACTION_INPUT_BYTES
+        || literals.len().saturating_mul(text.len()) > MAX_EXACT_REDACTION_COMPARISONS
+    {
+        // The caller asked for exact redaction but the bounded synchronous
+        // path cannot prove it within its work budget. Returning only a
+        // marker is fail-closed and never exposes the unredacted input.
+        return "[REDACTED]".to_string();
+    }
     let marker = ["[REDACTED]", "[FILTERED]", "<hidden>", "***", ""]
         .into_iter()
         .find(|candidate| !literals.iter().any(|secret| candidate.contains(secret)))
@@ -1445,27 +1561,31 @@ pub struct ExactSecretStreamRedactor {
     received: usize,
     emitted: usize,
     limit: usize,
+    comparisons: usize,
 }
 
 impl ExactSecretStreamRedactor {
-    pub fn new(secrets: impl IntoIterator<Item = Vec<u8>>, limit: usize) -> Self {
+    pub fn new(
+        secrets: impl IntoIterator<Item = Vec<u8>>,
+        limit: usize,
+    ) -> Result<Self, ExactRedactionLimitExceeded> {
         let mut secrets = secrets
             .into_iter()
             .filter(|secret| !secret.is_empty())
             .collect::<Vec<_>>();
-        {
-            let registered = trusted_exact_secrets()
-                .read()
-                .expect("trusted exact-secret registry is not poisoned");
-            secrets.extend(
-                registered
-                    .iter()
-                    .filter(|secret| !secret.is_empty())
-                    .map(|secret| secret.as_bytes().to_vec()),
-            );
-        }
+        with_trusted_exact_secret_refs(|registered| {
+            secrets.extend(registered.iter().map(|secret| secret.as_bytes().to_vec()));
+        });
         secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
         secrets.dedup();
+        if secrets.len() > MAX_TRUSTED_EXACT_SECRET_ENTRIES
+            || secrets
+                .iter()
+                .any(|secret| secret.len() > MAX_TRUSTED_EXACT_SECRET_LITERAL_BYTES)
+            || secrets.iter().map(Vec::len).sum::<usize>() > MAX_TRUSTED_EXACT_SECRET_BYTES
+        {
+            return Err(ExactRedactionLimitExceeded);
+        }
         let marker = [
             b"[REDACTED]".as_slice(),
             b"[FILTERED]".as_slice(),
@@ -1489,15 +1609,16 @@ impl ExactSecretStreamRedactor {
             .max()
             .unwrap_or(1)
             .saturating_sub(1);
-        Self {
+        Ok(Self {
             secrets,
             marker,
             carry: Vec::new(),
             keep,
             received: 0,
             emitted: 0,
-            limit,
-        }
+            limit: limit.min(MAX_EXACT_REDACTION_INPUT_BYTES),
+            comparisons: 0,
+        })
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, ExactRedactionLimitExceeded> {
@@ -1519,6 +1640,11 @@ impl ExactSecretStreamRedactor {
         let mut output = Vec::new();
         let mut position = 0;
         while position < safe_end {
+            self.comparisons = self
+                .comparisons
+                .checked_add(self.secrets.len())
+                .filter(|comparisons| *comparisons <= MAX_EXACT_REDACTION_COMPARISONS)
+                .ok_or(ExactRedactionLimitExceeded)?;
             let (replacement, consumed) = if let Some(secret) = self
                 .secrets
                 .iter()
@@ -1544,7 +1670,7 @@ impl ExactSecretStreamRedactor {
         bytes: &[u8],
         limit: usize,
     ) -> Result<Vec<u8>, ExactRedactionLimitExceeded> {
-        let mut redactor = Self::new(secrets, limit);
+        let mut redactor = Self::new(secrets, limit)?;
         let mut output = redactor.push(bytes)?;
         output.extend_from_slice(&redactor.finish()?);
         Ok(output)
@@ -1590,16 +1716,34 @@ mod tests {
     #[test]
     fn registered_exact_literals_redact_across_free_text_line_boundaries() {
         let value = ["§", "\n", "¶"].concat();
-        register_trusted_exact_secrets(std::slice::from_ref(&value));
+        let _scope = register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
         let rendered = redact_output_text(&format!("prefix {value} suffix"));
         assert!(!rendered.contains(&value));
         assert!(rendered.contains("[REDACTED]"));
     }
 
     #[test]
+    fn trusted_exact_secret_scope_releases_literals_and_enforces_bounds() {
+        let value = "scope-lifecycle-fixture".to_string();
+        let scope = register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
+        assert_eq!(redact_output_text(&value), "[REDACTED]");
+        drop(scope);
+        assert_eq!(redact_output_text(&value), value);
+
+        let too_many = (0..=MAX_TRUSTED_EXACT_SECRET_ENTRIES)
+            .map(|index| format!("registry-fixture-{index}"))
+            .collect::<Vec<_>>();
+        assert!(register_trusted_exact_secrets(&too_many).is_err());
+        assert!(register_trusted_exact_secrets(&[
+            "x".repeat(MAX_TRUSTED_EXACT_SECRET_LITERAL_BYTES + 1,)
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn exact_stream_redaction_is_boundary_safe_and_bounds_expansion() {
-        let value = [b'z', b'!'];
-        let mut redactor = ExactSecretStreamRedactor::new(vec![value.to_vec()], 64);
+        let value = *b"z!";
+        let mut redactor = ExactSecretStreamRedactor::new(vec![value.to_vec()], 64).unwrap();
         let mut output = redactor.push(b"prefix z").unwrap();
         output.extend_from_slice(&redactor.push(b"! suffix").unwrap());
         output.extend_from_slice(&redactor.finish().unwrap());
@@ -1615,9 +1759,9 @@ mod tests {
     #[test]
     fn exact_stream_redaction_includes_registered_literals_without_explicit_copying() {
         let value = ["registered", "-stream-fixture"].concat();
-        register_trusted_exact_secrets(std::slice::from_ref(&value));
+        let _scope = register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
         let split = value.len() / 2;
-        let mut redactor = ExactSecretStreamRedactor::new(Vec::new(), 64);
+        let mut redactor = ExactSecretStreamRedactor::new(Vec::new(), 64).unwrap();
         let mut output = redactor.push(&value.as_bytes()[..split]).unwrap();
         output.extend(redactor.push(&value.as_bytes()[split..]).unwrap());
         output.extend(redactor.finish().unwrap());
@@ -1625,6 +1769,25 @@ mod tests {
         assert!(!output
             .windows(value.len())
             .any(|window| window == value.as_bytes()));
+    }
+
+    #[test]
+    fn trusted_exact_registry_rejects_literal_entry_and_byte_limits() {
+        assert!(register_trusted_exact_secrets(&["x".repeat(4097)]).is_err());
+        let entries = (0..257)
+            .map(|index| format!("entry-{index:03}"))
+            .collect::<Vec<_>>();
+        assert!(register_trusted_exact_secrets(&entries).is_err());
+        let bytes = (0..65)
+            .map(|index| format!("byte-{index:02}-{}", "x".repeat(1024)))
+            .collect::<Vec<_>>();
+        assert!(register_trusted_exact_secrets(&bytes).is_err());
+    }
+
+    #[test]
+    fn exact_redaction_fails_closed_when_synchronous_work_is_over_budget() {
+        let text = "x".repeat(MAX_EXACT_REDACTION_INPUT_BYTES + 1);
+        assert_eq!(redact_exact_secrets(&text, &["fixture"]), "[REDACTED]");
     }
 
     #[test]

@@ -350,6 +350,31 @@ async fn cancel_exact_staged_provisional(server: &ServerContext, handle: &str) -
     .unwrap_or(false)
 }
 
+/// Remove a failed pre-dispatch body staging transaction while its per-handle
+/// coordinator is held. Failure leaves the exact durable owner row intact so
+/// startup and the bounded cleanup path retain both quota and file ownership.
+async fn retire_failed_body_staging_locked(server: &ServerContext, expected: &Provisional) -> bool {
+    if remove_revert_body(expected).is_err() {
+        return false;
+    }
+    let Some(store) = &server.state.session_store else {
+        return false;
+    };
+    if store
+        .compare_and_delete_provisional(expected.clone())
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut registry = server.state.provisional.write().await;
+    if registry.get(&expected.handle) != Some(expected) {
+        return false;
+    }
+    registry.remove(&expected.handle);
+    true
+}
+
 /// Drop any API-proxy delete-provenance tied to a now-resolved auto-revert
 /// handle. A proxy-armed create records provenance so a later contained delete
 /// of that object cancels the moot create-revert; once the revert itself
@@ -834,6 +859,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
+            let transition_gate = server.provisional_transition_gate(&provisional.handle);
+            let transition = transition_gate.lock().await;
             let body_path = provisional
                 .api_revert
                 .as_ref()
@@ -864,14 +891,14 @@ impl guard::proxy::GateSink for DaemonGateSink {
                         path.display(),
                         error
                     );
+                    let _ = retire_failed_body_staging_locked(&server, &durable_owner).await;
                     let _ = ready_tx.send(None);
                     return;
                 }
                 #[cfg(test)]
                 pause_api_containment(&endpoint, "body_written").await;
-                let transition_gate = server.provisional_transition_gate(&provisional.handle);
-                let _transition = transition_gate.lock().await;
                 let Some(store) = &server.state.session_store else {
+                    let _ = retire_failed_body_staging_locked(&server, &durable_owner).await;
                     let _ = ready_tx.send(None);
                     return;
                 };
@@ -880,11 +907,14 @@ impl guard::proxy::GateSink for DaemonGateSink {
                     .await
                 {
                     tracing::error!("api-proxy revert body ownership was not finalized: {error}");
+                    let _ = retire_failed_body_staging_locked(&server, &durable_owner).await;
                     let _ = ready_tx.send(None);
                     return;
                 }
                 let mut registry = server.state.provisional.write().await;
                 if registry.get(&provisional.handle) != Some(&durable_owner) {
+                    drop(registry);
+                    let _ = retire_failed_body_staging_locked(&server, &provisional).await;
                     let _ = ready_tx.send(None);
                     return;
                 }
@@ -892,7 +922,9 @@ impl guard::proxy::GateSink for DaemonGateSink {
             }
             #[cfg(test)]
             pause_api_containment(&endpoint, "published").await;
-            if ready_tx.send(Some(handle.clone())).is_err() || accepted_rx.await.is_err() {
+            let delivered = ready_tx.send(Some(handle.clone())).is_ok();
+            drop(transition);
+            if !delivered || accepted_rx.await.is_err() {
                 let _ = cancel_exact_staged_provisional(&server, &handle).await;
             }
         });
@@ -1374,7 +1406,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         handoff: &mut dyn guard::proxy::ApiForwardHandoff,
     ) -> Result<(), String> {
         let transition_gate = self.server.provisional_transition_gate(handle);
-        let _transition =
+        let transition =
             tokio::time::timeout(std::time::Duration::from_secs(5), transition_gate.lock())
                 .await
                 .map_err(|_| "provisional cleanup authority lock timed out".to_string())?;
@@ -1399,6 +1431,11 @@ impl guard::proxy::GateSink for DaemonGateSink {
         if !api.requires_uid_precondition {
             return Err("provisional cleanup lacks an exact UID precondition".to_string());
         }
+        // This exact row/UID/provenance comparison is the cleanup admission
+        // point. The per-handle coordinator is released before network I/O;
+        // later revocation applies to later cleanup attempts and publication
+        // still revalidates the created-resource registry.
+        drop(transition);
         handoff.forward().await
     }
 }
@@ -2501,7 +2538,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
     )
     .await
     {
-        Ok(resolved) => resolved.secret_sources,
+        Ok(resolved) => resolved.into_resolved().secret_sources,
         Err(error) => {
             return ExecuteResult::exec_failed(
                 reason,
@@ -3119,7 +3156,7 @@ async fn execute_snapshot_with_access_request_inner(
     )
     .await
     {
-        Ok(resolved) => resolved.secret_sources,
+        Ok(resolved) => resolved.into_resolved().secret_sources,
         Err(error) => {
             return ExecuteResult::exec_failed(
                 reason.to_string(),

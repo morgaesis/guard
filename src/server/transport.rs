@@ -433,13 +433,14 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
     ) -> std::result::Result<(), String> {
         let registry = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            self.server.state.sessions.clone().read_owned(),
+            self.server.state.sessions.read(),
         )
         .await
         .map_err(|_| "timed out acquiring session authority coordination".to_string())?;
         if self.context_from_registry(&registry, token).as_ref() != Some(expected) {
             return Err("session expired, was revoked, or changed".to_string());
         }
+        drop(registry);
         handoff.forward().await
     }
 
@@ -710,9 +711,12 @@ impl Server {
         sessions: SessionRegistry,
         session_store: Option<SessionStore>,
     ) -> Result<Self> {
-        guard::redact::register_trusted_exact_secrets(&config.redact_secrets);
+        let trusted_exact_secret_scope =
+            guard::redact::register_trusted_exact_secrets(&config.redact_secrets)
+                .context("register daemon exact-redaction literals")?;
         let mut state =
             ServerState::new(evaluator, secrets, tool_registry, sessions, session_store);
+        state._trusted_exact_secret_scope = trusted_exact_secret_scope;
         // Count every audited event at the single audit emission choke point by
         // installing this daemon's metrics as the process-global observer, so
         // the read-only metrics surface and the audit log share one source of

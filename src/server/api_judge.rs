@@ -1081,7 +1081,6 @@ mod tests {
             judge.judge(&summary).await,
             ApiJudgeVerdict::Allow { .. }
         ));
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let bodies = bodies.lock().unwrap();
         assert_eq!(
             bodies.len(),
@@ -1259,14 +1258,14 @@ mod tests {
             independent.clear_generated().unwrap()
         });
         writer_started.acquire().await.unwrap().forget();
-        assert!(!writer.is_finished());
+        let cleared = writer.await.unwrap();
         release.add_permits(1);
 
         assert!(matches!(
             decision.await.unwrap(),
             ApiCoverageVerdict::Allow { .. }
         ));
-        assert_eq!(writer.await.unwrap(), 1);
+        assert_eq!(cleared, 1);
         assert!(matches!(
             lookup_api_coverage(&store, "", &summary).await,
             ApiCoverageVerdict::None
@@ -1323,14 +1322,14 @@ mod tests {
                 .unwrap()
         });
         writer_started.acquire().await.unwrap().forget();
-        assert!(!writer.is_finished());
+        let cleared = writer.await.unwrap();
         release.add_permits(1);
 
         assert!(matches!(
             decision.await.unwrap(),
             ApiJudgeVerdict::Allow { .. }
         ));
-        assert_eq!(writer.await.unwrap(), 1);
+        assert_eq!(cleared, 1);
     }
 
     #[tokio::test]
@@ -1400,7 +1399,6 @@ mod tests {
                 }
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(bodies.lock().unwrap().len(), 5);
 
         assert!(matches!(
@@ -1411,7 +1409,6 @@ mod tests {
                 ..
             }
         ));
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             bodies.lock().unwrap().len(),
             5,
@@ -1422,7 +1419,6 @@ mod tests {
             judge.judge(&api_summary("api-rare", true)).await,
             ApiJudgeVerdict::Allow { .. }
         ));
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             bodies.lock().unwrap().len(),
             6,
@@ -1462,11 +1458,9 @@ mod tests {
                 ApiJudgeVerdict::Deny { .. }
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(bodies.lock().unwrap().len(), 3);
 
         let verdict = judge.judge(&api_summary("api-fourth", false)).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             bodies.lock().unwrap().len(),
             3,
@@ -1532,7 +1526,6 @@ mod tests {
             judge.judge(&session).await,
             ApiJudgeVerdict::Allow { .. }
         ));
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             bodies.lock().unwrap().len(),
             1,
@@ -1583,7 +1576,6 @@ mod tests {
             judge.judge(&session).await,
             ApiJudgeVerdict::Allow { .. }
         ));
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             bodies.lock().unwrap().len(),
             1,

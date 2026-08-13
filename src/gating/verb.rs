@@ -650,7 +650,7 @@ impl VerbCatalog {
             }
             if is_synthesized_verb(&verb) {
                 let original = serde_json::to_value(&verb)?;
-                verb = canonicalize_generated_catalog_envelope(verb)?;
+                verb = canonicalize_generated_authority_envelope(verb)?;
                 repaired |= original != serde_json::to_value(&verb)?;
             }
             normalize_operator_boundaries(&mut verb);
@@ -1030,7 +1030,7 @@ impl VerbCatalog {
     pub fn append_verb(&mut self, verb: &Verb) -> Result<()> {
         let canonical;
         let verb = if is_synthesized_verb(verb) {
-            canonical = canonicalize_generated_catalog_envelope(verb.clone())?;
+            canonical = canonicalize_generated_authority_envelope(verb.clone())?;
             &canonical
         } else {
             verb
@@ -1165,6 +1165,7 @@ impl VerbCatalog {
     /// persisted with the grant definition rather than mixed into the catalog
     /// file. Names outside the reserved `grant-` namespace cannot be replaced.
     pub fn upsert_saved_grant_verb(&mut self, verb: Verb) -> Result<()> {
+        let verb = canonicalize_generated_authority_envelope(verb)?;
         validate_verb(&verb)?;
         if !verb.name.starts_with("grant-") {
             bail!(
@@ -1190,26 +1191,28 @@ impl VerbCatalog {
     /// Install approved generated access coverage without writing the
     /// operator-authored catalog. The exact candidate remains durable in its
     /// approved access request and is restored from SQLite at startup.
-    pub fn upsert_access_verb(&mut self, mut verb: Verb) -> Result<()> {
-        verb = normalize_generated_access_verb(verb)?;
+    pub fn canonical_generated_access_verb(&self, verb: Verb) -> Result<Verb> {
+        let mut verb = normalize_generated_access_verb(verb)?;
         if verb.baseline {
             bail!("generated access coverage must not be baseline");
         }
         if verb.name != generated_access_verb_name(&verb) {
             bail!("generated access coverage name does not match its matcher digest");
         }
-        // Synthesis proposes the matcher, not its safety class. Promotion may
-        // make the exact matcher deterministic, but consequence routing is
-        // derived locally so a model cannot label a mutation reversible. A
-        // matcher that provably wraps operator-reviewed catalog coverage
-        // inherits that coverage's class instead of the irreversible default,
-        // so wrapping a reversible verb does not hold every run for approval.
-        verb.consequence = if synthesized_access_is_statically_read_only(&verb) {
-            Reversibility::Reversible
-        } else {
-            self.wrapped_operator_consequence(&verb)
-                .unwrap_or(Reversibility::Irreversible)
-        };
+        // Synthesis proposes the matcher, not its safety class. Consequence
+        // routing is derived locally from the matcher and exact operator
+        // coverage, so provenance and model metadata cannot affect it.
+        verb.consequence = canonical_generated_access_consequence(&verb);
+        if verb.consequence == Reversibility::Irreversible {
+            if let Some(inherited) = self.wrapped_operator_consequence(&verb) {
+                verb.consequence = inherited;
+            }
+        }
+        Ok(verb)
+    }
+
+    pub fn upsert_access_verb(&mut self, verb: Verb) -> Result<()> {
+        let mut verb = self.canonical_generated_access_verb(verb)?;
         verb.trusted = true;
         if let Some(existing) = self.verbs.get(&verb.name) {
             if serde_json::to_value(existing)? == serde_json::to_value(&verb)? {
@@ -1223,6 +1226,37 @@ impl VerbCatalog {
         self.verbs.insert(verb.name.clone(), verb);
         self.refresh_version()?;
         Ok(())
+    }
+
+    /// Inherit an operator-reviewed consequence only when every concrete argv
+    /// admitted by the generated matcher reverse-matches compatible catalog
+    /// coverage. Non-enumerable or broader matchers inherit nothing and stay
+    /// at the fail-closed generated default.
+    fn wrapped_operator_consequence(&self, candidate: &Verb) -> Option<Reversibility> {
+        if !candidate.coverage.is_empty() || candidate.binary.contains('{') {
+            return None;
+        }
+        let mut inherited: Option<Reversibility> = None;
+        for args in enumerate_matcher_commands(candidate)? {
+            let class = self
+                .match_command_all(&candidate.binary, &args)
+                .into_iter()
+                .filter(|matched| {
+                    matched.action != CoverageAction::Deny
+                        && matched.rendered.name != candidate.name
+                        && !matched.rendered.name.starts_with("grant-")
+                        && !matched.rendered.name.starts_with("access-generated-")
+                })
+                .map(|matched| matched.rendered.consequence)
+                .max_by_key(|class| reversibility_rank(*class))?;
+            inherited = Some(match inherited {
+                Some(previous) if reversibility_rank(previous) >= reversibility_rank(class) => {
+                    previous
+                }
+                _ => class,
+            });
+        }
+        inherited
     }
 
     pub fn remove_saved_grant_verbs(&mut self, grant_name: &str) -> Result<usize> {
@@ -1275,43 +1309,6 @@ impl VerbCatalog {
             tracing::warn!("catalog deletion committed with a durability warning: {error}");
         }
         Ok(verb)
-    }
-
-    /// Consequence inherited from operator catalog coverage that a generated
-    /// access matcher wraps. A wrap holds only when every concrete command
-    /// the matcher admits reverse-matches a non-generated catalog verb,
-    /// proven by enumerating the matcher's parameter space and replaying each
-    /// command through the catalog's own reverse match; a matcher broader
-    /// than the operator-reviewed coverage, or one whose parameters are not
-    /// plain literal enumerations, inherits nothing. Each command takes the
-    /// most conservative class among its matches and the wrap takes the most
-    /// conservative class across commands, so inheritance can never assign a
-    /// class less restrictive than the wrapped verb's own.
-    fn wrapped_operator_consequence(&self, candidate: &Verb) -> Option<Reversibility> {
-        if !candidate.coverage.is_empty() || candidate.binary.contains('{') {
-            return None;
-        }
-        let mut inherited: Option<Reversibility> = None;
-        for args in enumerate_matcher_commands(candidate)? {
-            let class = self
-                .match_command_all(&candidate.binary, &args)
-                .into_iter()
-                .filter(|matched| {
-                    matched.action != CoverageAction::Deny
-                        && matched.rendered.name != candidate.name
-                        && !matched.rendered.name.starts_with("grant-")
-                        && !matched.rendered.name.starts_with("access-generated-")
-                })
-                .map(|matched| matched.rendered.consequence)
-                .max_by_key(|class| reversibility_rank(*class))?;
-            inherited = Some(match inherited {
-                Some(previous) if reversibility_rank(previous) >= reversibility_rank(class) => {
-                    previous
-                }
-                _ => class,
-            });
-        }
-        inherited
     }
 
     fn refresh_version(&mut self) -> Result<()> {
@@ -1892,6 +1889,21 @@ fn synthesized_access_is_statically_read_only(verb: &Verb) -> bool {
     }
 }
 
+/// Derive the fail-closed consequence permitted for generated access coverage
+/// before any exact operator coverage refinement is considered.
+///
+/// This function intentionally reads only executable matcher authority. It is
+/// shared by pending reductions, durable proposal parsing, approval
+/// projection, and installation, so provenance and model-supplied metadata
+/// cannot make the same matcher converge to different gate behavior.
+pub fn canonical_generated_access_consequence(verb: &Verb) -> Reversibility {
+    if synthesized_access_is_statically_read_only(verb) {
+        Reversibility::Reversible
+    } else {
+        Reversibility::Irreversible
+    }
+}
+
 /// Every concrete argv a generated matcher's template admits, or `None` when
 /// a referenced parameter pattern is not a plain literal enumeration or the
 /// combination space exceeds the bound.
@@ -2406,10 +2418,19 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
 /// Canonical authority-bearing fields for generated access coverage. This
 /// stable shape identifies the matcher shown to an operator.
 pub fn generated_access_matcher_shape(verb: &Verb) -> serde_json::Value {
+    let coverage = verb
+        .coverage
+        .iter()
+        .cloned()
+        .map(|mut cell| {
+            cell.provenance = None;
+            cell
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "binary": verb.binary,
         "args": verb.args,
-        "coverage": verb.coverage,
+        "coverage": coverage,
         "credential_plan": verb.credential_plan,
         "params": verb.params,
     })
@@ -2592,12 +2613,14 @@ fn sanitize_synthesized_verb_prose(verb: &mut Verb) {
 }
 
 pub fn canonicalize_synthesized_verb_envelope(mut verb: Verb) -> Result<Verb> {
-    verb = canonicalize_generated_catalog_envelope(verb)?;
+    verb = canonicalize_generated_authority_envelope(verb)?;
     validate_synthesized_safety(&verb)?;
     Ok(verb)
 }
 
-fn canonicalize_generated_catalog_envelope(mut verb: Verb) -> Result<Verb> {
+/// Canonicalize the complete generated-authority envelope without changing
+/// executable authority. Saved grants and catalog synthesis share this gate.
+pub fn canonicalize_generated_authority_envelope(mut verb: Verb) -> Result<Verb> {
     sanitize_synthesized_verb_prose(&mut verb);
     if generated_authority_contains_sensitive_literal(&verb) {
         bail!(
@@ -2659,6 +2682,13 @@ pub fn parse_normalized_generated_access_verb(value: &serde_json::Value) -> Resu
     }
     if normalized.name != generated_access_verb_name(&normalized) {
         bail!("generated access coverage name does not match its matcher digest");
+    }
+    if canonical_generated_access_consequence(&normalized) == Reversibility::Reversible
+        && normalized.consequence != Reversibility::Reversible
+    {
+        bail!(
+            "generated access coverage consequence does not match the locally derived matcher consequence"
+        );
     }
     if serde_json::to_value(&normalized).context("encode normalized proposed access coverage")?
         != *value
@@ -4026,7 +4056,7 @@ verbs:
         let value = ["q", "7"].concat();
         let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "safe");
         verb.promotion_stamp = Some(format!("password={value}"));
-        assert!(canonicalize_generated_catalog_envelope(verb.clone()).is_err());
+        assert!(canonicalize_generated_authority_envelope(verb.clone()).is_err());
 
         let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
         assert!(VerbCatalog::from_yaml(&yaml).is_err());
@@ -4397,6 +4427,7 @@ verbs:
             ),
         ];
         for (candidate, expected) in cases {
+            let candidate = catalog.canonical_generated_access_verb(candidate).unwrap();
             let name = candidate.name.clone();
             catalog.upsert_access_verb(candidate).unwrap();
             let installed = catalog.get(&name).unwrap();
@@ -4442,9 +4473,10 @@ verbs:
     }
 
     #[test]
-    fn generated_access_matcher_wrapping_catalog_verb_inherits_its_consequence() {
+    fn generated_access_matcher_inherits_exact_catalog_consequence() {
         let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
         let wrapper = toolbox_wrapper("^(status|df)$");
+        let wrapper = catalog.canonical_generated_access_verb(wrapper).unwrap();
         let name = wrapper.name.clone();
         catalog.upsert_access_verb(wrapper).unwrap();
         assert_eq!(
@@ -4455,12 +4487,116 @@ verbs:
     }
 
     #[test]
-    fn generated_access_matcher_broader_than_catalog_coverage_stays_irreversible() {
-        // One admitted value escapes the wrapped verb's own pattern, so the
-        // matcher is broader than the operator-reviewed coverage and keeps
-        // the fail-closed default.
+    fn generated_access_rejects_a_forged_consequence_after_normalization() {
+        let mut verb = synth_verb("kubectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = args_vec(&["get", "pods"]);
+        verb.consequence = Reversibility::Irreversible;
+        verb.name = generated_access_verb_name(&verb);
+        let mut serialized = serde_json::to_value(canonical_generated_access_verb(verb)).unwrap();
+        serialized["consequence"] = serde_json::json!("irreversible");
+        assert!(parse_normalized_generated_access_verb(&serialized)
+            .unwrap_err()
+            .to_string()
+            .contains("locally derived matcher consequence"));
+    }
+
+    #[test]
+    fn generated_access_identity_converges_when_all_provenance_fields_vary() {
+        let mut first = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        first.baseline = false;
+        first.args = args_vec(&["inspect", "{item}"]);
+        first.params.insert(
+            "item".to_string(),
+            ParamSpec {
+                pattern: "^[a-z]+$".to_string(),
+                required: true,
+                default: None,
+                allow_dash: false,
+            },
+        );
+        let mut second = first.clone();
+        for (verb, source, evidence, regime, prompt, model, dimension, generated_unix) in [
+            (
+                &mut first,
+                "source-one",
+                "evidence-one",
+                "regime-one",
+                "prompt-one",
+                "model-one",
+                "dimension-one",
+                1,
+            ),
+            (
+                &mut second,
+                "source-two",
+                "evidence-two",
+                "regime-two",
+                "prompt-two",
+                "model-two",
+                "dimension-two",
+                2,
+            ),
+        ] {
+            verb.coverage = vec![VerbCoverageCell {
+                name: "item".to_string(),
+                action: CoverageAction::Evaluate,
+                required_args: Vec::new(),
+                forbidden_args: Vec::new(),
+                min_args: None,
+                max_args: None,
+                options: Vec::new(),
+                target: None,
+                inventory: None,
+                namespace: None,
+                fanout: None,
+                cwd: None,
+                environment: Vec::new(),
+                override_marker: None,
+                sticky: false,
+                provenance: Some(CoverageProvenance {
+                    source: source.to_string(),
+                    evidence: vec![evidence.to_string()],
+                    regime_stamp: regime.to_string(),
+                    prompt_stamp: prompt.to_string(),
+                    model_stamp: model.to_string(),
+                    generated_unix,
+                    probes: vec![CoverageProbe {
+                        dimension: dimension.to_string(),
+                        args: args_vec(&["inspect", "item"]),
+                        expected_match: true,
+                        observed_match: true,
+                    }],
+                }),
+            }];
+            verb.consequence = Reversibility::Irreversible;
+            verb.name = generated_access_verb_name(verb);
+        }
+        let first = canonical_generated_access_verb(first);
+        let second = canonical_generated_access_verb(second);
+        assert_eq!(
+            generated_access_matcher_shape(&first),
+            generated_access_matcher_shape(&second)
+        );
+        assert_eq!(
+            generated_access_verb_name(&first),
+            generated_access_verb_name(&second)
+        );
+        assert_eq!(
+            generated_access_matcher_digest(&generated_access_matcher_shape(&first)),
+            generated_access_matcher_digest(&generated_access_matcher_shape(&second))
+        );
+        assert_eq!(first.consequence, second.consequence);
+    }
+
+    #[test]
+    fn generated_access_matcher_with_mutating_shape_stays_irreversible() {
+        // A kubectl exec wrapper is not one of the statically proven read-only
+        // shapes, so the local consequence remains fail-closed regardless of
+        // the operator catalog's unrelated coverage.
         let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
         let wrapper = toolbox_wrapper("^(status|osd-purge)$");
+        let wrapper = catalog.canonical_generated_access_verb(wrapper).unwrap();
         let name = wrapper.name.clone();
         catalog.upsert_access_verb(wrapper).unwrap();
         assert_eq!(
@@ -4468,10 +4604,10 @@ verbs:
             Reversibility::Irreversible
         );
 
-        // A free-text parameter is not enumerable, so nothing is inherited
-        // even though every actually-valid value would match the catalog verb.
+        // The same rule applies to a free-text parameter.
         let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
         let wrapper = toolbox_wrapper("^[a-z]+$");
+        let wrapper = catalog.canonical_generated_access_verb(wrapper).unwrap();
         let name = wrapper.name.clone();
         catalog.upsert_access_verb(wrapper).unwrap();
         assert_eq!(
@@ -5477,6 +5613,7 @@ verbs:
             verb.baseline = false;
             verb.args = templates;
             verb.params = params;
+            verb.consequence = canonical_generated_access_consequence(&verb);
             verb.name = generated_access_verb_name(&verb);
             let name = verb.name.clone();
             let mut catalog = VerbCatalog::empty();

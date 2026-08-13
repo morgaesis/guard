@@ -8,12 +8,16 @@
 use anyhow::{bail, Context, Result};
 use guard::env::now_unix;
 use guard::gating::verb::{
-    parse_normalized_generated_access_verb, CoverageAction, CoverageProbe, CoverageProvenance,
-    ValueConstraint, Verb, VerbCoverageCell,
+    canonicalize_generated_authority_envelope, generated_access_matcher_shape,
+    normalize_generated_access_verb, parse_normalized_generated_access_verb, CoverageAction,
+    CoverageProbe, CoverageProvenance, ValueConstraint, Verb, VerbCoverageCell,
 };
 use guard::gating::Reversibility;
 use guard::principal::PrincipalKey;
-use guard::redact::{command_contains_sensitive_literals, command_metadata};
+use guard::redact::{
+    command_contains_sensitive_literals, command_metadata, json_contains_exact_secrets,
+    redact_output_text, text_contains_sensitive_literals,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -71,6 +75,7 @@ pub struct GrantCeiling {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SavedGrant {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,6 +109,16 @@ pub struct SavedGrant {
 }
 
 impl SavedGrant {
+    pub fn validate_canonical(&self) -> Result<()> {
+        validate_saved_grant(self)
+    }
+
+    pub fn canonicalized_for_migration(mut self) -> Result<Self> {
+        canonicalize_saved_grant_envelope(&mut self)?;
+        validate_saved_grant(&self)?;
+        Ok(self)
+    }
+
     pub fn normalize(mut self) -> Result<Self> {
         validate_name(&self.name)?;
         normalize_strings(&mut self.activated_verbs);
@@ -133,6 +148,7 @@ impl SavedGrant {
         if self.ceiling.evaluation_modes.is_empty() {
             self.ceiling.evaluation_modes.push(self.evaluation_mode);
         }
+        canonicalize_saved_grant_envelope(&mut self)?;
         validate_saved_grant(&self)?;
         Ok(self)
     }
@@ -382,13 +398,29 @@ impl GrantRequest {
             .requester
             .as_ref()
             .context("access request requires an authenticated requester")?;
+        // The convergence key is a digest of matcher authority, not a
+        // persistence validator. Use normalized authority when available and
+        // retain the raw matcher shape for a request that must be rejected by
+        // the durable validator, so callers can still submit it for a
+        // fail-closed rejection rather than failing while constructing its
+        // diagnostic key.
+        let proposed_authority = self
+            .proposed_verbs
+            .iter()
+            .map(|value| {
+                let verb = serde_json::from_value::<Verb>(value.clone())
+                    .context("decode proposed access coverage for request key")?;
+                let authority = normalize_generated_access_verb(verb.clone()).unwrap_or(verb);
+                Ok(generated_access_matcher_shape(&authority))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let encoded = serde_json::to_vec(&(
             requester,
             &self.session_token,
             &self.delta,
             self.requested_uses,
             &self.authority_verbs,
-            &self.proposed_verbs,
+            proposed_authority,
             &self.issued_session_revision,
         ))?;
         let digest = Sha256::digest(encoded);
@@ -766,6 +798,11 @@ fn migrate_legacy_pattern(
 }
 
 fn validate_saved_grant(grant: &SavedGrant) -> Result<()> {
+    let mut canonical = grant.clone();
+    canonicalize_saved_grant_envelope(&mut canonical)?;
+    if serde_json::to_value(&canonical)? != serde_json::to_value(grant)? {
+        bail!("saved grant metadata is not in canonical sanitized form");
+    }
     if grant.activated_verbs.is_empty()
         && grant.generated_verbs.is_empty()
         && grant.secret_names.is_empty()
@@ -820,6 +857,26 @@ fn validate_saved_grant(grant: &SavedGrant) -> Result<()> {
     Ok(())
 }
 
+fn canonicalize_saved_grant_envelope(grant: &mut SavedGrant) -> Result<()> {
+    grant.label = grant.label.take().map(|value| redact_output_text(&value));
+    grant.description = redact_output_text(&grant.description);
+    if grant
+        .prompt_append
+        .as_deref()
+        .is_some_and(text_contains_sensitive_literals)
+    {
+        bail!("saved grant evaluator context contains a sensitive literal");
+    }
+    for verb in &mut grant.generated_verbs {
+        *verb = canonicalize_generated_authority_envelope(verb.clone())?;
+    }
+    let serialized = serde_json::to_value(&*grant)?;
+    if json_contains_exact_secrets(&serialized, &[]) {
+        bail!("saved grant contains a trusted exact credential literal");
+    }
+    Ok(())
+}
+
 fn validate_name(name: &str) -> Result<()> {
     let valid = !name.is_empty()
         && name.bytes().enumerate().all(|(index, byte)| {
@@ -849,6 +906,7 @@ fn selector_matches(selector: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use guard::gating::verb::{generated_access_verb_name, ParamSpec};
 
     #[test]
     fn parses_saved_grant_catalog() {
@@ -981,6 +1039,34 @@ mod tests {
         let error = SavedGrantCatalog::from_yaml(&yaml).expect_err("credential authority");
         assert!(error.to_string().contains("credential-bearing"));
         assert!(!error.to_string().contains(&value));
+    }
+
+    #[test]
+    fn saved_grant_canonicalizes_exact_literals_in_explanatory_metadata() {
+        let value = ["grant", "-metadata-fixture"].concat();
+        let _scope =
+            guard::redact::register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
+        let grant = SavedGrant {
+            name: "fixture".to_string(),
+            label: Some(format!("label {value}")),
+            description: format!("description {value}"),
+            activated_verbs: vec!["fixture-verb".to_string()],
+            override_markers: Vec::new(),
+            secret_names: Vec::new(),
+            ttl_secs: None,
+            prompt_append: None,
+            evaluation_mode: EvaluationMode::ReadOnly,
+            auto_approve_requests: false,
+            ceiling: GrantCeiling::default(),
+            generated_verbs: Vec::new(),
+            revision: 1,
+            created_unix: 1,
+            updated_unix: 1,
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(grant.label.as_deref(), Some("label [REDACTED]"));
+        assert_eq!(grant.description, "description [REDACTED]");
     }
 
     #[test]
@@ -1147,5 +1233,95 @@ mod tests {
         assert_eq!(execution.request_key, prose.request_key);
         prose.session_token = "another-session".to_string();
         assert_ne!(execution.request_key, prose.canonical_access_key().unwrap());
+    }
+
+    #[test]
+    fn access_request_keys_ignore_every_generated_provenance_field() {
+        fn proposal(seed: &str, generated_unix: u64) -> serde_json::Value {
+            let mut verb = Verb {
+                name: "access-generated-fixture".to_string(),
+                description: String::new(),
+                binary: "fixturectl".to_string(),
+                args: vec!["inspect".to_string(), "{item}".to_string()],
+                baseline: false,
+                coverage: vec![VerbCoverageCell {
+                    name: "item".to_string(),
+                    action: CoverageAction::Evaluate,
+                    required_args: Vec::new(),
+                    forbidden_args: Vec::new(),
+                    min_args: None,
+                    max_args: None,
+                    options: Vec::new(),
+                    target: None,
+                    inventory: None,
+                    namespace: None,
+                    fanout: None,
+                    cwd: None,
+                    environment: Vec::new(),
+                    override_marker: None,
+                    sticky: false,
+                    provenance: Some(CoverageProvenance {
+                        source: format!("source-{seed}"),
+                        evidence: vec![format!("evidence-{seed}")],
+                        regime_stamp: format!("regime-{seed}"),
+                        prompt_stamp: format!("prompt-{seed}"),
+                        model_stamp: format!("model-{seed}"),
+                        generated_unix,
+                        probes: vec![CoverageProbe {
+                            dimension: format!("dimension-{seed}"),
+                            args: vec!["inspect".to_string(), "item".to_string()],
+                            expected_match: true,
+                            observed_match: true,
+                        }],
+                    }),
+                }],
+                credential_plan: None,
+                params: BTreeMap::from([(
+                    "item".to_string(),
+                    ParamSpec {
+                        pattern: "^[a-z]+$".to_string(),
+                        required: true,
+                        default: None,
+                        allow_dash: false,
+                    },
+                )]),
+                consequence: Reversibility::Irreversible,
+                revert: None,
+                trusted: false,
+                prompt_context: None,
+                source_prose: None,
+                evidence: None,
+                auto_promoted: false,
+                promotion_stamp: None,
+            };
+            verb = guard::gating::verb::normalize_generated_access_verb(verb).unwrap();
+            verb.name = generated_access_verb_name(&verb);
+            serde_json::to_value(verb).unwrap()
+        }
+
+        let first_proposal = proposal("one", 1);
+        let name = serde_json::from_value::<Verb>(first_proposal.clone())
+            .unwrap()
+            .name;
+        let delta = GrantRequestDelta {
+            activated_verbs: vec![name.to_string()],
+            ..GrantRequestDelta::default()
+        };
+        let mut first = GrantRequest::new_access(
+            PrincipalKey::from_uid(1001),
+            None,
+            "agent:1001".to_string(),
+            delta.clone(),
+            "inspect bounded fixture".to_string(),
+        )
+        .unwrap();
+        first.authority_verbs = vec![name.to_string()];
+        first.proposed_verbs = vec![first_proposal];
+        first.request_key = first.canonical_access_key().unwrap();
+
+        let mut second = first.clone();
+        second.proposed_verbs = vec![proposal("two", 2)];
+        second.request_key = second.canonical_access_key().unwrap();
+        assert_eq!(first.request_key, second.request_key);
     }
 }

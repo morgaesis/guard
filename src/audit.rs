@@ -832,7 +832,8 @@ mod tests {
     #[test]
     fn central_audit_projection_redacts_registered_exact_literals_in_all_fields() {
         let value = ["audit", "-exact-fixture"].concat();
-        crate::redact::register_trusted_exact_secrets(std::slice::from_ref(&value));
+        let _scope =
+            crate::redact::register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
         let event = AuditEvent::new(AuditKind::Denied)
             .handle(format!("handle-{value}"))
             .caller(format!("caller-{value}"))

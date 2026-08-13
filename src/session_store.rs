@@ -1359,6 +1359,9 @@ impl SessionStore {
                         "durable saved-grant index disagrees with serialized row for {name}"
                     );
                 }
+                grant
+                    .validate_canonical()
+                    .with_context(|| format!("validate durable saved grant {name}"))?;
             }
         }
         {
@@ -1514,6 +1517,7 @@ impl SessionStore {
 
     #[cfg(test)]
     pub async fn save_saved_grant(&self, grant: SavedGrant) -> Result<()> {
+        grant.validate_canonical()?;
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = Self::open_connection(&path)?;
@@ -1577,6 +1581,9 @@ impl SessionStore {
                         "durable saved-grant index disagrees with serialized row for {name}"
                     );
                 }
+                grant
+                    .validate_canonical()
+                    .with_context(|| format!("validate durable saved grant {name}"))?;
                 grants.push(grant);
             }
             Ok(grants)
@@ -3220,6 +3227,39 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                         sanitized_deny,
                         rowid
                     ],
+                )?;
+            }
+        }
+    }
+    {
+        let mut stmt = conn.prepare("SELECT rowid, name, json FROM saved_grants")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (rowid, name, json) in rows {
+            let Ok(grant) = serde_json::from_str::<SavedGrant>(&json) else {
+                continue;
+            };
+            let canonical = grant.canonicalized_for_migration().ok();
+            if let Some(canonical) = canonical {
+                let canonical_json = serde_json::to_string(&canonical)?;
+                if canonical_json != json {
+                    conn.execute(
+                        "UPDATE saved_grants SET json = ?1 WHERE rowid = ?2",
+                        params![canonical_json, rowid],
+                    )?;
+                }
+            } else {
+                conn.execute("DELETE FROM saved_grants WHERE rowid = ?1", params![rowid])?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO saved_grant_tombstones (name, deleted_unix) VALUES (?1, ?2)",
+                    params![name, encode_u64(guard::env::now_unix())?],
                 )?;
             }
         }
@@ -6835,7 +6875,8 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        guard::redact::register_trusted_exact_secrets(std::slice::from_ref(&value));
+        let _scope =
+            guard::redact::register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
 
         let approvals = store.load_approvals().await.unwrap();
         let provisionals = store.load_provisionals().await.unwrap();
@@ -6873,7 +6914,8 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        guard::redact::register_trusted_exact_secrets(std::slice::from_ref(&value));
+        let _scope =
+            guard::redact::register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
 
         let loaded = store.load_grant_requests().await.unwrap();
         assert_eq!(
@@ -6921,7 +6963,8 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        guard::redact::register_trusted_exact_secrets(std::slice::from_ref(&value));
+        let _scope =
+            guard::redact::register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
 
         let loaded = store.load_provisionals().await.unwrap();
         assert_eq!(loaded[0].status, ProvisionalStatus::RevertFailed);

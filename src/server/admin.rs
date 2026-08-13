@@ -899,8 +899,18 @@ async fn reduce_access_intent(
             }
             let mut proposal = verb;
             proposal.trusted = false;
-            guard::gating::verb::normalize_generated_access_verb(proposal)
-                .map_err(|error| format!("stored generated access coverage was rejected: {error}"))
+            let supplied = proposal.consequence;
+            let canonical = catalog
+                .canonical_generated_access_verb(proposal)
+                .map_err(|error| {
+                    format!("stored generated access coverage was rejected: {error}")
+                })?;
+            if supplied != canonical.consequence {
+                return Err(
+                    "stored generated access coverage consequence is not canonical".to_string(),
+                );
+            }
+            Ok(canonical)
         })
         .collect::<Result<Vec<_>, String>>()?;
     let clauses = access_intent_clauses(intent);
@@ -1002,8 +1012,18 @@ async fn reduce_generated_access_candidate(
             }
             let mut proposal = verb;
             proposal.trusted = false;
-            guard::gating::verb::normalize_generated_access_verb(proposal)
-                .map_err(|error| format!("stored generated access coverage was rejected: {error}"))
+            let supplied = proposal.consequence;
+            let proposal = catalog
+                .canonical_generated_access_verb(proposal)
+                .map_err(|error| {
+                    format!("stored generated access coverage was rejected: {error}")
+                })?;
+            if supplied != proposal.consequence {
+                return Err(
+                    "stored generated access coverage consequence is not canonical".to_string(),
+                );
+            }
+            Ok(proposal)
         })
         .collect::<Result<Vec<_>, String>>()?;
     if let Some(reused) = existing.iter().find(|verb| {
@@ -1012,6 +1032,9 @@ async fn reduce_generated_access_candidate(
         return access_reduction(vec![reused.clone()]);
     }
     candidate.name = generated_access_verb_name(&candidate);
+    candidate = catalog
+        .canonical_generated_access_verb(candidate)
+        .map_err(|error| format!("synthesized access coverage was rejected: {error}"))?;
     catalog
         .validate_candidate(&candidate)
         .map_err(|error| format!("invalid non-baseline access coverage: {error}"))?;
@@ -1041,25 +1064,31 @@ fn access_reduction(matched: Vec<Verb>) -> Result<(Vec<Verb>, Vec<Verb>), String
     Ok((reduced, proposed))
 }
 
-fn access_capability(verb: &Verb) -> Option<AccessCapability> {
+fn access_capability(catalog: &VerbCatalog, verb: &Verb) -> Option<AccessCapability> {
+    let mut projected = verb.clone();
     if verb.name.starts_with("access-generated-") {
         let mut proposal = verb.clone();
         proposal.trusted = false;
         let serialized = serde_json::to_value(proposal).ok()?;
-        guard::gating::verb::parse_normalized_generated_access_verb(&serialized).ok()?;
+        let proposal =
+            guard::gating::verb::parse_normalized_generated_access_verb(&serialized).ok()?;
+        projected = catalog.canonical_generated_access_verb(proposal).ok()?;
+        if projected.consequence != verb.consequence {
+            return None;
+        }
     }
-    let matcher = generated_access_matcher_shape(verb);
+    let matcher = generated_access_matcher_shape(&projected);
     Some(AccessCapability {
-        verb: verb.name.clone(),
-        description: redact_output_text(&verb.description),
+        verb: projected.name.clone(),
+        description: redact_output_text(&projected.description),
         matcher_digest: generated_access_matcher_digest(&matcher),
         matcher,
-        consequence: verb.consequence.as_str().to_string(),
-        credential_plan: verb.credential_plan.clone(),
-        baseline: verb.baseline,
+        consequence: projected.consequence.as_str().to_string(),
+        credential_plan: projected.credential_plan.clone(),
+        baseline: projected.baseline,
         trusted: verb.trusted,
-        has_revert: verb.revert.is_some(),
-        evidence: verb.evidence.as_deref().map(redact_output_text),
+        has_revert: projected.revert.is_some(),
+        evidence: projected.evidence.as_deref().map(redact_output_text),
     })
 }
 
@@ -1094,7 +1123,7 @@ mod access_capability_tests {
         };
         verb = guard::gating::verb::normalize_generated_access_verb(verb).unwrap();
         verb.name = generated_access_verb_name(&verb);
-        let capability = access_capability(&verb).unwrap();
+        let capability = access_capability(&VerbCatalog::empty(), &verb).unwrap();
         let projection = serde_json::to_string(&capability).unwrap();
         assert!(!projection.contains(&value));
         assert_eq!(capability.description, verb.description);
@@ -1134,7 +1163,7 @@ mod access_capability_tests {
             promotion_stamp: None,
         };
         verb.name = generated_access_verb_name(&verb);
-        assert!(access_capability(&verb).is_none());
+        assert!(access_capability(&VerbCatalog::empty(), &verb).is_none());
     }
 
     #[test]
@@ -1184,7 +1213,7 @@ mod access_capability_tests {
             promotion_stamp: None,
         };
         verb.name = generated_access_verb_name(&verb);
-        assert!(access_capability(&verb).is_none());
+        assert!(access_capability(&VerbCatalog::empty(), &verb).is_none());
     }
 }
 
@@ -1193,7 +1222,7 @@ async fn capabilities_for(server: &ServerContext, names: &[String]) -> Vec<Acces
     names
         .iter()
         .filter_map(|name| catalog.get(name))
-        .filter_map(access_capability)
+        .filter_map(|verb| access_capability(&catalog, verb))
         .collect()
 }
 
@@ -1214,7 +1243,7 @@ async fn capabilities_for_request(
         .authority_verbs
         .iter()
         .filter_map(|name| catalog.get(name).or_else(|| proposed.get(name)))
-        .filter_map(access_capability)
+        .filter_map(|verb| access_capability(&catalog, verb))
         .collect()
 }
 
@@ -1998,6 +2027,7 @@ pub(super) async fn submit_access_request(
                 .ok_or_else(|| "access target expired while resolving".to_string())?;
             return Ok(access_item_for_session(server, &summary, &audience).await);
         }
+        let catalog = server.state.verbs.read().await;
         return Ok(AccessItem {
             reference: "baseline".to_string(),
             kind: "effective".to_string(),
@@ -2014,7 +2044,10 @@ pub(super) async fn submit_access_request(
             next_action: "guard access list".to_string(),
             approval_options: Vec::new(),
             intent: Some(intent),
-            capabilities: reduced.iter().filter_map(access_capability).collect(),
+            capabilities: reduced
+                .iter()
+                .filter_map(|verb| access_capability(&catalog, verb))
+                .collect(),
             decided_reason: None,
         });
     }

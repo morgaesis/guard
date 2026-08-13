@@ -1168,21 +1168,38 @@ mod tests {
         .unwrap();
         let acquired = Arc::new(std::sync::Barrier::new(2));
         let release = Arc::new(std::sync::Barrier::new(2));
+        let locked_path = path.clone();
         let lock_thread = {
             let acquired = acquired.clone();
             let release = release.clone();
             std::thread::spawn(move || {
-                crate::learned_rules::hold_learning_file_lock_for_test(&path, &acquired, &release);
+                crate::learned_rules::hold_learning_file_lock_for_test(
+                    &locked_path,
+                    &acquired,
+                    &release,
+                );
             })
         };
         acquired.wait();
 
-        let evaluation = tokio::spawn(async move { evaluator.evaluate("fixturectl status").await });
-        tokio::time::timeout(std::time::Duration::from_millis(250), async {
-            tokio::task::yield_now().await;
-        })
-        .await
-        .expect("Tokio worker remained responsive during filesystem lock contention");
+        let attempted =
+            crate::learned_rules::observe_authority_snapshot_attempt_for_test(path.clone());
+        let evaluation = tokio::spawn(async move {
+            evaluator
+                .evaluate_scoped_argv(
+                    "fixturectl",
+                    &["status".to_string()],
+                    None,
+                    false,
+                    false,
+                    None,
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || attempted.recv())
+            .await
+            .unwrap()
+            .expect("evaluation reached durable authority snapshot acquisition");
         release.wait();
         let _ = evaluation.await.unwrap();
         lock_thread.join().unwrap();

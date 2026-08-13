@@ -18,6 +18,7 @@
 //! per object.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -82,6 +83,18 @@ struct RouteAuthority {
     policy_fingerprint: String,
 }
 
+struct AuthorityUpdateGuard<'a> {
+    revision: &'a AtomicU64,
+    _coordination: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for AuthorityUpdateGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.revision.fetch_add(1, Ordering::Release);
+        debug_assert!(!previous.is_multiple_of(2));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuardHoldOutcome {
     Approved,
@@ -117,6 +130,9 @@ pub struct ApiProxy {
     /// swaps mark the generation odd for their short transition, then publish
     /// the next even value. Routes bind an even generation plus policy digest.
     authority_revision: AtomicU64,
+    /// Serializes the short authority publication and first upstream-send poll.
+    /// It never spans pending network I/O or response streaming.
+    authority_initiation: Mutex<()>,
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
     gate: OnceLock<Arc<dyn GateSink>>,
@@ -443,10 +459,6 @@ impl ApiForwardHandoff for UpstreamSendHandoff<'_> {
         {
             return Err("policy authority changed before upstream handoff".to_string());
         }
-        // This exact generation comparison is the finite authorization
-        // linearization point. No registry guard crosses the bounded network
-        // handoff; response-derived authority is revalidated again before it
-        // is published locally.
         let request = self
             .request
             .take()
@@ -457,7 +469,33 @@ impl ApiForwardHandoff for UpstreamSendHandoff<'_> {
                 return Err("durable mutation dispatch preparation failed".to_string());
             }
         }
-        match tokio::time::timeout(self.timeout, request.send()).await {
+        if self
+            .proxy
+            .recheck_final_authority(&self.route_authority, self.operation.as_ref())
+            .await
+            .is_some()
+        {
+            return Err("policy authority changed during durable dispatch preparation".to_string());
+        }
+        let send = request.send();
+        tokio::pin!(send);
+        let first_poll = {
+            let _reservation = self
+                .proxy
+                .reserve_authority_initiation(&self.route_authority)
+                .ok_or_else(|| "policy authority changed before upstream initiation".to_string())?;
+            // The first poll is the finite side-effect initiation point. Policy
+            // publication cannot interleave with it, and the coordination is
+            // released immediately if the network future remains pending.
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            send.as_mut().poll(&mut context)
+        };
+        let result = match first_poll {
+            std::task::Poll::Ready(result) => Ok(result),
+            std::task::Poll::Pending => tokio::time::timeout(self.timeout, &mut send).await,
+        };
+        match result {
             Ok(result) => {
                 self.outcome = UpstreamHandoffOutcome::Finished(result);
                 Ok(())
@@ -880,6 +918,7 @@ impl ApiProxy {
             policy: Arc::new(RwLock::new(policy)),
             policy_path,
             authority_revision: AtomicU64::new(0),
+            authority_initiation: Mutex::new(()),
             gate: OnceLock::new(),
             judge: StdRwLock::new(None),
             judge_builder: OnceLock::new(),
@@ -977,6 +1016,16 @@ impl ApiProxy {
         }
     }
 
+    #[doc(hidden)]
+    pub async fn wait_for_policy_fingerprint(&self, expected: &str) {
+        loop {
+            if self.policy_fingerprint().await == expected {
+                return;
+            }
+            self.policy_reload_notify.notified().await;
+        }
+    }
+
     pub fn attach_session_sink(&self, sink: Arc<dyn ApiSessionSink>) {
         let _ = self.session_sink.set(sink);
     }
@@ -1009,9 +1058,14 @@ impl ApiProxy {
     /// Attach an API judge. Later calls replace the active judge, which lets a
     /// policy intent reload swap in a fresh evaluator and fresh cache.
     pub fn attach_judge(&self, judge: Arc<dyn ApiJudge>) {
-        self.begin_authority_update();
-        *self.judge.write().unwrap() = Some(judge);
-        self.finish_authority_update();
+        let Some(_update) = self.begin_authority_update() else {
+            tracing::error!(target: "guard::apiproxy", "API judge update timed out");
+            return;
+        };
+        *self
+            .judge
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(judge);
     }
 
     /// Attach a builder used by the policy reloader to rebuild the judge when
@@ -1024,16 +1078,22 @@ impl ApiProxy {
     pub fn has_judge(&self) -> bool {
         self.judge
             .read()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .is_some_and(|judge| judge.evaluator_enabled())
     }
 
-    fn begin_authority_update(&self) {
-        loop {
+    fn begin_authority_update(&self) -> Option<AuthorityUpdateGuard<'_>> {
+        const MAX_UPDATE_ATTEMPTS: usize = 1024;
+        let coordination = match self.authority_initiation.try_lock() {
+            Ok(coordination) => coordination,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        for _ in 0..MAX_UPDATE_ATTEMPTS {
             let revision = self.authority_revision.load(Ordering::Acquire);
             if !revision.is_multiple_of(2) {
-                std::thread::yield_now();
+                std::hint::spin_loop();
                 continue;
             }
             if self
@@ -1046,18 +1106,38 @@ impl ApiProxy {
                 )
                 .is_ok()
             {
-                return;
+                return Some(AuthorityUpdateGuard {
+                    revision: &self.authority_revision,
+                    _coordination: coordination,
+                });
             }
         }
+        None
     }
 
-    fn finish_authority_update(&self) {
-        let previous = self.authority_revision.fetch_add(1, Ordering::Release);
-        debug_assert!(!previous.is_multiple_of(2));
+    fn reserve_authority_initiation(
+        &self,
+        expected: &RouteAuthority,
+    ) -> Option<std::sync::MutexGuard<'_, ()>> {
+        const MAX_RESERVATION_ATTEMPTS: usize = 1024;
+        for _ in 0..MAX_RESERVATION_ATTEMPTS {
+            let coordination = match self.authority_initiation.try_lock() {
+                Ok(coordination) => coordination,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+            };
+            return (self.authority_revision.load(Ordering::Acquire) == expected.revision)
+                .then_some(coordination);
+        }
+        None
     }
 
-    async fn capture_route_authority(&self) -> (ApiPolicy, RouteAuthority) {
-        loop {
+    async fn capture_route_authority(&self) -> Result<(ApiPolicy, RouteAuthority)> {
+        const MAX_CAPTURE_ATTEMPTS: usize = 64;
+        for _ in 0..MAX_CAPTURE_ATTEMPTS {
             let before = self.authority_revision.load(Ordering::Acquire);
             if !before.is_multiple_of(2) {
                 tokio::task::yield_now().await;
@@ -1067,15 +1147,16 @@ impl ApiProxy {
             let after = self.authority_revision.load(Ordering::Acquire);
             if before == after && after.is_multiple_of(2) {
                 let policy_fingerprint = policy.authority_fingerprint();
-                return (
+                return Ok((
                     policy,
                     RouteAuthority {
                         revision: after,
                         policy_fingerprint,
                     },
-                );
+                ));
             }
         }
+        anyhow::bail!("API route authority remained unstable")
     }
 
     pub fn protocol_name(&self) -> &str {
@@ -1285,7 +1366,16 @@ impl ApiProxy {
         conn_id: u64,
         session_context: Option<ApiSessionContext>,
     ) -> Response<ProxyBody> {
-        let (route_policy, route_authority) = self.capture_route_authority().await;
+        let (route_policy, route_authority) = match self.capture_route_authority().await {
+            Ok(authority) => authority,
+            Err(_) => {
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: API route authority is unavailable",
+                    "Forbidden",
+                )
+            }
+        };
         req.extensions_mut().insert(route_authority);
         let method = req.method().clone();
         let path = req.uri().path().to_string();
@@ -1874,7 +1964,12 @@ impl ApiProxy {
             Ok(body) => body,
             Err(reason) => return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid"),
         };
-        let Some(judge) = self.judge.read().unwrap().clone() else {
+        let Some(judge) = self
+            .judge
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
             return self.status_resp(
                 StatusCode::FORBIDDEN,
                 "guard api-proxy: no exact typed API coverage resolver is attached",
@@ -3040,7 +3135,8 @@ impl ApiProxy {
             .take()
             .ok_or_else(|| anyhow::anyhow!("upstream response body was already consumed"))?;
         let source: ReqwestByteStream = Box::pin(upstream_resp.bytes_stream());
-        let redactor = ExactSecretRedactor::new(response_secrets, self.upstream_body_limit);
+        let redactor = ExactSecretRedactor::new(response_secrets, self.upstream_body_limit)
+            .map_err(|_| anyhow!("upstream redaction context exceeds its resource limit"))?;
         let stream = futures::stream::try_unfold(
             (source, redactor, false),
             |(mut source, mut redactor, finished)| async move {
@@ -3292,7 +3388,13 @@ impl ApiProxy {
         if let Some(reason) = op.and_then(|operation| self.protocol.deny_outright(operation)) {
             return Some(self.status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden"));
         }
-        let (_, current) = self.capture_route_authority().await;
+        let Ok((_, current)) = self.capture_route_authority().await else {
+            return Some(self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: API route authority is unavailable",
+                "Forbidden",
+            ));
+        };
         if &current != expected {
             return Some(self.status_resp(
                 StatusCode::FORBIDDEN,
@@ -3723,7 +3825,10 @@ impl ApiProxy {
             return;
         };
         let judge = builder(intent);
-        *self.judge.write().unwrap() = judge;
+        *self
+            .judge
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = judge;
         tracing::info!(target: "guard::apiproxy", "rebuilt api evaluator for policy intent change");
     }
 }
@@ -4191,12 +4296,14 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
                 };
                 let old_intent = policy.intent.clone();
                 let new_intent = p.intent.clone();
-                proxy.begin_authority_update();
+                let Some(_update) = proxy.begin_authority_update() else {
+                    tracing::error!(target: "guard::apiproxy", "API policy publication coordination timed out");
+                    continue;
+                };
                 if old_intent != new_intent {
                     proxy.rebuild_judge_for_intent_during_update(new_intent);
                 }
                 *policy = p;
-                proxy.finish_authority_update();
                 last = Some(observed);
                 // Wake observers again after publication. The earlier signal
                 // marks entry into authority coordination for contention
@@ -4249,7 +4356,8 @@ mod tests {
 
     #[test]
     fn exact_response_redaction_spans_chunk_boundaries() {
-        let mut redactor = ExactSecretRedactor::new(vec![b"operator-secret-token".to_vec()], 1024);
+        let mut redactor =
+            ExactSecretRedactor::new(vec![b"operator-secret-token".to_vec()], 1024).unwrap();
         let mut output = redactor.push(b"prefix operator-secr").unwrap();
         output.extend_from_slice(&redactor.push(b"et-token suffix").unwrap());
         output.extend_from_slice(&redactor.finish().unwrap());
@@ -4261,7 +4369,7 @@ mod tests {
     #[test]
     fn exact_response_redaction_enforces_raw_and_expanded_byte_limits() {
         let proxy = test_proxy().with_upstream_body_limit(8);
-        let value = [b'x', b'!'];
+        let value = *b"x!";
         assert!(proxy
             .redact_upstream_bytes(vec![value.to_vec()], &value.repeat(4))
             .is_err());
@@ -4271,14 +4379,37 @@ mod tests {
     #[tokio::test]
     async fn response_derived_authority_rejects_a_stale_route_generation() {
         let proxy = test_proxy();
-        let (_, expected) = proxy.capture_route_authority().await;
-        proxy.begin_authority_update();
-        proxy.finish_authority_update();
+        let (_, expected) = proxy.capture_route_authority().await.unwrap();
+        drop(proxy.begin_authority_update().unwrap());
         assert!(
             !proxy
                 .publication_authority_is_current(&expected, None)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn authority_update_panic_finalizes_revision_and_reads_remain_bounded() {
+        let proxy = test_proxy();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _update = proxy.begin_authority_update().unwrap();
+            panic!("injected authority publication panic");
+        }));
+        assert!(proxy
+            .authority_revision
+            .load(Ordering::Acquire)
+            .is_multiple_of(2));
+        assert!(proxy.capture_route_authority().await.is_ok());
+
+        proxy
+            .authority_revision
+            .store(u64::MAX - 1, Ordering::Release);
+        drop(proxy.begin_authority_update().unwrap());
+        assert_eq!(proxy.authority_revision.load(Ordering::Acquire), 0);
+
+        proxy.authority_revision.store(1, Ordering::Release);
+        assert!(proxy.capture_route_authority().await.is_err());
+        proxy.authority_revision.store(2, Ordering::Release);
     }
 
     #[test]
