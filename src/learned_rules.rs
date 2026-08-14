@@ -1091,10 +1091,19 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         unsafe { LocalFree(descriptor) };
         anyhow::bail!("failed to enumerate the Windows authority DACL");
     }
+    if count != 0 && entries.is_null() {
+        unsafe { LocalFree(descriptor) };
+        anyhow::bail!("Windows authority DACL enumeration returned no entry buffer");
+    }
 
     let dangerous = windows_authority_mutation_mask(directory);
     let result = (|| -> Result<()> {
-        for entry in unsafe { std::slice::from_raw_parts(entries, count as usize) } {
+        let entries = if count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(entries, count as usize) }
+        };
+        for entry in entries {
             if !matches!(entry.grfAccessMode, GRANT_ACCESS | SET_ACCESS)
                 || entry.grfAccessPermissions & dangerous == 0
             {
@@ -1117,7 +1126,9 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         Ok(())
     })();
     unsafe {
-        LocalFree(entries.cast());
+        if !entries.is_null() {
+            LocalFree(entries.cast());
+        }
         LocalFree(descriptor);
     }
     result
