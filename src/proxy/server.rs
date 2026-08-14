@@ -36,7 +36,9 @@ use hyper::{header, HeaderMap, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
+};
 use tokio_rustls::TlsAcceptor;
 
 use super::gate::{
@@ -83,16 +85,21 @@ struct RouteAuthority {
     policy_fingerprint: String,
 }
 
-struct AuthorityUpdateGuard<'a> {
+struct AuthorityRevisionTransition<'a> {
     revision: &'a AtomicU64,
-    _coordination: std::sync::MutexGuard<'a, ()>,
 }
 
-impl Drop for AuthorityUpdateGuard<'_> {
+impl Drop for AuthorityRevisionTransition<'_> {
     fn drop(&mut self) {
         let previous = self.revision.fetch_add(1, Ordering::Release);
         debug_assert!(!previous.is_multiple_of(2));
     }
+}
+
+struct AuthorityUpdateGuard<'a> {
+    _revision_transition: AuthorityRevisionTransition<'a>,
+    _update_serial: OwnedMutexGuard<()>,
+    _coordination: OwnedRwLockWriteGuard<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,9 +137,13 @@ pub struct ApiProxy {
     /// swaps mark the generation odd for their short transition, then publish
     /// the next even value. Routes bind an even generation plus policy digest.
     authority_revision: AtomicU64,
-    /// Serializes the short authority publication and first upstream-send poll.
-    /// It never spans pending network I/O or response streaming.
-    authority_initiation: Mutex<()>,
+    /// Upstream handoffs hold a read lease through response headers. Authority
+    /// publication takes the write lease, so revocation waits for every
+    /// in-flight handoff without serializing independent reads and writes.
+    authority_initiation: Arc<RwLock<()>>,
+    /// Serializes update intents so only one revision can be marked odd while
+    /// it waits for existing upstream handoffs to finish.
+    authority_update_serial: Arc<AsyncMutex<()>>,
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
     gate: OnceLock<Arc<dyn GateSink>>,
@@ -174,7 +185,10 @@ pub struct ApiProxy {
     /// [`POLICY_RELOAD_SECS`] default; tests inject a short interval so they
     /// can observe a reload without a multi-second wait.
     policy_reload_interval: Duration,
-    policy_reload_attempt: AtomicU64,
+    /// Wrapping generation advanced once when an authority revision becomes
+    /// transitional, before the update waits for in-flight handoffs.
+    authority_transition_generation: AtomicU64,
+    authority_transition_notify: tokio::sync::Notify,
     policy_reload_notify: tokio::sync::Notify,
 }
 
@@ -479,14 +493,15 @@ impl ApiForwardHandoff for UpstreamSendHandoff<'_> {
         }
         let send = request.send();
         tokio::pin!(send);
+        let _reservation = self
+            .proxy
+            .reserve_authority_initiation(&self.route_authority)
+            .await
+            .ok_or_else(|| "policy authority changed before upstream initiation".to_string())?;
+        // Keep the lease until the request future reaches response headers. A
+        // first poll can only queue a write; releasing here would let policy
+        // publication commit before the transport actually sends it.
         let first_poll = {
-            let _reservation = self
-                .proxy
-                .reserve_authority_initiation(&self.route_authority)
-                .ok_or_else(|| "policy authority changed before upstream initiation".to_string())?;
-            // The first poll is the finite side-effect initiation point. Policy
-            // publication cannot interleave with it, and the coordination is
-            // released immediately if the network future remains pending.
             let waker = futures::task::noop_waker();
             let mut context = std::task::Context::from_waker(&waker);
             send.as_mut().poll(&mut context)
@@ -928,7 +943,8 @@ impl ApiProxy {
             policy: Arc::new(RwLock::new(policy)),
             policy_path,
             authority_revision: AtomicU64::new(0),
-            authority_initiation: Mutex::new(()),
+            authority_initiation: Arc::new(RwLock::new(())),
+            authority_update_serial: Arc::new(AsyncMutex::new(())),
             gate: OnceLock::new(),
             judge: StdRwLock::new(None),
             judge_builder: OnceLock::new(),
@@ -945,7 +961,8 @@ impl ApiProxy {
             upstream_body_timeout: UPSTREAM_BODY_TIMEOUT,
             upstream_body_limit: MAX_UPSTREAM_BODY,
             policy_reload_interval: Duration::from_secs(POLICY_RELOAD_SECS),
-            policy_reload_attempt: AtomicU64::new(0),
+            authority_transition_generation: AtomicU64::new(0),
+            authority_transition_notify: tokio::sync::Notify::new(),
             policy_reload_notify: tokio::sync::Notify::new(),
         }
     }
@@ -1010,29 +1027,51 @@ impl ApiProxy {
         self.policy.read().await.authority_fingerprint()
     }
 
-    #[doc(hidden)]
-    pub fn policy_reload_attempt(&self) -> u64 {
-        self.policy_reload_attempt.load(Ordering::Acquire)
+    /// Return the wrapping generation of authority transitions that have begun.
+    ///
+    /// The generation advances exactly once after the proxy publishes an odd
+    /// authority revision, before the update waits for in-flight upstream
+    /// handoffs. It observes transition entry, not completed policy
+    /// publication.
+    pub fn authority_transition_generation(&self) -> u64 {
+        self.authority_transition_generation.load(Ordering::Acquire)
     }
 
-    #[doc(hidden)]
-    pub async fn wait_for_policy_reload_attempt_after(&self, baseline: u64) {
+    /// Wait for an authority transition after `observed_generation` and return
+    /// the new wrapping generation.
+    pub async fn wait_for_authority_transition_after(&self, observed_generation: u64) -> u64 {
         loop {
-            let notified = self.policy_reload_notify.notified();
-            if self.policy_reload_attempt() > baseline {
-                return;
+            let notified = self.authority_transition_notify.notified();
+            let generation = self.authority_transition_generation();
+            if generation != observed_generation {
+                return generation;
             }
             notified.await;
         }
     }
 
-    #[doc(hidden)]
+    /// Wait until `expected` is the active policy authority fingerprint.
+    /// Notification registration precedes each observation, so publication
+    /// cannot be missed between the fingerprint read and the wait.
     pub async fn wait_for_policy_fingerprint(&self, expected: &str) {
+        self.wait_for_policy_fingerprint_with_before_check(expected, || {})
+            .await;
+    }
+
+    async fn wait_for_policy_fingerprint_with_before_check<F>(
+        &self,
+        expected: &str,
+        mut before_check: F,
+    ) where
+        F: FnMut(),
+    {
         loop {
+            let notified = self.policy_reload_notify.notified();
+            before_check();
             if self.policy_fingerprint().await == expected {
                 return;
             }
-            self.policy_reload_notify.notified().await;
+            notified.await;
         }
     }
 
@@ -1054,9 +1093,8 @@ impl ApiProxy {
     /// Drop provenance for a resolved auto-revert. Called by the daemon when a
     /// proxy-armed create-revert is confirmed or reverted, so a create record
     /// cannot outlive the revert window it was tied to.
-    pub async fn forget_created_by_handle(&self, handle: &str) -> bool {
+    pub fn forget_created_by_handle(&self, handle: &str) {
         self.created.lock().unwrap().forget_by_handle(handle);
-        true
     }
 
     /// Attach the daemon's consequence bridge before serving. Idempotent; a
@@ -1065,13 +1103,13 @@ impl ApiProxy {
         let _ = self.gate.set(sink);
     }
 
-    /// Attach an API judge. Later calls replace the active judge, which lets a
-    /// policy intent reload swap in a fresh evaluator and fresh cache.
-    pub fn attach_judge(&self, judge: Arc<dyn ApiJudge>) {
-        let Some(_update) = self.begin_authority_update() else {
-            tracing::error!(target: "guard::apiproxy", "API judge update timed out");
-            return;
-        };
+    /// Attach or replace the API judge with full authority coordination.
+    ///
+    /// The revision is marked transitional and the write lease is held until
+    /// the replacement is published, so in-flight upstream handoffs cannot
+    /// race an evaluator change.
+    pub async fn attach_judge(&self, judge: Arc<dyn ApiJudge>) {
+        let _update = self.begin_authority_update().await;
         *self
             .judge
             .write()
@@ -1093,56 +1131,53 @@ impl ApiProxy {
             .is_some_and(|judge| judge.evaluator_enabled())
     }
 
-    fn begin_authority_update(&self) -> Option<AuthorityUpdateGuard<'_>> {
-        const MAX_UPDATE_ATTEMPTS: usize = 1024;
-        let coordination = match self.authority_initiation.try_lock() {
-            Ok(coordination) => coordination,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
-        for _ in 0..MAX_UPDATE_ATTEMPTS {
-            let revision = self.authority_revision.load(Ordering::Acquire);
-            if !revision.is_multiple_of(2) {
-                std::hint::spin_loop();
-                continue;
-            }
-            if self
-                .authority_revision
-                .compare_exchange(
-                    revision,
-                    revision.saturating_add(1),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Some(AuthorityUpdateGuard {
-                    revision: &self.authority_revision,
-                    _coordination: coordination,
-                });
-            }
-        }
-        None
+    async fn begin_authority_update(&self) -> AuthorityUpdateGuard<'_> {
+        self.begin_authority_update_with_callback(|| {}).await
     }
 
-    fn reserve_authority_initiation(
+    async fn begin_authority_update_with_callback<F>(
+        &self,
+        after_revision_published: F,
+    ) -> AuthorityUpdateGuard<'_>
+    where
+        F: FnOnce(),
+    {
+        let update_serial = self.authority_update_serial.clone().lock_owned().await;
+        let revision = self.authority_revision.load(Ordering::Acquire);
+        debug_assert!(revision.is_multiple_of(2));
+        let next = revision.wrapping_add(1);
+        self.authority_revision
+            .compare_exchange(revision, next, Ordering::AcqRel, Ordering::Acquire)
+            .expect("authority update serial keeps revision stable");
+        // Own the odd revision before awaiting the write lease. Cancellation
+        // while waiting for an in-flight handoff must publish an even revision.
+        let revision_transition = AuthorityRevisionTransition {
+            revision: &self.authority_revision,
+        };
+        self.authority_transition_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.authority_transition_notify.notify_waiters();
+        after_revision_published();
+        let coordination = self.authority_initiation.clone().write_owned().await;
+        AuthorityUpdateGuard {
+            _revision_transition: revision_transition,
+            _update_serial: update_serial,
+            _coordination: coordination,
+        }
+    }
+
+    async fn reserve_authority_initiation(
         &self,
         expected: &RouteAuthority,
-    ) -> Option<std::sync::MutexGuard<'_, ()>> {
-        const MAX_RESERVATION_ATTEMPTS: usize = 1024;
-        for _ in 0..MAX_RESERVATION_ATTEMPTS {
-            let coordination = match self.authority_initiation.try_lock() {
-                Ok(coordination) => coordination,
-                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    std::hint::spin_loop();
-                    continue;
-                }
-            };
-            return (self.authority_revision.load(Ordering::Acquire) == expected.revision)
-                .then_some(coordination);
+    ) -> Option<OwnedRwLockReadGuard<()>> {
+        if self.authority_revision.load(Ordering::Acquire) != expected.revision
+            || !expected.revision.is_multiple_of(2)
+        {
+            return None;
         }
-        None
+        let coordination = self.authority_initiation.clone().try_read_owned().ok()?;
+        (self.authority_revision.load(Ordering::Acquire) == expected.revision)
+            .then_some(coordination)
     }
 
     async fn capture_route_authority(&self) -> Result<(ApiPolicy, RouteAuthority)> {
@@ -2954,7 +2989,7 @@ impl ApiProxy {
                         Some(&created.handle),
                     ));
                 }
-                let _ = self.forget_created_by_handle(&created.handle).await;
+                self.forget_created_by_handle(&created.handle);
             }
             let bytes = self
                 .redact_upstream_bytes(response_secrets, &bytes)
@@ -4298,28 +4333,15 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
                     last = Some(observed);
                     continue;
                 }
-                proxy.policy_reload_attempt.fetch_add(1, Ordering::AcqRel);
-                proxy.policy_reload_notify.notify_waiters();
-                let Ok(mut policy) = proxy.policy.try_write() else {
-                    tracing::debug!(target: "guard::apiproxy", "policy publication deferred while a policy snapshot is active");
-                    continue;
-                };
+                let _update = proxy.begin_authority_update().await;
+                let mut policy = proxy.policy.write().await;
                 let old_intent = policy.intent.clone();
                 let new_intent = p.intent.clone();
-                let Some(_update) = proxy.begin_authority_update() else {
-                    tracing::error!(target: "guard::apiproxy", "API policy publication coordination timed out");
-                    continue;
-                };
                 if old_intent != new_intent {
                     proxy.rebuild_judge_for_intent_during_update(new_intent);
                 }
                 *policy = p;
                 last = Some(observed);
-                // Wake observers again after publication. The earlier signal
-                // marks entry into authority coordination for contention
-                // tests; this one prevents a waiter from parking after seeing
-                // that attempt but before the new fingerprint becomes live.
-                proxy.policy_reload_attempt.fetch_add(1, Ordering::AcqRel);
                 proxy.policy_reload_notify.notify_waiters();
                 tracing::info!(target: "guard::apiproxy", "reloaded api-policy from {}", path.display());
             }
@@ -4338,6 +4360,24 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestJudge;
+
+    #[async_trait::async_trait]
+    impl ApiJudge for TestJudge {
+        async fn authorize_forward(
+            &self,
+            _summary: &ApiRequestSummary,
+            _requirement: ApiForwardRequirement,
+            _handoff: &mut dyn ApiForwardHandoff,
+        ) -> Result<(), String> {
+            Err("test judge does not authorize forwarding".to_string())
+        }
+
+        async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+            ApiJudgeVerdict::Error("test judge".to_string())
+        }
+    }
 
     #[test]
     fn body_shape_redacts_values_and_sanitizes_untrusted_keys() {
@@ -4387,10 +4427,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_fingerprint_wait_registers_before_observation() {
+        let proxy = test_proxy();
+        let replacement = ApiPolicy::from_yaml("default: allow\n").unwrap();
+        let expected = replacement.authority_fingerprint();
+        let mut replacement = Some(replacement);
+        let mut checks = 0;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            proxy.wait_for_policy_fingerprint_with_before_check(&expected, || {
+                checks += 1;
+                match checks {
+                    1 => proxy.policy_reload_notify.notify_waiters(),
+                    2 => {
+                        *proxy
+                            .policy
+                            .try_write()
+                            .expect("policy is available for deterministic publication") =
+                            replacement.take().expect("replacement publishes once");
+                    }
+                    _ => panic!("fingerprint waiter performed an unexpected extra check"),
+                }
+            }),
+        )
+        .await
+        .expect("a notification between registration and observation must not be lost");
+        assert_eq!(checks, 2);
+    }
+
+    #[tokio::test]
     async fn response_derived_authority_rejects_a_stale_route_generation() {
         let proxy = test_proxy();
         let (_, expected) = proxy.capture_route_authority().await.unwrap();
-        drop(proxy.begin_authority_update().unwrap());
+        drop(proxy.begin_authority_update().await);
         assert!(
             !proxy
                 .publication_authority_is_current(&expected, None)
@@ -4400,11 +4470,16 @@ mod tests {
 
     #[tokio::test]
     async fn authority_update_panic_finalizes_revision_and_reads_remain_bounded() {
-        let proxy = test_proxy();
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _update = proxy.begin_authority_update().unwrap();
-            panic!("injected authority publication panic");
-        }));
+        let proxy = Arc::new(test_proxy());
+        let panic_result = tokio::spawn({
+            let proxy = proxy.clone();
+            async move {
+                let _update = proxy.begin_authority_update().await;
+                panic!("injected authority publication panic");
+            }
+        })
+        .await;
+        assert!(panic_result.is_err());
         assert!(proxy
             .authority_revision
             .load(Ordering::Acquire)
@@ -4414,12 +4489,138 @@ mod tests {
         proxy
             .authority_revision
             .store(u64::MAX - 1, Ordering::Release);
-        drop(proxy.begin_authority_update().unwrap());
+        drop(proxy.begin_authority_update().await);
         assert_eq!(proxy.authority_revision.load(Ordering::Acquire), 0);
 
         proxy.authority_revision.store(1, Ordering::Release);
         assert!(proxy.capture_route_authority().await.is_err());
         proxy.authority_revision.store(2, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn authority_update_waits_for_upstream_initiation_lease() {
+        let proxy = Arc::new(test_proxy());
+        let (_, expected) = proxy.capture_route_authority().await.unwrap();
+        let lease = proxy
+            .reserve_authority_initiation(&expected)
+            .await
+            .expect("current authority must reserve");
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let update = tokio::spawn({
+            let proxy = proxy.clone();
+            let callback_proxy = proxy.clone();
+            async move {
+                let _update = proxy
+                    .begin_authority_update_with_callback(move || {
+                        let _ = published_tx
+                            .send(callback_proxy.authority_revision.load(Ordering::Acquire));
+                    })
+                    .await;
+                proxy.authority_revision.load(Ordering::Acquire)
+            }
+        });
+        let published_revision = tokio::time::timeout(Duration::from_secs(1), published_rx)
+            .await
+            .expect("authority update publishes before waiting for the lease")
+            .expect("authority publication callback remains live");
+        assert!(!published_revision.is_multiple_of(2));
+        assert!(!update.is_finished());
+        drop(lease);
+        assert_eq!(update.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn authority_update_callback_runs_after_odd_revision_publication() {
+        let proxy = Arc::new(test_proxy());
+        let observed_revision = Arc::new(AtomicU64::new(0));
+        let transition_generation = proxy.authority_transition_generation();
+        let callback_proxy = proxy.clone();
+        let callback_observed_revision = observed_revision.clone();
+        let update = proxy
+            .begin_authority_update_with_callback(move || {
+                callback_observed_revision.store(
+                    callback_proxy.authority_revision.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+            })
+            .await;
+
+        assert_eq!(observed_revision.load(Ordering::Acquire), 1);
+        assert_eq!(
+            proxy.authority_transition_generation(),
+            transition_generation.wrapping_add(1)
+        );
+        drop(update);
+        assert_eq!(
+            proxy.authority_transition_generation(),
+            transition_generation.wrapping_add(1)
+        );
+        assert!(proxy
+            .authority_revision
+            .load(Ordering::Acquire)
+            .is_multiple_of(2));
+    }
+
+    #[tokio::test]
+    async fn cancelled_authority_update_restores_even_revision_before_write_lease() {
+        let proxy = Arc::new(test_proxy());
+        let (_, expected) = proxy.capture_route_authority().await.unwrap();
+        let lease = proxy
+            .reserve_authority_initiation(&expected)
+            .await
+            .expect("current authority must reserve");
+
+        let update = tokio::spawn({
+            let proxy = proxy.clone();
+            async move {
+                let _update = proxy.begin_authority_update().await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !proxy
+                    .authority_revision
+                    .load(Ordering::Acquire)
+                    .is_multiple_of(2)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authority update must publish its odd revision");
+        update.abort();
+        assert!(update.await.unwrap_err().is_cancelled());
+        assert!(proxy
+            .authority_revision
+            .load(Ordering::Acquire)
+            .is_multiple_of(2));
+
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(1), proxy.capture_route_authority())
+            .await
+            .expect("capture remains bounded after cancellation")
+            .expect("authority capture remains available after cancellation");
+        let update_guard =
+            tokio::time::timeout(Duration::from_secs(1), proxy.begin_authority_update())
+                .await
+                .expect("subsequent update remains bounded");
+        drop(update_guard);
+        assert!(proxy
+            .authority_revision
+            .load(Ordering::Acquire)
+            .is_multiple_of(2));
+
+        proxy
+            .authority_revision
+            .store(u64::MAX - 1, Ordering::Release);
+        let update_guard =
+            tokio::time::timeout(Duration::from_secs(1), proxy.begin_authority_update())
+                .await
+                .expect("maximum even revision update remains bounded");
+        drop(update_guard);
+        assert_eq!(proxy.authority_revision.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -4616,6 +4817,20 @@ mod tests {
             ApiPolicy::deny_all(),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn judge_attachment_uses_authority_coordination() {
+        let proxy = test_proxy();
+        let before = proxy.authority_revision.load(Ordering::Acquire);
+
+        proxy.attach_judge(Arc::new(TestJudge)).await;
+
+        assert!(proxy.has_judge());
+        assert_eq!(
+            proxy.authority_revision.load(Ordering::Acquire),
+            before.wrapping_add(2)
+        );
     }
 
     fn delete_op(name: &str) -> ApiOp {
@@ -4899,8 +5114,8 @@ mod tests {
         assert!(!proxy.matches_upstream_identity("kubernetes", "", ""));
     }
 
-    #[tokio::test]
-    async fn forget_created_by_handle_clears_public_provenance() {
+    #[test]
+    fn forget_created_by_handle_clears_public_provenance() {
         let proxy = test_proxy();
         proxy.created.lock().unwrap().remember(
             created_key(1, "foo"),
@@ -4909,7 +5124,7 @@ mod tests {
             "provenance".to_string(),
         );
 
-        assert!(proxy.forget_created_by_handle("h1").await);
+        proxy.forget_created_by_handle("h1");
 
         assert!(proxy
             .created_provenance(&delete_op("foo"), 1, None)

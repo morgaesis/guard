@@ -655,6 +655,9 @@ impl VerbCatalog {
             }
             normalize_operator_boundaries(&mut verb);
             validate_verb(&verb)?;
+            if verb.auto_promoted {
+                validate_auto_promoted_verb_durable_safety(&verb)?;
+            }
             if verbs.insert(verb.name.clone(), verb.clone()).is_some() {
                 bail!("duplicate verb name: '{}'", verb.name);
             }
@@ -2752,8 +2755,8 @@ pub fn gate_rejection_guidance(reason: &str) -> Option<&'static str> {
 ///   latency and only discards the per-instance LLM reasoning a human would
 ///   otherwise see in the hold queue.
 /// - Model-generated rollback authority is never auto-promoted. Recoverable
-///   commands remain under live inverse assessment or operator review; this
-///   keeps a model-proposed revert from becoming a preauthorized action.
+///   candidates are declined here; caller-driven recoverable commands remain
+///   under live inverse assessment or operator review.
 /// - Every parameter pattern must be a plain alternation of the exact,
 ///   regex-escaped values observed in `evidence` (never a model-authored
 ///   regex) and every evidence sample must re-match its own template -- this
@@ -2781,6 +2784,12 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
         .any(|cell| !cell.environment.is_empty())
     {
         bail!("an auto-promoted verb may not authorize caller environment bindings");
+    }
+    if canonical_auto_promoted_consequence(verb) != verb.consequence {
+        bail!(
+            "auto-promoted verb '{}' consequence does not match its independently derived matcher safety",
+            verb.name
+        );
     }
     if !is_kebab_name(&verb.name) {
         bail!(
@@ -2815,6 +2824,109 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
             );
         }
     }
+    Ok(())
+}
+
+/// Validate the subset of promotion safety that can be proven from a durable
+/// catalog row without replaying model evidence. Durable auto-promotion is
+/// deliberately narrower than the in-memory evidence proof: it admits only
+/// the mechanically generated preauthorized read shape and never persists a
+/// model-proposed rollback or caller-controlled boundary.
+pub fn validate_auto_promoted_verb_durable_safety(verb: &Verb) -> Result<()> {
+    validate_auto_promoted_verb_safety(verb, &[])?;
+    if verb.revert.is_some() {
+        bail!(
+            "auto-promoted verb '{}' may not persist rollback authority",
+            verb.name
+        );
+    }
+    let referenced: BTreeSet<String> = verb
+        .args
+        .iter()
+        .flat_map(|token| placeholders(token))
+        .collect();
+    if referenced.len() != verb.params.len() {
+        bail!(
+            "auto-promoted verb '{}' durable matcher must reference every declared parameter",
+            verb.name
+        );
+    }
+    for pname in &referenced {
+        let spec = verb.params.get(pname).ok_or_else(|| {
+            anyhow::anyhow!(
+                "auto-promoted verb '{}' durable matcher references undeclared parameter '{}'",
+                verb.name,
+                pname
+            )
+        })?;
+        if spec.value_type() != ParamValueType::Token {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' must use token semantics",
+                verb.name,
+                pname
+            );
+        }
+        if !spec.required || spec.default.is_some() {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' must be required and have no default",
+                verb.name,
+                pname
+            );
+        }
+        let literals = enumerate_pattern_literals(spec.pattern_text()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "auto-promoted verb '{}' durable parameter '{}' must be a finite plain literal alternation",
+                verb.name,
+                pname
+            )
+        })?;
+        let canonical_pattern = format!(
+            "^({})$",
+            literals
+                .iter()
+                .map(|value| regex::escape(value))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        if spec.pattern_text() != canonical_pattern {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' pattern does not match the generator-canonical exact pattern",
+                verb.name,
+                pname
+            );
+        }
+        if spec.allow_dash != literals.iter().any(|value| value.starts_with('-')) {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' has inconsistent allow_dash generator metadata",
+                verb.name,
+                pname
+            );
+        }
+    }
+    let concrete_commands = enumerate_matcher_commands(verb).ok_or_else(|| {
+        anyhow::anyhow!(
+            "auto-promoted verb '{}' durable matcher must have a bounded finite command set",
+            verb.name
+        )
+    })?;
+    for args in concrete_commands {
+        let mut concrete = verb.clone();
+        concrete.args = args;
+        concrete.params.clear();
+        concrete.coverage.clear();
+        if !synthesized_access_is_statically_read_only(&concrete) {
+            bail!(
+                "auto-promoted verb '{}' durable matcher expands to a command that is not independently read-only",
+                verb.name
+            );
+        }
+    }
+    // Coverage is display and matching metadata, not an independent source
+    // of executable consequence. Existing durable promotions may omit it;
+    // when present, the ordinary catalog validator has already checked its
+    // structure and the checks above reject caller-controlled environment
+    // bindings. The executable matcher and its parameters remain the source
+    // of the independently derived consequence.
     Ok(())
 }
 
@@ -5210,7 +5322,7 @@ verbs:
 
     #[test]
     fn auto_promoted_verb_cannot_authorize_caller_environment() {
-        let catalog = VerbCatalog::from_yaml(
+        let error = VerbCatalog::from_yaml(
             r#"
 verbs:
   - name: generated-check
@@ -5227,10 +5339,7 @@ verbs:
             values: ["/srv/automation/ansible.cfg"]
 "#,
         )
-        .unwrap();
-        let verb = catalog.get("generated-check").unwrap();
-
-        let error = validate_auto_promoted_verb_safety(verb, &[]).unwrap_err();
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("may not authorize caller environment bindings"));
@@ -5252,6 +5361,122 @@ verbs:
         );
         let error = VerbCatalog::from_yaml(&yaml).unwrap_err();
         assert!(error.to_string().contains("literal credential argv"));
+    }
+
+    #[test]
+    fn forged_auto_promoted_consequence_is_rejected_at_catalog_load() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-delete
+    binary: kubectl
+    args: ["delete", "pods"]
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+    coverage:
+      - name: evidence-backed
+        action: preauthorized
+        required_args: ["delete", "pods"]
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("consequence does not match"));
+    }
+
+    #[test]
+    fn forged_auto_promoted_parameter_cannot_smuggle_a_mutating_subcommand() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-pod-read
+    binary: kubectl
+    args: ["--namespace", "get", "{operation}", "pods", "--all"]
+    params:
+      operation:
+        pattern: "^(delete)$"
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("expands to a command that is not independently read-only"));
+    }
+
+    #[test]
+    fn auto_promoted_safe_finite_parameter_commands_remain_valid() {
+        let catalog = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-pod-read
+    binary: kubectl
+    args: ["get", "pods", "--namespace", "{namespace}"]
+    params:
+      namespace:
+        pattern: "^(dev|staging)$"
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap();
+        assert!(catalog.get("generated-pod-read").is_some());
+    }
+
+    #[test]
+    fn forged_auto_promoted_broad_regex_is_rejected_at_catalog_load() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-prod-get
+    binary: kubectl
+    args: ["get", "pods", "{target}"]
+    params:
+      target:
+        pattern: "^prod-[a-z]+$"
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("finite plain literal alternation"));
+    }
+
+    #[test]
+    fn forged_auto_promoted_regex_escape_is_rejected_at_catalog_load() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-digit-get
+    binary: kubectl
+    args: ["get", "pods", "{target}"]
+    params:
+      target:
+        pattern: '^(\d)$'
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("generator-canonical exact pattern"));
     }
 
     #[test]

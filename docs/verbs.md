@@ -172,10 +172,12 @@ operator-authored catalog is unchanged. Equivalent typed shapes are reused
 instead of duplicated.
 
 With consequence gating active, repeated eligible evaluator approvals can
-promote exact observed shapes into trusted verbs. Parameter patterns contain
-only escaped values supported by evidence. Irreversible shapes are ineligible;
-recoverable shapes require validated rollback. Promotion records the evaluator
-regime, and a model or prompt change sends stale coverage back to evaluation.
+promote exact observed, statically read-only shapes into trusted verbs. Parameter
+patterns contain only escaped values supported by evidence. Irreversible and
+recoverable shapes are not auto-promoted: mutating commands remain under
+consequence gating or operator review, and a model-proposed rollback never
+creates unattended authority. Promotion records the evaluator regime, and a
+model or prompt change sends stale coverage back to evaluation.
 
 API traffic uses the same verb vocabulary. Generated API cells bind endpoint,
 session fingerprint, full session revision, operation, namespace, body shape,

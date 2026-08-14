@@ -45,7 +45,7 @@ use super::learning::{
 };
 #[cfg(unix)]
 use super::path_with_shim_dir;
-use super::runtime::NotifyEvent;
+use super::runtime::{NotifyEvent, ProcessGuard};
 use super::transport::{write_policy_decision, write_stream_message};
 #[cfg(unix)]
 use super::wire::ExecOutcome;
@@ -2861,18 +2861,21 @@ impl AnsibleInventoryDiagnostics {
     }
 }
 
-fn append_bounded_diagnostic(output: Option<String>, diagnostic: &str) -> Option<String> {
-    let mut output = output.unwrap_or_default();
-    let reserved = diagnostic.len().min(MAX_OUTPUT_BYTES);
-    let maximum_existing = MAX_OUTPUT_BYTES.saturating_sub(reserved);
-    if output.len() > maximum_existing {
-        let mut boundary = maximum_existing;
-        while boundary > 0 && !output.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        output.truncate(boundary);
+fn append_accounted_diagnostic(
+    output: Option<String>,
+    diagnostic: &str,
+    retained_total: &AtomicUsize,
+) -> Option<String> {
+    let separator_len: usize = output
+        .as_deref()
+        .filter(|value| !value.is_empty() && !value.ends_with('\n'))
+        .map_or(0, |_| 1);
+    let additional = separator_len.saturating_add(diagnostic.len());
+    if reserve_bounded_output(retained_total, additional).is_err() {
+        return output;
     }
-    if !output.is_empty() && !output.ends_with('\n') {
+    let mut output = output.unwrap_or_default();
+    if separator_len != 0 {
         output.push('\n');
     }
     output.push_str(diagnostic);
@@ -3508,31 +3511,30 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         .chain(exact_output_secrets.iter())
         .map(|secret| secret.as_bytes().to_vec())
         .collect::<Vec<_>>();
-    let (stdout_result, stderr_result) = tokio::join!(
-        async {
-            match stdout_pipe {
-                Some(pipe) => read_bounded_redacted_output(pipe, exact_secrets.clone()).await,
-                None => Ok(Vec::new()),
-            }
-        },
-        async {
-            match stderr_pipe {
-                Some(pipe) => read_bounded_redacted_output(pipe, exact_secrets.clone()).await,
-                None => Ok(Vec::new()),
-            }
+    let raw_total = Arc::new(AtomicUsize::new(0));
+    let stdout_secrets = exact_secrets.clone();
+    let stdout_total = raw_total.clone();
+    let stdout_reader = async move {
+        match stdout_pipe {
+            Some(pipe) => read_bounded_redacted_output(pipe, stdout_secrets, stdout_total).await,
+            None => Ok(Vec::new()),
         }
-    );
-    if stdout_result.is_err() || stderr_result.is_err() {
+    };
+    let stderr_reader = async move {
+        match stderr_pipe {
+            Some(pipe) => read_bounded_redacted_output(pipe, exact_secrets, raw_total).await,
+            None => Ok(Vec::new()),
+        }
+    };
+    let buffered_output = collect_bounded_output_pair(stdout_reader, stderr_reader).await;
+    if let Err(error) = buffered_output {
         if let Some(guard) = process_guard.take() {
             guard.terminate();
         }
         let _ = child.kill().await;
         let _ = child.wait().await;
-        return ExecuteResult::exec_failed_after_start(
-            allow_reason,
-            "command output exceeded the bounded byte limit".to_string(),
-        )
-        .with_exposed_secret_refs(exposed_secret_refs);
+        return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+            .with_exposed_secret_refs(exposed_secret_refs);
     }
     let status = match child.wait().await {
         Ok(status) => status,
@@ -3548,31 +3550,43 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         guard.complete();
     }
 
-    let stdout_bytes = stdout_result.expect("checked above");
-    let stderr_bytes = stderr_result.expect("checked above");
+    let (stdout_bytes, stderr_bytes) = buffered_output.expect("checked above");
+    let retained_total = Arc::new(AtomicUsize::new(0));
     let stdout = if stdout_bytes.is_empty() {
         None
     } else {
-        let mut redacted = redact_command_text(
+        let redacted = match redact_bounded_buffered_output(
             server,
             &redaction_env,
             &exact_output_secrets,
             String::from_utf8_lossy(&stdout_bytes).to_string(),
-        );
-        truncate_utf8_bytes(&mut redacted, MAX_OUTPUT_BYTES);
+            &retained_total,
+        ) {
+            Ok(redacted) => redacted,
+            Err(error) => {
+                return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            }
+        };
         Some(redacted)
     };
 
     let mut stderr = if stderr_bytes.is_empty() {
         None
     } else {
-        let mut redacted = redact_command_text(
+        let redacted = match redact_bounded_buffered_output(
             server,
             &redaction_env,
             &exact_output_secrets,
             String::from_utf8_lossy(&stderr_bytes).to_string(),
-        );
-        truncate_utf8_bytes(&mut redacted, MAX_OUTPUT_BYTES);
+            &retained_total,
+        ) {
+            Ok(redacted) => redacted,
+            Err(error) => {
+                return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            }
+        };
         Some(redacted)
     };
 
@@ -3584,7 +3598,11 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         diagnostics.observe(&String::from_utf8_lossy(&stderr_bytes));
         if diagnostics.normalizes_success_to_failure(exit_code) {
             exit_code = Some(1);
-            stderr = append_bounded_diagnostic(stderr, ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC);
+            stderr = append_accounted_diagnostic(
+                stderr,
+                ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC,
+                &retained_total,
+            );
         }
     }
 
@@ -3604,32 +3622,277 @@ fn truncate_utf8_bytes(value: &mut String, limit: usize) {
     value.truncate(end);
 }
 
+#[derive(Debug)]
+enum BoundedOutputError {
+    OutputLimit,
+    RedactionContext,
+    PipeIo(String),
+}
+
+impl std::fmt::Display for BoundedOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutputLimit => {
+                formatter.write_str("command output exceeded the bounded byte limit")
+            }
+            Self::RedactionContext => {
+                formatter.write_str("command redaction context exceeded its resource limit")
+            }
+            Self::PipeIo(detail) => write!(formatter, "command output pipe failed: {detail}"),
+        }
+    }
+}
+
+fn bounded_error_detail(error: impl std::fmt::Display) -> String {
+    let mut detail = error.to_string();
+    detail.retain(|character| !character.is_control());
+    truncate_utf8_bytes(&mut detail, 160);
+    detail
+}
+
+fn reserve_bounded_output(total: &AtomicUsize, amount: usize) -> Result<(), BoundedOutputError> {
+    let reserved = total.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current
+            .checked_add(amount)
+            .filter(|next| *next <= MAX_OUTPUT_BYTES)
+    });
+    reserved
+        .map(|_| ())
+        .map_err(|_| BoundedOutputError::OutputLimit)
+}
+
+fn redact_bounded_buffered_output(
+    server: &ServerContext,
+    tool_env: &HashMap<String, String>,
+    exact_output_secrets: &[String],
+    text: String,
+    retained_total: &AtomicUsize,
+) -> Result<String, BoundedOutputError> {
+    let redacted = redact_command_text(server, tool_env, exact_output_secrets, text);
+    reserve_bounded_output(retained_total, redacted.len())?;
+    Ok(redacted)
+}
+
 async fn read_bounded_redacted_output<R>(
     mut reader: R,
     exact_secrets: Vec<Vec<u8>>,
-) -> Result<Vec<u8>, ()>
+    raw_total: Arc<AtomicUsize>,
+) -> Result<Vec<u8>, BoundedOutputError>
 where
     R: AsyncRead + Unpin,
 {
     const CHUNK_BYTES: usize = 8 * 1024;
-    let mut redactor =
-        ExactSecretStreamRedactor::new(exact_secrets, MAX_OUTPUT_BYTES).map_err(|_| ())?;
+    let mut redactor = ExactSecretStreamRedactor::new(exact_secrets, MAX_OUTPUT_BYTES)
+        .map_err(|_| BoundedOutputError::RedactionContext)?;
     let mut output = Vec::new();
     let mut buffer = vec![0_u8; CHUNK_BYTES];
     loop {
-        let read = reader.read(&mut buffer).await.map_err(|_| ())?;
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| BoundedOutputError::PipeIo(bounded_error_detail(error)))?;
         if read == 0 {
-            output.extend(redactor.finish().map_err(|_| ())?);
+            output.extend(
+                redactor
+                    .finish()
+                    .map_err(|_| BoundedOutputError::OutputLimit)?,
+            );
             return Ok(output);
         }
-        output.extend(redactor.push(&buffer[..read]).map_err(|_| ())?);
+        reserve_bounded_output(&raw_total, read)?;
+        output.extend(
+            redactor
+                .push(&buffer[..read])
+                .map_err(|_| BoundedOutputError::OutputLimit)?,
+        );
+    }
+}
+
+async fn collect_bounded_output_pair(
+    stdout_reader: impl std::future::Future<Output = Result<Vec<u8>, BoundedOutputError>>,
+    stderr_reader: impl std::future::Future<Output = Result<Vec<u8>, BoundedOutputError>>,
+) -> Result<(Vec<u8>, Vec<u8>), BoundedOutputError> {
+    tokio::pin!(stdout_reader);
+    tokio::pin!(stderr_reader);
+    tokio::select! {
+        stdout = &mut stdout_reader => match stdout {
+            Ok(stdout) => match stderr_reader.await {
+                Ok(stderr) => Ok((stdout, stderr)),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        stderr = &mut stderr_reader => match stderr {
+            Ok(stderr) => match stdout_reader.await {
+                Ok(stdout) => Ok((stdout, stderr)),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
     }
 }
 
 #[derive(Debug)]
 enum StreamChunk {
-    Data { stream: OutputStream, data: Vec<u8> },
+    Data {
+        stream: OutputStream,
+        data: Vec<u8>,
+    },
     LimitExceeded,
+    PipeError {
+        stream: OutputStream,
+        detail: String,
+    },
+}
+
+struct StreamReaderTask {
+    stream: OutputStream,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct StreamTaskJoinError {
+    stream: OutputStream,
+    detail: &'static str,
+}
+
+struct StreamTaskCleanup {
+    tasks: Vec<StreamReaderTask>,
+}
+
+impl StreamTaskCleanup {
+    async fn join(&mut self) -> Result<(), StreamTaskJoinError> {
+        while let Some(task) = self.tasks.pop() {
+            if let Err(error) = task.handle.await {
+                let detail = if error.is_panic() {
+                    "reader task panicked"
+                } else if error.is_cancelled() {
+                    "reader task was cancelled"
+                } else {
+                    "reader task failed"
+                };
+                return Err(StreamTaskJoinError {
+                    stream: task.stream,
+                    detail,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn abort_and_join(&mut self) {
+        for task in &self.tasks {
+            task.handle.abort();
+        }
+        while let Some(task) = self.tasks.pop() {
+            let _ = task.handle.await;
+        }
+    }
+}
+
+impl Drop for StreamTaskCleanup {
+    fn drop(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.handle.abort();
+        }
+    }
+}
+
+async fn cleanup_streaming_failure(
+    child: &mut tokio::process::Child,
+    process_guard: &mut Option<ProcessGuard>,
+    stream_tasks: &mut StreamTaskCleanup,
+) {
+    stream_tasks.abort_and_join().await;
+    if let Some(guard) = process_guard.take() {
+        guard.terminate();
+    } else {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
+}
+
+fn output_stream_name(stream: OutputStream) -> &'static str {
+    match stream {
+        OutputStream::Stdout => "stdout",
+        OutputStream::Stderr => "stderr",
+    }
+}
+
+fn reserve_emitted_output(total: &mut usize, amount: usize) -> bool {
+    let Some(next) = total.checked_add(amount) else {
+        return false;
+    };
+    if next > MAX_OUTPUT_BYTES {
+        return false;
+    }
+    *total = next;
+    true
+}
+
+#[derive(Default)]
+struct StreamingHeuristicRedactor {
+    pending_line: Vec<u8>,
+    state: RedactionState,
+}
+
+impl StreamingHeuristicRedactor {
+    fn push<F>(&mut self, data: &[u8], mut redact_line: F) -> Result<String, BoundedOutputError>
+    where
+        F: FnMut(String, &mut RedactionState) -> String,
+    {
+        let mut output = String::new();
+        let mut remaining = data;
+        while let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
+            let line_end = newline + 1;
+            self.append_pending(&remaining[..line_end])?;
+            remaining = &remaining[line_end..];
+
+            let line =
+                String::from_utf8_lossy(&std::mem::take(&mut self.pending_line)).into_owned();
+            let redacted = redact_line(line, &mut self.state);
+            Self::append_output(&mut output, &redacted)?;
+        }
+        self.append_pending(remaining)?;
+        Ok(output)
+    }
+
+    fn finish<F>(&mut self, mut redact_line: F) -> Result<String, BoundedOutputError>
+    where
+        F: FnMut(String, &mut RedactionState) -> String,
+    {
+        if self.pending_line.is_empty() {
+            return Ok(String::new());
+        }
+        let line = String::from_utf8_lossy(&std::mem::take(&mut self.pending_line)).into_owned();
+        let redacted = redact_line(line, &mut self.state);
+        if redacted.len() > MAX_OUTPUT_BYTES {
+            return Err(BoundedOutputError::OutputLimit);
+        }
+        Ok(redacted)
+    }
+
+    fn append_pending(&mut self, data: &[u8]) -> Result<(), BoundedOutputError> {
+        let Some(next) = self.pending_line.len().checked_add(data.len()) else {
+            return Err(BoundedOutputError::OutputLimit);
+        };
+        if next > MAX_OUTPUT_BYTES {
+            return Err(BoundedOutputError::OutputLimit);
+        }
+        self.pending_line.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn append_output(output: &mut String, data: &str) -> Result<(), BoundedOutputError> {
+        let Some(next) = output.len().checked_add(data.len()) else {
+            return Err(BoundedOutputError::OutputLimit);
+        };
+        if next > MAX_OUTPUT_BYTES {
+            return Err(BoundedOutputError::OutputLimit);
+        }
+        output.push_str(data);
+        Ok(())
+    }
 }
 
 struct OutputRedactionContext<'a> {
@@ -3674,29 +3937,35 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     );
 
     let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
-    let mut stream_tasks = Vec::new();
+    let mut stream_tasks = StreamTaskCleanup { tasks: Vec::new() };
     let raw_total = Arc::new(AtomicUsize::new(0));
 
     if let Some(stdout) = child.stdout.take() {
         let tx = tx.clone();
         let raw_total = raw_total.clone();
-        stream_tasks.push(tokio::spawn(async move {
-            forward_stream_chunks(stdout, OutputStream::Stdout, tx, raw_total).await;
-        }));
+        stream_tasks.tasks.push(StreamReaderTask {
+            stream: OutputStream::Stdout,
+            handle: tokio::spawn(async move {
+                forward_stream_chunks(stdout, OutputStream::Stdout, tx, raw_total).await;
+            }),
+        });
     }
 
     if let Some(stderr) = child.stderr.take() {
         let tx = tx.clone();
         let raw_total = raw_total.clone();
-        stream_tasks.push(tokio::spawn(async move {
-            forward_stream_chunks(stderr, OutputStream::Stderr, tx, raw_total).await;
-        }));
+        stream_tasks.tasks.push(StreamReaderTask {
+            stream: OutputStream::Stderr,
+            handle: tokio::spawn(async move {
+                forward_stream_chunks(stderr, OutputStream::Stderr, tx, raw_total).await;
+            }),
+        });
     }
 
     drop(tx);
 
-    let mut stdout_redaction = RedactionState::default();
-    let mut stderr_redaction = RedactionState::default();
+    let mut stdout_redaction = StreamingHeuristicRedactor::default();
+    let mut stderr_redaction = StreamingHeuristicRedactor::default();
     let exact_secrets = server
         .config
         .redact_secrets
@@ -3708,12 +3977,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         match ExactSecretStreamRedactor::new(exact_secrets.clone(), MAX_OUTPUT_BYTES) {
             Ok(redactor) => redactor,
             Err(_) => {
-                if let Some(guard) = process_guard.take() {
-                    guard.terminate();
-                } else {
-                    let _ = child.kill().await;
-                }
-                let _ = child.wait().await;
+                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                 return ExecuteResult::exec_failed_after_start(
                     allow_reason,
                     "command redaction context exceeded its resource limit".to_string(),
@@ -3735,59 +3999,55 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                     if let Some(diagnostics) = &mut ansible_diagnostics {
                         diagnostics.observe(&String::from_utf8_lossy(&data));
                     }
-                    let (redaction_state, exact_redactor) = match stream {
+                    let (heuristic_redactor, exact_redactor) = match stream {
                         OutputStream::Stdout => (&mut stdout_redaction, &mut stdout_exact),
                         OutputStream::Stderr => (&mut stderr_redaction, &mut stderr_exact),
                     };
                     let Ok(data) = exact_redactor.push(&data) else {
-                        if let Some(guard) = process_guard.take() {
-                            guard.terminate();
-                        } else {
-                            let _ = child.kill().await;
-                        }
-                        let _ = child.wait().await;
+                        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                         return ExecuteResult::exec_failed_after_start(
                             allow_reason,
                             "command output exceeded the redacted byte limit".to_string(),
                         )
                         .with_exposed_secret_refs(audit.exposed_secret_refs);
                     };
+                    let data = match heuristic_redactor.push(&data, |line, state| {
+                        redact_command_text_with_state(
+                            server,
+                            redaction.environment,
+                            redaction.exact_secrets,
+                            line,
+                            state,
+                        )
+                    }) {
+                        Ok(data) => data,
+                        Err(_) => {
+                            cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                            return ExecuteResult::exec_failed_after_start(
+                                allow_reason,
+                                "command output exceeded the redacted byte limit".to_string(),
+                            )
+                            .with_exposed_secret_refs(audit.exposed_secret_refs);
+                        }
+                    };
                     if data.is_empty() {
                         continue;
                     }
-                    let data = redact_command_text_with_state(
-                        server,
-                        redaction.environment,
-                        redaction.exact_secrets,
-                        String::from_utf8_lossy(&data).to_string(),
-                        redaction_state,
-                    );
-                    if emitted_total.saturating_add(data.len()) > MAX_OUTPUT_BYTES {
-                        if let Some(guard) = process_guard.take() {
-                            guard.terminate();
-                        } else {
-                            let _ = child.kill().await;
-                        }
-                        let _ = child.wait().await;
+                    if !reserve_emitted_output(&mut emitted_total, data.len()) {
+                        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                         return ExecuteResult::exec_failed_after_start(
                             allow_reason,
                             "command output exceeded the redacted byte limit".to_string(),
                         )
                         .with_exposed_secret_refs(audit.exposed_secret_refs);
                     }
-                    emitted_total += data.len();
                     let message = match stream {
                         OutputStream::Stdout => ExecuteStreamMessage::Stdout { data },
                         OutputStream::Stderr => ExecuteStreamMessage::Stderr { data },
                     };
 
                     if let Err(e) = write_stream_message(writer, &message).await {
-                        if let Some(guard) = process_guard.take() {
-                            guard.terminate();
-                        } else {
-                            let _ = child.kill().await;
-                        }
-                        let _ = child.wait().await;
+                        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                         return ExecuteResult::exec_failed_after_start(
                             allow_reason,
                             format!("client stream error: {}", e),
@@ -3796,20 +4056,27 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                     }
                     }
                     Some(StreamChunk::LimitExceeded) => {
-                        if let Some(guard) = process_guard.take() {
-                            guard.terminate();
-                        } else {
-                            let _ = child.kill().await;
-                        }
-                        let _ = child.wait().await;
+                        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                         return ExecuteResult::exec_failed_after_start(
                             allow_reason,
                             "command output exceeded the byte limit".to_string(),
                         )
                         .with_exposed_secret_refs(audit.exposed_secret_refs);
                     }
+                    Some(StreamChunk::PipeError { stream, detail }) => {
+                        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                        return ExecuteResult::exec_failed_after_start(
+                            allow_reason,
+                            format!(
+                                "command {} output pipe failed: {}",
+                                output_stream_name(stream),
+                                detail
+                            ),
+                        )
+                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                    }
                     None => {
-                        for (stream, exact_redactor, redaction_state) in [
+                        for (stream, exact_redactor, heuristic_redactor) in [
                             (
                                 OutputStream::Stdout,
                                 &mut stdout_exact,
@@ -3822,53 +4089,85 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                             ),
                         ] {
                             let Ok(data) = exact_redactor.finish() else {
-                                if let Some(guard) = process_guard.take() {
-                                    guard.terminate();
-                                } else {
-                                    let _ = child.kill().await;
-                                }
-                                let _ = child.wait().await;
+                                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                                 return ExecuteResult::exec_failed_after_start(
                                     allow_reason,
                                     "command output exceeded the redacted byte limit".to_string(),
                                 )
                                 .with_exposed_secret_refs(audit.exposed_secret_refs);
                             };
-                            if data.is_empty() {
-                                continue;
-                            }
-                            let data = redact_command_text_with_state(
-                                server,
-                                redaction.environment,
-                                redaction.exact_secrets,
-                                String::from_utf8_lossy(&data).to_string(),
-                                redaction_state,
-                            );
-                            if emitted_total.saturating_add(data.len()) > MAX_OUTPUT_BYTES {
-                                if let Some(guard) = process_guard.take() {
-                                    guard.terminate();
-                                } else {
-                                    let _ = child.kill().await;
+                            let mut data = match heuristic_redactor.push(&data, |line, state| {
+                                redact_command_text_with_state(
+                                    server,
+                                    redaction.environment,
+                                    redaction.exact_secrets,
+                                    line,
+                                    state,
+                                )
+                            }) {
+                                Ok(data) => data,
+                                Err(_) => {
+                                    cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                    return ExecuteResult::exec_failed_after_start(
+                                        allow_reason,
+                                        "command output exceeded the redacted byte limit".to_string(),
+                                    )
+                                    .with_exposed_secret_refs(audit.exposed_secret_refs);
                                 }
-                                let _ = child.wait().await;
+                            };
+                            let tail = match heuristic_redactor.finish(|line, state| {
+                                redact_command_text_with_state(
+                                    server,
+                                    redaction.environment,
+                                    redaction.exact_secrets,
+                                    line,
+                                    state,
+                                )
+                            }) {
+                                Ok(tail) => tail,
+                                Err(_) => {
+                                    cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                    return ExecuteResult::exec_failed_after_start(
+                                        allow_reason,
+                                        "command output exceeded the redacted byte limit".to_string(),
+                                    )
+                                    .with_exposed_secret_refs(audit.exposed_secret_refs);
+                                }
+                            };
+                            let Some(total_len) = data.len().checked_add(tail.len()) else {
+                                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                return ExecuteResult::exec_failed_after_start(
+                                    allow_reason,
+                                    "command output exceeded the redacted byte limit".to_string(),
+                                )
+                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            };
+                            if total_len > MAX_OUTPUT_BYTES {
+                                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                                 return ExecuteResult::exec_failed_after_start(
                                     allow_reason,
                                     "command output exceeded the redacted byte limit".to_string(),
                                 )
                                 .with_exposed_secret_refs(audit.exposed_secret_refs);
                             }
-                            emitted_total += data.len();
+                            data.push_str(&tail);
+                            if data.is_empty() {
+                                continue;
+                            }
+                            if !reserve_emitted_output(&mut emitted_total, data.len()) {
+                                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                return ExecuteResult::exec_failed_after_start(
+                                    allow_reason,
+                                    "command output exceeded the redacted byte limit".to_string(),
+                                )
+                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            }
                             let message = match stream {
                                 OutputStream::Stdout => ExecuteStreamMessage::Stdout { data },
                                 OutputStream::Stderr => ExecuteStreamMessage::Stderr { data },
                             };
                             if let Err(error) = write_stream_message(writer, &message).await {
-                                if let Some(guard) = process_guard.take() {
-                                    guard.terminate();
-                                } else {
-                                    let _ = child.kill().await;
-                                }
-                                let _ = child.wait().await;
+                                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                                 return ExecuteResult::exec_failed_after_start(
                                     allow_reason,
                                     format!("client stream error: {error}"),
@@ -3882,12 +4181,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
             }
             _ = keepalive.tick() => {
                 if let Err(e) = write_stream_message(writer, &ExecuteStreamMessage::Keepalive).await {
-                    if let Some(guard) = process_guard.take() {
-                        guard.terminate();
-                    } else {
-                        let _ = child.kill().await;
-                    }
-                    let _ = child.wait().await;
+                    cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                     return ExecuteResult::exec_failed_after_start(
                         allow_reason,
                         format!("client stream error: {}", e),
@@ -3898,8 +4192,17 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         }
     }
 
-    for task in stream_tasks {
-        let _ = task.await;
+    if let Err(error) = stream_tasks.join().await {
+        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+        return ExecuteResult::exec_failed_after_start(
+            allow_reason,
+            format!(
+                "command {} output {}",
+                output_stream_name(error.stream),
+                error.detail
+            ),
+        )
+        .with_exposed_secret_refs(audit.exposed_secret_refs);
     }
 
     let status = match child.wait().await {
@@ -3922,15 +4225,20 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         .is_some_and(|diagnostics| diagnostics.normalizes_success_to_failure(exit_code))
     {
         exit_code = Some(1);
-        let diagnostic = ExecuteStreamMessage::Stderr {
-            data: ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC.to_string(),
-        };
-        if let Err(e) = write_stream_message(writer, &diagnostic).await {
-            return ExecuteResult::exec_failed_after_start(
-                allow_reason,
-                format!("client stream error: {}", e),
-            )
-            .with_exposed_secret_refs(audit.exposed_secret_refs);
+        if reserve_emitted_output(
+            &mut emitted_total,
+            ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC.len(),
+        ) {
+            let diagnostic = ExecuteStreamMessage::Stderr {
+                data: ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC.to_string(),
+            };
+            if let Err(e) = write_stream_message(writer, &diagnostic).await {
+                return ExecuteResult::exec_failed_after_start(
+                    allow_reason,
+                    format!("client stream error: {}", e),
+                )
+                .with_exposed_secret_refs(audit.exposed_secret_refs);
+            }
         }
     }
 
@@ -4001,9 +4309,9 @@ async fn forward_stream_chunks<R>(
             }
             Err(e) => {
                 let _ = tx
-                    .send(StreamChunk::Data {
-                        stream: OutputStream::Stderr,
-                        data: format!("guard stream read error: {}\n", e).into_bytes(),
+                    .send(StreamChunk::PipeError {
+                        stream,
+                        detail: bounded_error_detail(e),
                     })
                     .await;
                 break;
@@ -4119,6 +4427,8 @@ pub(super) fn merge_envelope_context(
 mod decision_trace_feature_tests {
     use super::*;
     use guard::gating::verb::CoverageAction;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
 
     #[test]
     fn buffered_output_truncation_preserves_utf8_and_the_byte_cap() {
@@ -4151,6 +4461,7 @@ mod decision_trace_feature_tests {
                     retained += data.len();
                 }
                 StreamChunk::LimitExceeded => limited = true,
+                StreamChunk::PipeError { .. } => panic!("unexpected pipe error"),
             }
         }
         task.await.unwrap();
@@ -4158,13 +4469,308 @@ mod decision_trace_feature_tests {
         assert!(retained <= MAX_OUTPUT_BYTES);
     }
 
+    fn redact_complete_test_line(line: String, state: &mut RedactionState) -> String {
+        let had_trailing_newline = line.ends_with('\n');
+        let line = line.strip_suffix('\n').unwrap_or(&line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let mut redacted = redact_output_with_state(line, state);
+        if had_trailing_newline {
+            redacted.push('\n');
+        }
+        redacted
+    }
+
+    #[test]
+    fn streaming_heuristic_redaction_holds_a_split_credential_field_until_line_end() {
+        const CHUNK_BYTES: usize = 8 * 1024;
+        const FIELD_PREFIX: &[u8] = b" API_TO";
+        const SENSITIVE_VALUE: &str = "fixture-sensitive-value";
+
+        let mut first_chunk = vec![b'x'; CHUNK_BYTES - FIELD_PREFIX.len()];
+        first_chunk.extend_from_slice(FIELD_PREFIX);
+        assert_eq!(first_chunk.len(), CHUNK_BYTES);
+        let second_chunk = format!("KEN={SENSITIVE_VALUE}\n");
+
+        let mut exact = ExactSecretStreamRedactor::new(Vec::new(), MAX_OUTPUT_BYTES).unwrap();
+        let mut heuristic = StreamingHeuristicRedactor::default();
+        let first = exact.push(&first_chunk).unwrap();
+        assert!(heuristic
+            .push(&first, redact_complete_test_line)
+            .unwrap()
+            .is_empty());
+
+        let second = exact.push(second_chunk.as_bytes()).unwrap();
+        let mut output = heuristic.push(&second, redact_complete_test_line).unwrap();
+        output.push_str(
+            &heuristic
+                .push(&exact.finish().unwrap(), redact_complete_test_line)
+                .unwrap(),
+        );
+        output.push_str(&heuristic.finish(redact_complete_test_line).unwrap());
+
+        assert!(!output.contains(SENSITIVE_VALUE));
+        assert!(output.contains("API_TOKEN=[REDACTED]"));
+    }
+
+    #[test]
+    fn streaming_heuristic_redaction_rejects_an_oversized_unterminated_line() {
+        let mut redactor = StreamingHeuristicRedactor::default();
+        assert!(redactor
+            .push(&vec![b'x'; MAX_OUTPUT_BYTES], redact_complete_test_line,)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            redactor.push(b"x", redact_complete_test_line),
+            Err(BoundedOutputError::OutputLimit)
+        ));
+    }
+
     #[tokio::test]
     async fn buffered_child_output_is_bounded_before_collection() {
         let reader =
             tokio::io::AsyncReadExt::take(tokio::io::repeat(b'x'), (MAX_OUTPUT_BYTES + 1) as u64);
-        assert!(read_bounded_redacted_output(reader, Vec::new())
-            .await
-            .is_err());
+        assert!(
+            read_bounded_redacted_output(reader, Vec::new(), Arc::new(AtomicUsize::new(0)),)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn buffered_output_budget_is_shared_across_stdout_and_stderr() {
+        let total = AtomicUsize::new(0);
+        assert!(reserve_bounded_output(&total, MAX_OUTPUT_BYTES - 1).is_ok());
+        assert!(matches!(
+            reserve_bounded_output(&total, 2),
+            Err(BoundedOutputError::OutputLimit)
+        ));
+    }
+
+    struct FailingOutputReader;
+
+    impl AsyncRead for FailingOutputReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "bounded output test pipe",
+            )))
+        }
+    }
+
+    struct PendingOutputReader;
+
+    impl AsyncRead for PendingOutputReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    struct OneByteOutputReader {
+        emitted: bool,
+    }
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl AsyncRead for OneByteOutputReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.emitted {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.emitted = true;
+            buf.put_slice(b"x");
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_task_cleanup_aborts_and_joins_pending_reader() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _signal = DropSignal(task_dropped);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let mut cleanup = StreamTaskCleanup {
+            tasks: vec![StreamReaderTask {
+                stream: OutputStream::Stdout,
+                handle: task,
+            }],
+        };
+        started_rx.await.expect("reader task must start");
+
+        cleanup.abort_and_join().await;
+
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(cleanup.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_task_join_reports_a_panicking_reader() {
+        let task = tokio::spawn(async {
+            panic!("injected reader task panic");
+        });
+        let mut cleanup = StreamTaskCleanup {
+            tasks: vec![StreamReaderTask {
+                stream: OutputStream::Stderr,
+                handle: task,
+            }],
+        };
+
+        let error = cleanup.join().await.unwrap_err();
+
+        assert!(matches!(error.stream, OutputStream::Stderr));
+        assert_eq!(error.detail, "reader task panicked");
+        assert!(cleanup.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_pipe_error_preserves_originating_stream() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let task = tokio::spawn(forward_stream_chunks(
+            FailingOutputReader,
+            OutputStream::Stdout,
+            tx,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+
+        match rx.recv().await {
+            Some(StreamChunk::PipeError { stream, detail }) => {
+                assert!(matches!(stream, OutputStream::Stdout));
+                assert!(detail.contains("bounded output test pipe"));
+            }
+            other => panic!("unexpected stream result: {other:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn diagnostics_consume_the_shared_output_budgets() {
+        let diagnostic = ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC;
+        let retained_total = AtomicUsize::new(MAX_OUTPUT_BYTES - 1);
+        let existing = Some("x".to_string());
+        assert_eq!(
+            append_accounted_diagnostic(existing.clone(), diagnostic, &retained_total,),
+            existing
+        );
+        assert_eq!(retained_total.load(Ordering::Acquire), MAX_OUTPUT_BYTES - 1);
+
+        let mut emitted_total = MAX_OUTPUT_BYTES - diagnostic.len();
+        assert!(reserve_emitted_output(&mut emitted_total, diagnostic.len()));
+        assert_eq!(emitted_total, MAX_OUTPUT_BYTES);
+        assert!(!reserve_emitted_output(&mut emitted_total, 1));
+        assert_eq!(emitted_total, MAX_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn buffered_output_coordinator_kills_pending_sibling_on_stdout_limit() {
+        let total = Arc::new(AtomicUsize::new(MAX_OUTPUT_BYTES));
+        let stdout = read_bounded_redacted_output(
+            OneByteOutputReader { emitted: false },
+            Vec::new(),
+            total.clone(),
+        );
+        let stderr = read_bounded_redacted_output(PendingOutputReader, Vec::new(), total);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_bounded_output_pair(stdout, stderr),
+        )
+        .await
+        .expect("stdout limit must not wait for a pending stderr reader")
+        .unwrap_err();
+        assert!(matches!(error, BoundedOutputError::OutputLimit));
+    }
+
+    #[tokio::test]
+    async fn buffered_output_coordinator_kills_pending_sibling_on_stderr_limit() {
+        let total = Arc::new(AtomicUsize::new(MAX_OUTPUT_BYTES));
+        let stdout = read_bounded_redacted_output(PendingOutputReader, Vec::new(), total.clone());
+        let stderr =
+            read_bounded_redacted_output(OneByteOutputReader { emitted: false }, Vec::new(), total);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_bounded_output_pair(stdout, stderr),
+        )
+        .await
+        .expect("stderr limit must not wait for a pending stdout reader")
+        .unwrap_err();
+        assert!(matches!(error, BoundedOutputError::OutputLimit));
+    }
+
+    #[tokio::test]
+    async fn buffered_output_coordinator_preserves_first_failure_from_either_stream() {
+        let stdout = read_bounded_redacted_output(
+            FailingOutputReader,
+            Vec::new(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let stderr = read_bounded_redacted_output(
+            PendingOutputReader,
+            Vec::new(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_bounded_output_pair(stdout, stderr),
+        )
+        .await
+        .expect("stdout failure must not wait for a pending stderr reader")
+        .unwrap_err();
+        assert!(matches!(error, BoundedOutputError::PipeIo(_)));
+        assert!(error.to_string().contains("bounded output test pipe"));
+
+        let stdout = read_bounded_redacted_output(
+            PendingOutputReader,
+            Vec::new(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let stderr = read_bounded_redacted_output(
+            FailingOutputReader,
+            Vec::new(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_bounded_output_pair(stdout, stderr),
+        )
+        .await
+        .expect("stderr failure must not wait for a pending stdout reader")
+        .unwrap_err();
+        assert!(matches!(error, BoundedOutputError::PipeIo(_)));
+        assert!(error.to_string().contains("bounded output test pipe"));
+    }
+
+    #[tokio::test]
+    async fn buffered_output_reports_pipe_failures_as_typed_diagnostics() {
+        let error = read_bounded_redacted_output(
+            FailingOutputReader,
+            Vec::new(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, BoundedOutputError::PipeIo(_)));
+        assert!(error.to_string().len() <= 220);
     }
 
     #[test]

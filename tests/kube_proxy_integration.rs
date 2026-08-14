@@ -1665,8 +1665,14 @@ async fn policy_reload_during_arbitration_prevents_mutable_forwarding() {
     });
     started.notified().await;
     let deny_policy = "default: deny\n";
+    let authority_baseline = proxy.authority_transition_generation();
     std::fs::write(&policy_path, deny_policy).unwrap();
-    wait_for_policy_reload(&proxy, deny_policy).await;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.wait_for_authority_transition_after(authority_baseline),
+    )
+    .await
+    .expect("policy reloader publishes odd authority before arbitration release");
     release.notify_one();
 
     assert_eq!(request.await.unwrap().status(), 403);
@@ -1674,7 +1680,7 @@ async fn policy_reload_during_arbitration_prevents_mutable_forwarding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn read_handoff_allows_concurrent_policy_reload_after_linearization() {
+async fn read_handoff_holds_authority_until_upstream_response_headers() {
     let (upstream_base, read_reached, release_read) =
         spawn_policy_barrier_upstream(hyper::Method::GET).await;
     let upstream =
@@ -1713,17 +1719,17 @@ async fn read_handoff_allows_concurrent_policy_reload_after_linearization() {
     });
     read_reached.acquire().await.unwrap().forget();
     let deny_policy = "default: deny\n";
-    let reload_baseline = proxy.policy_reload_attempt();
+    let authority_baseline = proxy.authority_transition_generation();
     std::fs::write(&policy_path, deny_policy).unwrap();
     tokio::time::timeout(
         Duration::from_secs(3),
-        proxy.wait_for_policy_reload_attempt_after(reload_baseline),
+        proxy.wait_for_authority_transition_after(authority_baseline),
     )
     .await
     .expect("policy reloader reaches authority coordination");
-    wait_for_policy_reload(&proxy, deny_policy).await;
     release_read.add_permits(1);
     assert_eq!(request.await.unwrap().status(), 200);
+    wait_for_policy_reload(&proxy, deny_policy).await;
     assert_eq!(
         client
             .get(url)
@@ -1737,7 +1743,7 @@ async fn read_handoff_allows_concurrent_policy_reload_after_linearization() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn evaluated_read_handoff_allows_concurrent_policy_reload_after_linearization() {
+async fn evaluated_read_handoff_holds_authority_until_upstream_response_headers() {
     let (upstream_base, read_reached, release_read) =
         spawn_policy_barrier_upstream(hyper::Method::GET).await;
     let upstream =
@@ -1755,10 +1761,12 @@ async fn evaluated_read_handoff_allows_concurrent_policy_reload_after_linearizat
             .with_listener_mode(ApiListenerMode::Policy)
             .with_policy_reload_interval(Duration::from_millis(50)),
     );
-    proxy.attach_judge(Arc::new(RecordingJudge::new(vec![judge_allow(
-        Some(1),
-        Some(Reversibility::Reversible),
-    )])));
+    proxy
+        .attach_judge(Arc::new(RecordingJudge::new(vec![judge_allow(
+            Some(1),
+            Some(Reversibility::Reversible),
+        )])))
+        .await;
     proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
@@ -1780,17 +1788,17 @@ async fn evaluated_read_handoff_allows_concurrent_policy_reload_after_linearizat
     });
     read_reached.acquire().await.unwrap().forget();
     let deny_policy = "default: deny\n";
-    let reload_baseline = proxy.policy_reload_attempt();
+    let authority_baseline = proxy.authority_transition_generation();
     std::fs::write(&policy_path, deny_policy).unwrap();
     tokio::time::timeout(
         Duration::from_secs(3),
-        proxy.wait_for_policy_reload_attempt_after(reload_baseline),
+        proxy.wait_for_authority_transition_after(authority_baseline),
     )
     .await
     .expect("policy reloader reaches authority coordination");
-    wait_for_policy_reload(&proxy, deny_policy).await;
     release_read.add_permits(1);
     assert_eq!(request.await.unwrap().status(), 200);
+    wait_for_policy_reload(&proxy, deny_policy).await;
     assert_eq!(
         client
             .get(url)
@@ -1842,11 +1850,11 @@ async fn read_does_not_queue_behind_reload_waiting_for_a_stalled_mutation() {
     });
     mutation_reached.acquire().await.unwrap().forget();
     let deny_policy = "default: deny\n";
-    let reload_baseline = proxy.policy_reload_attempt();
+    let authority_baseline = proxy.authority_transition_generation();
     std::fs::write(&policy_path, deny_policy).unwrap();
     tokio::time::timeout(
         Duration::from_secs(3),
-        proxy.wait_for_policy_reload_attempt_after(reload_baseline),
+        proxy.wait_for_authority_transition_after(authority_baseline),
     )
     .await
     .expect("policy reloader reaches authority coordination");
@@ -2112,7 +2120,7 @@ async fn start_proxy_with_limits(
         proxy.attach_gate(gate);
     }
     if let Some(judge) = judge {
-        proxy.attach_judge(judge);
+        proxy.attach_judge(judge).await;
     }
     proxy.attach_session_sink(session_sink);
     tokio::spawn(proxy.clone().serve_on(listener));
@@ -4601,7 +4609,7 @@ async fn readonly_listener_requires_session_override_and_keeps_protocol_denies()
             .with_listener_mode(ApiListenerMode::Readonly),
     );
     let judge = RecordingJudge::new(vec![judge_allow(Some(1), Some(Reversibility::Reversible))]);
-    proxy.attach_judge(Arc::new(judge.clone()));
+    proxy.attach_judge(Arc::new(judge.clone())).await;
     proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
@@ -4661,7 +4669,7 @@ async fn issued_session_modes_enforce_api_boundary_without_prompt_bypass() {
             .with_listener_mode(ApiListenerMode::Readonly),
     );
     let judge = ModeCoverageJudge::default();
-    proxy.attach_judge(Arc::new(judge.clone()));
+    proxy.attach_judge(Arc::new(judge.clone())).await;
     proxy.attach_session_sink(Arc::new(ModeSessionSink));
     tokio::spawn(proxy.serve_on(listener));
     let client = reqwest::Client::builder()
@@ -4746,10 +4754,12 @@ async fn session_expansion_is_revalidated_immediately_before_forward() {
         ApiProxy::new(listen, tls, upstream, policy, None)
             .with_listener_mode(ApiListenerMode::Readonly),
     );
-    proxy.attach_judge(Arc::new(RecordingJudge::new(vec![judge_allow(
-        Some(1),
-        Some(Reversibility::Reversible),
-    )])));
+    proxy
+        .attach_judge(Arc::new(RecordingJudge::new(vec![judge_allow(
+            Some(1),
+            Some(Reversibility::Reversible),
+        )])))
+        .await;
     proxy.attach_session_sink(Arc::new(ChangingSessionSink {
         resolutions: AtomicUsize::new(0),
     }));
@@ -4810,10 +4820,12 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
     );
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    proxy.attach_judge(Arc::new(BlockingJudge {
-        started: started.clone(),
-        release: release.clone(),
-    }));
+    proxy
+        .attach_judge(Arc::new(BlockingJudge {
+            started: started.clone(),
+            release: release.clone(),
+        }))
+        .await;
     proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()

@@ -1541,11 +1541,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 let proxy = Arc::new(proxy);
                 let mut api_judge_attached = false;
                 if let Some(coverage) = api_promotion_store.clone() {
-                    proxy.attach_judge(server::DaemonApiJudge::build_coverage_only(
-                        &api_judge_llm,
-                        policy_intent.as_deref(),
-                        coverage,
-                    ));
+                    proxy
+                        .attach_judge(server::DaemonApiJudge::build_coverage_only(
+                            &api_judge_llm,
+                            policy_intent.as_deref(),
+                            coverage,
+                        ))
+                        .await;
                 }
                 if api_judge_llm.enabled
                     && api_judge_llm
@@ -1576,7 +1578,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         );
                     proxy.attach_judge_builder(builder.clone());
                     if let Some(judge) = builder(policy_intent) {
-                        proxy.attach_judge(judge);
+                        proxy.attach_judge(judge).await;
                         api_judge_attached = true;
                         tracing::info!(
                             "API proxy evaluator attached for {}",
@@ -1648,7 +1650,8 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     api_judge_cache_ttl,
                     api_promotion_store.clone(),
                     api_judge_spend.clone(),
-                )?;
+                )
+                .await?;
                 tracing::info!(
                     "API endpoint '{}' enabled for {} on {}",
                     name,
@@ -1811,7 +1814,7 @@ fn is_supported_api_loopback(ip: std::net::IpAddr) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_named_api_proxy(
+async fn build_named_api_proxy(
     spec: ApiEndpointSpec,
     llm: &guard::evaluate::LlmConfig,
     cache_enabled: bool,
@@ -1940,11 +1943,13 @@ fn build_named_api_proxy(
     let proxy = Arc::new(proxy);
     let mut judge_attached = false;
     if let Some(store) = coverage.clone() {
-        proxy.attach_judge(server::DaemonApiJudge::build_coverage_only(
-            llm,
-            policy_intent.as_deref(),
-            store,
-        ));
+        proxy
+            .attach_judge(server::DaemonApiJudge::build_coverage_only(
+                llm,
+                policy_intent.as_deref(),
+                store,
+            ))
+            .await;
     }
     if llm.enabled && llm.api_key.as_ref().is_some_and(|key| !key.is_empty()) {
         let llm = llm.clone();
@@ -1967,7 +1972,7 @@ fn build_named_api_proxy(
         });
         proxy.attach_judge_builder(builder.clone());
         if let Some(judge) = builder(policy_intent) {
-            proxy.attach_judge(judge);
+            proxy.attach_judge(judge).await;
             judge_attached = true;
         }
     }
@@ -2071,8 +2076,8 @@ mod api_endpoint_tests {
         }
     }
 
-    #[test]
-    fn builds_multiple_named_listeners_for_the_same_protocol() {
+    #[tokio::test]
+    async fn builds_multiple_named_listeners_for_the_same_protocol() {
         let temp = tempfile::tempdir().unwrap();
         let kubeconfig = temp.path().join("upstream.yaml");
         std::fs::write(
@@ -2101,6 +2106,7 @@ mod api_endpoint_tests {
                 server::ApiJudgeSpendConfig::default(),
             )),
         )
+        .await
         .unwrap();
         let second = build_named_api_proxy(
             endpoint("second", kubeconfig),
@@ -2113,6 +2119,7 @@ mod api_endpoint_tests {
                 server::ApiJudgeSpendConfig::default(),
             )),
         )
+        .await
         .unwrap();
         assert_eq!(first.0, "first");
         assert_eq!(second.0, "second");

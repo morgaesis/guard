@@ -392,9 +392,7 @@ pub(super) async fn forget_proxy_provenance(server: &ServerContext, handle: &str
         .cloned()
         .collect();
     for proxy in proxies {
-        if !proxy.forget_created_by_handle(handle).await {
-            tracing::warn!("api-proxy cleanup provenance revocation timed out");
-        }
+        proxy.forget_created_by_handle(handle);
     }
 }
 
