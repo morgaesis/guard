@@ -950,13 +950,13 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSidToSidW, GetExplicitEntriesFromAclW, GetSecurityInfo, GRANT_ACCESS,
-        SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
+        ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, EqualSid, GetTokenInformation, TokenUser, WinBuiltinAdministratorsSid,
-        WinLocalSystemSid, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
-        SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER,
+        CreateWellKnownSid, EqualSid, GetAce, GetTokenInformation, IsValidAcl, IsValidSid,
+        TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID, SECURITY_MAX_SID_SIZE,
+        TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -1088,42 +1088,55 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         unsafe { LocalFree(descriptor) };
         anyhow::bail!("authority object is not owned by a trusted Windows principal");
     }
-    let mut count = 0;
-    let mut entries = std::ptr::null_mut();
-    let entries_status = unsafe { GetExplicitEntriesFromAclW(dacl, &mut count, &mut entries) };
-    if entries_status != ERROR_SUCCESS {
-        unsafe { LocalFree(descriptor) };
-        anyhow::bail!("failed to enumerate the Windows authority DACL");
-    }
-    let acl_entry_count = unsafe { u32::from((*dacl).AceCount) };
-    if count != acl_entry_count || (count != 0 && entries.is_null()) {
-        unsafe {
-            if !entries.is_null() {
-                LocalFree(entries.cast());
-            }
-            LocalFree(descriptor);
-        }
-        anyhow::bail!("Windows authority DACL enumeration did not cover every ACE");
-    }
 
     let dangerous = windows_authority_mutation_mask(directory);
     let result = (|| -> Result<()> {
-        let entries = if count == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(entries, count as usize) }
-        };
-        for entry in entries {
-            if !matches!(entry.grfAccessMode, GRANT_ACCESS | SET_ACCESS)
-                || entry.grfAccessPermissions & dangerous == 0
-            {
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+        const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+        if unsafe { IsValidAcl(dacl) } == 0 {
+            anyhow::bail!("authority object has an invalid Windows DACL");
+        }
+        for index in 0..unsafe { (*dacl).AceCount } {
+            let mut ace = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, u32::from(index), &mut ace) } == 0 || ace.is_null() {
+                anyhow::bail!("failed to enumerate the Windows authority DACL");
+            }
+            let header = ace.cast::<ACE_HEADER>();
+            match unsafe { (*header).AceType } {
+                ACCESS_DENIED_ACE_TYPE => continue,
+                ACCESS_ALLOWED_ACE_TYPE => {}
+                // Object and callback ACEs have variable trustee layouts and
+                // may evaluate code or object-type conditions. Authority
+                // storage accepts only unconditional, directly inspectable
+                // grants and fails closed on every other ACE form.
+                _ => anyhow::bail!("authority DACL contains an unsupported ACE type"),
+            }
+            let ace_size = usize::from(unsafe { (*header).AceSize });
+            if ace_size < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
+                anyhow::bail!("authority DACL contains a truncated access-allowed ACE");
+            }
+            let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+            if unsafe { (*allowed).Mask } & dangerous == 0 {
                 continue;
             }
-            if entry.Trustee.TrusteeForm != TRUSTEE_IS_SID || entry.Trustee.ptstrName.is_null() {
-                anyhow::bail!("authority DACL grants mutation rights to an unverified trustee");
+            let trustee: PSID =
+                unsafe { std::ptr::addr_of!((*allowed).SidStart).cast_mut().cast() };
+            let sid_offset = trustee as usize - ace as usize;
+            const SID_HEADER_SIZE: usize = 8;
+            if sid_offset + SID_HEADER_SIZE > ace_size {
+                anyhow::bail!("authority DACL contains a truncated trustee SID");
             }
-            let trustee = entry.Trustee.ptstrName.cast();
+            let sub_authority_count = usize::from(unsafe { *trustee.cast::<u8>().add(1) });
+            let sid_size = SID_HEADER_SIZE + sub_authority_count * std::mem::size_of::<u32>();
+            if sid_offset + sid_size > ace_size {
+                anyhow::bail!("authority DACL contains a truncated trustee SID");
+            }
+            if unsafe { IsValidSid(trustee) } == 0 {
+                anyhow::bail!("authority DACL grants mutation rights to an invalid trustee SID");
+            }
             let trusted = unsafe { EqualSid(trustee, owner) } != 0
+                || unsafe { EqualSid(trustee, current_user.as_ptr().cast_mut().cast()) } != 0
                 || unsafe { EqualSid(trustee, system.as_ptr().cast_mut().cast()) } != 0
                 || unsafe { EqualSid(trustee, administrators.as_ptr().cast_mut().cast()) } != 0
                 // Owner Rights represents the already validated object owner.
@@ -1135,12 +1148,7 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         }
         Ok(())
     })();
-    unsafe {
-        if !entries.is_null() {
-            LocalFree(entries.cast());
-        }
-        LocalFree(descriptor);
-    }
+    unsafe { LocalFree(descriptor) };
     result
 }
 
@@ -5285,6 +5293,104 @@ mod tests {
         for right in [FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD] {
             assert_ne!(windows_authority_mutation_mask(true) & right, 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_authority_validation_reads_every_raw_ace_and_rejects_inherited_mutation() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{
+            SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+
+        fn apply_dacl(path: &Path, sddl: &str) {
+            let path = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let sddl = sddl
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let mut descriptor = std::ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        sddl.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut descriptor,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            let applied = unsafe {
+                SetFileSecurityW(
+                    path.as_ptr(),
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    descriptor,
+                )
+            };
+            unsafe { LocalFree(descriptor) };
+            assert_ne!(applied, 0);
+        }
+
+        let temp = authority_tempdir();
+        let path = temp.path().join("learned.yaml");
+        write_authority_file(&path, "version: 1\n").unwrap();
+        let file = owner_only_options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        apply_dacl(&path, "D:P(A;;FA;;;OW)(A;ID;GR;;;AU)");
+        validate_authority_file(&file).unwrap();
+
+        apply_dacl(&path, "D:P(A;;FA;;;OW)(D;ID;GW;;;AU)");
+        validate_authority_file(&file).unwrap();
+
+        apply_dacl(&path, "D:P(A;;FA;;;OW)(A;ID;GW;;;AU)");
+        let error = validate_authority_file(&file).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("grants mutation rights to an untrusted principal"));
+
+        let inherited_parent = temp.path().join("inherited");
+        std::fs::create_dir(&inherited_parent).unwrap();
+        apply_dacl(
+            &inherited_parent,
+            "D:P(A;;FA;;;OW)(A;OICI;FA;;;CO)(A;OICI;GR;;;AU)",
+        );
+        let read_only_child = inherited_parent.join("read-only.yaml");
+        std::fs::write(&read_only_child, "version: 1\n").unwrap();
+        let read_only_child = owner_only_options()
+            .read(true)
+            .write(true)
+            .open(read_only_child)
+            .unwrap();
+        validate_authority_file(&read_only_child).unwrap();
+
+        apply_dacl(
+            &inherited_parent,
+            "D:P(A;;FA;;;OW)(A;OICI;FA;;;CO)(A;OICI;GW;;;AU)",
+        );
+        let writable_child = inherited_parent.join("writable.yaml");
+        std::fs::write(&writable_child, "version: 1\n").unwrap();
+        let writable_child = owner_only_options()
+            .read(true)
+            .write(true)
+            .open(writable_child)
+            .unwrap();
+        let error = validate_authority_file(&writable_child).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("grants mutation rights to an untrusted principal"));
     }
 
     #[cfg(windows)]
