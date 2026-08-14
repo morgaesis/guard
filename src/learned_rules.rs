@@ -1510,7 +1510,11 @@ fn preserve_recovery_metadata(source: &Path, recovery: &Path) -> Result<()> {
             },
         )?;
     }
-    std::fs::File::open(recovery)?
+    #[cfg(windows)]
+    let recovery_file = open_windows_recovery_file(recovery)?;
+    #[cfg(not(windows))]
+    let recovery_file = std::fs::File::open(recovery)?;
+    recovery_file
         .sync_all()
         .with_context(|| format!("failed to sync recovery metadata for {}", source.display()))
 }
