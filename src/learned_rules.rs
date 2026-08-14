@@ -151,8 +151,8 @@ enum DirectoryIdentity {
     Windows { volume: u32, index: u64 },
 }
 
-/// Exact authority bytes and filesystem identity observed while the
-/// destination lock and pinned parent are held.
+/// Exact authority bytes and filesystem identity observed through a pinned
+/// parent, with a destination lock for mutable authority.
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct LearningFileSnapshot {
@@ -2058,6 +2058,68 @@ pub(crate) fn load_learning_file_snapshot(path: &Path) -> Result<LearningFileSna
     lock.verify_parent_binding()?;
     recover_learning_file_transaction_locked(lock.destination())?;
     read_learning_file_snapshot_locked(&lock)
+}
+
+/// Read one operator-owned authority file without creating writable sibling
+/// state. The returned bytes are immutable process input: callers must not
+/// retain the path as live, reloadable authority. This is for packaged
+/// configuration trees that deliberately grant the daemon read access only.
+pub(crate) fn load_immutable_learning_file_snapshot(path: &Path) -> Result<LearningFileSnapshot> {
+    let destination = canonical_destination(path)?;
+    let canonical_parent = destination
+        .parent()
+        .context("immutable authority file has no canonical parent")?
+        .to_path_buf();
+    let parent = open_parent_directory(&canonical_parent)?;
+    validate_trusted_parent(&parent, &canonical_parent)?;
+    let parent_identity = directory_identity(&parent)?;
+    let destination = bind_destination_to_parent(&parent, &destination)?;
+    if !transaction_artifacts(&destination)?.is_empty() {
+        anyhow::bail!("immutable authority file has pending transaction artifacts");
+    }
+    ensure_regular_file(&destination)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(&destination)
+        .with_context(|| format!("failed to open immutable authority {}", path.display()))?;
+    validate_authority_file(&file)?;
+    let modified = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)
+        .with_context(|| format!("failed to read immutable authority {}", path.display()))?;
+    verify_open_file_binding(&file, &destination)?;
+    validate_trusted_parent(&parent, &canonical_parent)?;
+    if directory_identity(&parent)? != parent_identity {
+        anyhow::bail!("immutable authority directory changed while it was read");
+    }
+    if !transaction_artifacts(&destination)?.is_empty() {
+        anyhow::bail!("immutable authority transaction appeared while it was read");
+    }
+    Ok(LearningFileSnapshot {
+        generation: Some(content_digest(&content)),
+        content: Some(content),
+        parent_identity,
+        modified,
+    })
 }
 
 fn read_learning_file_snapshot_locked(lock: &DestinationLock) -> Result<LearningFileSnapshot> {

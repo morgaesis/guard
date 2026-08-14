@@ -16,8 +16,9 @@
 use super::coverage::reversibility_rank;
 use super::Reversibility;
 use crate::learned_rules::{
-    load_learning_file_snapshot, rewrite_learning_file_bounded,
-    write_learning_file_atomically_for_locked_snapshot, AsyncDurableStore, LearningFileSnapshot,
+    load_immutable_learning_file_snapshot, load_learning_file_snapshot,
+    rewrite_learning_file_bounded, write_learning_file_atomically_for_locked_snapshot,
+    AsyncDurableStore, LearningFileSnapshot,
 };
 use crate::redact::{
     command_contains_sensitive_literals, named_value_contains_sensitive_literals,
@@ -696,6 +697,24 @@ impl VerbCatalog {
         catalog.path = Some(path.to_path_buf());
         catalog.mtime = snapshot.modified();
         catalog.snapshot = Some(snapshot);
+        Ok(catalog)
+    }
+
+    /// Load an operator-owned catalog as immutable process input. This mode
+    /// never creates a transaction lock beside the catalog and never observes
+    /// later path changes, so a read-only packaged configuration directory
+    /// does not become writable by the daemon.
+    pub fn load_immutable(path: &Path) -> Result<Self> {
+        let snapshot = load_immutable_learning_file_snapshot(path)?;
+        let bytes = snapshot.content().context("verb catalog does not exist")?;
+        let text = std::str::from_utf8(bytes)
+            .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
+        let (catalog, repair) = Self::from_yaml_with_repair(text)?;
+        if repair.is_some() {
+            anyhow::bail!(
+                "immutable verb catalog requires canonical repair; update it before starting the service"
+            );
+        }
         Ok(catalog)
     }
 
@@ -4046,6 +4065,42 @@ verbs:
         crate::learned_rules::write_authority_file(&path, yaml).unwrap();
         VerbCatalog::load(&path).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn immutable_catalog_load_creates_no_sibling_state_and_retains_no_live_path() {
+        let yaml = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+
+        let mut catalog = VerbCatalog::load_immutable(&path).unwrap();
+        assert!(catalog.get("safe").is_some());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        std::fs::write(&path, "verbs: []\n").unwrap();
+        assert!(!catalog.reload_if_stale().unwrap());
+        assert!(catalog.get("safe").is_some());
+        assert!(catalog
+            .append_verb(&synth_verb("true", None, false, "later"))
+            .unwrap_err()
+            .to_string()
+            .contains("not backed by a file"));
+    }
+
+    #[test]
+    fn immutable_catalog_rejects_required_repair_without_writing() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
+        verb.source_prose = Some(format!("password={value}"));
+        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, &yaml).unwrap();
+
+        let error = VerbCatalog::load_immutable(&path).unwrap_err();
+        assert!(error.to_string().contains("requires canonical repair"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

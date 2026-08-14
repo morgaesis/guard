@@ -3,7 +3,8 @@
 Verbs are Guard's typed operation interface. A verb fixes a binary, validates
 parameters, describes credential and execution plans, declares consequence, and
 optionally supplies rollback. The daemon loads an operator catalog through
-`--verbs` or `GUARD_VERBS` and hot-reloads it on change.
+`--verbs` or `GUARD_VERBS`. Foreground servers hot-reload catalog changes. The
+packaged Windows service loads its administrator-owned catalog once at startup.
 
 ```bash
 guard verb list
@@ -28,6 +29,10 @@ catalog before atomically replacing the catalog file. The replacement must
 retain the requested name. Runtime-generated, automatically promoted, and
 reserved-namespace verbs cannot be amended through this command. Like other
 catalog mutations, amend requires the admin bearer.
+
+The packaged Windows service treats the installed catalog as immutable process
+input and disables automatic promotion. Administrators update that catalog
+while the service is stopped, then restart the service to load the new bytes.
 
 ## Command templates
 
