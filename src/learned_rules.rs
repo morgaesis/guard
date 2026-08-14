@@ -37,7 +37,8 @@ use crate::redact::{
 /// Outcome of an atomic learning-file replacement.
 ///
 /// A warning means the destination contains the returned snapshot, but a later
-/// durability or cleanup operation failed. Callers adopt this snapshot before
+/// durability or cleanup operation failed or the platform cannot independently
+/// confirm directory-entry durability. Callers adopt this snapshot before
 /// surfacing the warning so memory does not diverge from committed authority.
 #[derive(Debug)]
 #[cfg_attr(windows, allow(dead_code))]
@@ -553,6 +554,9 @@ pub(crate) fn write_authority_file(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(windows)]
+    apply_owner_only_windows_dacl(path)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(())
 }
 
@@ -1091,9 +1095,15 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         unsafe { LocalFree(descriptor) };
         anyhow::bail!("failed to enumerate the Windows authority DACL");
     }
-    if count != 0 && entries.is_null() {
-        unsafe { LocalFree(descriptor) };
-        anyhow::bail!("Windows authority DACL enumeration returned no entry buffer");
+    let acl_entry_count = unsafe { u32::from((*dacl).AceCount) };
+    if count != acl_entry_count || (count != 0 && entries.is_null()) {
+        unsafe {
+            if !entries.is_null() {
+                LocalFree(entries.cast());
+            }
+            LocalFree(descriptor);
+        }
+        anyhow::bail!("Windows authority DACL enumeration did not cover every ACE");
     }
 
     let dangerous = windows_authority_mutation_mask(directory);
@@ -3083,6 +3093,7 @@ pub(crate) fn preserve_corrupt_learning_file(path: &Path, content: &[u8]) -> Res
         .with_context(|| format!("failed to preserve corrupt state for {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("failed to sync corrupt-state copy for {}", path.display()))?;
+    drop(file);
     preserve_recovery_metadata(path, &preserved)?;
     #[cfg(unix)]
     sync_parent_directory(parent).with_context(|| {
@@ -4202,6 +4213,7 @@ pub(crate) fn looks_dangerous_for_learned_allow(command: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn atomic_writer_propagates_parent_sync_failure_after_replace() {
         let temp = authority_tempdir();
@@ -4232,6 +4244,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path).unwrap(), "current");
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_writer_durably_creates_each_missing_parent() {
         let temp = authority_tempdir();
@@ -5288,7 +5301,9 @@ mod tests {
         )
         .unwrap();
         let (second, warning) = outcome.into_parts();
-        assert!(warning.is_none());
+        assert!(warning.is_some_and(|warning| warning
+            .to_string()
+            .contains("does not expose independent directory-entry flush confirmation")));
         write_learning_file_atomically_for_locked_snapshot(
             &destination,
             &second,
@@ -5358,7 +5373,8 @@ mod tests {
             PROTECTED_DACL_SECURITY_INFORMATION,
         };
         use windows_sys::Win32::Storage::FileSystem::{
-            GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
+            GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN,
+            FILE_ATTRIBUTE_NORMAL,
         };
 
         fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
@@ -5429,10 +5445,12 @@ mod tests {
         write_learning_file_atomically(&path, "newer").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
         assert_eq!(security(&path), before_security);
+        let after_attributes = unsafe { GetFileAttributesW(path_wide.as_ptr()) };
         assert_eq!(
-            unsafe { GetFileAttributesW(path_wide.as_ptr()) },
-            before_attributes
+            after_attributes & !FILE_ATTRIBUTE_ARCHIVE,
+            before_attributes & !FILE_ATTRIBUTE_ARCHIVE
         );
+        assert_ne!(after_attributes & FILE_ATTRIBUTE_ARCHIVE, 0);
         assert_ne!(
             unsafe { SetFileAttributesW(path_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) },
             0
