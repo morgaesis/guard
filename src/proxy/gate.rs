@@ -33,6 +33,12 @@ pub struct ApiMutation {
     /// The HTTP request that undoes the mutation, executed through the
     /// protocol's upstream with the daemon's credential.
     pub revert: HttpRevert,
+    /// Whether the revert must be bound to an exact resource UID before it can
+    /// become executable.
+    pub revert_requires_uid_precondition: bool,
+    /// Guard-generated provenance value already included in the exact create
+    /// body admitted by the evaluator or operator.
+    pub create_provenance: Option<String>,
     /// Session authority that allowed the mutation, represented only by its
     /// audit fingerprint.
     pub session_fingerprint: Option<String>,
@@ -62,20 +68,42 @@ pub enum HoldDecision {
 /// consequence machinery.
 #[async_trait]
 pub trait GateSink: Send + Sync {
-    /// Arm an auto-revert envelope around a mutation the proxy already applied.
-    /// Returns the provisional handle, or `None` if the daemon declined (e.g.
-    /// the outstanding-provisional cap is hit). The proxy proceeds regardless -
-    /// the mutation is already live; `None` only means it will not auto-revert.
+    /// Durably stage an auto-revert before a mutation is sent upstream.
+    /// Returns the provisional handle, or `None` if the daemon cannot provide
+    /// durable containment.
     async fn arm_revert(&self, mutation: ApiMutation) -> Option<String>;
+
+    /// Durably mark that the finite upstream handoff may begin. The row remains
+    /// inert until the response-header outcome is classified.
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool;
+
+    /// Mark a staged revert as live after successful upstream response headers.
+    /// The confirmation window begins only after this durable transition.
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool;
+
+    /// Preserve an actionable rollback and record why the upstream mutation
+    /// outcome is uncertain.
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool;
+
+    /// Retire a dispatch marker after response headers definitively prove the
+    /// upstream rejected the mutation before applying it.
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool;
+
+    /// Remove an exact inert staged revert after a pre-dispatch failure.
+    async fn cancel_staged_revert(&self, handle: &str) -> bool;
 
     /// Whether the sink could arm a revert right now (capacity available, and a
     /// body-bearing revert can be persisted safely). The proxy consults this on
     /// the evaluate path before forwarding a write it would only forward
     /// *because* a revert was promised, so it can hold rather than forward a
     /// write it cannot contain. Default: assume it can, for sinks that always
-    /// accept a revert. Best-effort: a race between this check and `arm_revert`
-    /// is possible, but this closes the common deterministic gaps (no capacity,
-    /// no safe revert directory).
+    /// accept a staged revert. The staging operation remains authoritative;
+    /// this early check only avoids needless evaluator work.
     async fn can_arm_revert(&self) -> bool {
         true
     }
@@ -85,8 +113,18 @@ pub trait GateSink: Send + Sync {
     /// created earlier in the session that the workload has now deleted (e.g. a
     /// Helm post-install hook removing its own check resource). Cancels the
     /// pending revert so the sweeper does not later try to delete an object that
-    /// no longer exists. Default: no-op, for sinks that do not track reverts.
-    async fn resolve(&self, _handle: &str) {}
+    /// no longer exists. Returns only after durable resolution is committed.
+    async fn resolve(&self, handle: &str) -> bool;
+
+    /// Revalidate a live create rollback and retain its revocation coordination
+    /// through the finite cleanup request handoff.
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String>;
 
     /// Enqueue a policy-held API request for operator approval and wait for the
     /// decision. The request stays buffered in the proxy while the operator
@@ -163,7 +201,13 @@ pub struct ApiRequestSummary {
     pub name: Option<String>,
     pub dry_run: bool,
     pub authority_selectors: BTreeMap<String, String>,
+    /// Stable caller-authored shape used for durable coverage identity. Guard
+    /// preconditions may change `redacted_body_shape` without changing this
+    /// bucket.
+    pub coverage_body_shape: String,
     pub redacted_body_shape: String,
+    /// Digest of the exact, fully transformed bytes authorized for handoff.
+    pub authorized_body_sha256: String,
     pub revert_constructible: RevertConstructible,
     pub rarity: bool,
     pub endpoint: String,
@@ -194,6 +238,7 @@ impl ApiRequestSummary {
                 "dry_run: {}\n",
                 "authority_selectors: {}\n",
                 "body_shape: {}\n",
+                "body_sha256: {}\n",
                 "revert_constructible: {}\n",
                 "rarity: {}",
                 "\nendpoint: {}\nsession: {}\nsession_revision: {}\nsession_intent: {}\ncredential_ref: {}"
@@ -227,6 +272,7 @@ impl ApiRequestSummary {
                     .join(",")
             },
             self.redacted_body_shape,
+            self.authorized_body_sha256,
             self.revert_constructible.as_str(),
             self.rarity,
             self.endpoint,
@@ -276,7 +322,23 @@ pub struct ApiSessionEvent {
 #[async_trait]
 pub trait ApiSessionSink: Send + Sync {
     async fn resolve(&self, token: &str) -> Option<ApiSessionContext>;
+    /// Revalidate an exact session context, retain compatible coordination,
+    /// and invoke the proxy-owned handoff exactly once while it remains held.
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String>;
     async fn record(&self, token: &str, event: ApiSessionEvent);
+}
+
+/// One-shot proxy-owned upstream handoff. Authority providers can invoke this
+/// only while their retained lease is in lexical scope; they cannot construct
+/// or return a stand-in capability.
+#[async_trait]
+pub trait ApiForwardHandoff: Send {
+    async fn forward(&mut self) -> Result<(), String>;
 }
 
 /// API evaluator verdict. An allow is still routed through `decide_gate`; it is
@@ -287,11 +349,27 @@ pub enum ApiJudgeVerdict {
         reason: String,
         risk: Option<i32>,
         reversibility: Option<Reversibility>,
+        authorization: ApiAuthorizationKind,
     },
     Deny {
         reason: String,
     },
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiAuthorizationKind {
+    Evaluated,
+    Coverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiForwardRequirement {
+    Evaluated,
+    Coverage {
+        risk: i32,
+        reversibility: Reversibility,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +397,15 @@ pub trait ApiJudge: Send + Sync {
     async fn coverage(&self, _summary: &ApiRequestSummary) -> ApiCoverageVerdict {
         ApiCoverageVerdict::None
     }
+
+    /// Revalidate revocable durable authority immediately before the upstream
+    /// send and retain it through that finite handoff.
+    async fn authorize_forward(
+        &self,
+        summary: &ApiRequestSummary,
+        requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String>;
 
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict;
 }

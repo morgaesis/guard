@@ -22,10 +22,9 @@ use anyhow::Result;
 use guard::gating::allow_promotion::is_cwd_dependent_opaque_carrier;
 use guard::gating::Reversibility;
 use guard::learned_rules::{AutoShimMode, LearningOutcome};
-use guard::redact::{command_line, redact_output_text};
+use guard::redact::{command_contains_sensitive_literals, command_line};
 use std::path::PathBuf;
 
-use super::execute::persist_session_snapshot;
 use super::{deterministic_credential_deny_reason, ServerContext};
 
 const SESSION_AUTO_AMEND_MAX_ALLOW_RISK: i32 = 2;
@@ -62,12 +61,7 @@ pub(super) fn validate_session_exact_rule_candidate(
             return Err("appeal command contains control characters".to_string());
         }
     }
-    // A session exact rule persists this argv verbatim in the state database
-    // and echoes it from every session inspection command. If credential
-    // redaction would change the command line, the rule would either store a
-    // secret or never match; refuse the amendment instead.
-    let command = command_line(binary, args);
-    if redact_output_text(&command) != command {
+    if command_contains_sensitive_literals(binary, args) {
         return Err(
             "appeal command contains credential-shaped material and cannot be stored as a session rule"
                 .to_string(),
@@ -143,19 +137,30 @@ pub(super) async fn amend_session_exact_rule(
     args: Vec<String>,
     cwd: Option<PathBuf>,
 ) -> Result<bool> {
-    let (amended, before, after) = {
-        let mut reg = server.state.sessions.write().await;
-        let before = reg.clone();
-        let amended = reg
-            .amend_exact(token, decision, binary, args, cwd)
+    let sessions = server.state.sessions.clone();
+    let session_store = server.state.session_store.clone();
+    #[cfg(test)]
+    let transition_attempt_events = server.state.session_transition_attempt_events.clone();
+    let token = token.to_string();
+    tokio::spawn(async move {
+        // The detached task owns live coordination through staging, durable
+        // commit, and publication. Cancellation cannot expose an uncommitted
+        // rule or let a successor overtake a committed amendment.
+        #[cfg(test)]
+        transition_attempt_events.add_permits(1);
+        let mut live = sessions.write_owned().await;
+        let mut staged = live.clone();
+        let amended = staged
+            .amend_exact(&token, decision, binary, args, cwd)
             .ok_or_else(|| anyhow::anyhow!("session token is revoked, expired, or unknown"))?;
-        (amended, before, reg.clone())
-    };
-    if let Err(err) = persist_session_snapshot(server.state.session_store.clone(), after).await {
-        *server.state.sessions.write().await = before;
-        return Err(err);
-    }
-    Ok(amended)
+        if let Some(store) = session_store {
+            store.persist_registry_strict(&staged).await?;
+        }
+        *live = staged;
+        Ok(amended)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("session amendment coordination task failed: {error}"))?
 }
 
 pub(super) async fn maybe_auto_amend_session_after_llm(
@@ -167,6 +172,9 @@ pub(super) async fn maybe_auto_amend_session_after_llm(
     cwd: Option<&PathBuf>,
     risk: Option<i32>,
 ) -> Option<String> {
+    if command_contains_sensitive_literals(binary, args) {
+        return None;
+    }
     let token = token?;
     let enabled = {
         let reg = server.state.sessions.read().await;
@@ -296,6 +304,9 @@ pub(super) async fn maybe_promote_allow_verb(
     reversibility: Option<Reversibility>,
     reason: &str,
 ) {
+    if command_contains_sensitive_literals(binary, args) {
+        return;
+    }
     if is_cwd_dependent_opaque_carrier(binary) {
         tracing::debug!(
             binary,
@@ -327,7 +338,7 @@ pub(super) async fn maybe_promote_allow_verb(
         return;
     }
     let evaluator = server.state.evaluator.clone();
-    let verbs = server.state.verbs.clone();
+    let server = server.clone();
     let audit_sink = server.state.audit.clone();
     tokio::spawn(async move {
         // `Ok(None)` here means "not confident yet" or a transient LLM
@@ -361,8 +372,13 @@ pub(super) async fn maybe_promote_allow_verb(
                 return;
             }
         };
-        let mut cat = verbs.write().await;
-        match cat.append_verb(&verb) {
+        let candidate = verb.clone();
+        match server
+            .mutate_verb_catalog("auto-promoted verb catalog append", move |catalog| {
+                catalog.append_verb(&candidate)
+            })
+            .await
+        {
             Ok(()) => {
                 let _ = guard::audit::emit(
                     audit_sink.as_deref(),
@@ -381,7 +397,6 @@ pub(super) async fn maybe_promote_allow_verb(
                 );
             }
         }
-        drop(cat);
         if let Err(err) = evaluator.mark_allow_promotion_resolved(&outcome).await {
             tracing::warn!("failed to mark allow-promotion bucket resolved: {}", err);
         }

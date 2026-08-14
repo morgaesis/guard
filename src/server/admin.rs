@@ -12,13 +12,16 @@ use crate::session::{
     SessionInteraction,
 };
 use guard::audit::{AuditEvent, AuditKind};
+use guard::gating::verb::{
+    canonical_generated_access_consequence, generated_access_matcher_digest,
+    generated_access_matcher_shape, generated_access_verb_name, Verb, VerbCatalog,
+};
 #[cfg(test)]
 use guard::gating::verb::{CoverageAction, CoverageProbe, CoverageProvenance, VerbCoverageCell};
-use guard::gating::verb::{Verb, VerbCatalog};
 use guard::principal::{scope_eq, PrincipalKey};
 #[cfg(test)]
 use guard::redact::redact_output;
-use guard::redact::{command_line, redact_output_text};
+use guard::redact::{redact_command_line, redact_output_text};
 
 use super::execute::audit_session_fingerprint;
 #[cfg(test)]
@@ -27,9 +30,9 @@ use super::execute::{
     session_source_from_eval,
 };
 use super::gate_runtime::{
-    bound_persisted_transcript, converge_forward_persistence_failure, finish_revert,
-    forget_proxy_provenance, is_api_proxy_sentinel, now_unix, persist_approval, remove_revert_body,
-    resume_approval,
+    bound_persisted_transcript, finish_revert, forget_proxy_provenance, is_api_proxy_sentinel,
+    now_unix, persist_approval, persist_provisional_transition,
+    persist_terminal_provisional_with_body_cleanup, resume_approval,
 };
 #[cfg(test)]
 use super::learning::{
@@ -194,6 +197,7 @@ mod regeneration_proposal_tests {
                 verb_params: BTreeMap::new(),
                 catalog_version: None,
                 verb_digest: None,
+                verb_composition_digest: None,
                 access_verbs: Vec::new(),
                 access_requests: Vec::new(),
                 principal: Some(PrincipalKey::from_uid(1001)),
@@ -357,6 +361,7 @@ mod regeneration_proposal_tests {
             verb_params: BTreeMap::new(),
             catalog_version: Some(1),
             verb_digest: None,
+            verb_composition_digest: None,
             access_verbs: vec!["host-inspect".to_string()],
             access_requests: Vec::new(),
             principal: Some(caller),
@@ -646,24 +651,6 @@ fn validate_access_denial_reason(reason: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-fn access_verb_shape(verb: &Verb) -> serde_json::Value {
-    serde_json::json!({
-        "binary": verb.binary,
-        "args": verb.args,
-        "coverage": verb.coverage,
-        "credential_plan": verb.credential_plan,
-        "params": verb.params,
-    })
-}
-
-fn access_matcher_digest(matcher: &serde_json::Value) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(serde_json::to_vec(matcher).expect("access matcher serializes"))
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 fn intent_matches_verb(intent: &str, verb: &Verb) -> bool {
     if intent.trim().eq_ignore_ascii_case(&verb.name) {
         return true;
@@ -876,14 +863,56 @@ mod semantic_intent_tests {
 async fn reduce_access_intent(
     server: &ServerContext,
     intent: &str,
+    observed_argv: Option<(&str, &[String])>,
 ) -> Result<(Vec<Verb>, Vec<Verb>), String> {
-    let existing = {
-        let mut catalog = server.state.verbs.write().await;
-        if let Err(error) = catalog.reload_if_stale() {
-            tracing::warn!("verb catalog reload failed, using previous: {error}");
-        }
-        catalog.list()
-    };
+    if let Some((binary, args)) = observed_argv {
+        let candidate = guard::gating::verb::Verb {
+            name: "access-generated-pending".to_string(),
+            description: String::new(),
+            binary: binary.to_string(),
+            args: args.to_vec(),
+            baseline: false,
+            coverage: Vec::new(),
+            credential_plan: None,
+            params: std::collections::BTreeMap::new(),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
+        };
+        return reduce_generated_access_candidate(server, candidate).await;
+    }
+    let catalog = server
+        .refresh_and_lease_verb_catalog_for_use("access proposal selection")
+        .await
+        .map_err(|error| format!("verb catalog authority is unavailable: {error}"))?;
+    let existing = catalog
+        .list()
+        .into_iter()
+        .map(|verb| {
+            if !verb.name.starts_with("access-generated-") {
+                return Ok(verb);
+            }
+            let mut proposal = verb;
+            proposal.trusted = false;
+            let supplied = proposal.consequence;
+            let canonical = catalog
+                .canonical_generated_access_verb(proposal)
+                .map_err(|error| {
+                    format!("stored generated access coverage was rejected: {error}")
+                })?;
+            if supplied != canonical.consequence {
+                return Err(
+                    "stored generated access coverage consequence is not canonical".to_string(),
+                );
+            }
+            Ok(canonical)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let clauses = access_intent_clauses(intent);
     let named_by_clause = clauses
         .iter()
@@ -930,12 +959,12 @@ async fn reduce_access_intent(
                     .to_string(),
             );
         }
-        return Ok(access_reduction(
+        return access_reduction(
             existing
                 .into_iter()
                 .filter(|verb| selected.contains(&verb.name))
                 .collect(),
-        ));
+        );
     }
     let matched = existing
         .iter()
@@ -943,13 +972,14 @@ async fn reduce_access_intent(
         .cloned()
         .collect::<Vec<_>>();
     if !matched.is_empty() {
-        return Ok(access_reduction(matched));
+        return access_reduction(matched);
     }
     if let Some(best) = unique_semantic_intent_match(intent, &existing) {
-        return Ok(access_reduction(vec![best.clone()]));
+        return access_reduction(vec![best.clone()]);
     }
 
-    let mut candidate = server
+    drop(catalog);
+    let candidate = server
         .state
         .evaluator
         .synthesize_verb(intent, None, &[])
@@ -957,39 +987,56 @@ async fn reduce_access_intent(
         .map_err(|error| {
             format!("access intent could not be reduced to typed coverage: {error}")
         })?;
-    candidate.source_prose = Some(intent.to_string());
+    reduce_generated_access_candidate(server, candidate).await
+}
+
+async fn reduce_generated_access_candidate(
+    server: &ServerContext,
+    mut candidate: Verb,
+) -> Result<(Vec<Verb>, Vec<Verb>), String> {
     candidate.baseline = false;
     candidate.trusted = false;
-    // A model-authored rollback is evidence, not a verified rollback envelope.
-    // Removing it preserves the consequence gate, which holds recoverable work
-    // until an operator-authored verb supplies a reviewed revert.
-    candidate.revert = None;
-    guard::gating::verb::validate_synthesized_safety(&candidate)
+    candidate = guard::gating::verb::normalize_generated_access_verb(candidate)
         .map_err(|error| format!("synthesized access coverage was rejected: {error}"))?;
+    // A pending request must carry the fail-closed consequence derived from
+    // the generated matcher alone. Operator coverage can refine the class
+    // when approved and installed, but must not make an unreviewed proposal
+    // look safer than its own executable shape proves.
+    candidate.consequence = canonical_generated_access_consequence(&candidate);
 
-    if let Some(reused) = existing
-        .iter()
-        .find(|verb| access_verb_shape(verb) == access_verb_shape(&candidate))
-    {
-        return Ok(access_reduction(vec![reused.clone()]));
-    }
-
-    let catalog = server.state.verbs.read().await;
-    if let Some(reused) = catalog
+    let catalog = server
+        .refresh_and_lease_verb_catalog_for_use("generated access proposal validation")
+        .await
+        .map_err(|error| format!("verb catalog authority is unavailable: {error}"))?;
+    let existing = catalog
         .list()
         .into_iter()
-        .find(|verb| access_verb_shape(verb) == access_verb_shape(&candidate))
-    {
-        return Ok(access_reduction(vec![reused]));
+        .map(|verb| {
+            if !verb.name.starts_with("access-generated-") {
+                return Ok(verb);
+            }
+            let mut proposal = verb;
+            proposal.trusted = false;
+            let supplied = proposal.consequence;
+            let proposal = catalog
+                .canonical_generated_access_verb(proposal)
+                .map_err(|error| {
+                    format!("stored generated access coverage was rejected: {error}")
+                })?;
+            if supplied != proposal.consequence {
+                return Err(
+                    "stored generated access coverage consequence is not canonical".to_string(),
+                );
+            }
+            Ok(proposal)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if let Some(reused) = existing.iter().find(|verb| {
+        generated_access_matcher_shape(verb) == generated_access_matcher_shape(&candidate)
+    }) {
+        return access_reduction(vec![reused.clone()]);
     }
-    let digest = access_matcher_digest(&access_verb_shape(&candidate));
-    candidate.name = format!("access-generated-{}", &digest[..16]);
-    candidate.description = access_grant_description(&candidate);
-    candidate.source_prose = None;
-    candidate.evidence = None;
-    candidate.prompt_context = None;
-    candidate.auto_promoted = false;
-    candidate.promotion_stamp = None;
+    candidate.name = generated_access_verb_name(&candidate);
     catalog
         .validate_candidate(&candidate)
         .map_err(|error| format!("invalid non-baseline access coverage: {error}"))?;
@@ -997,104 +1044,178 @@ async fn reduce_access_intent(
 }
 
 /// Split a reduction into the coverage it authorizes and the coverage that has
-/// to be reviewed again. A generated access matcher lives only in the running
-/// catalog, is never operator-authored, and loses its trust on restart, so an
-/// intent that resolves to one re-proposes it however the reduction found it:
-/// by explicit name, by matching prose, or by an identical matcher shape.
-fn access_reduction(matched: Vec<Verb>) -> (Vec<Verb>, Vec<Verb>) {
+/// to be reviewed again. Generated matchers are request-owned authority rather
+/// than operator-authored catalog policy, so an intent that resolves to one
+/// retains it as a proposal however the reduction found it: by explicit name,
+/// by matching prose, or by an identical matcher shape.
+fn access_reduction(matched: Vec<Verb>) -> Result<(Vec<Verb>, Vec<Verb>), String> {
     let mut proposed = Vec::new();
-    let reduced = matched
-        .into_iter()
-        .map(|verb| {
-            if !verb.name.starts_with("access-generated-") {
-                return verb;
-            }
-            let mut proposal = verb;
-            proposal.trusted = false;
-            proposed.push(proposal.clone());
-            proposal
-        })
-        .collect();
-    (reduced, proposed)
+    let mut reduced = Vec::with_capacity(matched.len());
+    for verb in matched {
+        if !verb.name.starts_with("access-generated-") {
+            reduced.push(verb);
+            continue;
+        }
+        let mut proposal = verb;
+        proposal.trusted = false;
+        let proposal = guard::gating::verb::normalize_generated_access_verb(proposal)
+            .map_err(|error| format!("stored generated access coverage was rejected: {error}"))?;
+        proposed.push(proposal.clone());
+        reduced.push(proposal);
+    }
+    Ok((reduced, proposed))
 }
 
-/// Bounds on a grant description the daemon renders. A model can answer with a
-/// single word or with a page, and an approval card has to stay both
-/// informative and readable, so a description outside this range is replaced by
-/// the deterministic template rather than shown or truncated mid-sentence.
-const MIN_ACCESS_DESCRIPTION_CHARS: usize = 12;
-const MAX_ACCESS_DESCRIPTION_CHARS: usize = 400;
-
-/// Plain-language account of the access a synthesized matcher admits, written
-/// for the operator deciding on the request rather than restating the
-/// requester's intent. The synthesis call that produces the matcher also
-/// returns this description, so it costs no extra round trip and can neither
-/// delay nor fail request creation: an unusable description falls back to a
-/// deterministic template derived from the matcher itself.
-fn access_grant_description(verb: &Verb) -> String {
-    synthesized_access_description(verb).unwrap_or_else(|| derived_access_description(verb))
-}
-
-fn synthesized_access_description(verb: &Verb) -> Option<String> {
-    let text = verb
-        .description
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let length = text.chars().count();
-    if !(MIN_ACCESS_DESCRIPTION_CHARS..=MAX_ACCESS_DESCRIPTION_CHARS).contains(&length) {
-        return None;
+fn access_capability(catalog: &VerbCatalog, verb: &Verb) -> Option<AccessCapability> {
+    let mut projected = verb.clone();
+    if verb.name.starts_with("access-generated-") {
+        let mut proposal = verb.clone();
+        proposal.trusted = false;
+        let serialized = serde_json::to_value(proposal).ok()?;
+        let proposal =
+            guard::gating::verb::parse_normalized_generated_access_verb(&serialized).ok()?;
+        projected = catalog.canonical_generated_access_verb(proposal).ok()?;
+        if projected.consequence != verb.consequence {
+            return None;
+        }
     }
-    // The description is displayed at the moment of decision. Text that
-    // survives redaction unchanged is safe to render; anything else is not.
-    if redact_output_text(&text) != text {
-        return None;
-    }
-    if text.eq_ignore_ascii_case(&verb.name) || text.eq_ignore_ascii_case(&verb.binary) {
-        return None;
-    }
-    Some(text)
-}
-
-/// Description built only from the matcher: the binary, the arguments the
-/// template pins, and the values the caller still supplies.
-fn derived_access_description(verb: &Verb) -> String {
-    let pinned = verb
-        .args
-        .iter()
-        .filter(|arg| !arg.contains('{'))
-        .cloned()
-        .collect::<Vec<_>>();
-    let params = verb.params.keys().cloned().collect::<Vec<_>>();
-    let mut text = format!("Runs {}", verb.binary);
-    if !pinned.is_empty() {
-        text.push_str(&format!(" with pinned arguments {}", pinned.join(" ")));
-    }
-    match params.len() {
-        0 => text.push_str(" and no caller-supplied values"),
-        1 => text.push_str(&format!(" and one caller-supplied value ({})", params[0])),
-        count => text.push_str(&format!(
-            " and {count} caller-supplied values ({})",
-            params.join(", ")
-        )),
-    }
-    text.push('.');
-    text
-}
-
-fn access_capability(verb: &Verb) -> AccessCapability {
-    let matcher = access_verb_shape(verb);
-    AccessCapability {
-        verb: verb.name.clone(),
-        description: redact_output_text(&verb.description),
-        matcher_digest: access_matcher_digest(&matcher),
+    let matcher = generated_access_matcher_shape(&projected);
+    Some(AccessCapability {
+        verb: projected.name.clone(),
+        description: redact_output_text(&projected.description),
+        matcher_digest: generated_access_matcher_digest(&matcher),
         matcher,
-        consequence: verb.consequence.as_str().to_string(),
-        credential_plan: verb.credential_plan.clone(),
-        baseline: verb.baseline,
+        consequence: projected.consequence.as_str().to_string(),
+        credential_plan: projected.credential_plan.clone(),
+        baseline: projected.baseline,
         trusted: verb.trusted,
-        has_revert: verb.revert.is_some(),
-        evidence: verb.evidence.as_deref().map(redact_output_text),
+        has_revert: projected.revert.is_some(),
+        evidence: projected.evidence.as_deref().map(redact_output_text),
+    })
+}
+
+#[cfg(test)]
+mod access_capability_tests {
+    use super::*;
+    use guard::gating::verb::ParamSpec;
+
+    #[test]
+    fn generated_capability_uses_only_the_canonical_proposal_envelope() {
+        let value = ["q", "7"].concat();
+        let mut verb = Verb {
+            name: "access-generated-fixture".to_string(),
+            description: format!("password={value}"),
+            binary: "fixturectl".to_string(),
+            args: vec!["status".to_string()],
+            baseline: true,
+            coverage: Vec::new(),
+            credential_plan: None,
+            params: std::collections::BTreeMap::new(),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: Some(guard::gating::verb::VerbCommand {
+                binary: "fixturectl".to_string(),
+                args: vec!["undo".to_string()],
+            }),
+            trusted: true,
+            prompt_context: Some(format!("password={value}")),
+            source_prose: Some(format!("password={value}")),
+            evidence: Some(format!("password={value}")),
+            auto_promoted: true,
+            promotion_stamp: Some(format!("password={value}")),
+        };
+        verb = guard::gating::verb::normalize_generated_access_verb(verb).unwrap();
+        verb.name = generated_access_verb_name(&verb);
+        let capability = access_capability(&VerbCatalog::empty(), &verb).unwrap();
+        let projection = serde_json::to_string(&capability).unwrap();
+        assert!(!projection.contains(&value));
+        assert_eq!(capability.description, verb.description);
+        assert!(!capability.baseline);
+        assert!(!capability.trusted);
+        assert!(!capability.has_revert);
+        assert!(capability.evidence.is_none());
+    }
+
+    #[test]
+    fn generated_capability_projection_omits_sensitive_parameter_authority() {
+        let value = ["q", "7"].concat();
+        let mut verb = Verb {
+            name: "access-generated-fixture".to_string(),
+            description: "fixture".to_string(),
+            binary: "fixturectl".to_string(),
+            args: vec!["inspect".to_string(), "{password}".to_string()],
+            baseline: false,
+            coverage: Vec::new(),
+            credential_plan: None,
+            params: std::collections::BTreeMap::from([(
+                "password".to_string(),
+                ParamSpec {
+                    pattern: "^[a-z0-9]+$".to_string(),
+                    required: false,
+                    default: Some(value.clone()),
+                    allow_dash: false,
+                },
+            )]),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
+        };
+        verb.name = generated_access_verb_name(&verb);
+        assert!(access_capability(&VerbCatalog::empty(), &verb).is_none());
+    }
+
+    #[test]
+    fn generated_capability_projection_omits_sensitive_provenance_stamps() {
+        let value = ["q", "7"].concat();
+        let mut verb = Verb {
+            name: "access-generated-fixture".to_string(),
+            description: "fixture".to_string(),
+            binary: "fixturectl".to_string(),
+            args: vec!["status".to_string()],
+            baseline: false,
+            coverage: vec![VerbCoverageCell {
+                name: "exact".to_string(),
+                action: CoverageAction::Evaluate,
+                required_args: Vec::new(),
+                forbidden_args: Vec::new(),
+                min_args: Some(1),
+                max_args: Some(1),
+                options: Vec::new(),
+                target: None,
+                inventory: None,
+                namespace: None,
+                fanout: None,
+                cwd: None,
+                environment: Vec::new(),
+                override_marker: None,
+                sticky: false,
+                provenance: Some(CoverageProvenance {
+                    source: "fixture".to_string(),
+                    evidence: Vec::new(),
+                    regime_stamp: format!("password={value}"),
+                    prompt_stamp: "safe-prompt".to_string(),
+                    model_stamp: "safe-model".to_string(),
+                    generated_unix: 1,
+                    probes: Vec::new(),
+                }),
+            }],
+            credential_plan: None,
+            params: std::collections::BTreeMap::new(),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
+        };
+        verb.name = generated_access_verb_name(&verb);
+        assert!(access_capability(&VerbCatalog::empty(), &verb).is_none());
     }
 }
 
@@ -1103,7 +1224,7 @@ async fn capabilities_for(server: &ServerContext, names: &[String]) -> Vec<Acces
     names
         .iter()
         .filter_map(|name| catalog.get(name))
-        .map(access_capability)
+        .filter_map(|verb| access_capability(&catalog, verb))
         .collect()
 }
 
@@ -1111,10 +1232,12 @@ async fn capabilities_for_request(
     server: &ServerContext,
     request: &GrantRequest,
 ) -> Vec<AccessCapability> {
-    let proposed = request
-        .proposed_verbs
-        .iter()
-        .filter_map(|value| serde_json::from_value::<Verb>(value.clone()).ok())
+    let Ok(proposed) = proposed_access_verbs(request) else {
+        tracing::warn!("invalid proposed access coverage; omitting request capabilities");
+        return Vec::new();
+    };
+    let proposed = proposed
+        .into_iter()
         .map(|verb| (verb.name.clone(), verb))
         .collect::<std::collections::BTreeMap<_, _>>();
     let catalog = server.state.verbs.read().await;
@@ -1122,7 +1245,7 @@ async fn capabilities_for_request(
         .authority_verbs
         .iter()
         .filter_map(|name| catalog.get(name).or_else(|| proposed.get(name)))
-        .map(access_capability)
+        .filter_map(|verb| access_capability(&catalog, verb))
         .collect()
 }
 
@@ -1136,20 +1259,23 @@ pub(super) async fn install_approved_access_verbs(server: &ServerContext) -> Res
         .into_iter()
         .map(|summary| summary.token)
         .collect::<std::collections::BTreeSet<_>>();
-    let requests = server.state.grant_requests.read().await;
-    let mut catalog = server.state.verbs.read().await.clone();
-    for request in requests.values().filter(|request| {
-        request.status == GrantRequestStatus::Approved
-            && active_tokens.contains(&request.session_token)
-    }) {
-        for verb in proposed_access_verbs(request)? {
-            catalog
-                .upsert_access_verb(verb)
-                .map_err(|error| format!("failed to restore approved access coverage: {error}"))?;
+    let proposals = {
+        let requests = server.state.grant_requests.read().await;
+        let mut proposals = Vec::new();
+        for request in requests.values().filter(|request| {
+            request.status == GrantRequestStatus::Approved
+                && active_tokens.contains(&request.session_token)
+        }) {
+            proposals.extend(proposed_access_verbs(request)?);
         }
+        proposals
+    };
+    let mut catalog = server.state.verbs.write().await;
+    for verb in proposals {
+        catalog
+            .upsert_access_verb(verb)
+            .map_err(|error| format!("failed to restore approved access coverage: {error}"))?;
     }
-    drop(requests);
-    *server.state.verbs.write().await = catalog;
     Ok(())
 }
 
@@ -1696,6 +1822,7 @@ pub(super) async fn submit_access_request(
     explicit_target: Option<&str>,
     intent: &str,
     requested_uses: Option<u64>,
+    observed_argv: Option<(&str, &[String])>,
 ) -> Result<AccessItem, String> {
     let audience = AccessAudience::from_caller(server, caller);
     let intent = redact_output_text(&validate_access_intent(intent)?);
@@ -1759,7 +1886,7 @@ pub(super) async fn submit_access_request(
         }
     };
 
-    if requested_uses.is_some() {
+    if observed_argv.is_none() && requested_uses.is_some() {
         if let Some(existing) = server
             .state
             .grant_requests
@@ -1802,45 +1929,47 @@ pub(super) async fn submit_access_request(
             session_revision = snapshot.revision;
             session_expiry = snapshot.expires_at;
         }
-        let requests = server.state.grant_requests.read().await;
-        if let Some(existing) = requests
-            .values()
-            .find(|existing| {
-                existing
-                    .requester
-                    .as_ref()
-                    .is_some_and(|principal| principal.eq_ci(&requester))
-                    && existing.session_token == session_token.as_deref().unwrap_or_default()
-                    && normalize_access_intent(&existing.justification)
-                        == normalize_access_intent(&intent)
-                    && existing.requested_uses == requested_uses
-                    && existing.issued_session_revision == session_revision
-                    && existing.status == GrantRequestStatus::Pending
-            })
-            .cloned()
-        {
-            drop(requests);
-            return Ok(access_item_for_request(server, &existing, &audience).await);
-        }
-        if requests.len() >= MAX_GRANT_REQUESTS {
-            return Err("access request queue is full".to_string());
-        }
-        let pending = requests
-            .values()
-            .filter(|existing| {
-                existing
-                    .requester
-                    .as_ref()
-                    .is_some_and(|principal| principal.eq_ci(&requester))
-                    && existing.status == GrantRequestStatus::Pending
-            })
-            .count();
-        if pending >= MAX_PENDING_GRANT_REQUESTS_PER_SESSION {
-            return Err("access request queue is full for this principal".to_string());
+        if observed_argv.is_none() {
+            let requests = server.state.grant_requests.read().await;
+            if let Some(existing) = requests
+                .values()
+                .find(|existing| {
+                    existing
+                        .requester
+                        .as_ref()
+                        .is_some_and(|principal| principal.eq_ci(&requester))
+                        && existing.session_token == session_token.as_deref().unwrap_or_default()
+                        && normalize_access_intent(&existing.justification)
+                            == normalize_access_intent(&intent)
+                        && existing.requested_uses == requested_uses
+                        && existing.issued_session_revision == session_revision
+                        && existing.status == GrantRequestStatus::Pending
+                })
+                .cloned()
+            {
+                drop(requests);
+                return Ok(access_item_for_request(server, &existing, &audience).await);
+            }
+            if requests.len() >= MAX_GRANT_REQUESTS {
+                return Err("access request queue is full".to_string());
+            }
+            let pending = requests
+                .values()
+                .filter(|existing| {
+                    existing
+                        .requester
+                        .as_ref()
+                        .is_some_and(|principal| principal.eq_ci(&requester))
+                        && existing.status == GrantRequestStatus::Pending
+                })
+                .count();
+            if pending >= MAX_PENDING_GRANT_REQUESTS_PER_SESSION {
+                return Err("access request queue is full for this principal".to_string());
+            }
         }
     }
 
-    let (reduced, proposed_verbs) = reduce_access_intent(server, &intent).await?;
+    let (reduced, proposed_verbs) = reduce_access_intent(server, &intent, observed_argv).await?;
     let _transition = server.state.grant_request_transition_gate.lock().await;
     if let Some(token) = session_token.as_deref() {
         let sessions = server.state.sessions.read().await;
@@ -1900,6 +2029,7 @@ pub(super) async fn submit_access_request(
                 .ok_or_else(|| "access target expired while resolving".to_string())?;
             return Ok(access_item_for_session(server, &summary, &audience).await);
         }
+        let catalog = server.state.verbs.read().await;
         return Ok(AccessItem {
             reference: "baseline".to_string(),
             kind: "effective".to_string(),
@@ -1916,7 +2046,10 @@ pub(super) async fn submit_access_request(
             next_action: "guard access list".to_string(),
             approval_options: Vec::new(),
             intent: Some(intent),
-            capabilities: reduced.iter().map(access_capability).collect(),
+            capabilities: reduced
+                .iter()
+                .filter_map(|verb| access_capability(&catalog, verb))
+                .collect(),
             decided_reason: None,
         });
     }
@@ -2030,58 +2163,55 @@ fn new_access_session(requester: PrincipalKey, label: String, expires_at: u64) -
 }
 
 fn proposed_access_verbs(request: &GrantRequest) -> Result<Vec<Verb>, String> {
-    request
-        .proposed_verbs
-        .iter()
-        .map(|value| {
-            serde_json::from_value::<Verb>(value.clone())
-                .map_err(|error| format!("invalid proposed access coverage: {error}"))
-        })
-        .collect()
+    if request.has_access_projection() {
+        request
+            .validate_principal_access_shape()
+            .map_err(|error| error.to_string())
+    } else {
+        request
+            .validated_generated_access_proposals()
+            .map_err(|error| error.to_string())
+    }
 }
 
-async fn validate_access_verbs(
-    server: &ServerContext,
-    names: &[String],
-    proposed: &[Verb],
-) -> Result<(), String> {
-    let catalog = server.state.verbs.read().await;
-    for name in names {
-        let proposal = proposed.iter().find(|verb| &verb.name == name);
-        let verb = proposal
-            .or_else(|| catalog.get(name))
-            .ok_or_else(|| format!("access request references unknown verb: '{name}'"))?;
-        if verb.baseline {
-            return Err(format!(
-                "access request may not activate baseline verb: '{name}'"
-            ));
-        }
-        if proposal.is_some() {
-            guard::gating::verb::validate_synthesized_safety(verb).map_err(|error| {
-                format!("access request references unsafe verb '{name}': {error}")
-            })?;
-        }
-    }
-    if proposed
-        .iter()
-        .any(|verb| !names.iter().any(|name| name == &verb.name))
-    {
-        return Err("access request contains unreferenced proposed coverage".to_string());
-    }
-    Ok(())
+#[cfg(all(test, unix))]
+type AccessApprovalLockHook = (
+    std::sync::Arc<tokio::sync::Semaphore>,
+    std::sync::Arc<tokio::sync::Semaphore>,
+);
+
+#[cfg(all(test, unix))]
+fn access_approval_lock_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<usize, AccessApprovalLockHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<usize, AccessApprovalLockHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
-async fn stage_proposed_access_verbs(
+#[cfg(all(test, unix))]
+pub(super) fn pause_access_approval_before_verb_lock_for_test(
     server: &ServerContext,
-    proposed: &[Verb],
-) -> Result<guard::gating::verb::VerbCatalog, String> {
-    let mut catalog = server.state.verbs.read().await.clone();
-    for verb in proposed {
-        catalog
-            .upsert_access_verb(verb.clone())
-            .map_err(|error| format!("failed to stage approved access coverage: {error}"))?;
+) -> AccessApprovalLockHook {
+    let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    access_approval_lock_hooks().lock().unwrap().insert(
+        std::sync::Arc::as_ptr(&server.state.verbs) as usize,
+        (reached.clone(), release.clone()),
+    );
+    (reached, release)
+}
+
+#[cfg(all(test, unix))]
+async fn pause_access_approval_before_verb_lock(server: &ServerContext) {
+    let hook = access_approval_lock_hooks()
+        .lock()
+        .unwrap()
+        .remove(&(std::sync::Arc::as_ptr(&server.state.verbs) as usize));
+    if let Some((reached, release)) = hook {
+        reached.add_permits(1);
+        release.acquire().await.unwrap().forget();
     }
-    Ok(catalog)
 }
 
 async fn reload_sessions_after_registry_conflict(
@@ -2089,6 +2219,7 @@ async fn reload_sessions_after_registry_conflict(
     error: &anyhow::Error,
     already_retried: bool,
     operation: &str,
+    baseline_revision: u64,
 ) -> Result<bool, String> {
     if already_retried
         || !crate::session_store::SessionStore::is_registry_generation_conflict(error)
@@ -2101,52 +2232,49 @@ async fn reload_sessions_after_registry_conflict(
     let durable = store.load_registry().await.map_err(|reload_error| {
         format!("failed to reload sessions after concurrent {operation}: {reload_error}")
     })?;
-    *server.state.sessions.write().await = durable;
+    let mut sessions = server.state.sessions.write().await;
+    if sessions.revision() == baseline_revision {
+        *sessions = durable;
+    }
     Ok(true)
 }
 
 fn validate_access_request_shape(request: &GrantRequest) -> Result<(), String> {
-    if request.requester.is_none()
-        || request.target.as_deref().is_none_or(str::is_empty)
-        || request.request_key.is_empty()
-    {
-        return Err("request is not a canonical principal-bound access request".to_string());
-    }
-    if request.saved_grant.is_some()
-        || request.issued_saved_revision.is_some()
-        || !request.delta.override_markers.is_empty()
-        || !request.delta.secret_names.is_empty()
-        || request.delta.ttl_secs.is_some()
-        || request.delta.prompt_append.is_some()
-        || request.delta.evaluation_mode.is_some()
-    {
-        return Err(
-            "access request contains authority outside its displayed verb scope".to_string(),
-        );
-    }
-    if request.authority_verbs.is_empty()
-        || request
-            .delta
-            .activated_verbs
-            .iter()
-            .any(|verb| !request.authority_verbs.contains(verb))
-    {
-        return Err("access request verb scope is incomplete or inconsistent".to_string());
-    }
-    if request.status == GrantRequestStatus::Pending {
-        let expected = request
-            .canonical_access_key()
-            .map_err(|error| format!("invalid access request convergence key: {error}"))?;
-        if expected != request.request_key {
-            return Err(
-                "access request convergence key does not match its displayed scope".to_string(),
-            );
-        }
-    }
-    Ok(())
+    request
+        .validate_principal_access_shape()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 async fn approve_access_request(
+    server: &ServerContext,
+    handle: &str,
+    uses: Option<u64>,
+    audience: &AccessAudience,
+) -> AccessDecisionResult {
+    let owned_server = server.clone();
+    let owned_handle = handle.to_string();
+    let owned_audience = audience.clone();
+    match tokio::spawn(async move {
+        approve_access_request_owned(&owned_server, &owned_handle, uses, &owned_audience).await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => AccessDecisionResult {
+            request: handle.to_string(),
+            success: false,
+            state: "error".to_string(),
+            target: None,
+            remaining_uses: None,
+            use_policy: "unavailable".to_string(),
+            message: format!("access approval coordination failed: {error}"),
+            consequence: String::new(),
+        },
+    }
+}
+
+async fn approve_access_request_owned(
     server: &ServerContext,
     handle: &str,
     uses: Option<u64>,
@@ -2248,26 +2376,65 @@ async fn approve_access_request(
             }
         }
     };
-    if let Err(message) =
-        validate_access_verbs(server, &pending.delta.activated_verbs, &proposed_verbs).await
-    {
-        return AccessDecisionResult {
-            request: handle.to_string(),
-            success: false,
-            state: "rejected".to_string(),
-            target: pending.target.clone(),
-            remaining_uses: None,
-            use_policy: "unavailable".to_string(),
-            message,
-            consequence: String::new(),
-        };
-    }
+    #[cfg(all(test, unix))]
+    pause_access_approval_before_verb_lock(server).await;
 
     let mut generation_retry = false;
     loop {
         let requester = pending.requester.clone().expect("checked above");
-        let mut live_sessions = server.state.sessions.write().await;
-        let mut staged = live_sessions.clone();
+        if let Err(error) = server.refresh_verb_catalog_for_decision().await {
+            return AccessDecisionResult {
+                request: handle.to_string(),
+                success: false,
+                state: "stale".to_string(),
+                target: pending.target.clone(),
+                remaining_uses: None,
+                use_policy: "unavailable".to_string(),
+                message: format!("verb catalog authority is unavailable: {error}"),
+                consequence: String::new(),
+            };
+        }
+        let baseline_verbs = server.state.verbs.read().await.clone();
+        let mut staged_verbs = baseline_verbs.clone();
+        if let Some(error) = proposed_verbs.iter().find_map(|verb| {
+            staged_verbs
+                .upsert_access_verb(verb.clone())
+                .err()
+                .map(|error| format!("failed to stage approved access coverage: {error}"))
+        }) {
+            return AccessDecisionResult {
+                request: handle.to_string(),
+                success: false,
+                state: "stale".to_string(),
+                target: pending.target.clone(),
+                remaining_uses: None,
+                use_policy: "unavailable".to_string(),
+                message: error,
+                consequence: String::new(),
+            };
+        }
+        if let Some(message) = pending.delta.activated_verbs.iter().find_map(|name| {
+            staged_verbs.get(name).map_or_else(
+                || Some(format!("access request references unknown verb: '{name}'")),
+                |verb| {
+                    verb.baseline
+                        .then(|| format!("access request may not activate baseline verb: '{name}'"))
+                },
+            )
+        }) {
+            return AccessDecisionResult {
+                request: handle.to_string(),
+                success: false,
+                state: "rejected".to_string(),
+                target: pending.target.clone(),
+                remaining_uses: None,
+                use_policy: "unavailable".to_string(),
+                message,
+                consequence: String::new(),
+            };
+        }
+        let baseline_sessions = server.state.sessions.read().await.clone();
+        let mut staged = baseline_sessions.clone();
         staged.purge_expired();
         let token = if pending.session_token.is_empty() {
             access_token_for_principal_ci(&staged, &requester)
@@ -2366,22 +2533,6 @@ async fn approve_access_request(
             pending.authority_verbs.clone(),
         );
 
-        let staged_verbs = match stage_proposed_access_verbs(server, &proposed_verbs).await {
-            Ok(staged_verbs) => staged_verbs,
-            Err(message) => {
-                return AccessDecisionResult {
-                    request: handle.to_string(),
-                    success: false,
-                    state: "stale".to_string(),
-                    target: pending.target.clone(),
-                    remaining_uses: None,
-                    use_policy: "unavailable".to_string(),
-                    message,
-                    consequence: String::new(),
-                }
-            }
-        };
-
         let mut approved = pending.clone();
         approved.session_token = token.clone();
         approved.target = Some(session_reference(&token));
@@ -2444,12 +2595,12 @@ async fn approve_access_request(
                 )
                 .await
             {
-                drop(live_sessions);
                 match reload_sessions_after_registry_conflict(
                     server,
                     &error,
                     generation_retry,
                     "access approval",
+                    baseline_sessions.revision(),
                 )
                 .await
                 {
@@ -2486,9 +2637,44 @@ async fn approve_access_request(
         }
         let grant_uses = staged.access_grant_uses(&token, handle);
         let remaining_uses = grant_uses.and_then(|(_, remaining)| remaining);
-        *server.state.verbs.write().await = staged_verbs;
-        *live_sessions = staged;
-        drop(live_sessions);
+        {
+            let mut live_verbs = server.state.verbs.write().await;
+            if live_verbs.version() == baseline_verbs.version() {
+                *live_verbs = staged_verbs;
+            } else if proposed_verbs
+                .iter()
+                .any(|verb| live_verbs.upsert_access_verb(verb.clone()).is_err())
+            {
+                return AccessDecisionResult {
+                    request: handle.to_string(),
+                    success: false,
+                    state: "stale".to_string(),
+                    target: approved.target.clone(),
+                    remaining_uses,
+                    use_policy: "unavailable".to_string(),
+                    message: "verb catalog changed while access approval was committing"
+                        .to_string(),
+                    consequence: String::new(),
+                };
+            }
+        }
+        {
+            let mut live_sessions = server.state.sessions.write().await;
+            if live_sessions.revision() != baseline_sessions.revision() {
+                return AccessDecisionResult {
+                    request: handle.to_string(),
+                    success: false,
+                    state: "stale".to_string(),
+                    target: approved.target.clone(),
+                    remaining_uses,
+                    use_policy: "unavailable".to_string(),
+                    message: "session authority changed while access approval was committing"
+                        .to_string(),
+                    consequence: String::new(),
+                };
+            }
+            *live_sessions = staged;
+        }
         {
             let mut requests = server.state.grant_requests.write().await;
             for (_, rebased) in rebased_pending {
@@ -2496,6 +2682,8 @@ async fn approve_access_request(
             }
             requests.insert(handle.to_string(), approved.clone());
         }
+        #[cfg(test)]
+        server.state.session_publication_events.add_permits(1);
         emit_grant_request_event(server, &approved, "access_request_approved");
         return AccessDecisionResult {
             request: handle.to_string(),
@@ -2506,6 +2694,149 @@ async fn approve_access_request(
             use_policy: access_use_policy(grant_uses).to_string(),
             message: "access approved".to_string(),
             consequence: String::new(),
+        };
+    }
+}
+
+async fn revoke_access_target(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    target: String,
+) -> AdminResponse {
+    let owned_server = server.clone();
+    let owned_caller = caller.clone();
+    match tokio::spawn(async move {
+        revoke_access_target_owned(&owned_server, &owned_caller, &target).await
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => AdminResponse::Error {
+            message: format!("access revoke coordination failed: {error}"),
+        },
+    }
+}
+
+async fn revoke_access_target_owned(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    target: &str,
+) -> AdminResponse {
+    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let mut generation_retry = false;
+    loop {
+        let baseline_sessions = server.state.sessions.read().await.clone();
+        let token = match baseline_sessions.token_for_access_target(target) {
+            Ok(Some(token)) if baseline_sessions.is_access_managed(&token) => token,
+            Ok(Some(_)) => {
+                return AdminResponse::Error {
+                    message: "access revoke only accepts access-managed sessions".to_string(),
+                }
+            }
+            Ok(None) => {
+                return AdminResponse::Error {
+                    message: format!("unknown active access target: '{target}'"),
+                }
+            }
+            Err(message) => return AdminResponse::Error { message },
+        };
+        let reference = session_reference(&token);
+        let expected_revision = baseline_sessions.effective_revision_key(&token);
+        let mut staged = baseline_sessions.clone();
+        if !staged.revoke(&token) {
+            return AdminResponse::Error {
+                message: format!("unknown active access target: '{target}'"),
+            };
+        }
+        let baseline_requests = server.state.grant_requests.read().await.clone();
+        let withdrawals = baseline_requests
+            .values()
+            .filter(|request| {
+                request.status == GrantRequestStatus::Pending && request.session_token == token
+            })
+            .cloned()
+            .map(|pending| {
+                let mut withdrawn = pending.clone();
+                withdrawn.status = GrantRequestStatus::Withdrawn;
+                withdrawn.decided_unix = Some(now_unix());
+                withdrawn.decided_reason = Some("target access session was revoked".to_string());
+                withdrawn.next_action = format!("guard access show {}", withdrawn.handle);
+                (pending, withdrawn)
+            })
+            .collect::<Vec<_>>();
+        if let Some(store) = &server.state.session_store {
+            if let Err(error) = store
+                .commit_access_revoke(
+                    token.clone(),
+                    expected_revision,
+                    staged.clone(),
+                    withdrawals.clone(),
+                )
+                .await
+            {
+                match reload_sessions_after_registry_conflict(
+                    server,
+                    &error,
+                    generation_retry,
+                    "access revoke",
+                    baseline_sessions.revision(),
+                )
+                .await
+                {
+                    Ok(true) => {
+                        generation_retry = true;
+                        continue;
+                    }
+                    Err(message) => return AdminResponse::Error { message },
+                    Ok(false) => {}
+                }
+                return AdminResponse::Error {
+                    message: format!("failed to persist access revoke: {error}"),
+                };
+            }
+        }
+        {
+            let mut live_sessions = server.state.sessions.write().await;
+            if live_sessions.revision() != baseline_sessions.revision() {
+                return AdminResponse::Error {
+                    message:
+                        "session authority changed while access revocation was committing; durable revocation remains authoritative"
+                            .to_string(),
+                };
+            }
+            *live_sessions = staged;
+        }
+        {
+            let mut live_requests = server.state.grant_requests.write().await;
+            for (pending, withdrawn) in &withdrawals {
+                if live_requests.get(&pending.handle) == Some(pending) {
+                    live_requests.insert(withdrawn.handle.clone(), withdrawn.clone());
+                }
+            }
+        }
+        #[cfg(test)]
+        server.state.session_publication_events.add_permits(1);
+        for (_, withdrawn) in &withdrawals {
+            emit_grant_request_event(server, withdrawn, "grant_request_withdrawn");
+        }
+        server.emit_audit_ungated(
+            AuditEvent::new(AuditKind::SessionRevoke)
+                .caller(caller)
+                .field("token_fingerprint", &reference)
+                .field("access_managed", true),
+        );
+        return AdminResponse::AccessDecisions {
+            items: vec![AccessDecisionResult {
+                request: reference.clone(),
+                success: true,
+                state: "revoked".to_string(),
+                target: Some(reference),
+                remaining_uses: None,
+                use_policy: "unavailable".to_string(),
+                message: "access revoked".to_string(),
+                consequence: String::new(),
+            }],
+            wait: None,
         };
     }
 }
@@ -2667,22 +2998,6 @@ async fn approve_held_access(
             consequence: String::new(),
         };
     };
-    if let Some(verb_name) = approval.snapshot.verb_name.as_deref() {
-        let catalog = server.state.verbs.read().await;
-        if let Some(staleness) = held_verb_staleness(&approval.snapshot, verb_name, &catalog) {
-            return AccessDecisionResult {
-                request: handle.to_string(),
-                success: false,
-                state: "stale".to_string(),
-                target: Some(format!("agent:{requester}")),
-                remaining_uses: None,
-                use_policy: "unavailable".to_string(),
-                message: format!("{}; re-issue the command", staleness.clause(verb_name)),
-                consequence: String::new(),
-            };
-        }
-    }
-
     let originating_access_token = if approval.snapshot.session_fingerprint.is_none() {
         None
     } else {
@@ -3060,7 +3375,7 @@ async fn handle_session_appeal(
             message: "session token must not be empty".to_string(),
         };
     }
-    let command_line = command_line(&binary, &args);
+    let command_line = redact_command_line(&binary, &args);
     if let Err(reason) = validate_session_exact_rule_candidate(&binary, &args) {
         return AdminResponse::SessionAppeal {
             allowed: false,
@@ -3511,7 +3826,7 @@ async fn session_status_response(
         .provisional
         .read()
         .await
-        .list()
+        .visible_list()
         .iter()
         .filter(|provisional| {
             provisional.session_fingerprint.as_deref() == Some(fingerprint.as_str())
@@ -3643,10 +3958,17 @@ async fn dispatch_admin_request(
                 }
             }
             if !activated_verbs.is_empty() || !override_markers.is_empty() {
-                let mut catalog = server.state.verbs.write().await;
-                if let Err(error) = catalog.reload_if_stale() {
-                    tracing::warn!("verb catalog reload failed, using previous: {}", error);
-                }
+                let catalog = match server
+                    .refresh_and_lease_verb_catalog_for_use("session verb activation")
+                    .await
+                {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        return AdminResponse::Error {
+                            message: format!("verb catalog authority is unavailable: {error}"),
+                        }
+                    }
+                };
                 for name in &activated_verbs {
                     let Some(verb) = catalog.get(name) else {
                         return AdminResponse::Error {
@@ -3723,8 +4045,9 @@ async fn dispatch_admin_request(
                 granted_at: 0, // SessionRegistry::grant fills the current time
                 owner: session_owner,
             };
-            let mut live = server.state.sessions.write().await;
-            let mut staged = live.clone();
+            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let baseline = server.state.sessions.read().await.clone();
+            let mut staged = baseline.clone();
             staged.purge_expired();
             if !staged.grant(token.clone(), grant) {
                 return AdminResponse::Error {
@@ -3736,6 +4059,13 @@ async fn dispatch_admin_request(
             {
                 return AdminResponse::Error {
                     message: format!("failed to persist session grant: {err}"),
+                };
+            }
+            let mut live = server.state.sessions.write().await;
+            if live.revision() != baseline.revision() {
+                return AdminResponse::Error {
+                    message: "session authority changed while the durable grant was committing"
+                        .to_string(),
                 };
             }
             *live = staged;
@@ -3760,14 +4090,23 @@ async fn dispatch_admin_request(
         } => handle_session_appeal(server, caller, token, binary, args).await,
         #[cfg(test)]
         AdminRequest::SessionRevoke { token } => {
-            let mut live = server.state.sessions.write().await;
-            let mut staged = live.clone();
+            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let baseline = server.state.sessions.read().await.clone();
+            let mut staged = baseline.clone();
             let removed = staged.revoke(&token);
             if let Err(err) =
                 persist_session_snapshot(server.state.session_store.clone(), staged.clone()).await
             {
                 return AdminResponse::Error {
                     message: format!("failed to persist session revoke: {err}"),
+                };
+            }
+            let mut live = server.state.sessions.write().await;
+            if live.revision() != baseline.revision() {
+                return AdminResponse::Error {
+                    message:
+                        "session authority changed while the durable revocation was committing"
+                            .to_string(),
                 };
             }
             *live = staged;
@@ -3914,7 +4253,7 @@ async fn dispatch_admin_request(
                 .provisional
                 .read()
                 .await
-                .list()
+                .visible_list()
                 .iter()
                 .filter(|provisional| {
                     provisional.session_fingerprint.as_deref() == Some(fingerprint.as_str())
@@ -4251,10 +4590,17 @@ async fn dispatch_admin_request(
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_else(|| "readonly".to_string());
             let (verb_catalog_hash, verb_catalog_changed_unix) = {
-                let mut catalog = server.state.verbs.write().await;
-                if let Err(error) = catalog.reload_if_stale() {
-                    tracing::warn!("verb catalog reload failed during status: {}", error);
-                }
+                let catalog = match server
+                    .refresh_and_lease_verb_catalog_for_use("status catalog projection")
+                    .await
+                {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        return AdminResponse::Error {
+                            message: format!("verb catalog authority is unavailable: {error}"),
+                        }
+                    }
+                };
                 (catalog.short_hash(), catalog.changed_unix())
             };
 
@@ -4298,7 +4644,12 @@ async fn dispatch_admin_request(
                         .map(|path| path.display().to_string()),
                     secret_backend: server.state.secrets.backend_name().to_string(),
                     gate: server.config.gate.as_str().to_string(),
-                    pending_provisionals: server.state.provisional.read().await.outstanding(),
+                    pending_provisionals: server
+                        .state
+                        .provisional
+                        .read()
+                        .await
+                        .visible_outstanding(),
                     pending_approvals: server.state.approvals.read().await.outstanding(),
                     verb_catalog_hash,
                     verb_catalog_changed_unix,
@@ -4320,7 +4671,7 @@ async fn dispatch_admin_request(
                 .provisional
                 .read()
                 .await
-                .list()
+                .visible_list()
                 .iter()
                 .filter(|p| is_daemon || scope_eq(&p.principal, &caller_key))
                 .map(ProvisionalSummary::from_row)
@@ -4360,10 +4711,17 @@ async fn dispatch_admin_request(
             handle_approval_withdraw(server, caller, &handle).await
         }
         AdminRequest::VerbList => {
-            let mut cat = server.state.verbs.write().await;
-            if let Err(e) = cat.reload_if_stale() {
-                tracing::warn!("verb catalog reload failed: {}", e);
-            }
+            let cat = match server
+                .refresh_and_lease_verb_catalog_for_use("verb list projection")
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    return AdminResponse::Error {
+                        message: format!("verb catalog authority is unavailable: {error}"),
+                    }
+                }
+            };
             if caller_is_session_admin(server, caller) {
                 let current_stamp = server.state.evaluator.verb_promotion_stamp();
                 let items = cat
@@ -4405,10 +4763,17 @@ async fn dispatch_admin_request(
             }
         }
         AdminRequest::VerbShow { name } => {
-            let mut catalog = server.state.verbs.write().await;
-            if let Err(error) = catalog.reload_if_stale() {
-                tracing::warn!("verb catalog reload failed: {}", error);
-            }
+            let catalog = match server
+                .refresh_and_lease_verb_catalog_for_use("verb detail projection")
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    return AdminResponse::Error {
+                        message: format!("verb catalog authority is unavailable: {error}"),
+                    }
+                }
+            };
             match catalog.get(&name).cloned() {
                 Some(verb) => AdminResponse::VerbCreated {
                     verb,
@@ -4421,7 +4786,13 @@ async fn dispatch_admin_request(
             }
         }
         AdminRequest::VerbDelete { name } => {
-            match server.state.verbs.write().await.delete_verb(&name) {
+            let delete_name = name.clone();
+            match server
+                .mutate_verb_catalog("verb catalog deletion", move |catalog| {
+                    catalog.delete_verb(&delete_name)
+                })
+                .await
+            {
                 Ok(_) => AdminResponse::Ok,
                 Err(error) => AdminResponse::Error {
                     message: error.to_string(),
@@ -4453,8 +4824,8 @@ async fn dispatch_admin_request(
                     }
                 }
             };
-            // Record provenance verbatim (tidied to one line); the model's
-            // evidence is metadata only and never affects rendering.
+            // Explanatory provenance is normalized and sanitized before it
+            // contributes to preview identity or durable catalog content.
             verb.source_prose = Some(prose_norm);
             if let Some(ev) = verb.evidence.take() {
                 verb.evidence = Some(normalize_ws(&ev));
@@ -4469,6 +4840,14 @@ async fn dispatch_admin_request(
             // pass the synthesis safety gate (no shell/interpreter binary, no
             // over-broad parameter pattern, kebab-case name).
             verb.trusted = false;
+            verb = match guard::gating::verb::canonicalize_synthesized_verb_envelope(verb) {
+                Ok(verb) => verb,
+                Err(e) => {
+                    return AdminResponse::Error {
+                        message: format!("synthesized verb rejected by the safety gate: {e}"),
+                    }
+                }
+            };
             if let Err(e) = guard::gating::verb::validate_synthesized_safety(&verb) {
                 return AdminResponse::Error {
                     message: format!("synthesized verb rejected by the safety gate: {e}"),
@@ -4487,7 +4866,12 @@ async fn dispatch_admin_request(
             let result = if preview {
                 Ok(())
             } else {
-                server.state.verbs.write().await.append_verb(&verb)
+                let candidate = verb.clone();
+                server
+                    .mutate_verb_catalog("verb catalog append", move |catalog| {
+                        catalog.append_verb(&candidate)
+                    })
+                    .await
             };
             match result {
                 Ok(()) => {
@@ -4534,7 +4918,8 @@ async fn dispatch_admin_request(
             // The gate re-runs at install time: the daemon's rules may have
             // tightened since the preview, and the stored shape must never
             // outrank a live rejection.
-            if let Err(e) = guard::gating::verb::validate_synthesized_safety(&verb) {
+            if let Err(e) = guard::gating::verb::validate_canonical_synthesized_verb_envelope(&verb)
+            {
                 return AdminResponse::Error {
                     message: format!("previewed verb rejected by the safety gate: {e}"),
                 };
@@ -4547,7 +4932,12 @@ async fn dispatch_admin_request(
             if let Err(message) = preflight_synthesized_verb(server, caller, &verb).await {
                 return AdminResponse::Error { message };
             }
-            let result = server.state.verbs.write().await.append_verb(&verb);
+            let candidate = verb.clone();
+            let result = server
+                .mutate_verb_catalog("previewed verb catalog append", move |catalog| {
+                    catalog.append_verb(&candidate)
+                })
+                .await;
             match result {
                 Ok(()) => {
                     server
@@ -4580,11 +4970,14 @@ async fn dispatch_admin_request(
             replacement,
         } => {
             let new_digest = replacement.definition_digest();
-            let result = server.state.verbs.write().await.amend_verb_if_digest(
-                &name,
-                &expected_digest,
-                &replacement,
-            );
+            let amend_name = name.clone();
+            let amend_digest = expected_digest.clone();
+            let amend_replacement = replacement.clone();
+            let result = server
+                .mutate_verb_catalog("verb catalog amendment", move |catalog| {
+                    catalog.amend_verb_if_digest(&amend_name, &amend_digest, &amend_replacement)
+                })
+                .await;
             match result {
                 Ok(previous) => {
                     debug_assert_eq!(previous.definition_digest(), expected_digest);
@@ -4607,7 +5000,21 @@ async fn dispatch_admin_request(
         }
         AdminRequest::VerbCoverageList => {
             let items = match &server.state.api_coverage {
-                Some(store) => store.read().await.coverage(),
+                Some(store) => {
+                    if let Err(error) = super::api_judge::refresh_api_coverage_once(store).await {
+                        return AdminResponse::Error {
+                            message: format!("API coverage authority is unavailable: {error}"),
+                        };
+                    }
+                    match super::api_judge::lease_api_coverage_for_decision(store).await {
+                        Ok(lease) => lease.coverage(),
+                        Err(error) => {
+                            return AdminResponse::Error {
+                                message: format!("API coverage authority is unavailable: {error}"),
+                            }
+                        }
+                    }
+                }
                 None => Vec::new(),
             };
             AdminResponse::VerbCoverage { items }
@@ -4616,7 +5023,13 @@ async fn dispatch_admin_request(
             let Some(store) = &server.state.api_coverage else {
                 return AdminResponse::VerbCoverageCleared { removed: 0 };
             };
-            match store.write().await.clear_generated() {
+            match guard::learned_rules::run_async_durable_store_operation(
+                store,
+                "API coverage clear",
+                |candidate| candidate.clear_generated(),
+            )
+            .await
+            {
                 Ok(removed) => {
                     server.emit_audit_ungated(
                         AuditEvent::new(AuditKind::ApiVerbCoverageCleared)
@@ -4853,7 +5266,7 @@ async fn dispatch_admin_request(
                 updated,
                 verb.clone(),
             );
-            let (staged_grants, staged_verbs, updated, added, removed, changed) = match staged {
+            let (_staged_grants, _staged_verbs, updated, added, removed, changed) = match staged {
                 Ok(staged) => staged,
                 Err(message) => return AdminResponse::Error { message },
             };
@@ -4890,8 +5303,39 @@ async fn dispatch_admin_request(
                     };
                 }
             }
-            *server.state.saved_grants.write().await = staged_grants;
-            *server.state.verbs.write().await = staged_verbs;
+            let mut live_grants = server.state.saved_grants.write().await;
+            if live_grants
+                .get(&name)
+                .is_none_or(|current| current.revision != existing.revision)
+            {
+                return AdminResponse::Error {
+                    message: "regeneration proposal is stale: saved grant revision changed"
+                        .to_string(),
+                };
+            }
+            let mut live_verbs = server.state.verbs.write().await;
+            let mut next_grants = live_grants.clone();
+            let mut next_verbs = live_verbs.clone();
+            let updated = match next_grants.replace(updated) {
+                Ok(updated) => updated,
+                Err(error) => {
+                    return AdminResponse::Error {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            if let Err(error) = next_verbs.remove_saved_grant_verbs(&name) {
+                return AdminResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+            if let Err(error) = next_verbs.upsert_saved_grant_verb(verb) {
+                return AdminResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+            *live_grants = next_grants;
+            *live_verbs = next_verbs;
             AdminResponse::SavedGrantRegenerated {
                 grant: updated,
                 added,
@@ -5225,7 +5669,7 @@ async fn dispatch_admin_request(
             }
         }
         AdminRequest::AccessRequest { intent } => {
-            match submit_access_request(server, caller, None, &intent, None).await {
+            match submit_access_request(server, caller, None, &intent, None, None).await {
                 Ok(item) => AdminResponse::AccessItem { item },
                 Err(message) => AdminResponse::Error { message },
             }
@@ -5291,146 +5735,42 @@ async fn dispatch_admin_request(
             }
             AdminResponse::AccessDecisions { items, wait: None }
         }
-        AdminRequest::AccessRevoke { target } => {
-            let _transition = server.state.grant_request_transition_gate.lock().await;
-            let mut generation_retry = false;
-            'access_revoke: loop {
-                let mut live_sessions = server.state.sessions.write().await;
-                let token = match live_sessions.token_for_access_target(&target) {
-                    Ok(Some(token)) if live_sessions.is_access_managed(&token) => token,
-                    Ok(Some(_)) => {
-                        return AdminResponse::Error {
-                            message: "access revoke only accepts access-managed sessions"
-                                .to_string(),
-                        }
-                    }
-                    Ok(None) => {
-                        return AdminResponse::Error {
-                            message: format!("unknown active access target: '{target}'"),
-                        }
-                    }
-                    Err(message) => return AdminResponse::Error { message },
-                };
-                let reference = session_reference(&token);
-                let expected_revision = live_sessions.effective_revision_key(&token);
-                let mut staged = live_sessions.clone();
-                if !staged.revoke(&token) {
-                    return AdminResponse::Error {
-                        message: format!("unknown active access target: '{target}'"),
-                    };
-                }
-                let mut live_requests = server.state.grant_requests.write().await;
-                let withdrawals = live_requests
-                    .values()
-                    .filter(|request| {
-                        request.status == GrantRequestStatus::Pending
-                            && request.session_token == token
-                    })
-                    .cloned()
-                    .map(|pending| {
-                        let mut withdrawn = pending.clone();
-                        withdrawn.status = GrantRequestStatus::Withdrawn;
-                        withdrawn.decided_unix = Some(now_unix());
-                        withdrawn.decided_reason =
-                            Some("target access session was revoked".to_string());
-                        withdrawn.next_action = format!("guard access show {}", withdrawn.handle);
-                        (pending, withdrawn)
-                    })
-                    .collect::<Vec<_>>();
-                if let Some(store) = &server.state.session_store {
-                    if let Err(error) = store
-                        .commit_access_revoke(
-                            token.clone(),
-                            expected_revision,
-                            staged.clone(),
-                            withdrawals.clone(),
-                        )
-                        .await
-                    {
-                        drop(live_requests);
-                        drop(live_sessions);
-                        match reload_sessions_after_registry_conflict(
-                            server,
-                            &error,
-                            generation_retry,
-                            "access revoke",
-                        )
-                        .await
-                        {
-                            Ok(true) => {
-                                generation_retry = true;
-                                continue 'access_revoke;
-                            }
-                            Err(message) => return AdminResponse::Error { message },
-                            Ok(false) => {}
-                        }
-                        return AdminResponse::Error {
-                            message: format!("failed to persist access revoke: {error}"),
-                        };
-                    }
-                }
-                *live_sessions = staged;
-                for (_, withdrawn) in &withdrawals {
-                    live_requests.insert(withdrawn.handle.clone(), withdrawn.clone());
-                }
-                drop(live_requests);
-                drop(live_sessions);
-                for (_, withdrawn) in &withdrawals {
-                    emit_grant_request_event(server, withdrawn, "grant_request_withdrawn");
-                }
-                server.emit_audit_ungated(
-                    AuditEvent::new(AuditKind::SessionRevoke)
-                        .caller(caller)
-                        .field("token_fingerprint", &reference)
-                        .field("access_managed", true),
-                );
-                break 'access_revoke AdminResponse::AccessDecisions {
-                    items: vec![AccessDecisionResult {
-                        request: reference.clone(),
-                        success: true,
-                        state: "revoked".to_string(),
-                        target: Some(reference),
-                        remaining_uses: None,
-                        use_policy: "unavailable".to_string(),
-                        message: "access revoked".to_string(),
-                        consequence: String::new(),
-                    }],
-                    wait: None,
-                };
-            }
-        }
+        AdminRequest::AccessRevoke { target } => revoke_access_target(server, caller, target).await,
         AdminRequest::AccessExtend {
             target,
             intent,
             uses,
-        } => match submit_access_request(server, caller, Some(&target), &intent, uses).await {
-            Ok(item) if item.kind == "request" => AdminResponse::AccessDecisions {
-                items: vec![
-                    approve_access_request(
-                        server,
-                        &item.reference,
-                        uses,
-                        &AccessAudience::from_caller(server, caller),
-                    )
-                    .await,
-                ],
-                wait: None,
-            },
-            Ok(item) => AdminResponse::AccessDecisions {
-                items: vec![AccessDecisionResult {
-                    request: item.reference,
-                    success: true,
-                    state: item.state,
-                    target: Some(item.target),
-                    remaining_uses: item.remaining_uses,
-                    use_policy: item.use_policy,
-                    message: "equivalent authority is already active; no change made".to_string(),
-                    consequence: String::new(),
-                }],
-                wait: None,
-            },
-            Err(message) => AdminResponse::Error { message },
-        },
+        } => {
+            match submit_access_request(server, caller, Some(&target), &intent, uses, None).await {
+                Ok(item) if item.kind == "request" => AdminResponse::AccessDecisions {
+                    items: vec![
+                        approve_access_request(
+                            server,
+                            &item.reference,
+                            uses,
+                            &AccessAudience::from_caller(server, caller),
+                        )
+                        .await,
+                    ],
+                    wait: None,
+                },
+                Ok(item) => AdminResponse::AccessDecisions {
+                    items: vec![AccessDecisionResult {
+                        request: item.reference,
+                        success: true,
+                        state: item.state,
+                        target: Some(item.target),
+                        remaining_uses: item.remaining_uses,
+                        use_policy: item.use_policy,
+                        message: "equivalent authority is already active; no change made"
+                            .to_string(),
+                        consequence: String::new(),
+                    }],
+                    wait: None,
+                },
+                Err(message) => AdminResponse::Error { message },
+            }
+        }
         AdminRequest::AccessList => Box::pin(list_access_items(server, caller)).await,
         AdminRequest::AccessShow { reference } => {
             Box::pin(show_access_item(server, caller, &reference)).await
@@ -5518,7 +5858,7 @@ async fn dispatch_admin_request(
             preview.state.notify_hook = None;
             let mut items = Vec::with_capacity(commands.len());
             for command in commands {
-                let rendered = command_line(&command.binary, &command.args);
+                let rendered = redact_command_line(&command.binary, &command.args);
                 let response = super::execute::execute_command(
                     super::wire::ExecuteRequest {
                         binary: command.binary,
@@ -5658,6 +5998,11 @@ pub(super) struct VerbPreviewCache {
 }
 
 impl VerbPreviewCache {
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Store one previewed candidate, most recent first. Re-previewing an
     /// identical candidate refreshes its position instead of duplicating it.
     pub(super) fn insert(&mut self, digest: String, verb: Verb) {
@@ -5799,6 +6144,27 @@ async fn decide_grant_request(
     approve: bool,
     reason: &str,
 ) -> AdminResponse {
+    let owned_server = server.clone();
+    let owned_handle = handle.to_string();
+    let owned_reason = reason.to_string();
+    match tokio::spawn(async move {
+        decide_grant_request_owned(&owned_server, &owned_handle, approve, &owned_reason).await
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => AdminResponse::Error {
+            message: format!("grant request coordination failed: {error}"),
+        },
+    }
+}
+
+async fn decide_grant_request_owned(
+    server: &ServerContext,
+    handle: &str,
+    approve: bool,
+    reason: &str,
+) -> AdminResponse {
     let _transition = server.state.grant_request_transition_gate.lock().await;
     let request = server
         .state
@@ -5907,14 +6273,30 @@ async fn apply_and_persist_grant_request_delta_if_current(
     pending: &GrantRequest,
     approved: &GrantRequest,
 ) -> Result<(), String> {
-    let mut sessions = server.state.sessions.write().await;
-    if sessions.effective_revision_key(&pending.session_token) != pending.issued_session_revision {
+    let owned_server = server.clone();
+    let owned_pending = pending.clone();
+    let owned_approved = approved.clone();
+    tokio::spawn(async move {
+        apply_and_persist_grant_request_delta_owned(&owned_server, &owned_pending, &owned_approved)
+            .await
+    })
+    .await
+    .map_err(|error| format!("grant request coordination failed: {error}"))?
+}
+
+async fn apply_and_persist_grant_request_delta_owned(
+    server: &ServerContext,
+    pending: &GrantRequest,
+    approved: &GrantRequest,
+) -> Result<(), String> {
+    let baseline = server.state.sessions.read().await.clone();
+    if baseline.effective_revision_key(&pending.session_token) != pending.issued_session_revision {
         return Err(format!(
             "grant request '{}' no longer matches the issued session revision; submit a new request",
             pending.handle
         ));
     }
-    let issued = sessions.saved_grant_for(&pending.session_token);
+    let issued = baseline.saved_grant_for(&pending.session_token);
     let issued_matches = match (&pending.saved_grant, pending.issued_saved_revision, issued) {
         (Some(expected_name), Some(expected_revision), Some((name, revision))) => {
             expected_name == &name && expected_revision == revision
@@ -5928,7 +6310,7 @@ async fn apply_and_persist_grant_request_delta_if_current(
             pending.handle
         ));
     }
-    let mut staged = sessions.clone();
+    let mut staged = baseline.clone();
     staged
         .apply_delta(&pending.session_token, &pending.delta)
         .ok_or_else(|| format!("unknown active session: '{}'", pending.session_token))?;
@@ -5943,7 +6325,24 @@ async fn apply_and_persist_grant_request_delta_if_current(
             .await
             .map_err(|error| format!("failed to persist approved grant request: {error}"))?;
     }
-    *sessions = staged;
+    {
+        let mut sessions = server.state.sessions.write().await;
+        if sessions.revision() != baseline.revision() {
+            return Err(
+                "session authority changed while grant approval was committing; durable state remains authoritative"
+                    .to_string(),
+            );
+        }
+        *sessions = staged;
+    }
+    {
+        let mut requests = server.state.grant_requests.write().await;
+        if requests.get(&pending.handle) == Some(pending) {
+            requests.insert(approved.handle.clone(), approved.clone());
+        }
+    }
+    #[cfg(test)]
+    server.state.session_publication_events.add_permits(1);
     Ok(())
 }
 
@@ -6118,9 +6517,7 @@ async fn handle_confirm(
             message: super::AUDIT_UNAVAILABLE_REASON.to_string(),
         };
     }
-    let _transition = server.state.grant_request_transition_gate.lock().await;
-    let mut registry = server.state.provisional.write().await;
-    let Some(expected) = registry.get(handle).cloned() else {
+    let Some(expected) = server.state.provisional.read().await.get(handle).cloned() else {
         return AdminResponse::Error {
             message: format!("no provisional with handle '{}'", handle),
         };
@@ -6135,16 +6532,14 @@ async fn handle_confirm(
             }
         }
     };
-    if !converge_forward_persistence_failure(server, &expected).await {
-        return AdminResponse::Error {
-            message: "cannot confirm provisional because its durable state is unavailable; no decision was applied; retry the command".to_string(),
-        };
-    }
-    if let Some(store) = &server.state.session_store {
-        if let Err(error) = store
-            .compare_and_swap_provisional(expected, next.clone())
-            .await
-        {
+    match persist_terminal_provisional_with_body_cleanup(server, expected, next.clone()).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return AdminResponse::Error {
+                message: "provisional changed before confirmation; no decision was applied; retry the command".to_string(),
+            }
+        }
+        Err(error) => {
             tracing::warn!(
                 "failed to persist provisional confirmation for {}: {}",
                 handle,
@@ -6155,11 +6550,7 @@ async fn handle_confirm(
             };
         }
     }
-    registry.insert(next.clone());
-    drop(registry);
     forget_proxy_provenance(server, handle).await;
-    // The durable row is terminal, so the rollback body is no longer needed.
-    remove_revert_body(&next);
     server.emit_event(NotifyEvent {
         event: "decision_made",
         at_unix: now_unix(),
@@ -6312,9 +6703,7 @@ async fn handle_manual_revert(
     caller: &CallerIdentity,
     handle: &str,
 ) -> AdminResponse {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
-    let mut registry = server.state.provisional.write().await;
-    let Some(expected) = registry.get(handle).cloned() else {
+    let Some(expected) = server.state.provisional.read().await.get(handle).cloned() else {
         return AdminResponse::Error {
             message: format!("no provisional with handle '{}'", handle),
         };
@@ -6329,25 +6718,20 @@ async fn handle_manual_revert(
             }
         }
     };
-    if !converge_forward_persistence_failure(server, &expected).await {
-        return AdminResponse::Error {
-            message: "cannot revert provisional because its durable state is unavailable; no rollback was started; retry the command".to_string(),
-        };
-    }
-    if let Some(store) = &server.state.session_store {
-        if let Err(error) = store
-            .compare_and_swap_provisional(expected, claimed.clone())
-            .await
-        {
+    match persist_provisional_transition(server, expected, claimed.clone()).await {
+        Ok(true) => {}
+        Ok(false) => return AdminResponse::Error {
+            message:
+                "provisional changed before rollback; no rollback was started; retry the command"
+                    .to_string(),
+        },
+        Err(error) => {
             tracing::warn!("failed to persist rollback claim for {}: {}", handle, error);
             return AdminResponse::Error {
                 message: "cannot revert provisional because its durable state is unavailable; no rollback was started; retry the command".to_string(),
             };
         }
     }
-    registry.insert(claimed.clone());
-    drop(registry);
-    drop(_transition);
     let outcome = finish_revert(server, &claimed, caller, "manual").await;
     AdminResponse::GateAction {
         message: outcome.0,
@@ -6562,14 +6946,23 @@ async fn arm_held_command(
             Err(message) => AdminResponse::Error { message },
         };
     }
-    if let Some(verb_name) = approval.snapshot.verb_name.as_deref() {
-        let catalog = server.state.verbs.read().await;
-        if let Some(staleness) = held_verb_staleness(&approval.snapshot, verb_name, &catalog) {
+    let _held_verb_lease = if let Some(verb_name) = approval.snapshot.verb_name.as_deref() {
+        let lease = match server
+            .refresh_and_lease_verb_catalog_for_use("held command arming")
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                return AdminResponse::Error {
+                    message: format!("verb catalog authority is unavailable: {error}"),
+                }
+            }
+        };
+        if let Some(staleness) = held_verb_staleness(&approval.snapshot, verb_name, &lease) {
             let message = format!(
                 "{}; held approval voided, re-issue the command",
                 staleness.clause(verb_name)
             );
-            drop(catalog);
             let mut voided = approval.clone();
             voided.status = ApprovalStatus::ExecFailed;
             voided.decided_unix = Some(now);
@@ -6579,7 +6972,10 @@ async fn arm_held_command(
                 Err(message) => AdminResponse::Error { message },
             };
         }
-    }
+        Some(lease)
+    } else {
+        None
+    };
     if approval.snapshot.principal.is_none() {
         return AdminResponse::Error {
             message: "held command has no authenticated requester".to_string(),
@@ -6703,11 +7099,35 @@ async fn handle_approve_claimed(
     // artifact may no longer mean what the operator reviewed. Void the
     // approval rather than execute a stale rendering; unrelated catalog
     // changes leave the hold intact.
-    if let Some(vname) = &snapshot.verb_name {
-        let staleness = {
-            let catalog = server.state.verbs.read().await;
-            held_verb_staleness(&snapshot, vname, &catalog)
+    let _held_verb_lease = if let Some(vname) = &snapshot.verb_name {
+        let lease = match server
+            .refresh_and_lease_verb_catalog_for_use("held command execution")
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                let detail =
+                    format!("verb catalog authority is unavailable; approval voided: {error}");
+                let now = now_unix();
+                let Some(expected) = server.state.approvals.read().await.get(handle).cloned()
+                else {
+                    return AdminResponse::Error {
+                        message: format!(
+                            "approval {handle} disappeared before terminal persistence"
+                        ),
+                    };
+                };
+                let next = match approval_exec_failed_row(expected.clone(), now, detail.clone()) {
+                    Ok(next) => next,
+                    Err(message) => return AdminResponse::Error { message },
+                };
+                if let Err(message) = commit_terminal_approval(server, expected, next).await {
+                    return AdminResponse::Error { message };
+                }
+                return AdminResponse::Error { message: detail };
+            }
         };
+        let staleness = held_verb_staleness(&snapshot, vname, &lease);
         if let Some(staleness) = staleness {
             let now = now_unix();
             let detail = format!(
@@ -6745,7 +7165,10 @@ async fn handle_approve_claimed(
             });
             return AdminResponse::Error { message: detail };
         }
-    }
+        Some(lease)
+    } else {
+        None
+    };
     // The exact Approving claim is already durable before this point. The
     // approval audit must also land before execution; otherwise the hold moves
     // durably to ExecFailed and no process starts.
@@ -6778,6 +7201,7 @@ async fn handle_approve_claimed(
         };
     }
     let reason = format!("operator-approved held command {}", handle);
+    drop(_held_verb_lease);
     let result = super::gate_runtime::execute_snapshot(server, &snapshot, &reason).await;
     let now = now_unix();
     let Some(expected) = server.state.approvals.read().await.get(handle).cloned() else {

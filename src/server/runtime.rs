@@ -452,7 +452,12 @@ fn bounded_notify_event(mut event: NotifyEvent) -> NotifyEvent {
         .requester_principal
         .map(|principal| guard::redact::audit_escape(&principal).into_owned());
     event.requester_principal = bounded_notify_text(event.requester_principal, 128);
-    event.reason = bounded_notify_text(event.reason, 1024);
+    event.reason = bounded_notify_text(
+        event
+            .reason
+            .map(|reason| guard::gating::sanitize_gate_text(&reason)),
+        1024,
+    );
     event.status = bounded_notify_text(event.status, 64);
     event
 }
@@ -604,18 +609,22 @@ mod tests {
             encoded.len() < 512,
             "recovery notification must stay bounded"
         );
+        let value = ["q", "7"].concat();
         let bounded = bounded_notify_event(NotifyEvent {
             event: "startup_recovery_escalated",
             at_unix: 44,
             handle: Some("h".repeat(1_000)),
             session_fingerprint: None,
             requester_principal: None,
-            reason: Some("r".repeat(100_000)),
+            reason: Some(format!("password={value}{}", "r".repeat(100_000))),
             status: Some("needs_operator_decision".into()),
             behavior: None,
         });
         assert_eq!(bounded.handle.unwrap().len(), 128);
-        assert_eq!(bounded.reason.unwrap().len(), 1024);
+        let reason = bounded.reason.unwrap();
+        assert!(reason.chars().count() <= 1024);
+        assert!(!reason.contains(&value));
+        assert!(reason.contains("[REDACTED]"));
     }
 
     #[tokio::test]

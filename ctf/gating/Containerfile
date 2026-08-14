@@ -31,7 +31,9 @@ RUN useradd -m -u 1000 guarddaemon \
     && useradd -m -u 1002 other-agent
 
 COPY ctf/gating/verbs.yaml /etc/guard/verbs.yaml
-RUN chmod 0644 /etc/guard/verbs.yaml
+RUN chmod 0644 /etc/guard/verbs.yaml \
+    && install -o guarddaemon -g guarddaemon -m 0600 \
+      /dev/null /etc/guard/.verbs.yaml.learning-lock
 COPY ctf/gating/attack.sh /attack.sh
 RUN chmod 0755 /attack.sh
 COPY ctf/gating/synthetic-user.sh /synthetic-user.sh

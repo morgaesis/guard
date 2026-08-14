@@ -393,19 +393,25 @@ impl ProtocolConfig for KubernetesProtocol {
             )
     }
 
+    fn definitively_rejects_mutation(&self, _op: &ApiOp, status: u16) -> bool {
+        matches!(
+            status,
+            400 | 401 | 403 | 404 | 405 | 406 | 409 | 410 | 411 | 413 | 414 | 415 | 422 | 429
+        )
+    }
+
     fn wants_prior_snapshot(&self, op: &ApiOp) -> bool {
         matches!(op.verb, Verb::Update | Verb::Patch | Verb::Delete) && op.name.is_some()
     }
 
     /// An update/patch with a usable prior state reverts by PUT-restoring it, a
     /// delete reverts by POST-recreating the sanitized prior object, and a
-    /// create reverts by deleting the possibly server-named object from the
-    /// response.
+    /// named create reverts by deleting the object identified in the request.
     fn plan_revert(
         &self,
         op: &ApiOp,
         prior_object: Option<&[u8]>,
-        response: &[u8],
+        create_body: &[u8],
     ) -> Result<PlannedRevert, String> {
         match op.verb {
             Verb::Update | Verb::Patch => {
@@ -446,8 +452,8 @@ impl ProtocolConfig for KubernetesProtocol {
             _ => return Err("operation has no Kubernetes HTTP revert".to_string()),
         }
 
-        let value: Value = serde_json::from_slice(response).map_err(|_| {
-            "allowed write but response was unparsable; no auto-revert armed".to_string()
+        let value: Value = serde_json::from_slice(create_body).map_err(|_| {
+            "allowed create but request was unparsable; no auto-revert armed".to_string()
         })?;
         let Some(name) = value
             .get("metadata")
@@ -455,7 +461,7 @@ impl ProtocolConfig for KubernetesProtocol {
             .and_then(|n| n.as_str())
         else {
             return Err(
-                "allowed create but response carried no object name; no auto-revert armed"
+                "allowed create but request carried no object name; no auto-revert armed"
                     .to_string(),
             );
         };
@@ -862,5 +868,19 @@ mod tests {
                 b"{}"
             )
             .is_err());
+    }
+
+    #[test]
+    fn only_definitive_client_rejections_retire_inert_containment() {
+        let protocol = KubernetesProtocol;
+        let create = op("POST", "/api/v1/namespaces/dev/pods");
+        for status in [
+            400, 401, 403, 404, 405, 406, 409, 410, 411, 413, 414, 415, 422, 429,
+        ] {
+            assert!(protocol.definitively_rejects_mutation(&create, status));
+        }
+        for status in [201, 408, 500, 502, 503, 504] {
+            assert!(!protocol.definitively_rejects_mutation(&create, status));
+        }
     }
 }

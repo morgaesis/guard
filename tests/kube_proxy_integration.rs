@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,10 +24,93 @@ use tokio_rustls::rustls::{self, pki_types};
 
 use guard::gating::Reversibility;
 use guard::proxy::{
-    ApiCoverageVerdict, ApiEvaluationMode, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict,
-    ApiListenerMode, ApiPolicy, ApiProxy, ApiRequestSummary, ApiSessionContext, ApiSessionEvent,
-    ApiSessionSink, GateSink, ProxyTls, Upstream,
+    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardHandoff,
+    ApiForwardRequirement, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiListenerMode, ApiPolicy,
+    ApiProxy, ApiRequestSummary, ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink,
+    ProxyTls, Upstream,
 };
+
+const CREATE_PROVENANCE_ANNOTATION: &str = "guard.morgaesis.dev/provisional";
+#[derive(Clone, Default)]
+struct CreateObservation {
+    provenance: Option<String>,
+    name: Option<String>,
+    namespace: Option<String>,
+    body_sha256: Option<String>,
+}
+
+type CreateProvenance = Arc<std::sync::Mutex<CreateObservation>>;
+
+async fn reject_test_cleanup(_handoff: &mut dyn ApiForwardHandoff) -> Result<(), String> {
+    Err("test cleanup authority is unavailable".to_string())
+}
+
+async fn observe_create_provenance(
+    request: Request<Incoming>,
+    provenance: &CreateProvenance,
+) -> (hyper::Method, String) {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    if method == hyper::Method::POST {
+        let body = request.into_body().collect().await.unwrap().to_bytes();
+        if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+            *provenance.lock().unwrap() = CreateObservation {
+                provenance: value
+                    .pointer(&format!(
+                        "/metadata/annotations/{}",
+                        CREATE_PROVENANCE_ANNOTATION
+                            .replace('~', "~0")
+                            .replace('/', "~1")
+                    ))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                name: value
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                namespace: value
+                    .pointer("/metadata/namespace")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                body_sha256: Some({
+                    use sha2::Digest;
+                    sha2::Sha256::digest(&body)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect()
+                }),
+            };
+        }
+    }
+    (method, path)
+}
+
+fn attach_create_provenance(object: &mut Value, provenance: &CreateProvenance) {
+    let observation = provenance.lock().unwrap().clone();
+    let Some(marker) = observation.provenance else {
+        return;
+    };
+    object["metadata"]["annotations"][CREATE_PROVENANCE_ANNOTATION] = Value::String(marker);
+    if let Some(name) = observation.name {
+        object["metadata"]["name"] = Value::String(name);
+    }
+    if let Some(namespace) = observation.namespace {
+        object["metadata"]["namespace"] = Value::String(namespace);
+    }
+}
+
+async fn authorize_test_session(
+    sink: &(impl ApiSessionSink + ?Sized),
+    token: &str,
+    expected: &ApiSessionContext,
+    handoff: &mut dyn ApiForwardHandoff,
+) -> Result<(), String> {
+    if sink.resolve(token).await.as_ref() == Some(expected) {
+        handoff.forward().await
+    } else {
+        Err("session authority changed".to_string())
+    }
+}
 
 struct LiveSessionSink;
 
@@ -42,6 +125,15 @@ impl ApiSessionSink for LiveSessionSink {
             evaluation_mode: ApiEvaluationMode::Evaluator,
             can_evaluate_api_override: true,
         })
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -62,6 +154,15 @@ impl ApiSessionSink for RestrictedCredentialSessionSink {
         })
     }
 
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
+    }
+
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
 }
 
@@ -78,6 +179,15 @@ impl ApiSessionSink for H2SessionSink {
             evaluation_mode: ApiEvaluationMode::Evaluator,
             can_evaluate_api_override: true,
         })
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -106,6 +216,15 @@ impl ApiSessionSink for RecordingSessionSink {
         })
     }
 
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
+    }
+
     async fn record(&self, _token: &str, event: ApiSessionEvent) {
         self.events.lock().unwrap().push(event);
     }
@@ -113,6 +232,73 @@ impl ApiSessionSink for RecordingSessionSink {
 
 struct ChangingSessionSink {
     resolutions: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct LinearizedSessionSink {
+    context: ApiSessionContext,
+    live: Arc<tokio::sync::RwLock<Option<ApiSessionContext>>>,
+    reached_handoff: Arc<tokio::sync::Semaphore>,
+    release_handoff: Arc<tokio::sync::Semaphore>,
+    pause_handoff: bool,
+}
+
+impl LinearizedSessionSink {
+    fn new(pause_handoff: bool) -> Self {
+        let context = ApiSessionContext {
+            fingerprint: "linearized-session".to_string(),
+            revision: "linearized-revision".to_string(),
+            secret_entitlements: None,
+            intent: Some("inspect development resources".to_string()),
+            evaluation_mode: ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: true,
+        };
+        Self {
+            live: Arc::new(tokio::sync::RwLock::new(Some(context.clone()))),
+            context,
+            reached_handoff: Arc::new(tokio::sync::Semaphore::new(0)),
+            release_handoff: Arc::new(tokio::sync::Semaphore::new(0)),
+            pause_handoff,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiSessionSink for LinearizedSessionSink {
+    async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
+        if token != "live-session" {
+            return None;
+        }
+        self.live.read().await.clone()
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        if token != "live-session" {
+            return Err("unknown session".to_string());
+        }
+        let guard = self.live.clone().read_owned().await;
+        if guard.as_ref() != Some(expected) {
+            return Err("session authority changed".to_string());
+        }
+        self.reached_handoff.add_permits(1);
+        if self.pause_handoff {
+            self.release_handoff
+                .acquire()
+                .await
+                .map_err(|_| "session handoff closed".to_string())?
+                .forget();
+        }
+        let result = handoff.forward().await;
+        drop(guard);
+        result
+    }
+
+    async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
 }
 
 struct PrincipalSessionSink;
@@ -133,6 +319,15 @@ impl ApiSessionSink for PrincipalSessionSink {
             evaluation_mode: ApiEvaluationMode::Evaluator,
             can_evaluate_api_override: false,
         })
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -165,6 +360,19 @@ impl ApiSessionSink for BudgetSessionSink {
         })
     }
 
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        if token == "budget-session" && expected.revision == "budget-session-revision" {
+            handoff.forward().await
+        } else {
+            Err("session authority changed".to_string())
+        }
+    }
+
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
 }
 
@@ -174,7 +382,7 @@ impl ApiSessionSink for ChangingSessionSink {
         let attempt = self.resolutions.fetch_add(1, Ordering::SeqCst);
         (token == "live-then-edited").then(|| ApiSessionContext {
             fingerprint: "stable-audit-fingerprint".to_string(),
-            revision: if attempt < 3 {
+            revision: if attempt < 5 {
                 "original-session-revision"
             } else {
                 "edited-session-revision"
@@ -185,6 +393,15 @@ impl ApiSessionSink for ChangingSessionSink {
             evaluation_mode: ApiEvaluationMode::Evaluator,
             can_evaluate_api_override: true,
         })
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -253,11 +470,473 @@ async fn spawn_mock_upstream() -> String {
     format!("http://{addr}")
 }
 
+async fn spawn_counting_upstream() -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let requests = observed.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |request| {
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            mock_handler(request)
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), count)
+}
+
+async fn spawn_stalled_upstream() -> (String, Arc<tokio::sync::Semaphore>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let reached = Arc::new(tokio::sync::Semaphore::new(0));
+    let observed = reached.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let reached = observed.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |_request| {
+                            reached.add_permits(1);
+                            std::future::pending::<Result<Response<Full<Bytes>>, Infallible>>()
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), reached)
+}
+
+async fn spawn_success_headers_stalled_body() -> String {
+    type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, path) = observe_create_provenance(request, &provenance).await;
+                        if method == hyper::Method::GET {
+                            let mut object = created_pod_object();
+                            if let Some(name) = path.rsplit('/').next() {
+                                object["metadata"]["name"] = Value::String(name.to_string());
+                            }
+                            attach_create_provenance(&mut object, &provenance);
+                            let body = Full::new(Bytes::from(object.to_string()))
+                                .map_err(std::io::Error::other)
+                                .boxed();
+                            return Ok::<Response<MockBody>, Infallible>(
+                                Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/json")
+                                    .body(body)
+                                    .unwrap(),
+                            );
+                        }
+                        let frames =
+                            futures::stream::pending::<Result<Frame<Bytes>, std::io::Error>>();
+                        Ok(Response::builder()
+                            .status(201)
+                            .header("content-type", "application/json")
+                            .body(StreamBody::new(frames).boxed())
+                            .unwrap())
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_create_status_upstream(
+    status: u16,
+    content_encoding: Option<&'static str>,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let observed_deletes = deletes.clone();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let deletes = observed_deletes.clone();
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let deletes = deletes.clone();
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, path) = observe_create_provenance(request, &provenance).await;
+                        let mut builder =
+                            Response::builder().header("content-type", "application/json");
+                        let response_status = if method == hyper::Method::POST {
+                            status
+                        } else if method == hyper::Method::DELETE {
+                            deletes.fetch_add(1, Ordering::SeqCst);
+                            200
+                        } else {
+                            200
+                        };
+                        if let Some(encoding) = content_encoding {
+                            builder = builder.header("content-encoding", encoding);
+                        }
+                        let mut object = created_pod_object();
+                        if method == hyper::Method::GET {
+                            if let Some(name) = path.rsplit('/').next() {
+                                object["metadata"]["name"] = Value::String(name.to_string());
+                            }
+                        }
+                        attach_create_provenance(&mut object, &provenance);
+                        Ok::<_, Infallible>(
+                            builder
+                                .status(response_status)
+                                .body(Full::new(Bytes::from(object.to_string())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), deletes)
+}
+
+#[derive(Clone, Copy)]
+enum OversizedBodyKind {
+    Declared,
+    Chunked,
+}
+
+async fn spawn_oversized_body_upstream(kind: OversizedBodyKind) -> String {
+    type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(move |_request: Request<Incoming>| async move {
+                    let body: MockBody = match kind {
+                        OversizedBodyKind::Declared => Full::new(Bytes::from(vec![b'x'; 129]))
+                            .map_err(std::io::Error::other)
+                            .boxed(),
+                        OversizedBodyKind::Chunked => {
+                            let frames = futures::stream::iter([
+                                Ok::<_, std::io::Error>(Frame::data(Bytes::from(vec![b'x'; 65]))),
+                                Ok(Frame::data(Bytes::from(vec![b'y'; 65]))),
+                            ]);
+                            StreamBody::new(frames).boxed()
+                        }
+                    };
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(body)
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_cleanup_oversized_upstream(kind: OversizedBodyKind) -> String {
+    type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, path) = observe_create_provenance(request, &provenance).await;
+                        if method == hyper::Method::DELETE {
+                            let body: MockBody = match kind {
+                                OversizedBodyKind::Declared => {
+                                    Full::new(Bytes::from(vec![b'x'; 513]))
+                                        .map_err(std::io::Error::other)
+                                        .boxed()
+                                }
+                                OversizedBodyKind::Chunked => {
+                                    let frames = futures::stream::iter([
+                                        Ok::<_, std::io::Error>(Frame::data(Bytes::from(vec![
+                                            b'x';
+                                            257
+                                        ]))),
+                                        Ok(Frame::data(Bytes::from(vec![b'y'; 257]))),
+                                    ]);
+                                    StreamBody::new(frames).boxed()
+                                }
+                            };
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/json")
+                                    .body(body)
+                                    .unwrap(),
+                            );
+                        }
+                        let mut object = created_pod_object();
+                        if let Some(name) = path
+                            .rsplit('/')
+                            .next()
+                            .filter(|_| method == hyper::Method::GET)
+                        {
+                            object["metadata"]["name"] = Value::String(name.to_string());
+                        }
+                        attach_create_provenance(&mut object, &provenance);
+                        let status = if method == hyper::Method::POST {
+                            201
+                        } else {
+                            200
+                        };
+                        Ok(Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(
+                                Full::new(Bytes::from(object.to_string()))
+                                    .map_err(std::io::Error::other)
+                                    .boxed(),
+                            )
+                            .unwrap())
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_transport_error_upstream() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|_request: Request<Incoming>| async move {
+                    Err::<Response<Full<Bytes>>, _>(std::io::Error::other(
+                        "simulated upstream transport failure",
+                    ))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_replaceable_create_upstream() -> (String, Arc<AtomicBool>, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let replacement = Arc::new(AtomicBool::new(false));
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let state = replacement.clone();
+    let observed_deletes = deletes.clone();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let replacement = state.clone();
+            let deletes = observed_deletes.clone();
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let replacement = replacement.clone();
+                    let deletes = deletes.clone();
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, path) = observe_create_provenance(request, &provenance).await;
+                        if method == hyper::Method::DELETE {
+                            deletes.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let mut object = created_pod_object();
+                        if let Some(name) = path.rsplit('/').next() {
+                            object["metadata"]["name"] = Value::String(name.to_string());
+                        }
+                        attach_create_provenance(&mut object, &provenance);
+                        if replacement.load(Ordering::SeqCst) {
+                            object["metadata"]["uid"] =
+                                Value::String("replacement-resource-uid".to_string());
+                        }
+                        let status = if method == hyper::Method::POST {
+                            201
+                        } else {
+                            200
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(object.to_string())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), replacement, deletes)
+}
+
+async fn spawn_create_without_get_upstream() -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gets = Arc::new(AtomicUsize::new(0));
+    let observed_gets = gets.clone();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let provenance = provenance.clone();
+            let gets = observed_gets.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let provenance = provenance.clone();
+                    let gets = gets.clone();
+                    async move {
+                        let (method, _) = observe_create_provenance(request, &provenance).await;
+                        if method == hyper::Method::GET {
+                            gets.fetch_add(1, Ordering::SeqCst);
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(403)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
+                            );
+                        }
+                        let mut object = created_pod_object();
+                        attach_create_provenance(&mut object, &provenance);
+                        Ok(Response::builder()
+                            .status(201)
+                            .header("content-type", "application/json")
+                            .body(Full::new(Bytes::from(object.to_string())))
+                            .unwrap())
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), gets)
+}
+
+async fn spawn_policy_barrier_upstream(
+    block_method: hyper::Method,
+) -> (
+    String,
+    Arc<tokio::sync::Semaphore>,
+    Arc<tokio::sync::Semaphore>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let reached = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let observed = reached.clone();
+    let continuation = release.clone();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let reached = observed.clone();
+            let release = continuation.clone();
+            let block_method = block_method.clone();
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let reached = reached.clone();
+                    let release = release.clone();
+                    let block_method = block_method.clone();
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, _) = observe_create_provenance(request, &provenance).await;
+                        if method == block_method {
+                            reached.add_permits(1);
+                            release.acquire().await.unwrap().forget();
+                        }
+                        let status = if method == hyper::Method::POST {
+                            201
+                        } else {
+                            200
+                        };
+                        let mut object = created_pod_object();
+                        attach_create_provenance(&mut object, &provenance);
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(object.to_string())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), reached, release)
+}
+
 #[derive(Clone)]
 struct ArbitrationMock {
     object: Arc<std::sync::Mutex<Value>>,
     forwarded_mutations: Arc<AtomicUsize>,
     mutation_bodies: Arc<std::sync::Mutex<Vec<(hyper::Method, Value)>>>,
+    mutation_digests: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl ArbitrationMock {
@@ -278,6 +957,7 @@ impl ArbitrationMock {
             }))),
             forwarded_mutations: Arc::new(AtomicUsize::new(0)),
             mutation_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+            mutation_digests: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -321,6 +1001,13 @@ async fn arbitration_mock_handler(
     mock.forwarded_mutations.fetch_add(1, Ordering::SeqCst);
     let method = req.method().clone();
     let bytes = req.into_body().collect().await.unwrap().to_bytes();
+    mock.mutation_digests.lock().unwrap().push({
+        use sha2::Digest;
+        sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    });
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     mock.mutation_bodies
         .lock()
@@ -330,7 +1017,21 @@ async fn arbitration_mock_handler(
     let expected_uid = object["metadata"]["uid"].as_str().unwrap();
     let expected_version = object["metadata"]["resourceVersion"].as_str().unwrap();
     let guarded = match method {
-        hyper::Method::PUT | hyper::Method::PATCH => {
+        hyper::Method::PUT => {
+            body["metadata"]["resourceVersion"].as_str() == Some(expected_version)
+        }
+        hyper::Method::PATCH if body.is_array() => body.as_array().is_some_and(|operations| {
+            operations.first().is_some_and(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/uid"
+                    && operation["value"] == expected_uid
+            }) && operations.get(1).is_some_and(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/resourceVersion"
+                    && operation["value"] == expected_version
+            })
+        }),
+        hyper::Method::PATCH => {
             body["metadata"]["resourceVersion"].as_str() == Some(expected_version)
         }
         hyper::Method::DELETE => {
@@ -599,6 +1300,316 @@ async fn observations_are_principal_bound_and_arbitrate_interleaved_writes() {
     assert_eq!(delete.1["preconditions"]["resourceVersion"], "5");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_kubernetes_mutations_approve_the_exact_guarded_bytes() {
+    let cases = [
+        (
+            reqwest::Method::PUT,
+            Some("application/json"),
+            Some(r#"{"metadata":{"name":"api","namespace":"dev"},"spec":{"replicas":3}}"#),
+        ),
+        (
+            reqwest::Method::PATCH,
+            Some("application/merge-patch+json"),
+            Some(r#"{"spec":{"replicas":3}}"#),
+        ),
+        (
+            reqwest::Method::PATCH,
+            Some("application/json-patch+json"),
+            Some(r#"[{"op":"replace","path":"/spec/replicas","value":3}]"#),
+        ),
+        (reqwest::Method::DELETE, None, None),
+    ];
+    for (method, content_type, body) in cases {
+        let (upstream, mock) = spawn_arbitration_mock().await;
+        let upstream =
+            Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream), None).expect("upstream");
+        let tls = ProxyTls::generate().expect("tls");
+        let ca_pem = tls.ca_pem().to_string();
+        let policy = ApiPolicy::from_yaml(
+            "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [update, patch, delete]\n    resources: [deployments]\n    namespaces: [dev]\n    action: hold\n",
+        )
+        .unwrap();
+        let (listener, listen) = reserve_listener().await;
+        let proxy = Arc::new(
+            ApiProxy::new(listen, tls, upstream, policy, None)
+                .with_listener_mode(ApiListenerMode::Policy),
+        );
+        let sink = SnapshotSink::default();
+        proxy.attach_gate(Arc::new(sink.clone()));
+        proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+        tokio::spawn(proxy.serve_on(listener));
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+            .build()
+            .unwrap();
+        let url = format!("https://{listen}/apis/apps/v1/namespaces/dev/deployments/api");
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth("principal-a")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let mut request = client
+            .request(method.clone(), &url)
+            .bearer_auth("principal-a");
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let detail = response.text().await.unwrap();
+        assert!(
+            status.is_success(),
+            "{method} ({content_type:?}) approval returned {status}: {detail}"
+        );
+        let snapshots = sink.snapshots.lock().unwrap();
+        let digests = mock.mutation_digests.lock().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(digests.len(), 1);
+        assert_eq!(snapshots[0].body_sha256, digests[0]);
+    }
+}
+
+fn guarded_mutation_cases() -> Vec<(reqwest::Method, Option<&'static str>, Option<&'static str>)> {
+    vec![
+        (
+            reqwest::Method::PUT,
+            Some("application/json"),
+            Some(r#"{"metadata":{"name":"api","namespace":"dev"},"spec":{"replicas":3}}"#),
+        ),
+        (
+            reqwest::Method::PATCH,
+            Some("application/merge-patch+json"),
+            Some(r#"{"spec":{"replicas":3}}"#),
+        ),
+        (
+            reqwest::Method::PATCH,
+            Some("application/json-patch+json"),
+            Some(r#"[{"op":"replace","path":"/spec/replicas","value":3}]"#),
+        ),
+        (reqwest::Method::DELETE, None, None),
+    ]
+}
+
+async fn send_guarded_mutation(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    method: reqwest::Method,
+    content_type: Option<&str>,
+    body: Option<&str>,
+) -> reqwest::StatusCode {
+    let url = format!("{base}/apis/apps/v1/namespaces/dev/deployments/api");
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let mut request = client.request(method, url).bearer_auth(token);
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    if let Some(body) = body {
+        request = request.body(body.to_string());
+    }
+    request.send().await.unwrap().status()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evaluator_consequence_holds_bind_every_guarded_mutation_byte() {
+    let policy = "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [update, patch, delete]\n    resources: [deployments]\n    namespaces: [dev]\n    action: evaluate\n";
+    for (method, content_type, body) in guarded_mutation_cases() {
+        let (upstream, mock) = spawn_arbitration_mock().await;
+        let judge = RecordingJudge::new(vec![judge_allow(
+            Some(9),
+            Some(Reversibility::Irreversible),
+        )]);
+        let summaries = judge.summaries.clone();
+        let sink = SnapshotSink::default();
+        let (base, client) = start_proxy_with(
+            upstream,
+            policy,
+            Some(Arc::new(judge)),
+            Some(Arc::new(sink.clone())),
+            0,
+        )
+        .await;
+        assert!(
+            send_guarded_mutation(&client, &base, "live-session", method, content_type, body)
+                .await
+                .is_success()
+        );
+        let digest = mock.mutation_digests.lock().unwrap()[0].clone();
+        assert_eq!(summaries.lock().unwrap()[0].authorized_body_sha256, digest);
+        assert_eq!(sink.snapshots.lock().unwrap()[0].body_sha256, digest);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_evaluator_paths_bind_the_final_guarded_bytes() {
+    let policy = "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: evaluate\n";
+    for verdict in [
+        judge_allow(Some(1), Some(Reversibility::Reversible)),
+        judge_allow(Some(4), Some(Reversibility::Recoverable)),
+    ] {
+        let (upstream, mock) = spawn_arbitration_mock().await;
+        let judge = RecordingJudge::new(vec![verdict]);
+        let summaries = judge.summaries.clone();
+        let sink = RecordingSink::default();
+        let (base, client) = start_proxy_with(
+            upstream,
+            policy,
+            Some(Arc::new(judge)),
+            Some(Arc::new(sink)),
+            0,
+        )
+        .await;
+        assert!(send_guarded_mutation(
+            &client,
+            &base,
+            "live-session",
+            reqwest::Method::PATCH,
+            Some("application/json-patch+json"),
+            Some(r#"[{"op":"replace","path":"/spec/replicas","value":3}]"#),
+        )
+        .await
+        .is_success());
+        assert_eq!(
+            summaries.lock().unwrap()[0].authorized_body_sha256,
+            mock.mutation_digests.lock().unwrap()[0]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rarity_and_coverage_holds_bind_every_guarded_mutation_byte() {
+    type CoverageCase = (
+        Option<Arc<dyn ApiJudge>>,
+        u64,
+        Arc<dyn ApiSessionSink>,
+        &'static str,
+    );
+    let allow_policy = "default: deny\nrules:\n  - verbs: [get, update, patch, delete]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n";
+    for coverage in [false, true] {
+        for (method, content_type, body) in guarded_mutation_cases() {
+            let (upstream, mock) = spawn_arbitration_mock().await;
+            let sink = SnapshotSink::default();
+            let coverage_judge = HeldCoverageJudge::default();
+            let summaries = coverage_judge.summaries.clone();
+            let (judge, rarity, session_sink, token): CoverageCase = if coverage {
+                (
+                    Some(Arc::new(coverage_judge)),
+                    0,
+                    Arc::new(ModeSessionSink),
+                    "readonly",
+                )
+            } else {
+                (None, 1, Arc::new(LiveSessionSink), "live-session")
+            };
+            let (base, client) = start_proxy_with_session_sink(
+                upstream,
+                allow_policy,
+                judge,
+                Some(Arc::new(sink.clone())),
+                rarity,
+                session_sink,
+            )
+            .await;
+            assert!(
+                send_guarded_mutation(&client, &base, token, method, content_type, body)
+                    .await
+                    .is_success()
+            );
+            let digest = mock.mutation_digests.lock().unwrap()[0].clone();
+            assert_eq!(
+                sink.snapshots.lock().unwrap().last().unwrap().body_sha256,
+                digest
+            );
+            if coverage {
+                let summaries = summaries.lock().unwrap();
+                assert_eq!(summaries[0].authorized_body_sha256, digest);
+                assert_ne!(
+                    summaries[0].coverage_body_shape, summaries[0].redacted_body_shape,
+                    "guard preconditions must be excluded from coverage identity"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_change_after_hold_cannot_rewrite_approved_mutation_bytes() {
+    let (upstream, mock) = spawn_arbitration_mock().await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(
+        "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: hold\n",
+    )
+    .unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
+    let sink = BlockingSnapshotSink::default();
+    proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let url = format!("https://{listen}/apis/apps/v1/namespaces/dev/deployments/api");
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let pending = tokio::spawn({
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .patch(url)
+                .bearer_auth("principal-a")
+                .header("content-type", "application/merge-patch+json")
+                .body(r#"{"spec":{"replicas":3}}"#)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    sink.reached.acquire().await.unwrap().forget();
+    mock.advance_spec();
+    sink.release.add_permits(1);
+    assert_eq!(pending.await.unwrap().status(), 409);
+    let snapshots = sink.state.snapshots.lock().unwrap();
+    let digests = mock.mutation_digests.lock().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(digests.len(), 1);
+    assert_eq!(snapshots[0].body_sha256, digests[0]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_reload_during_arbitration_prevents_mutable_forwarding() {
     let started = Arc::new(tokio::sync::Notify::new());
@@ -654,12 +1665,273 @@ async fn policy_reload_during_arbitration_prevents_mutable_forwarding() {
     });
     started.notified().await;
     let deny_policy = "default: deny\n";
+    let authority_baseline = proxy.authority_transition_generation();
     std::fs::write(&policy_path, deny_policy).unwrap();
-    wait_for_policy_reload(&proxy, deny_policy).await;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.wait_for_authority_transition_after(authority_baseline),
+    )
+    .await
+    .expect("policy reloader publishes odd authority before arbitration release");
     release.notify_one();
 
     assert_eq!(request.await.unwrap().status(), 403);
     assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_handoff_holds_authority_until_upstream_response_headers() {
+    let (upstream_base, read_reached, release_read) =
+        spawn_policy_barrier_upstream(hyper::Method::GET).await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    let allow_policy = "default: allow\n";
+    std::fs::write(&policy_path, allow_policy).unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.clone().serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let url = format!("https://{listen}/api/v1/namespaces/dev/configmaps/cm");
+    let request = tokio::spawn({
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .get(url)
+                .bearer_auth("principal-a")
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    read_reached.acquire().await.unwrap().forget();
+    let deny_policy = "default: deny\n";
+    let authority_baseline = proxy.authority_transition_generation();
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.wait_for_authority_transition_after(authority_baseline),
+    )
+    .await
+    .expect("policy reloader reaches authority coordination");
+    release_read.add_permits(1);
+    assert_eq!(request.await.unwrap().status(), 200);
+    wait_for_policy_reload(&proxy, deny_policy).await;
+    assert_eq!(
+        client
+            .get(url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evaluated_read_handoff_holds_authority_until_upstream_response_headers() {
+    let (upstream_base, read_reached, release_read) =
+        spawn_policy_barrier_upstream(hyper::Method::GET).await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    let evaluate_policy = "default: deny\nrules:\n  - verbs: [get]\n    resources: [configmaps]\n    namespaces: [dev]\n    action: evaluate\n";
+    std::fs::write(&policy_path, evaluate_policy).unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
+    proxy
+        .attach_judge(Arc::new(RecordingJudge::new(vec![judge_allow(
+            Some(1),
+            Some(Reversibility::Reversible),
+        )])))
+        .await;
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.clone().serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let url = format!("https://{listen}/api/v1/namespaces/dev/configmaps/cm");
+    let request = tokio::spawn({
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .get(url)
+                .bearer_auth("principal-a")
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    read_reached.acquire().await.unwrap().forget();
+    let deny_policy = "default: deny\n";
+    let authority_baseline = proxy.authority_transition_generation();
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.wait_for_authority_transition_after(authority_baseline),
+    )
+    .await
+    .expect("policy reloader reaches authority coordination");
+    release_read.add_permits(1);
+    assert_eq!(request.await.unwrap().status(), 200);
+    wait_for_policy_reload(&proxy, deny_policy).await;
+    assert_eq!(
+        client
+            .get(url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_does_not_queue_behind_reload_waiting_for_a_stalled_mutation() {
+    let (upstream_base, mutation_reached, release_mutation) =
+        spawn_policy_barrier_upstream(hyper::Method::POST).await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    let allow_policy = "default: allow\n";
+    std::fs::write(&policy_path, allow_policy).unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.clone().serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let mutation = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .post(format!("https://{listen}/api/v1/namespaces/dev/pods"))
+                .bearer_auth("principal-a")
+                .body(r#"{"metadata":{"name":"blocked-pod"}}"#)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    mutation_reached.acquire().await.unwrap().forget();
+    let deny_policy = "default: deny\n";
+    let authority_baseline = proxy.authority_transition_generation();
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.wait_for_authority_transition_after(authority_baseline),
+    )
+    .await
+    .expect("policy reloader reaches authority coordination");
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .get(format!(
+                "https://{listen}/api/v1/namespaces/dev/configmaps/cm"
+            ))
+            .bearer_auth("principal-a")
+            .send(),
+    )
+    .await
+    .expect("read authority does not queue behind mutation reload")
+    .unwrap();
+    assert_eq!(read.status(), 403);
+    release_mutation.add_permits(1);
+    assert_eq!(mutation.await.unwrap().status(), 201);
+    wait_for_policy_reload(&proxy, deny_policy).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn final_denial_releases_policy_authority_before_staged_cleanup() {
+    let (upstream_base, _) = spawn_counting_upstream().await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    let allow_policy = "default: allow\n";
+    std::fs::write(&policy_path, allow_policy).unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
+    let sink = BlockingCancelSink {
+        stage_reached: Arc::new(tokio::sync::Semaphore::new(0)),
+        release_stage: Arc::new(tokio::sync::Semaphore::new(0)),
+        cancel_reached: Arc::new(tokio::sync::Semaphore::new(0)),
+        release_cancel: Arc::new(tokio::sync::Semaphore::new(0)),
+    };
+    proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.clone().serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let request = tokio::spawn(async move {
+        client
+            .post(format!("https://{listen}/api/v1/namespaces/dev/pods"))
+            .bearer_auth("principal-a")
+            .body(r#"{"metadata":{"name":"denied-pod"}}"#)
+            .send()
+            .await
+            .unwrap()
+    });
+    sink.stage_reached.acquire().await.unwrap().forget();
+    let deny_policy = "default: deny\n";
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    wait_for_policy_reload(&proxy, deny_policy).await;
+    sink.release_stage.add_permits(1);
+    sink.cancel_reached.acquire().await.unwrap().forget();
+
+    std::fs::write(&policy_path, allow_policy).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        wait_for_policy_reload(&proxy, allow_policy),
+    )
+    .await
+    .expect("policy reload completes while durable cleanup remains blocked");
+    sink.release_cancel.add_permits(1);
+    assert_eq!(request.await.unwrap().status(), 403);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -707,33 +1979,20 @@ async fn reserve_listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
     (listener, addr)
 }
 
-/// Poll until `condition` holds, panicking after a generous deadline. Replaces
-/// fixed settle sleeps for asynchronous post-response bookkeeping (revert
-/// arming, hold accounting) that has no completion signal of its own.
-async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    let start = std::time::Instant::now();
-    while !condition() {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// Poll until the proxy's hot-reloader has published the policy in `yaml`.
+/// Wait for the proxy's reload generation signal until `yaml` is published.
 async fn wait_for_policy_reload(proxy: &ApiProxy, yaml: &str) {
     let expected = ApiPolicy::from_yaml(yaml)
         .expect("reloaded policy parses")
         .authority_fingerprint();
-    let start = std::time::Instant::now();
-    while proxy.policy_fingerprint().await != expected {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "policy reload was not observed within 10s"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    if proxy.policy_fingerprint().await == expected {
+        return;
     }
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        proxy.wait_for_policy_fingerprint(&expected),
+    )
+    .await
+    .expect("policy reload was not observed within the bounded deadline");
 }
 
 fn kubeconfig_for(mock_base: &str) -> String {
@@ -749,6 +2008,97 @@ async fn start_proxy_with(
     gate: Option<Arc<dyn GateSink>>,
     rarity_threshold: u64,
 ) -> (String, reqwest::Client) {
+    start_proxy_with_session_sink(
+        mock_base,
+        policy_yaml,
+        judge,
+        gate,
+        rarity_threshold,
+        Arc::new(LiveSessionSink),
+    )
+    .await
+}
+
+async fn start_proxy_with_session_sink(
+    mock_base: String,
+    policy_yaml: &str,
+    judge: Option<Arc<dyn ApiJudge>>,
+    gate: Option<Arc<dyn GateSink>>,
+    rarity_threshold: u64,
+    session_sink: Arc<dyn ApiSessionSink>,
+) -> (String, reqwest::Client) {
+    start_proxy_with_session_sink_and_timeout(
+        mock_base,
+        policy_yaml,
+        judge,
+        gate,
+        rarity_threshold,
+        session_sink,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_proxy_with_session_sink_and_timeout(
+    mock_base: String,
+    policy_yaml: &str,
+    judge: Option<Arc<dyn ApiJudge>>,
+    gate: Option<Arc<dyn GateSink>>,
+    rarity_threshold: u64,
+    session_sink: Arc<dyn ApiSessionSink>,
+    handoff_timeout: Duration,
+) -> (String, reqwest::Client) {
+    start_proxy_with_timeouts(
+        mock_base,
+        policy_yaml,
+        judge,
+        gate,
+        rarity_threshold,
+        session_sink,
+        handoff_timeout,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_proxy_with_timeouts(
+    mock_base: String,
+    policy_yaml: &str,
+    judge: Option<Arc<dyn ApiJudge>>,
+    gate: Option<Arc<dyn GateSink>>,
+    rarity_threshold: u64,
+    session_sink: Arc<dyn ApiSessionSink>,
+    handoff_timeout: Duration,
+    body_timeout: Duration,
+) -> (String, reqwest::Client) {
+    start_proxy_with_limits(
+        mock_base,
+        policy_yaml,
+        judge,
+        gate,
+        rarity_threshold,
+        session_sink,
+        handoff_timeout,
+        body_timeout,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_proxy_with_limits(
+    mock_base: String,
+    policy_yaml: &str,
+    judge: Option<Arc<dyn ApiJudge>>,
+    gate: Option<Arc<dyn GateSink>>,
+    rarity_threshold: u64,
+    session_sink: Arc<dyn ApiSessionSink>,
+    handoff_timeout: Duration,
+    body_timeout: Duration,
+    body_limit: Option<usize>,
+) -> (String, reqwest::Client) {
     let kubeconfig = kubeconfig_for(&mock_base);
     let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -756,7 +2106,12 @@ async fn start_proxy_with(
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let (listener, listen) = reserve_listener().await;
     let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None)
-        .with_listener_mode(ApiListenerMode::Policy);
+        .with_listener_mode(ApiListenerMode::Policy)
+        .with_upstream_handoff_timeout(handoff_timeout)
+        .with_upstream_body_timeout(body_timeout);
+    if let Some(limit) = body_limit {
+        proxy = proxy.with_upstream_body_limit(limit);
+    }
     if rarity_threshold > 0 {
         proxy = proxy.with_rarity_escalation(rarity_threshold);
     }
@@ -765,9 +2120,9 @@ async fn start_proxy_with(
         proxy.attach_gate(gate);
     }
     if let Some(judge) = judge {
-        proxy.attach_judge(judge);
+        proxy.attach_judge(judge).await;
     }
-    proxy.attach_session_sink(Arc::new(LiveSessionSink));
+    proxy.attach_session_sink(session_sink);
     tokio::spawn(proxy.clone().serve_on(listener));
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
@@ -796,6 +2151,15 @@ struct BlockingJudge {
 
 #[async_trait::async_trait]
 impl ApiJudge for BlockingJudge {
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        _requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        handoff.forward().await
+    }
+
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
         self.started.notify_one();
         self.release.notified().await;
@@ -814,6 +2178,15 @@ impl RecordingJudge {
 
 #[async_trait::async_trait]
 impl ApiJudge for RecordingJudge {
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        _requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        handoff.forward().await
+    }
+
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict {
         self.summaries.lock().unwrap().push(summary.clone());
         self.verdicts
@@ -829,6 +2202,64 @@ struct ModeCoverageJudge {
     judge_calls: Arc<AtomicUsize>,
 }
 
+struct SkippedHandoffCoverageJudge;
+
+#[derive(Clone, Default)]
+struct HeldCoverageJudge {
+    summaries: Arc<std::sync::Mutex<Vec<ApiRequestSummary>>>,
+}
+
+#[async_trait::async_trait]
+impl ApiJudge for HeldCoverageJudge {
+    fn evaluator_enabled(&self) -> bool {
+        false
+    }
+
+    async fn coverage(&self, summary: &ApiRequestSummary) -> ApiCoverageVerdict {
+        self.summaries.lock().unwrap().push(summary.clone());
+        ApiCoverageVerdict::Allow {
+            risk: 9,
+            reversibility: Reversibility::Irreversible,
+        }
+    }
+
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        _requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        handoff.forward().await
+    }
+
+    async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+        ApiJudgeVerdict::Error("unexpected evaluator call".to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiJudge for SkippedHandoffCoverageJudge {
+    async fn coverage(&self, _summary: &ApiRequestSummary) -> ApiCoverageVerdict {
+        ApiCoverageVerdict::Allow {
+            risk: 1,
+            reversibility: Reversibility::Reversible,
+        }
+    }
+
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        _requirement: ApiForwardRequirement,
+        _handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+        ApiJudgeVerdict::Error("unexpected evaluator call".to_string())
+    }
+}
+
 #[async_trait::async_trait]
 impl ApiJudge for ModeCoverageJudge {
     async fn coverage(&self, summary: &ApiRequestSummary) -> ApiCoverageVerdict {
@@ -836,7 +2267,7 @@ impl ApiJudge for ModeCoverageJudge {
             && summary.session_revision.as_deref() == Some("readonly-revision")
             && summary.verb == "create"
             && summary.resource == "pods"
-            && summary.redacted_body_shape == "{}"
+            && summary.coverage_body_shape == "{}"
         {
             ApiCoverageVerdict::Allow {
                 risk: 1,
@@ -847,9 +2278,100 @@ impl ApiJudge for ModeCoverageJudge {
         }
     }
 
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        _requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        handoff.forward().await
+    }
+
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
         self.judge_calls.fetch_add(1, Ordering::SeqCst);
         judge_allow(Some(1), Some(Reversibility::Reversible))
+    }
+}
+
+#[derive(Clone)]
+struct LinearizedJudge {
+    coverage: bool,
+    hold: bool,
+    active: Arc<AtomicBool>,
+    coordination: Arc<tokio::sync::RwLock<()>>,
+    reached_handoff: Arc<tokio::sync::Semaphore>,
+    release_handoff: Arc<tokio::sync::Semaphore>,
+}
+
+impl LinearizedJudge {
+    fn new(coverage: bool) -> Self {
+        Self {
+            coverage,
+            hold: false,
+            active: Arc::new(AtomicBool::new(true)),
+            coordination: Arc::new(tokio::sync::RwLock::new(())),
+            reached_handoff: Arc::new(tokio::sync::Semaphore::new(0)),
+            release_handoff: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    fn held() -> Self {
+        Self {
+            hold: true,
+            ..Self::new(false)
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiJudge for LinearizedJudge {
+    async fn coverage(&self, _summary: &ApiRequestSummary) -> ApiCoverageVerdict {
+        if self.coverage {
+            ApiCoverageVerdict::Allow {
+                risk: 1,
+                reversibility: Reversibility::Reversible,
+            }
+        } else {
+            ApiCoverageVerdict::None
+        }
+    }
+
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        _requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        let guard = self.coordination.clone().read_owned().await;
+        if !self.active.load(Ordering::SeqCst) {
+            return Err("revoked".to_string());
+        }
+        self.reached_handoff.add_permits(1);
+        self.release_handoff
+            .acquire()
+            .await
+            .map_err(|_| "handoff closed".to_string())?
+            .forget();
+        let result = handoff.forward().await;
+        drop(guard);
+        result
+    }
+
+    async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+        ApiJudgeVerdict::Allow {
+            reason: "mock allow".to_string(),
+            risk: Some(if self.hold { 9 } else { 1 }),
+            reversibility: Some(if self.hold {
+                Reversibility::Irreversible
+            } else {
+                Reversibility::Reversible
+            }),
+            authorization: if self.coverage {
+                ApiAuthorizationKind::Coverage
+            } else {
+                ApiAuthorizationKind::Evaluated
+            },
+        }
     }
 }
 
@@ -900,6 +2422,15 @@ impl ApiSessionSink for ModeSessionSink {
         })
     }
 
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
+    }
+
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
 }
 
@@ -908,7 +2439,874 @@ fn judge_allow(risk: Option<i32>, reversibility: Option<Reversibility>) -> ApiJu
         reason: "mock allow".to_string(),
         risk,
         reversibility,
+        authorization: guard::proxy::ApiAuthorizationKind::Evaluated,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_authority_is_linearized_at_upstream_handoff() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [get]
+    resources: [configmaps]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let judge = Arc::new(LinearizedJudge::new(false));
+    let (base, client) = start_proxy_with(upstream, policy, Some(judge.clone()), None, 0).await;
+    let request = tokio::spawn(async move {
+        client
+            .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+            .send()
+            .await
+            .unwrap()
+    });
+    judge.reached_handoff.acquire().await.unwrap().forget();
+    assert!(judge.coordination.try_write().is_err());
+    let mutation_judge = judge.clone();
+    let revoke = tokio::spawn(async move {
+        let _guard = mutation_judge.coordination.write().await;
+        mutation_judge.active.store(false, Ordering::SeqCst);
+    });
+    judge.release_handoff.add_permits(1);
+
+    assert_eq!(request.await.unwrap().status(), 200);
+    revoke.await.unwrap();
+    assert_eq!(forwarded.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_revoked_before_upstream_handoff_prevents_forwarding() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [create]
+    resources: [pods]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let judge = Arc::new(LinearizedJudge::new(true));
+    judge.active.store(false, Ordering::SeqCst);
+    let (base, client) = start_proxy_with_session_sink(
+        upstream,
+        policy,
+        Some(judge),
+        None,
+        0,
+        Arc::new(ModeSessionSink),
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("readonly-authorized")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(forwarded.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_allow_cannot_forward_without_invoking_the_authorized_handoff() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [create]
+    resources: [pods]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let (base, client) = start_proxy_with_session_sink(
+        upstream,
+        policy,
+        Some(Arc::new(SkippedHandoffCoverageJudge)),
+        None,
+        0,
+        Arc::new(ModeSessionSink),
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("readonly-authorized")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(forwarded.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_revocation_or_amendment_before_handoff_prevents_upstream_forwarding() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [get]
+    resources: [configmaps]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    for revoke in [false, true] {
+        let (upstream, forwarded) = spawn_counting_upstream().await;
+        let judge = Arc::new(LinearizedJudge::new(false));
+        let session = Arc::new(LinearizedSessionSink::new(false));
+        let (base, client) = start_proxy_with_session_sink(
+            upstream,
+            policy,
+            Some(judge.clone()),
+            None,
+            0,
+            session.clone(),
+        )
+        .await;
+        let request = tokio::spawn(async move {
+            client
+                .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+                .send()
+                .await
+                .unwrap()
+        });
+        judge.reached_handoff.acquire().await.unwrap().forget();
+        let replacement = if revoke {
+            None
+        } else {
+            let mut amended = session.context.clone();
+            amended.revision = "amended-revision".to_string();
+            Some(amended)
+        };
+        *session.live.write().await = replacement;
+        judge.release_handoff.add_permits(1);
+
+        assert_eq!(request.await.unwrap().status(), 403);
+        assert_eq!(forwarded.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_lease_linearizes_at_the_finite_upstream_handoff() {
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let session = Arc::new(LinearizedSessionSink::new(true));
+    let (base, client) =
+        start_proxy_with_session_sink(upstream, "default: allow\n", None, None, 0, session.clone())
+            .await;
+    let request = tokio::spawn(async move {
+        client
+            .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+            .send()
+            .await
+            .unwrap()
+    });
+    session.reached_handoff.acquire().await.unwrap().forget();
+    let live = session.live.clone();
+    let revoke = tokio::spawn(async move {
+        *live.write().await = None;
+    });
+    assert!(session.live.try_write().is_err());
+    session.release_handoff.add_permits(1);
+
+    assert_eq!(request.await.unwrap().status(), 200);
+    revoke.await.unwrap();
+    assert_eq!(forwarded.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_upstream_handoff_times_out_and_releases_authority() {
+    let (upstream, reached_upstream) = spawn_stalled_upstream().await;
+    let session = Arc::new(LinearizedSessionSink::new(false));
+    let judge = Arc::new(LinearizedJudge::new(false));
+    judge.release_handoff.add_permits(1);
+    let (base, client) = start_proxy_with_session_sink_and_timeout(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [get]\n    resources: [configmaps]\n    namespaces: [dev]\n    action: evaluate\n",
+        Some(judge.clone()),
+        None,
+        0,
+        session.clone(),
+        Duration::from_millis(200),
+    )
+    .await;
+    let request = tokio::spawn(async move {
+        client
+            .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+            .send()
+            .await
+            .unwrap()
+    });
+    reached_upstream.acquire().await.unwrap().forget();
+    let live = session.live.clone();
+    let revoke = tokio::spawn(async move {
+        *live.write().await = None;
+    });
+    let judge_for_revoke = judge.clone();
+    let coverage_revoke = tokio::spawn(async move {
+        let _guard = judge_for_revoke.coordination.write().await;
+        judge_for_revoke.active.store(false, Ordering::SeqCst);
+    });
+    assert!(session.live.try_write().is_err());
+    assert!(judge.coordination.try_write().is_err());
+
+    assert_eq!(request.await.unwrap().status(), 504);
+    tokio::time::timeout(Duration::from_secs(2), revoke)
+        .await
+        .expect("session authority lease is released after handoff timeout")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), coverage_revoke)
+        .await
+        .expect("evaluator authority lease is released after handoff timeout")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_dispatch_marker_is_committed_at_the_final_send_boundary() {
+    let (upstream, reached_upstream) = spawn_stalled_upstream().await;
+    let sink = BlockingDispatchSink::default();
+    let reached_dispatch = sink.reached.clone();
+    let release_dispatch = sink.release.clone();
+    let state = sink.state.clone();
+    let (base, client) = start_proxy_with_timeouts(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+        Arc::new(LiveSessionSink),
+        Duration::from_millis(200),
+        Duration::from_secs(2),
+    )
+    .await;
+    let request = tokio::spawn(async move {
+        client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(r#"{"metadata":{"name":"dispatch-boundary"}}"#)
+            .send()
+            .await
+            .unwrap()
+    });
+    reached_dispatch.acquire().await.unwrap().forget();
+    assert!(reached_upstream.try_acquire().is_err());
+    release_dispatch.add_permits(1);
+    reached_upstream.acquire().await.unwrap().forget();
+    assert_eq!(request.await.unwrap().status(), 504);
+    assert_eq!(state.dispatching.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_dispatch_marker_cancels_inert_state_without_sending() {
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let sink = DispatchFailSink::default();
+    let state = sink.state.clone();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .body(r#"{"metadata":{"name":"dispatch-failure"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(forwarded.load(Ordering::SeqCst), 0);
+    assert_eq!(state.cancelled.lock().unwrap().len(), 1);
+    assert!(state.indeterminate.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_create_body_preserves_indeterminate_containment_without_uid() {
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with_timeouts(
+        spawn_success_headers_stalled_body().await,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+        Arc::new(LiveSessionSink),
+        Duration::from_secs(2),
+        Duration::from_millis(150),
+    )
+    .await;
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .bearer_auth("live-session")
+            .body(r#"{"metadata":{"name":"stalled-pod"}}"#)
+            .send(),
+    )
+    .await
+    .expect("proxy applies a bounded body timeout")
+    .unwrap();
+    assert_eq!(response.status(), 502);
+    assert_eq!(sink.calls.lock().unwrap().len(), 1);
+    assert!(sink.activated.lock().unwrap().is_empty());
+    assert_eq!(
+        sink.indeterminate.lock().unwrap().as_slice(),
+        ["test-handle-0"]
+    );
+    assert!(sink
+        .resource_uids
+        .lock()
+        .unwrap()
+        .first()
+        .is_some_and(Option::is_none));
+    assert_eq!(
+        response
+            .headers()
+            .get("x-guard-provisional")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-handle-0")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutation_identity_buffer_rejects_declared_and_chunked_oversize() {
+    for kind in [OversizedBodyKind::Declared, OversizedBodyKind::Chunked] {
+        let sink = RecordingSink::default();
+        let (base, client) = start_proxy_with_limits(
+            spawn_oversized_body_upstream(kind).await,
+            "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+            None,
+            Some(Arc::new(sink.clone())),
+            0,
+            Arc::new(LiveSessionSink),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(64),
+        )
+        .await;
+        let response = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(r#"{"metadata":{"name":"bounded-pod"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 502);
+        assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+        assert!(sink.activated.lock().unwrap().is_empty());
+        assert!(sink
+            .resource_uids
+            .lock()
+            .unwrap()
+            .first()
+            .is_some_and(Option::is_none));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redacted_read_buffer_rejects_declared_and_chunked_oversize() {
+    for kind in [OversizedBodyKind::Declared, OversizedBodyKind::Chunked] {
+        let (base, client) = start_proxy_with_limits(
+            spawn_oversized_body_upstream(kind).await,
+            "default: deny\nrules:\n  - verbs: [get]\n    resources: [secrets]\n    namespaces: [dev]\n    action: allow\n",
+            None,
+            None,
+            0,
+            Arc::new(LiveSessionSink),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(64),
+        )
+        .await;
+        let response = client
+            .get(format!("{base}/api/v1/namespaces/dev/secrets/example"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 502);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutation_handoff_timeout_preserves_operator_decision_without_an_unsafe_uid() {
+    let (upstream, reached_upstream) = spawn_stalled_upstream().await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with_timeouts(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+        Arc::new(LiveSessionSink),
+        Duration::from_millis(150),
+        Duration::from_secs(2),
+    )
+    .await;
+    let request = tokio::spawn(async move {
+        client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .bearer_auth("live-session")
+            .body(r#"{"metadata":{"name":"timeout-pod"}}"#)
+            .send()
+            .await
+            .unwrap()
+    });
+    reached_upstream.acquire().await.unwrap().forget();
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), 504);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-guard-provisional")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-handle-0")
+    );
+    assert_eq!(sink.handoffs.lock().unwrap().len(), 1);
+    assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+    assert!(sink
+        .resource_uids
+        .lock()
+        .unwrap()
+        .first()
+        .is_some_and(Option::is_none));
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutation_transport_error_preserves_an_actionable_provisional() {
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        spawn_transport_error_upstream().await,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"transport-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(response.headers().contains_key("x-guard-provisional"));
+    assert_eq!(sink.handoffs.lock().unwrap().len(), 1);
+    assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_error_preserves_indeterminate_containment_without_uid() {
+    let (upstream, forwarded_deletes) = spawn_create_status_upstream(500, None).await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"failed-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 500);
+    assert!(response.headers().contains_key("x-guard-provisional"));
+    assert_eq!(sink.indeterminate.lock().unwrap().len(), 1);
+    assert!(sink
+        .resource_uids
+        .lock()
+        .unwrap()
+        .first()
+        .is_some_and(Option::is_none));
+    assert!(sink.activated.lock().unwrap().is_empty());
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+
+    let delete = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/failed-pod"))
+        .bearer_auth("live-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 403);
+    assert_eq!(forwarded_deletes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_create_retires_dispatch_without_create_provenance() {
+    let (upstream, forwarded_deletes) = spawn_create_status_upstream(409, None).await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"existing-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert!(!response.headers().contains_key("x-guard-provisional"));
+    assert!(sink.indeterminate.lock().unwrap().is_empty());
+    assert!(sink.activated.lock().unwrap().is_empty());
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+    assert_eq!(sink.rejected.lock().unwrap().len(), 1);
+
+    let delete = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/existing-pod"))
+        .bearer_auth("live-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 403);
+    assert_eq!(forwarded_deletes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_uid_cannot_use_created_resource_cleanup_authority() {
+    let (upstream, replacement, forwarded_deletes) = spawn_replaceable_create_upstream().await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let created = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"replaceable-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    replacement.store(true, Ordering::SeqCst);
+
+    let delete = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/replaceable-pod"))
+        .bearer_auth("live-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 403);
+    assert_eq!(forwarded_deletes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_response_uid_arms_without_follow_up_get_authority() {
+    let (upstream, gets) = spawn_create_without_get_upstream().await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .body(r#"{"metadata":{"name":"response-authority"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    assert_eq!(gets.load(Ordering::SeqCst), 0);
+    assert_eq!(sink.activated.lock().unwrap().len(), 1);
+    assert!(sink
+        .resource_uids
+        .lock()
+        .unwrap()
+        .first()
+        .is_some_and(Option::is_some));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cleanup_buffer_rejects_declared_and_chunked_oversize_without_resolution() {
+    for kind in [OversizedBodyKind::Declared, OversizedBodyKind::Chunked] {
+        let sink = RecordingSink::default();
+        let (base, client) = start_proxy_with_limits(
+            spawn_cleanup_oversized_upstream(kind).await,
+            "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+            None,
+            Some(Arc::new(sink.clone())),
+            0,
+            Arc::new(LiveSessionSink),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(512),
+        )
+        .await;
+        let create = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(r#"{"metadata":{"name":"cleanup-bounded"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), 201);
+        let cleanup = client
+            .delete(format!("{base}/api/v1/namespaces/dev/pods/cleanup-bounded"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cleanup.status(), 502);
+        assert!(sink.resolved.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cleanup_revocation_linearizes_at_the_final_header_handoff() {
+    for (pause, expected_status, expected_deletes) in [
+        (CleanupLeasePause::BeforeLease, 403, 0),
+        (CleanupLeasePause::AfterLease, 200, 1),
+    ] {
+        let (upstream, _, deletes) = spawn_replaceable_create_upstream().await;
+        let sink = Arc::new(CleanupLeaseSink::new(pause));
+        let (base, client) = start_proxy_with(
+            upstream,
+            "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+            None,
+            Some(sink.clone()),
+            0,
+        )
+        .await;
+        let created = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(r#"{"metadata":{"name":"lease-linearized"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201);
+
+        let cleanup = tokio::spawn(async move {
+            client
+                .delete(format!(
+                    "{base}/api/v1/namespaces/dev/pods/lease-linearized"
+                ))
+                .send()
+                .await
+                .unwrap()
+        });
+        sink.reached.acquire().await.unwrap().forget();
+        let coordination = sink.coordination.clone();
+        let mut revoke = tokio::spawn(async move {
+            *coordination.write().await = false;
+        });
+        if matches!(pause, CleanupLeasePause::AfterLease) {
+            assert!(sink.coordination.try_write().is_err());
+        } else {
+            tokio::time::timeout(Duration::from_secs(2), &mut revoke)
+                .await
+                .expect("pre-handoff revocation completes before cleanup send")
+                .unwrap();
+        }
+        sink.release.add_permits(1);
+        assert_eq!(cleanup.await.unwrap().status(), expected_status);
+        if matches!(pause, CleanupLeasePause::AfterLease) {
+            tokio::time::timeout(Duration::from_secs(2), &mut revoke)
+                .await
+                .expect("post-handoff revocation completes after cleanup send")
+                .unwrap();
+        }
+        assert_eq!(deletes.load(Ordering::SeqCst), expected_deletes);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn encoded_success_keeps_activated_containment() {
+    let (upstream, _) = spawn_create_status_upstream(201, Some("gzip")).await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"encoded-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(response.headers().contains_key("x-guard-provisional"));
+    assert_eq!(sink.activated.lock().unwrap().len(), 1);
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_activation_failure_cannot_return_upstream_success() {
+    let (upstream, _) = spawn_create_status_upstream(201, None).await;
+    let sink = ActivationFailSink::default();
+    let state = sink.state.clone();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"activation-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(response.headers().contains_key("x-guard-provisional"));
+    assert_eq!(state.handoffs.lock().unwrap().len(), 2);
+    assert_eq!(state.activated.lock().unwrap().len(), 1);
+    assert_eq!(state.indeterminate.lock().unwrap().len(), 1);
+    assert!(state.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_containment_classification_never_advertises_an_uncommitted_handle() {
+    let (upstream, _) = spawn_create_status_upstream(201, None).await;
+    let sink = ClassificationFailSink::default();
+    let state = sink.state.clone();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body(r#"{"metadata":{"name":"classification-pod"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(!response.headers().contains_key("x-guard-provisional"));
+    assert!(state.activated.lock().unwrap().is_empty());
+    assert!(state.indeterminate.lock().unwrap().is_empty());
+    assert!(state.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_mutation_handoff_preserves_containment() {
+    let (upstream, reached_upstream) = spawn_stalled_upstream().await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with_timeouts(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+        Arc::new(LiveSessionSink),
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+    )
+    .await;
+    let request = tokio::spawn(async move {
+        let _ = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .bearer_auth("live-session")
+            .body(r#"{"metadata":{"name":"cancelled-pod"}}"#)
+            .send()
+            .await;
+    });
+    reached_upstream.acquire().await.unwrap().forget();
+    request.abort();
+    tokio::time::timeout(Duration::from_secs(3), sink.indeterminate_signal.acquire())
+        .await
+        .expect("cancelled request preserves an actionable provisional")
+        .unwrap()
+        .forget();
+    assert_eq!(sink.handoffs.lock().unwrap().len(), 1);
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_during_uid_transition_keeps_richer_identity() {
+    let (upstream, _) = spawn_create_status_upstream(201, None).await;
+    let sink = BlockingUidTransitionSink::default();
+    let state = sink.state.clone();
+    let reached = sink.reached.clone();
+    let release = sink.release.clone();
+    let (base, client) = start_proxy_with(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let request = tokio::spawn(async move {
+        let _ = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(r#"{"metadata":{"name":"cancel-transition"}}"#)
+            .send()
+            .await;
+    });
+    reached.acquire().await.unwrap().forget();
+    request.abort();
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), state.activated_signal.acquire())
+        .await
+        .expect("detached UID transition completes after caller cancellation")
+        .unwrap()
+        .forget();
+    assert!(state.indeterminate.lock().unwrap().is_empty());
+    assert!(state.cancelled.lock().unwrap().is_empty());
+    assert!(state
+        .resource_uids
+        .lock()
+        .unwrap()
+        .first()
+        .is_some_and(Option::is_some));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_authority_revoked_during_an_approved_hold_prevents_forwarding() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [create]
+    resources: [configmaps]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let judge = Arc::new(LinearizedJudge::held());
+    judge.active.store(false, Ordering::SeqCst);
+    let (base, client) = start_proxy_with(
+        upstream,
+        policy,
+        Some(judge),
+        Some(Arc::new(ApprovingSink)),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/configmaps"))
+        .body(r#"{"metadata":{"name":"held-config"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(forwarded.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1004,7 +3402,7 @@ async fn proxy_gates_redacts_and_forwards() {
     let resp = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
         .bearer_auth("live-session")
-        .body("{}")
+        .body(r#"{"metadata":{"name":"web-123"}}"#)
         .send()
         .await
         .unwrap();
@@ -1143,10 +3541,39 @@ async fn http2_multiplexes_session_authentication_failures_independently() {
 
 /// Records the reverts the proxy synthesizes, standing in for the daemon's
 /// consequence machinery.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct RecordingSink {
     calls: Arc<std::sync::Mutex<Vec<guard::proxy::ApiMutation>>>,
+    handoffs: Arc<std::sync::Mutex<Vec<String>>>,
+    activated: Arc<std::sync::Mutex<Vec<String>>>,
+    indeterminate: Arc<std::sync::Mutex<Vec<String>>>,
+    resource_uids: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    cancelled: Arc<std::sync::Mutex<Vec<String>>>,
     resolved: Arc<std::sync::Mutex<Vec<String>>>,
+    dispatching: Arc<std::sync::Mutex<Vec<String>>>,
+    rejected: Arc<std::sync::Mutex<Vec<String>>>,
+    activated_signal: Arc<tokio::sync::Semaphore>,
+    indeterminate_signal: Arc<tokio::sync::Semaphore>,
+    resolved_signal: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for RecordingSink {
+    fn default() -> Self {
+        Self {
+            calls: Arc::default(),
+            handoffs: Arc::default(),
+            activated: Arc::default(),
+            indeterminate: Arc::default(),
+            resource_uids: Arc::default(),
+            cancelled: Arc::default(),
+            resolved: Arc::default(),
+            dispatching: Arc::default(),
+            rejected: Arc::default(),
+            activated_signal: Arc::new(tokio::sync::Semaphore::new(0)),
+            indeterminate_signal: Arc::new(tokio::sync::Semaphore::new(0)),
+            resolved_signal: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1157,18 +3584,571 @@ impl guard::proxy::GateSink for RecordingSink {
         Some(handle)
     }
 
-    async fn resolve(&self, handle: &str) {
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.dispatching.lock().unwrap().push(handle.to_string());
+        true
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
+        self.handoffs.lock().unwrap().push(handle.to_string());
+        self.activated.lock().unwrap().push(handle.to_string());
+        self.resource_uids
+            .lock()
+            .unwrap()
+            .push(resource_uid.map(str::to_string));
+        self.activated_signal.add_permits(1);
+        true
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        _reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.handoffs.lock().unwrap().push(handle.to_string());
+        self.indeterminate.lock().unwrap().push(handle.to_string());
+        self.resource_uids
+            .lock()
+            .unwrap()
+            .push(resource_uid.map(str::to_string));
+        self.indeterminate_signal.add_permits(1);
+        true
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.cancelled.lock().unwrap().push(handle.to_string());
+        true
+    }
+
+    async fn mark_revert_rejected(&self, handle: &str, _reason: &str) -> bool {
+        self.handoffs.lock().unwrap().push(handle.to_string());
+        self.rejected.lock().unwrap().push(handle.to_string());
+        true
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
         self.resolved.lock().unwrap().push(handle.to_string());
+        self.resolved_signal.add_permits(1);
+        true
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        let index = self
+            .activated
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|active| active == handle)
+            .ok_or_else(|| "test cleanup authority is inactive".to_string())?;
+        if self
+            .resource_uids
+            .lock()
+            .unwrap()
+            .get(index)
+            .and_then(Option::as_deref)
+            != Some(resource_uid)
+            || self
+                .calls
+                .lock()
+                .unwrap()
+                .get(index)
+                .and_then(|mutation| mutation.create_provenance.as_deref())
+                != Some(create_provenance)
+        {
+            return Err("test cleanup authority identity changed".to_string());
+        }
+        handoff.forward().await
+    }
+}
+
+#[derive(Clone, Default)]
+struct ActivationFailSink {
+    state: RecordingSink,
+}
+
+#[derive(Clone, Default)]
+struct ClassificationFailSink {
+    state: RecordingSink,
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for ClassificationFailSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for ActivationFailSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, _resource_uid: Option<&str>) -> bool {
+        self.state.handoffs.lock().unwrap().push(handle.to_string());
+        self.state
+            .activated
+            .lock()
+            .unwrap()
+            .push(handle.to_string());
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.state
+            .mark_revert_indeterminate(handle, reason, resource_uid)
+            .await
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_rejected(handle, reason).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+}
+
+#[derive(Clone)]
+struct BlockingCancelSink {
+    stage_reached: Arc<tokio::sync::Semaphore>,
+    release_stage: Arc<tokio::sync::Semaphore>,
+    cancel_reached: Arc<tokio::sync::Semaphore>,
+    release_cancel: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone)]
+struct BlockingUidTransitionSink {
+    state: RecordingSink,
+    reached: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone)]
+struct BlockingDispatchSink {
+    state: RecordingSink,
+    reached: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone, Default)]
+struct DispatchFailSink {
+    state: RecordingSink,
+}
+
+impl Default for BlockingDispatchSink {
+    fn default() -> Self {
+        Self {
+            state: RecordingSink::default(),
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+impl Default for BlockingUidTransitionSink {
+    fn default() -> Self {
+        Self {
+            state: RecordingSink::default(),
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CleanupLeasePause {
+    BeforeLease,
+    AfterLease,
+}
+
+#[derive(Clone)]
+struct CleanupLeaseSink {
+    state: RecordingSink,
+    coordination: Arc<tokio::sync::RwLock<bool>>,
+    reached: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    pause: CleanupLeasePause,
+}
+
+impl CleanupLeaseSink {
+    fn new(pause: CleanupLeasePause) -> Self {
+        Self {
+            state: RecordingSink::default(),
+            coordination: Arc::new(tokio::sync::RwLock::new(true)),
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            pause,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for CleanupLeaseSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
+        self.state.mark_revert_forwarded(handle, resource_uid).await
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.state
+            .mark_revert_indeterminate(handle, reason, resource_uid)
+            .await
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_rejected(handle, reason).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        if matches!(self.pause, CleanupLeasePause::BeforeLease) {
+            self.reached.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|_| "cleanup test barrier closed".to_string())?
+                .forget();
+        }
+        let active = self.coordination.read().await;
+        if matches!(self.pause, CleanupLeasePause::AfterLease) {
+            self.reached.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|_| "cleanup test barrier closed".to_string())?
+                .forget();
+        }
+        if !*active {
+            return Err("cleanup authority was revoked".to_string());
+        }
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for BlockingUidTransitionSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
+        self.reached.add_permits(1);
+        if self.release.acquire().await.is_err() {
+            return false;
+        }
+        self.state.mark_revert_forwarded(handle, resource_uid).await
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.state
+            .mark_revert_indeterminate(handle, reason, resource_uid)
+            .await
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_rejected(handle, reason).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for BlockingDispatchSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.reached.add_permits(1);
+        let Ok(permit) = self.release.acquire().await else {
+            return false;
+        };
+        permit.forget();
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
+        self.state.mark_revert_forwarded(handle, resource_uid).await
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.state
+            .mark_revert_indeterminate(handle, reason, resource_uid)
+            .await
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_rejected(handle, reason).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for DispatchFailSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
+    }
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for BlockingCancelSink {
+    async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.stage_reached.add_permits(1);
+        self.release_stage.acquire().await.ok()?.forget();
+        Some("blocked-cancel-handle".to_string())
+    }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        true
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        self.cancel_reached.add_permits(1);
+        if self.release_cancel.acquire().await.is_err() {
+            return false;
+        }
+        true
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        _handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        Err("test cleanup authority is unavailable".to_string())
     }
 }
 
 /// Mock apiserver for the write path: returns a created Pod for POST, and a
 /// Deployment (with resourceVersion) for the snapshot GET and the PATCH.
 async fn write_mock_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    let is_create = req.method() == hyper::Method::POST;
-    let (code, body) = if is_create {
+    write_mock_handler_with_provenance(req, &CreateProvenance::default()).await
+}
+
+async fn write_mock_handler_with_provenance(
+    req: Request<Incoming>,
+    provenance: &CreateProvenance,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let (method, path) = observe_create_provenance(req, provenance).await;
+    let is_create = method == hyper::Method::POST;
+    let is_created_pod = path.ends_with("/pods/web-123");
+    let (code, mut body) = if is_create || is_created_pod {
         (
-            201,
+            if is_create { 201 } else { 200 },
             json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "web-123", "namespace": "dev", "uid": "pod-uid", "resourceVersion": "40"}}),
         )
     } else {
@@ -1182,6 +4162,9 @@ async fn write_mock_handler(req: Request<Incoming>) -> Result<Response<Full<Byte
             }),
         )
     };
+    if is_create || is_created_pod {
+        attach_create_provenance(&mut body, provenance);
+    }
     Ok(Response::builder()
         .status(code)
         .header("content-type", "application/json")
@@ -1190,23 +4173,71 @@ async fn write_mock_handler(req: Request<Incoming>) -> Result<Response<Full<Byte
 }
 
 async fn spawn_write_mock() -> String {
+    spawn_write_mock_with_observation().await.0
+}
+
+async fn spawn_counted_write_mock(writes: Arc<AtomicUsize>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let writes = writes.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |request| {
+                            let writes = writes.clone();
+                            async move {
+                                if request.method() != hyper::Method::GET {
+                                    writes.fetch_add(1, Ordering::SeqCst);
+                                }
+                                write_mock_handler(request).await
+                            }
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_write_mock_with_observation() -> (String, CreateProvenance) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
+    let observed = provenance.clone();
     tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            let provenance = provenance.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service_fn(write_mock_handler))
-                    .await;
+                let _ =
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            service_fn(move |request| {
+                                let provenance = provenance.clone();
+                                async move {
+                                    write_mock_handler_with_provenance(request, &provenance).await
+                                }
+                            }),
+                        )
+                        .await;
             });
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), observed)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1241,7 +4272,7 @@ async fn proxy_arms_auto_revert_for_writes() {
     let resp = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
         .bearer_auth("live-session")
-        .body("{}")
+        .body(r#"{"metadata":{"name":"web-123"}}"#)
         .send()
         .await
         .unwrap();
@@ -1288,10 +4319,7 @@ async fn proxy_arms_auto_revert_for_writes() {
 
     // Both response headers prove the reverts were durable before success was
     // returned; the sink records the same handles for lifecycle assertions.
-    wait_until("both writes to arm a revert", || {
-        sink.calls.lock().unwrap().len() == 2
-    })
-    .await;
+    assert_eq!(sink.calls.lock().unwrap().len(), 2);
 
     let calls = sink.calls.lock().unwrap();
     assert!(calls.iter().all(|call| {
@@ -1299,6 +4327,9 @@ async fn proxy_arms_auto_revert_for_writes() {
             && call.upstream_target == mock_base
             && call.upstream_identity.len() == 64
     }));
+    let resource_uids = sink.resource_uids.lock().unwrap();
+    assert!(resource_uids.first().is_some_and(Option::is_some));
+    assert!(resource_uids.get(1).is_some_and(Option::is_none));
 
     // The create armed a DELETE for the server-assigned object name.
     assert_eq!(calls[0].revert.method, "DELETE");
@@ -1578,7 +4609,7 @@ async fn readonly_listener_requires_session_override_and_keeps_protocol_denies()
             .with_listener_mode(ApiListenerMode::Readonly),
     );
     let judge = RecordingJudge::new(vec![judge_allow(Some(1), Some(Reversibility::Reversible))]);
-    proxy.attach_judge(Arc::new(judge.clone()));
+    proxy.attach_judge(Arc::new(judge.clone())).await;
     proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
@@ -1638,7 +4669,7 @@ async fn issued_session_modes_enforce_api_boundary_without_prompt_bypass() {
             .with_listener_mode(ApiListenerMode::Readonly),
     );
     let judge = ModeCoverageJudge::default();
-    proxy.attach_judge(Arc::new(judge.clone()));
+    proxy.attach_judge(Arc::new(judge.clone())).await;
     proxy.attach_session_sink(Arc::new(ModeSessionSink));
     tokio::spawn(proxy.serve_on(listener));
     let client = reqwest::Client::builder()
@@ -1723,10 +4754,12 @@ async fn session_expansion_is_revalidated_immediately_before_forward() {
         ApiProxy::new(listen, tls, upstream, policy, None)
             .with_listener_mode(ApiListenerMode::Readonly),
     );
-    proxy.attach_judge(Arc::new(RecordingJudge::new(vec![judge_allow(
-        Some(1),
-        Some(Reversibility::Reversible),
-    )])));
+    proxy
+        .attach_judge(Arc::new(RecordingJudge::new(vec![judge_allow(
+            Some(1),
+            Some(Reversibility::Reversible),
+        )])))
+        .await;
     proxy.attach_session_sink(Arc::new(ChangingSessionSink {
         resolutions: AtomicUsize::new(0),
     }));
@@ -1760,21 +4793,24 @@ async fn session_expansion_is_revalidated_immediately_before_forward() {
         .unwrap();
 
     assert_eq!(response.status(), 403);
-    assert!(response.text().await.unwrap().contains("revoked"));
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("session authority changed"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
-    let gets = Arc::new(AtomicUsize::new(0));
     let writes = Arc::new(AtomicUsize::new(0));
-    let (mock_base, _) = spawn_flaky_snapshot_mock(gets, writes.clone()).await;
+    let mock_base = spawn_counted_write_mock(writes.clone()).await;
     let upstream =
         Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let temp = tempfile::tempdir().unwrap();
     let policy_path = temp.path().join("api-policy.yaml");
-    let evaluate_policy = "default: deny\nrules:\n  - verbs: [patch]\n    resources: [pods]\n    namespaces: [dev]\n    action: evaluate\n";
+    let evaluate_policy = "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: evaluate\n";
     std::fs::write(&policy_path, evaluate_policy).unwrap();
     let policy = ApiPolicy::load_file(&policy_path).unwrap();
     let (listener, listen) = reserve_listener().await;
@@ -1784,19 +4820,35 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
     );
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    proxy.attach_judge(Arc::new(BlockingJudge {
-        started: started.clone(),
-        release: release.clone(),
-    }));
+    proxy
+        .attach_judge(Arc::new(BlockingJudge {
+            started: started.clone(),
+            release: release.clone(),
+        }))
+        .await;
     proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!(
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let request = tokio::spawn(async move {
         client
-            .patch(format!("https://{listen}/api/v1/namespaces/dev/pods/web"))
+            .patch(format!(
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
             .bearer_auth("live-session")
             .body("{}")
             .send()
@@ -1804,7 +4856,7 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
             .unwrap()
     });
     started.notified().await;
-    let deny_policy = "default: deny\nrules:\n  - verbs: [patch]\n    resources: [pods]\n    namespaces: [dev]\n    action: deny\n";
+    let deny_policy = "default: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: deny\n";
     std::fs::write(&policy_path, deny_policy).unwrap();
     wait_for_policy_reload(&proxy, deny_policy).await;
     release.notify_one();
@@ -2073,8 +5125,10 @@ async fn proxy_self_access_review_carries_upstream_credential() {
 /// `check-pod`; a DELETE returns a success Status (the object removed).
 async fn create_delete_mock_handler(
     req: Request<Incoming>,
+    provenance: CreateProvenance,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let (code, body) = match *req.method() {
+    let (method, _) = observe_create_provenance(req, &provenance).await;
+    let (code, mut body) = match method {
         hyper::Method::POST => (201, created_pod_object()),
         hyper::Method::GET => (200, created_pod_object()),
         hyper::Method::DELETE => (
@@ -2086,6 +5140,9 @@ async fn create_delete_mock_handler(
             json!({"kind": "Status", "apiVersion": "v1", "status": "Success"}),
         ),
     };
+    if matches!(method, hyper::Method::POST | hyper::Method::GET) {
+        attach_create_provenance(&mut body, &provenance);
+    }
     Ok(Response::builder()
         .status(code)
         .header("content-type", "application/json")
@@ -2110,16 +5167,23 @@ fn created_pod_object() -> Value {
 async fn spawn_create_delete_mock() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
     tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            let provenance = provenance.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service_fn(create_delete_mock_handler))
+                    .serve_connection(
+                        io,
+                        service_fn(move |request| {
+                            create_delete_mock_handler(request, provenance.clone())
+                        }),
+                    )
                     .await;
             });
         }
@@ -2131,6 +5195,7 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
     let outcomes = Arc::new(std::sync::Mutex::new(outcomes));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
     tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
@@ -2138,13 +5203,17 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
                 Err(_) => continue,
             };
             let outcomes = outcomes.clone();
+            let provenance = provenance.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req: Request<Incoming>| {
                     let outcomes = outcomes.clone();
+                    let provenance = provenance.clone();
                     async move {
-                        if req.method() == hyper::Method::POST {
-                            let body = created_pod_object();
+                        let (method, _) = observe_create_provenance(req, &provenance).await;
+                        if method == hyper::Method::POST {
+                            let mut body = created_pod_object();
+                            attach_create_provenance(&mut body, &provenance);
                             return Ok::<_, std::io::Error>(
                                 Response::builder()
                                     .status(201)
@@ -2153,7 +5222,7 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
                                     .unwrap(),
                             );
                         }
-                        if req.method() == hyper::Method::DELETE {
+                        if method == hyper::Method::DELETE {
                             let outcome = outcomes.lock().unwrap().pop_front().unwrap_or(Some(200));
                             let Some(status) = outcome else {
                                 return Err(std::io::Error::other("simulated upstream disconnect"));
@@ -2166,10 +5235,12 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
                                 )))
                                 .unwrap());
                         }
+                        let mut body = created_pod_object();
+                        attach_create_provenance(&mut body, &provenance);
                         Ok(Response::builder()
                             .status(200)
                             .header("content-type", "application/json")
-                            .body(Full::new(Bytes::from(created_pod_object().to_string())))
+                            .body(Full::new(Bytes::from(body.to_string())))
                             .unwrap())
                     }
                 });
@@ -2186,44 +5257,106 @@ async fn spawn_truncated_cleanup_mock() -> String {
     type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
+            let provenance = provenance.clone();
             tokio::spawn(async move {
-                let service = service_fn(|req: Request<Incoming>| async move {
-                    let response: Response<MockBody> = if req.method() == hyper::Method::POST {
-                        let body = created_pod_object().to_string();
-                        Response::builder()
-                            .status(201)
-                            .header("content-type", "application/json")
-                            .body(
-                                Full::new(Bytes::from(body))
-                                    .map_err(|never| match never {})
-                                    .boxed(),
-                            )
-                            .unwrap()
-                    } else if req.method() == hyper::Method::DELETE {
-                        let frames = futures::stream::iter([
-                            Ok(Frame::data(Bytes::from_static(b"{"))),
-                            Err(std::io::Error::other("simulated body disconnect")),
-                        ]);
-                        Response::builder()
-                            .status(200)
-                            .header("content-type", "application/json")
-                            .body(StreamBody::new(frames).boxed())
-                            .unwrap()
-                    } else {
-                        Response::builder()
-                            .status(200)
-                            .header("content-type", "application/json")
-                            .body(
-                                Full::new(Bytes::from(created_pod_object().to_string()))
-                                    .map_err(|never| match never {})
-                                    .boxed(),
-                            )
-                            .unwrap()
-                    };
-                    Ok::<_, Infallible>(response)
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, _) = observe_create_provenance(req, &provenance).await;
+                        let response: Response<MockBody> = if method == hyper::Method::POST {
+                            let mut body = created_pod_object();
+                            attach_create_provenance(&mut body, &provenance);
+                            let body = body.to_string();
+                            Response::builder()
+                                .status(201)
+                                .header("content-type", "application/json")
+                                .body(
+                                    Full::new(Bytes::from(body))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap()
+                        } else if method == hyper::Method::DELETE {
+                            let frames = futures::stream::iter([
+                                Ok(Frame::data(Bytes::from_static(b"{"))),
+                                Err(std::io::Error::other("simulated body disconnect")),
+                            ]);
+                            Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(StreamBody::new(frames).boxed())
+                                .unwrap()
+                        } else {
+                            let mut body = created_pod_object();
+                            attach_create_provenance(&mut body, &provenance);
+                            Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(
+                                    Full::new(Bytes::from(body.to_string()))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap()
+                        };
+                        Ok::<_, Infallible>(response)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_stalled_cleanup_body_mock() -> String {
+    type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provenance = CreateProvenance::default();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let provenance = provenance.clone();
+                    async move {
+                        let (method, _) = observe_create_provenance(req, &provenance).await;
+                        let response: Response<MockBody> = if method == hyper::Method::DELETE {
+                            let frames =
+                                futures::stream::pending::<Result<Frame<Bytes>, std::io::Error>>();
+                            Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(StreamBody::new(frames).boxed())
+                                .unwrap()
+                        } else {
+                            let status = if method == hyper::Method::POST {
+                                201
+                            } else {
+                                200
+                            };
+                            let mut body = created_pod_object();
+                            attach_create_provenance(&mut body, &provenance);
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(
+                                    Full::new(Bytes::from(body.to_string()))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap()
+                        };
+                        Ok::<_, Infallible>(response)
+                    }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -2238,6 +5371,14 @@ async fn start_provenance_proxy(
     mock_base: String,
     session_sink: Option<Arc<dyn ApiSessionSink>>,
 ) -> (SingleConnectionClient, RecordingSink) {
+    start_provenance_proxy_with_body_timeout(mock_base, session_sink, Duration::from_secs(10)).await
+}
+
+async fn start_provenance_proxy_with_body_timeout(
+    mock_base: String,
+    session_sink: Option<Arc<dyn ApiSessionSink>>,
+    body_timeout: Duration,
+) -> (SingleConnectionClient, RecordingSink) {
     let upstream =
         Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -2246,7 +5387,8 @@ async fn start_provenance_proxy(
     let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(
         ApiProxy::new(listen, tls, upstream, policy, None)
-            .with_listener_mode(ApiListenerMode::Policy),
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_upstream_body_timeout(body_timeout),
     );
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
@@ -2352,14 +5494,11 @@ async fn proxy_allows_contained_delete_of_created_resource() {
             hyper::Method::POST,
             "/api/v1/namespaces/dev/pods",
             Some("live-session"),
-            Some("{}"),
+            Some(r#"{"metadata":{"name":"check-pod"}}"#),
         )
         .await;
     assert_eq!(status, 201, "create forwarded");
-    wait_until("the create to arm exactly one revert", || {
-        sink.calls.lock().unwrap().len() == 1
-    })
-    .await;
+    assert_eq!(sink.calls.lock().unwrap().len(), 1);
 
     // Deleting that same resource is now contained cleanup: allowed and forwarded.
     let status = client
@@ -2376,10 +5515,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
     );
 
     // The now-moot auto-revert for the create was resolved.
-    wait_until("the create's auto-revert to resolve", || {
-        sink.resolved.lock().unwrap().len() == 1
-    })
-    .await;
+    assert_eq!(sink.resolved.lock().unwrap().len(), 1);
     assert_eq!(
         sink.calls.lock().unwrap().len(),
         1,
@@ -2414,7 +5550,7 @@ async fn contained_delete_retains_revert_on_transport_4xx_and_5xx_failures() {
                     hyper::Method::POST,
                     "/api/v1/namespaces/dev/pods",
                     Some("live-session"),
-                    Some("{}"),
+                    Some(r#"{"metadata":{"name":"check-pod"}}"#),
                 )
                 .await,
             201
@@ -2473,7 +5609,7 @@ async fn contained_delete_retains_revert_when_session_expires_before_forward() {
                 hyper::Method::POST,
                 "/api/v1/namespaces/dev/pods",
                 Some("budget-session"),
-                Some("{}"),
+                Some(r#"{"metadata":{"name":"check-pod"}}"#),
             )
             .await,
         201
@@ -2519,7 +5655,7 @@ async fn contained_delete_retains_revert_when_a_2xx_body_disconnects() {
                 hyper::Method::POST,
                 "/api/v1/namespaces/dev/pods",
                 Some("live-session"),
-                Some("{}"),
+                Some(r#"{"metadata":{"name":"check-pod"}}"#),
             )
             .await,
         201
@@ -2540,6 +5676,42 @@ async fn contained_delete_retains_revert_when_a_2xx_body_disconnects() {
         sink.resolved.lock().unwrap().is_empty(),
         "a truncated 2xx cleanup response must retain its revert"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contained_delete_body_stall_is_bounded_and_retains_revert() {
+    let (mut client, sink) = start_provenance_proxy_with_body_timeout(
+        spawn_stalled_cleanup_body_mock().await,
+        None,
+        Duration::from_millis(150),
+    )
+    .await;
+
+    assert_eq!(
+        client
+            .request(
+                hyper::Method::POST,
+                "/api/v1/namespaces/dev/pods",
+                Some("live-session"),
+                Some(r#"{"metadata":{"name":"check-pod"}}"#),
+            )
+            .await,
+        201
+    );
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.request(
+            hyper::Method::DELETE,
+            "/api/v1/namespaces/dev/pods/check-pod",
+            Some("live-session"),
+            None,
+        ),
+    )
+    .await
+    .expect("contained cleanup body has a finite timeout");
+    assert_eq!(status, 504);
+    assert!(sink.resolved.lock().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2571,14 +5743,12 @@ async fn created_provenance_never_overrides_an_explicit_policy_deny() {
     let created = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
         .bearer_auth("live-session")
-        .body("{}")
+        .body(r#"{"metadata":{"name":"check-pod"}}"#)
         .send()
         .await
         .unwrap();
     assert_eq!(created.status(), 201);
     created.bytes().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     let denied = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
         .bearer_auth("live-session")
@@ -2775,8 +5945,6 @@ rules:
         409,
         "an eviction that cannot carry object preconditions fails closed"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // No auto-revert was armed for the rejected subresource write, so no
     // provenance exists.
     assert_eq!(
@@ -2894,6 +6062,45 @@ impl guard::proxy::GateSink for ApprovingSink {
         None
     }
 
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
     async fn hold_request(
         &self,
         _snapshot: &ApiHoldSnapshot,
@@ -2915,6 +6122,45 @@ struct DenyingSink {
 impl guard::proxy::GateSink for DenyingSink {
     async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
         None
+    }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
     }
 
     async fn hold_request(
@@ -3069,7 +6315,7 @@ rules:
 async fn held_request_captures_complete_body_before_approval_and_stalls_fail_closed() {
     use sha2::{Digest, Sha256};
 
-    let mock_base = spawn_mock_upstream().await;
+    let (mock_base, observed_create) = spawn_write_mock_with_observation().await;
     let upstream =
         Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -3093,10 +6339,30 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
         .unwrap();
     let base = format!("https://{listen}");
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
-    let stream = futures::stream::unfold(rx, |mut receiver| async move {
-        receiver.recv().await.map(|item| (item, receiver))
-    });
+    let waiting_for_tail = Arc::new(tokio::sync::Semaphore::new(0));
+    let release_tail = Arc::new(tokio::sync::Semaphore::new(0));
+    let stream = futures::stream::unfold(
+        (0_u8, waiting_for_tail.clone(), release_tail.clone()),
+        |(step, waiting, release)| async move {
+            match step {
+                0 => Some((
+                    Ok::<_, std::io::Error>(Bytes::from_static(
+                        br#"{"metadata":{"name":"held-pod"},"spec":"#,
+                    )),
+                    (1, waiting, release),
+                )),
+                1 => {
+                    waiting.add_permits(1);
+                    release.acquire().await.ok()?.forget();
+                    Some((
+                        Ok(Bytes::from_static(br#"{"replicas":2}}"#)),
+                        (2, waiting, release),
+                    ))
+                }
+                _ => None,
+            }
+        },
+    );
     let request = tokio::spawn({
         let client = client.clone();
         let base = base.clone();
@@ -3110,21 +6376,29 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
                 .unwrap()
         }
     });
-    tx.send(Ok(Bytes::from_static(br#"{"spec":"#)))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(75)).await;
+    waiting_for_tail.acquire().await.unwrap().forget();
     assert!(
         sink.snapshots.lock().unwrap().is_empty(),
         "approval must not be requested while request bytes remain unread"
     );
-    tx.send(Ok(Bytes::from_static(br#"{"replicas":2}}"#)))
-        .await
-        .unwrap();
-    drop(tx);
-    assert_eq!(request.await.unwrap().status(), 200);
-    let body = br#"{"spec":{"replicas":2}}"#;
-    let expected_digest = Sha256::digest(body)
+    release_tail.add_permits(1);
+    assert_eq!(request.await.unwrap().status(), 201);
+    let marker = observed_create
+        .lock()
+        .unwrap()
+        .provenance
+        .clone()
+        .expect("forwarded create carries canonical provenance");
+    let mut approved_body = json!({
+        "metadata": {
+            "name": "held-pod",
+            "annotations": {}
+        },
+        "spec": {"replicas": 2}
+    });
+    approved_body["metadata"]["annotations"][CREATE_PROVENANCE_ANNOTATION] = Value::String(marker);
+    let body = serde_json::to_vec(&approved_body).unwrap();
+    let expected_digest = Sha256::digest(&body)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
@@ -3133,9 +6407,17 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].body_sha256, expected_digest);
         assert_eq!(
-            snapshots[0].redacted_body_shape,
-            "{\"spec\":{\"replicas\":<number>}}"
+            snapshots[0].body_sha256,
+            observed_create
+                .lock()
+                .unwrap()
+                .body_sha256
+                .clone()
+                .expect("upstream observed the approved body")
         );
+        assert!(snapshots[0]
+            .redacted_body_shape
+            .contains(CREATE_PROVENANCE_ANNOTATION));
     }
 
     let before = sink.snapshots.lock().unwrap().len();
@@ -3174,10 +6456,130 @@ struct SnapshotSink {
     snapshots: Arc<std::sync::Mutex<Vec<ApiHoldSnapshot>>>,
 }
 
+#[derive(Clone)]
+struct BlockingSnapshotSink {
+    state: SnapshotSink,
+    reached: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for BlockingSnapshotSink {
+    fn default() -> Self {
+        Self {
+            state: SnapshotSink::default(),
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl GateSink for BlockingSnapshotSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
+        self.state.mark_revert_forwarded(handle, resource_uid).await
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.state
+            .mark_revert_indeterminate(handle, reason, resource_uid)
+            .await
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        self.state.mark_revert_rejected(handle, reason).await
+    }
+
+    async fn hold_request(
+        &self,
+        snapshot: &ApiHoldSnapshot,
+        _reason: &str,
+        _session_context: Option<&ApiSessionContext>,
+    ) -> guard::proxy::HoldDecision {
+        self.state.snapshots.lock().unwrap().push(snapshot.clone());
+        self.reached.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        guard::proxy::HoldDecision::Approved {
+            handle: "snapshot-approved".to_string(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl GateSink for SnapshotSink {
     async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
         None
+    }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
     }
 
     async fn hold_request(
@@ -3197,6 +6599,45 @@ impl GateSink for SnapshotSink {
 impl guard::proxy::GateSink for CountingSink {
     async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
         None
+    }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
     }
 
     async fn hold_request(
@@ -3264,11 +6705,7 @@ async fn proxy_rarity_escalation_holds_only_rare_shapes() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    wait_until(
-        "2 holds for the first shape's rare window + 1 for the new-namespace shape",
-        || *sink.holds.lock().unwrap() == 3,
-    )
-    .await;
+    assert_eq!(*sink.holds.lock().unwrap(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3429,11 +6866,7 @@ rules:
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "recoverable with snapshot forwards");
-    wait_until(
-        "recoverable evaluate allow to arm a containment revert",
-        || sink.calls.lock().unwrap().len() == 1,
-    )
-    .await;
+    assert_eq!(sink.calls.lock().unwrap().len(), 1);
 
     let judge = RecordingJudge::new(vec![judge_allow(Some(4), Some(Reversibility::Recoverable))]);
     let (base, client) = start_proxy_with(
@@ -3444,11 +6877,24 @@ rules:
         0,
     )
     .await;
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
         ))
         .header("content-type", "application/merge-patch+json")
+        .bearer_auth("live-session")
         .body(r#"{"spec":{"replicas":5}}"#)
         .send()
         .await
@@ -3642,10 +7088,14 @@ async fn flaky_snapshot_handler(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_evaluate_holds_when_contained_revert_cannot_be_reestablished() {
+async fn evaluator_is_not_called_when_final_guard_cannot_be_materialized() {
     let policy = r#"
 default: deny
 rules:
+  - verbs: [get]
+    resources: [deployments]
+    namespaces: [dev]
+    action: allow
   - verbs: [patch]
     resources: [deployments]
     namespaces: [dev]
@@ -3654,12 +7104,8 @@ rules:
     let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (mock_base, _) = spawn_flaky_snapshot_mock(gets.clone(), writes.clone()).await;
-    // Recoverable + mid risk: decide_gate returns Contain only because a revert
-    // is promised. A gate is attached (so the write is tracked and the marker is
-    // constructible at judge time), can_arm_revert is true, but the forward-time
-    // snapshot re-fetch 404s, so containment cannot be re-established and the
-    // write must be held (RecordingSink's default hold denies → 403).
     let judge = RecordingJudge::new(vec![judge_allow(Some(5), Some(Reversibility::Recoverable))]);
+    let observed_judge = judge.clone();
     let sink = RecordingSink::default();
     let (base, client) = start_proxy_with(
         mock_base,
@@ -3669,21 +7115,34 @@ rules:
         0,
     )
     .await;
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
         ))
         .header("content-type", "application/merge-patch+json")
+        .bearer_auth("live-session")
         .body(r#"{"spec":{"replicas":9}}"#)
         .send()
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
-        403,
-        "a contained write whose revert cannot be re-established must be held, not forwarded"
+        409,
+        "a final guard that cannot be materialized must fail before evaluation"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(observed_judge.summaries.lock().unwrap().is_empty());
     assert_eq!(
         writes.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -3708,6 +7167,45 @@ impl guard::proxy::GateSink for CannotArmSink {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         None
     }
+
+    async fn mark_revert_dispatching(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn resolve(&self, _handle: &str) -> bool {
+        false
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        _handle: &str,
+        _resource_uid: &str,
+        _create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        reject_test_cleanup(handoff).await
+    }
+
+    async fn mark_revert_forwarded(&self, _handle: &str, _resource_uid: Option<&str>) -> bool {
+        false
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        _handle: &str,
+        _reason: &str,
+        _resource_uid: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    async fn mark_revert_rejected(&self, _handle: &str, _reason: &str) -> bool {
+        false
+    }
+
+    async fn cancel_staged_revert(&self, _handle: &str) -> bool {
+        false
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3715,6 +7213,10 @@ async fn proxy_evaluate_holds_when_sink_cannot_arm() {
     let policy = r#"
 default: deny
 rules:
+  - verbs: [get]
+    resources: [deployments]
+    namespaces: [dev]
+    action: allow
   - verbs: [patch]
     resources: [deployments]
     namespaces: [dev]
@@ -3734,11 +7236,24 @@ rules:
         0,
     )
     .await;
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
         ))
         .header("content-type", "application/merge-patch+json")
+        .bearer_auth("live-session")
         .body(r#"{"spec":{"replicas":9}}"#)
         .send()
         .await
@@ -3748,15 +7263,14 @@ rules:
         403,
         "a contained write must be held when the sink cannot arm a revert"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         armed.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "no revert arming should be attempted for a held write"
     );
-    // Only the pre-judge constructibility GET ran; no forward-time fetch and no
-    // write, since the request was held before forwarding.
-    assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // The pre-judge constructibility GET and the pre-approval guard
+    // materialization GET ran. No post-approval fetch or write occurs.
+    assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 async fn spawn_flaky_snapshot_mock(
@@ -3835,14 +7349,7 @@ rules:
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    // The object is fetched once for the caller's observation, then twice on
-    // the evaluate path: once before the
-    // judge to decide whether a revert is constructible (an input to the
-    // verdict), and again at forward time so the armed revert restores state as
-    // it was at the write, not as it was before the evaluator round trip.
-    wait_until(
-        "evaluate path to validate constructibility, then re-fetch fresh for arming",
-        || gets.load(std::sync::atomic::Ordering::SeqCst) == 3,
-    )
-    .await;
+    // The caller's observation and one pre-evaluator arbitration fetch are the
+    // only reads. The prepared snapshot and final bytes are reused at handoff.
+    assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 2);
 }

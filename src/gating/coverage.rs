@@ -36,6 +36,9 @@ pub struct VerbContext {
     /// same catalog read that produced `catalog_version`. Held approvals bind
     /// to it so unrelated catalog changes do not void them.
     pub verb_digest: Option<String>,
+    /// Canonical digest of the complete composed matcher result, including
+    /// every applicable coverage cell and every selected verb definition.
+    pub composition_digest: Option<String>,
     /// True only when every selected cell is an operator-approved session
     /// `evaluate` cell. The executor may then honor the access grant without
     /// asking the evaluator to decide the same typed operation again.
@@ -64,7 +67,7 @@ pub struct VerbMatchInfo {
     pub overridden: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum VerbDecision {
     None,
     Preauthorized,
@@ -284,6 +287,7 @@ pub fn resolve_scoped_matches(
                 params: first.matched.rendered.params.clone(),
                 catalog_version,
                 verb_digest: None,
+                composition_digest: None,
                 access_evaluation_override_eligible,
             }),
             revert,

@@ -3,6 +3,8 @@ use crate::server::admin::handle_admin_request_for_test;
 use crate::server::binary_path_candidates;
 #[cfg(unix)]
 use crate::server::execute::exec_after_approval_with_secret_authority;
+#[cfg(unix)]
+use crate::server::execute::execute_command_streaming;
 use crate::server::execute::{
     audit_command_line, audit_session_fingerprint, evaluation_context_prompt, execute_command,
     log_audit_policy_for_request, AnsibleInventoryDiagnostics,
@@ -36,6 +38,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
+#[cfg(unix)]
+use super::attach_test_audit_log;
 use super::capture_async;
 #[cfg(unix)]
 use super::production_audit_buffer;
@@ -124,28 +128,44 @@ impl Drop for EnvRestore {
 }
 
 #[test]
-fn audit_command_line_masks_inline_credentials() {
+fn audit_command_line_masks_sensitive_original_argv() {
+    let value = ["q", "7"].concat();
     let line = audit_command_line(
         "mysql",
         &[
             "-u".to_string(),
             "root".to_string(),
-            "--password=hunter2sekrit".to_string(),
+            format!("--password={value}"),
         ],
     );
-    assert!(!line.contains("hunter2sekrit"), "got: {line}");
-    assert!(line.contains("mysql"), "command shape survives: {line}");
+    assert!(!line.contains(&value));
+    assert!(line.contains("mysql"));
 
     let line = audit_command_line(
         "curl",
         &[
             "-H".to_string(),
-            "Authorization: Bearer sk-live-abcdef1234567890".to_string(),
+            format!("Authorization:\n{value}"),
             "https://api.example.com".to_string(),
         ],
     );
-    assert!(!line.contains("sk-live-abcdef1234567890"), "got: {line}");
-    assert!(line.contains("curl"), "got: {line}");
+    assert!(!line.contains(&value));
+    assert!(line.contains("curl"));
+
+    let line = audit_command_line("curl", &["-u".to_string(), value.clone()]);
+    assert!(!line.contains(&value));
+
+    let line = audit_command_line("curl.EXE", &[format!("-u:{value}")]);
+    assert!(!line.contains(&value));
+
+    let line = audit_command_line(
+        r"C:\Tools\docker.CMD",
+        &["login".to_string(), format!("-p{value}")],
+    );
+    assert!(!line.contains(&value));
+
+    let line = audit_command_line("ssh", &["-p".to_string(), "2222".to_string()]);
+    assert!(line.contains("-p 2222"));
 }
 
 /// Audit fingerprints are stable, distinct, 128-bit identifiers that do not
@@ -1023,6 +1043,137 @@ pub(super) async fn run_denying_llm(listener: tokio::net::TcpListener) {
     }
 }
 
+#[cfg(unix)]
+async fn run_policy_llm_once(
+    listener: tokio::net::TcpListener,
+    decision: &'static str,
+    reason: String,
+) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while let Ok(read) = stream.read(&mut chunk).await {
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .split("\r\n")
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length: ")
+                        .or_else(|| line.strip_prefix("content-length: "))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+    }
+    let arguments = serde_json::json!({
+        "decision": decision,
+        "reason": reason,
+        "risk": 1,
+    })
+    .to_string();
+    let body = serde_json::json!({
+        "choices": [{"message": {"tool_calls": [{
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "decide", "arguments": arguments}
+        }]}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn evaluator_rationale_cannot_reach_policy_audit_or_stream() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = temp.path().join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    for binary in ["curl", "mysqlsh"] {
+        let path = bin_dir.join(binary);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+
+    for (decision, binary, args, value) in [
+        (
+            "DENY",
+            "curl",
+            vec!["-u".to_string(), ["q", "7"].concat()],
+            ["q", "7"].concat(),
+        ),
+        (
+            "APPROVE",
+            "mysqlsh",
+            vec![format!("-p{}", ["r", "8"].concat())],
+            ["r", "8"].concat(),
+        ),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let mock = tokio::spawn(run_policy_llm_once(
+            listener,
+            decision,
+            format!("policy rationale password={value}"),
+        ));
+        let (mut cfg, logs) = make_test_config();
+        cfg.state.evaluator = Arc::new(
+            Evaluator::new(
+                EvalConfig::default()
+                    .cache_enabled(false)
+                    .llm_api_key("test-key".to_string())
+                    .llm_api_url(url)
+                    .llm_retries(0),
+            )
+            .unwrap(),
+        );
+        let (_audit_dir, audit) = attach_test_audit_log(&mut cfg);
+        let mut stream = Vec::new();
+        let request = basic_request(binary, args);
+        let (result, captured_logs) = capture_async(
+            &logs,
+            execute_command_streaming(
+                request,
+                &cfg,
+                &CallerIdentity::Unix { uid: 1000 },
+                &mut stream,
+            ),
+        )
+        .await;
+        mock.await.unwrap();
+
+        assert!(!result.policy_reason().contains(&value));
+        assert!(!stream
+            .windows(value.len())
+            .any(|part| part == value.as_bytes()));
+        assert!(
+            !captured_logs.contains(&value),
+            "{decision} rationale leaked for {binary}"
+        );
+        let durable = std::fs::read_to_string(audit.path()).unwrap();
+        assert!(!durable.contains(&value));
+    }
+}
+
 fn basic_request(binary: &str, args: Vec<String>) -> ExecuteRequest {
     ExecuteRequest {
         binary: binary.to_string(),
@@ -1238,6 +1389,11 @@ async fn repeated_llm_denials_append_count_hint_at_threshold_only() {
     tokio::spawn(run_denying_llm(listener));
 
     let temp = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut deny_config = DenyLearningConfig::new(temp.path().join("deny.yaml"));
     deny_config.min_denials = 2;
     let deny_store = DenyShapeStore::load(deny_config).unwrap();
@@ -1420,8 +1576,8 @@ async fn audit_line_injection_via_argv_is_escaped() {
     })
     .await;
 
-    // The durable JSONL record carries the raw injected string as a JSON
-    // field: physical-line forgery is impossible in the structured sink.
+    // The injected string is benign under argv-aware redaction and remains a
+    // JSON field, where physical-line forgery is impossible.
     let jsonl = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("read audit log");
     assert_eq!(
         jsonl.lines().count(),
@@ -1434,11 +1590,11 @@ async fn audit_line_injection_via_argv_is_escaped() {
     assert_eq!(
         record.event.cmd.as_deref(),
         Some(format!("echo {forged}").as_str()),
-        "the raw argv (newline included) is a JSON field, not a physical line"
+        "the redacted argv display is a JSON field, not a physical line"
     );
     assert_eq!(
         record.event.reason.as_deref(),
-        Some("denied\r\n[AUDIT] ALLOWED forged-via-reason")
+        Some("denied\n[AUDIT] ALLOWED forged-via-reason")
     );
     assert!(
         !jsonl
@@ -1466,7 +1622,7 @@ async fn audit_line_injection_via_argv_is_escaped() {
         "argv injection must appear escaped on the original line: {output}"
     );
     assert!(
-        output.contains("denied\\r\\n[AUDIT] ALLOWED forged-via-reason"),
+        output.contains("denied\\n[AUDIT] ALLOWED forged-via-reason"),
         "reason injection must appear escaped on the original line: {output}"
     );
     assert!(
@@ -1622,6 +1778,72 @@ async fn audit_allowed_then_exec_failed_emits_both_events() {
         output.contains("No such file"),
         "EXEC_FAILED line should carry the exec error reason: {output}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn execution_failure_prose_is_sanitized_before_audit_stream_and_response() {
+    let value = ["q", "7"].concat();
+    let (mut cfg, logs) = make_test_config();
+    let (_audit_dir, audit) = attach_test_audit_log(&mut cfg);
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let result = ExecuteResult::exec_failed(
+        "ordinary allow",
+        format!("failed to resolve password={value}"),
+    );
+
+    let (_, captured_logs) = capture_async(&logs, async {
+        emit_audit_events(&cfg, &caller, "fixturectl", &[], &result);
+    })
+    .await;
+    assert!(!captured_logs.contains(&value));
+    assert!(!std::fs::read_to_string(audit.path())
+        .unwrap()
+        .contains(&value));
+    if let ExecOutcome::Failed { reason, .. } = &result.exec {
+        assert!(!reason.contains(&value));
+    } else {
+        panic!("expected execution failure");
+    }
+    assert!(!serde_json::to_string(&result.into_response())
+        .unwrap()
+        .contains(&value));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_exact_literal_is_rejected_and_absent_from_all_command_projections() {
+    let value = ["x", "!"].concat();
+    let (mut cfg, logs) = make_test_config();
+    cfg.config.redact_secrets.push(value.clone());
+    let (_audit_dir, audit) = attach_test_audit_log(&mut cfg);
+    let token = "exact-literal-session".to_string();
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant(token.clone(), unrestricted_session());
+    let mut request = basic_request("echo", vec![value.clone()]);
+    request.session_token = Some(token);
+
+    let (result, captured_logs) = capture_async(
+        &logs,
+        execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }),
+    )
+    .await;
+
+    assert!(!result.policy_allowed());
+    assert!(!serde_json::to_string(&result.into_response())
+        .unwrap()
+        .contains(&value));
+    assert!(!captured_logs.contains(&value));
+    assert!(!std::fs::read_to_string(audit.path())
+        .unwrap()
+        .contains(&value));
+    let interactions = cfg.state.sessions.read().await.interactions_snapshot();
+    assert!(!serde_json::to_string(&interactions)
+        .unwrap()
+        .contains(&value));
 }
 
 /// Policy allows + exec succeeds: only the POLICY event fires.
@@ -2271,13 +2493,14 @@ async fn caller_env_cannot_override_daemon_child_env() {
 async fn redaction_covers_effective_tool_child_and_request_env_values() {
     let (mut cfg, _) = make_test_config();
     cfg.config.redact = true;
+    let short_exact = ['q', '7'].iter().collect::<String>();
     let _restore = EnvRestore::capture("GUARD_CHILD_SECRET");
     std::env::set_var("GUARD_CHILD_SECRET", "daemon-child-secret-value");
     cfg.config.extra_child_env = vec!["GUARD_CHILD_SECRET".to_string()];
     let tools = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         tools.path(),
-        "tools:\n  sh:\n    env:\n      TOOL_SECRET: guard-tool-secret-value\n",
+        format!("tools:\n  sh:\n    env:\n      TOOL_SECRET: {short_exact}\n"),
     )
     .unwrap();
     *cfg.state.tool_registry.write().await =
@@ -2324,10 +2547,7 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
     match result.exec {
         ExecOutcome::Completed { stdout, .. } => {
             let stdout = stdout.unwrap_or_default();
-            assert!(
-                !stdout.contains("guard-tool-secret-value"),
-                "stdout={stdout}"
-            );
+            assert!(!stdout.contains(&short_exact));
             assert!(
                 !stdout.contains("daemon-child-secret-value"),
                 "stdout={stdout}"
@@ -2337,6 +2557,58 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
         }
         other => panic!("expected redacted env output, got {:?}", other),
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trusted_exact_tool_values_redact_when_heuristic_redaction_is_disabled() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.redact = false;
+    let exact = ['¤', '9'].iter().collect::<String>();
+    cfg.state
+        .secrets
+        .set(&PrincipalKey::from_uid(1000), "tool/exact", &exact)
+        .await
+        .unwrap();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  sh:\n    secrets:\n      TOOL_EXACT: tool/exact\n",
+    )
+    .unwrap();
+    *cfg.state.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+
+    let token = "exact-output-redaction";
+    cfg.state.sessions.write().await.grant(
+        token.to_string(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1000)),
+        },
+    );
+    let mut request = basic_request(
+        "sh",
+        vec!["-c".to_string(), "printf '%s' \"$TOOL_EXACT\"".to_string()],
+    );
+    request.session_token = Some(token.to_string());
+    let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    let ExecOutcome::Completed { stdout, .. } = result.exec else {
+        panic!("expected completed command");
+    };
+    assert!(!stdout.unwrap_or_default().contains(&exact));
 }
 
 #[cfg(unix)]
@@ -2589,6 +2861,29 @@ fn containment_context_presents_the_complete_chain_to_the_evaluator() {
     ] {
         assert!(prompt.contains(required), "missing {required:?}: {prompt}");
     }
+}
+
+#[test]
+fn containment_context_redacts_each_structured_command_before_flattening() {
+    use crate::server::execute::merge_envelope_context;
+    use crate::server::{CommandSpec, RevertSpec};
+
+    let forward_value = ["q", "7"].concat();
+    let rollback_value = ["r", "8"].concat();
+    let check_value = ["s", "9"].concat();
+    let mut request = basic_request("curl", vec!["-u".into(), forward_value.clone()]);
+    let mut revert = RevertSpec::new("mysqlsh.exe", vec![format!("-p{rollback_value}")]);
+    revert.confirm_check = Some(CommandSpec {
+        binary: "mariadb-access".into(),
+        args: vec!["-P".into(), check_value.clone()],
+    });
+    request.revert = Some(revert);
+
+    let prompt = merge_envelope_context(None, &request).unwrap();
+    for value in [forward_value, rollback_value, check_value] {
+        assert!(!prompt.contains(&value));
+    }
+    assert_eq!(prompt.matches("[REDACTED]").count(), 3);
 }
 
 #[cfg(unix)]

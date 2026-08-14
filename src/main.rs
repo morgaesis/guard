@@ -860,6 +860,8 @@ enum ServerCommands {
         /// irreversible command is never eligible, since it always holds for
         /// operator approval regardless of `trusted`. See
         /// `gating::allow_promotion` for the full safety rationale.
+        /// The packaged Windows service disables promotion because its catalog
+        /// is administrator-owned immutable process input.
         /// Env: GUARD_LEARN_ALLOW.
         #[arg(
             long,
@@ -940,7 +942,8 @@ enum ServerCommands {
         approval_ttl: Option<String>,
 
         /// Path to the verb catalog YAML (the operator-defined, typed interface
-        /// agents call via `guard verb`). Hot-reloaded on change.
+        /// agents call via `guard verb`). Foreground servers hot-reload changes;
+        /// the packaged Windows service loads its catalog once at startup.
         /// Env: GUARD_VERBS.
         #[arg(long, value_name = "PATH")]
         verbs: Option<PathBuf>,

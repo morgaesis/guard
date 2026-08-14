@@ -4,18 +4,17 @@ use crate::session::{
     SessionInteraction, SessionOwner, SessionRegistry,
 };
 use crate::session_store::SessionStore;
-#[cfg(unix)]
-use anyhow::Context;
-use anyhow::{bail, Result};
+use crate::tool_config::{ResolvedToolEnv, ToolRegistry};
+use anyhow::{bail, Context, Result};
 use guard::gating::coverage::{
     baseline_override_applies, resolve_scoped_matches, ScopedCoverageMatch, VerbDecision,
     VerbResolution,
 };
-use guard::gating::verb::CoverageAction;
+use guard::gating::verb::{CoverageAction, VerbCatalog};
 use guard::gating::{Coverage, DecisionTrace};
 use guard::redact::{
-    command_line, redact_exact_secrets, redact_output, redact_output_text,
-    redact_output_with_state, RedactionState,
+    command_contains_exact_secrets, command_line, redact_command_line, redact_exact_secrets,
+    redact_output_text, redact_output_with_state, ExactSecretStreamRedactor, RedactionState,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -27,8 +26,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 #[cfg(unix)]
@@ -45,7 +45,7 @@ use super::learning::{
 };
 #[cfg(unix)]
 use super::path_with_shim_dir;
-use super::runtime::NotifyEvent;
+use super::runtime::{NotifyEvent, ProcessGuard};
 use super::transport::{write_policy_decision, write_stream_message};
 #[cfg(unix)]
 use super::wire::ExecOutcome;
@@ -84,7 +84,7 @@ pub(super) fn log_audit_policy_for_request(
                 .caller(caller)
                 .session_fingerprint(audit_session_fingerprint(request.session_token.as_deref()))
                 .cwd(cwd.display().to_string())
-                .cmd(audit_command_line(&request.binary, &request.args))
+                .cmd(server.redact_command_line(&request.binary, &request.args))
                 .reason(reason),
         )
     } else {
@@ -255,7 +255,7 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
     command_line: String,
     depth: u32,
 ) -> ExecuteResult {
-    if let Err(result) = enforce_binary_policy(phase, &request, &command_line).await {
+    if let Err(result) = enforce_binary_policy(phase, &request).await {
         return result;
     }
 
@@ -267,7 +267,6 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
         return deny_and_record(
             phase,
             &request,
-            command_line,
             SessionDecisionSource::SessionDeny,
             None,
             reason,
@@ -287,7 +286,6 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
         phase,
         request,
         &verb_resolution.context,
-        &command_line,
         depth,
         force_evaluate,
     )
@@ -306,20 +304,13 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
     }
 
     if !force_evaluate {
-        request = match try_trusted_verb_allow(
-            phase,
-            request,
-            &verb_resolution.context,
-            &command_line,
-            depth,
-        )
-        .await
-        {
-            Ok(request) => request,
-            Err(result) => return result,
-        };
+        request =
+            match try_trusted_verb_allow(phase, request, &verb_resolution.context, depth).await {
+                Ok(request) => request,
+                Err(result) => return result,
+            };
 
-        request = match try_static_fast_allow(phase, request, &command_line, depth).await {
+        request = match try_static_fast_allow(phase, request, depth).await {
             Ok(request) => request,
             Err(result) => return result,
         };
@@ -376,7 +367,6 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line(&request.binary, &request.args),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -388,7 +378,6 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line(&request.binary, &request.args),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -406,7 +395,6 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
             return Err(deny_and_record(
                 phase,
                 request,
-                command_line(&request.binary, &request.args),
                 SessionDecisionSource::Validation,
                 None,
                 reason,
@@ -425,7 +413,6 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
             return Err(deny_and_record(
                 phase,
                 request,
-                command_line(&request.binary, &request.args),
                 SessionDecisionSource::Validation,
                 None,
                 reason,
@@ -441,7 +428,6 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line(&request.binary, &request.args),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -553,13 +539,23 @@ fn selected_session_verbs<W: AsyncWrite + Unpin>(phase: &ExecPhase<'_, W>) -> Ve
 async fn deny_and_record<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &ExecuteRequest,
-    command: String,
     source: SessionDecisionSource,
     risk: Option<i32>,
     mut reason: String,
 ) -> ExecuteResult {
     let mut access_request_handle = None;
-    let durable_command = redact_output_text(&command);
+    let trusted_secrets = phase
+        .server
+        .config
+        .redact_secrets
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let durable_command = guard::redact::redact_command_line_with_exact_secrets(
+        &request.binary,
+        &request.args,
+        &trusted_secrets,
+    );
     let hard_verb_deny = phase.verb_matches.iter().any(|matched| {
         matched.selected
             && !matched.overridden
@@ -650,69 +646,78 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                     request
                 }))
             });
-            let (request, created) = {
-                let mut requests = phase.server.state.grant_requests.write().await;
-                let queue_full = requests.len() >= super::admin::MAX_GRANT_REQUESTS
-                    || requests
-                        .values()
-                        .filter(|request| {
-                            request.session_token == token
-                                && request.status
-                                    == crate::grant_profile::GrantRequestStatus::Pending
-                        })
-                        .count()
-                        >= super::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION;
-                if let Some(existing) = requests
+            let _transition = phase
+                .server
+                .state
+                .grant_request_transition_gate
+                .lock()
+                .await;
+            let baseline_requests = phase.server.state.grant_requests.read().await.clone();
+            let queue_full = baseline_requests.len() >= super::admin::MAX_GRANT_REQUESTS
+                || baseline_requests
                     .values()
-                    .find(|request| {
+                    .filter(|request| {
                         request.session_token == token
                             && request.status == crate::grant_profile::GrantRequestStatus::Pending
-                            && request.expires_unix > now
-                            && request.issued_session_revision
-                                == candidate
-                                    .as_ref()
-                                    .and_then(|candidate| candidate.issued_session_revision.clone())
-                            && request.request_key
-                                == candidate
-                                    .as_ref()
-                                    .map(|candidate| candidate.request_key.as_str())
-                                    .unwrap_or_default()
                     })
-                    .cloned()
+                    .count()
+                    >= super::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION;
+            let existing = baseline_requests
+                .values()
+                .find(|request| {
+                    request.session_token == token
+                        && request.status == crate::grant_profile::GrantRequestStatus::Pending
+                        && request.expires_unix > now
+                        && request.issued_session_revision
+                            == candidate
+                                .as_ref()
+                                .and_then(|candidate| candidate.issued_session_revision.clone())
+                        && request.request_key
+                            == candidate
+                                .as_ref()
+                                .map(|candidate| candidate.request_key.as_str())
+                                .unwrap_or_default()
+                })
+                .cloned();
+            let (request, created) = if let Some(existing) = existing {
+                (Some(existing), false)
+            } else if queue_full {
+                (None, false)
+            } else if let Some(candidate) = candidate {
+                if super::admin::grant_request_payload_bytes(&candidate)
+                    > super::admin::MAX_GRANT_REQUEST_PAYLOAD_BYTES
                 {
-                    (Some(existing), false)
-                } else if queue_full {
                     (None, false)
-                } else if let Some(candidate) = candidate {
-                    if super::admin::grant_request_payload_bytes(&candidate)
-                        > super::admin::MAX_GRANT_REQUEST_PAYLOAD_BYTES
-                    {
-                        (None, false)
-                    } else {
-                        let persisted = if let Some(store) = &phase.server.state.session_store {
-                            match store.save_grant_request(candidate.clone()).await {
-                                Ok(()) => true,
-                                Err(error) => {
-                                    tracing::warn!(
-                                        "failed to persist denial escalation: {}",
-                                        error
-                                    );
-                                    false
-                                }
+                } else {
+                    let persisted = if let Some(store) = &phase.server.state.session_store {
+                        match store.save_grant_request(candidate.clone()).await {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::warn!("failed to persist denial escalation: {}", error);
+                                false
                             }
-                        } else {
-                            true
-                        };
-                        if persisted {
+                        }
+                    } else {
+                        true
+                    };
+                    if persisted {
+                        let mut requests = phase.server.state.grant_requests.write().await;
+                        if *requests == baseline_requests {
                             requests.insert(candidate.handle.clone(), candidate.clone());
                             (Some(candidate), true)
                         } else {
-                            (None, false)
+                            let converged = requests
+                                .values()
+                                .find(|request| request.request_key == candidate.request_key)
+                                .cloned();
+                            (converged, false)
                         }
+                    } else {
+                        (None, false)
                     }
-                } else {
-                    (None, false)
                 }
+            } else {
+                (None, false)
             };
             if let Some(request) = request {
                 if request.requester.is_some() {
@@ -753,24 +758,15 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                 }
             }
         } else {
-            let matching_intent = {
-                let mut catalog = phase.server.state.verbs.write().await;
-                if let Err(error) = catalog.reload_if_stale() {
-                    tracing::warn!("verb catalog reload failed, using previous: {error}");
-                }
-                catalog
-                    .match_command_all(&request.binary, &request.args)
-                    .into_iter()
-                    .find(|matched| !matched.rendered.baseline)
-                    .map(|matched| matched.rendered.name)
-            };
-            let intent = matching_intent.unwrap_or_else(|| durable_command.clone());
+            let observed_argv = Some((request.binary.as_str(), request.args.as_slice()));
+            let intent = durable_command.clone();
             match super::admin::submit_access_request(
                 phase.server,
                 phase.caller,
                 None,
                 &intent,
                 None,
+                observed_argv,
             )
             .await
             {
@@ -812,7 +808,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
         phase.session_token.as_deref(),
         SessionInteraction {
             at_unix: 0,
-            command,
+            command: durable_command,
             allowed: false,
             source,
             reason: reason.clone(),
@@ -836,13 +832,24 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
     inputs: GateInputs,
-    command: String,
     source: SessionDecisionSource,
     depth: u32,
 ) -> ExecuteResult {
     let reason = inputs.reason.clone();
     let risk = inputs.risk;
     let trace = decision_trace_for_phase(phase, source, true);
+    let trusted_secrets = phase
+        .server
+        .config
+        .redact_secrets
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let interaction_command = guard::redact::redact_command_line_with_exact_secrets(
+        &request.binary,
+        &request.args,
+        &trusted_secrets,
+    );
     let mut context = RequestContext {
         server: phase.server,
         caller: phase.caller,
@@ -856,7 +863,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
         phase.session_token.as_deref(),
         SessionInteraction {
             at_unix: 0,
-            command,
+            command: interaction_command,
             allowed: true,
             source,
             reason,
@@ -929,20 +936,277 @@ struct EvaluationConstraints {
     typed_evaluation_required: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct VerbAuthorityExpectation {
+    pub(super) name: String,
+    pub(super) catalog_version: Option<u64>,
+    pub(super) definition_digest: Option<String>,
+    pub(super) composition_digest: Option<String>,
+}
+
+impl VerbAuthorityExpectation {
+    pub(super) fn from_context(context: &VerbContext) -> Self {
+        Self {
+            name: context.name.clone(),
+            catalog_version: Some(context.catalog_version),
+            definition_digest: context.verb_digest.clone(),
+            composition_digest: context.composition_digest.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CommandAuthorization {
+    check_learned_deny: bool,
+    verb: Option<VerbAuthorityExpectation>,
+    session: Option<SessionAuthoritySnapshot>,
+}
+
+impl CommandAuthorization {
+    pub(super) fn routed(
+        verb: Option<&VerbContext>,
+        session: Option<&SessionAuthoritySnapshot>,
+    ) -> Self {
+        Self {
+            check_learned_deny: true,
+            verb: verb.map(VerbAuthorityExpectation::from_context),
+            session: session.cloned(),
+        }
+    }
+
+    pub(super) fn replay(
+        verb: Option<VerbAuthorityExpectation>,
+        session: Option<SessionAuthoritySnapshot>,
+    ) -> Self {
+        Self {
+            check_learned_deny: true,
+            verb,
+            session,
+        }
+    }
+}
+
+struct CommandInitiationLease {
+    _learned_deny: Option<guard::evaluate::LearnedDenyUseLease>,
+    _verb: Option<guard::learned_rules::AuthorityUseLease<VerbCatalog>>,
+    _session: Option<tokio::sync::OwnedRwLockReadGuard<SessionRegistry>>,
+}
+
+struct ProcessInitiationLeases {
+    command: CommandInitiationLease,
+    tool_mapping: ToolMappingSpawnLease,
+}
+
+#[cfg(all(test, unix))]
+type CommandInitiationHook = (
+    std::sync::Arc<tokio::sync::Semaphore>,
+    std::sync::Arc<tokio::sync::Semaphore>,
+);
+
+#[cfg(all(test, unix))]
+fn command_initiation_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<usize, CommandInitiationHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<usize, CommandInitiationHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn pause_command_initiation_for_test(server: &ServerContext) -> CommandInitiationHook {
+    let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    command_initiation_hooks().lock().unwrap().insert(
+        std::sync::Arc::as_ptr(&server.state.verbs) as usize,
+        (reached.clone(), release.clone()),
+    );
+    (reached, release)
+}
+
+#[cfg(all(test, unix))]
+fn command_started_hooks() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<usize, std::sync::Arc<tokio::sync::Semaphore>>,
+> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<usize, std::sync::Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn observe_command_started_for_test(
+    server: &ServerContext,
+) -> std::sync::Arc<tokio::sync::Semaphore> {
+    let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    command_started_hooks().lock().unwrap().insert(
+        std::sync::Arc::as_ptr(&server.state.verbs) as usize,
+        reached.clone(),
+    );
+    reached
+}
+
+#[cfg(all(test, unix))]
+fn signal_command_started_for_test(server: &ServerContext) {
+    if let Some(reached) = command_started_hooks()
+        .lock()
+        .unwrap()
+        .remove(&(std::sync::Arc::as_ptr(&server.state.verbs) as usize))
+    {
+        reached.add_permits(1);
+    }
+}
+
+async fn acquire_command_initiation_lease(
+    server: &ServerContext,
+    request: &ExecuteRequest,
+    authorization: Option<&CommandAuthorization>,
+) -> Result<CommandInitiationLease, String> {
+    // Revocable command authority is acquired in one order: learned denies,
+    // verb catalog, then session registry. Administrative mutations acquire
+    // the same resources in that order so initiation cannot form a lock cycle.
+    #[cfg(all(test, unix))]
+    let hook = command_initiation_hooks()
+        .lock()
+        .unwrap()
+        .remove(&(std::sync::Arc::as_ptr(&server.state.verbs) as usize));
+    #[cfg(all(test, unix))]
+    if let Some((reached, release)) = hook {
+        reached.add_permits(1);
+        release
+            .acquire()
+            .await
+            .map_err(|_| "command initiation test hook closed".to_string())?
+            .forget();
+    }
+    let learned_deny = if authorization.is_some_and(|authority| authority.check_learned_deny) {
+        let lease = server
+            .state
+            .evaluator
+            .lease_learned_deny_for_use()
+            .await
+            .map_err(|error| format!("learned deny authority is unavailable: {error}"))?;
+        if let Some(reason) = lease.matching_reason(&request.binary, &request.args) {
+            return Err(format!("command denied before process start: {reason}"));
+        }
+        Some(lease)
+    } else {
+        None
+    };
+
+    let verb = if authorization
+        .and_then(|authority| authority.verb.as_ref())
+        .is_some()
+    {
+        let lease = server
+            .refresh_and_lease_verb_catalog_for_use("command process start")
+            .await
+            .map_err(|error| format!("verb catalog authority is unavailable: {error}"))?;
+        Some(lease)
+    } else {
+        None
+    };
+
+    let session = if let Some(token) = request.session_token.as_deref() {
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.state.sessions.clone().read_owned(),
+        )
+        .await
+        .map_err(|_| "timed out acquiring session authority coordination".to_string())?;
+        if !guard.has(token) {
+            return Err("session was revoked before process start".to_string());
+        }
+        if let Some(reason) = guard.suspension_reason(token, &server.config.behavior_limits) {
+            return Err(format!(
+                "session was suspended before process start: {reason}"
+            ));
+        }
+        if let Some(expected) = authorization.and_then(|authority| authority.session.as_ref()) {
+            let current = guard
+                .authority_snapshot(token)
+                .map(SessionAuthoritySnapshot::from);
+            if current.as_ref() != Some(expected) {
+                return Err("session authority changed before process start".to_string());
+            }
+        }
+        Some(guard)
+    } else if authorization
+        .and_then(|authority| authority.session.as_ref())
+        .is_some()
+    {
+        return Err("session authority is missing before process start".to_string());
+    } else {
+        None
+    };
+
+    if let (Some(expected), Some(lease)) = (
+        authorization.and_then(|authority| authority.verb.as_ref()),
+        verb.as_ref(),
+    ) {
+        let current =
+            compose_verb_authority_with_session(server, request, lease, session.as_deref()).await;
+        let Some(context) = current.context.as_ref() else {
+            return Err("composed verb authority no longer allows this command".to_string());
+        };
+        let unchanged = match expected.composition_digest.as_deref() {
+            Some(digest) => context.composition_digest.as_deref() == Some(digest),
+            None => {
+                let selected = current
+                    .matches
+                    .iter()
+                    .filter(|matched| matched.selected)
+                    .map(|matched| matched.verb.as_str())
+                    .collect::<BTreeSet<_>>();
+                selected.len() == 1
+                    && selected.contains(expected.name.as_str())
+                    && match expected.definition_digest.as_deref() {
+                        Some(digest) => context.verb_digest.as_deref() == Some(digest),
+                        None => {
+                            context.name == expected.name
+                                && expected.catalog_version == Some(lease.version())
+                        }
+                    }
+            }
+        };
+        if !unchanged {
+            return Err(
+                "composed verb authority was removed, amended, or changed before process start"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(CommandInitiationLease {
+        _learned_deny: learned_deny,
+        _verb: verb,
+        _session: session,
+    })
+}
+
 /// Resolve a verb invocation into a concrete command BEFORE any validation or
 /// evaluation. The rendered binary/args then pass through the same checks as a
 /// raw command; the verb's declared consequence class and rollback drive the
-/// gate. Verbs are operator-authored, so the catalog is hot-reloaded by mtime.
+/// gate. Verbs are operator-authored, so each deterministic decision refreshes
+/// from one locked durable snapshot before using catalog authority.
 async fn resolve_verb_context<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &mut ExecuteRequest,
 ) -> Result<VerbResolution, ExecuteResult> {
     let server = phase.server;
-    if let Some(invocation) = request.verb.clone() {
-        if !server.config.gate.is_on() {
-            let reason =
-                "verbs require consequence gating (start the daemon with --gate consequence)"
-                    .to_string();
+    if request.verb.is_some() && !server.config.gate.is_on() {
+        let reason = "verbs require consequence gating (start the daemon with --gate consequence)"
+            .to_string();
+        let _ = write_policy_decision(
+            phase.stream_output,
+            &mut *phase.stream_writer,
+            false,
+            &reason,
+        )
+        .await;
+        return Err(ExecuteResult::denied(reason));
+    }
+    if server.config.gate.is_on() {
+        if let Err(error) = server.refresh_verb_catalog_for_decision().await {
+            let reason = format!("verb catalog authority is unavailable: {error}");
             let _ = write_policy_decision(
                 phase.stream_output,
                 &mut *phase.stream_writer,
@@ -952,11 +1216,33 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             .await;
             return Err(ExecuteResult::denied(reason));
         }
-        let rendered = {
-            let mut cat = server.state.verbs.write().await;
-            if let Err(e) = cat.reload_if_stale() {
-                tracing::warn!("verb catalog reload failed, using previous: {}", e);
+    }
+    let catalog_lease = if server.config.gate.is_on() {
+        match server
+            .lease_verb_catalog_for_use("verb matcher selection")
+            .await
+        {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                let reason = format!("verb catalog authority is unavailable: {error}");
+                let _ = write_policy_decision(
+                    phase.stream_output,
+                    &mut *phase.stream_writer,
+                    false,
+                    &reason,
+                )
+                .await;
+                return Err(ExecuteResult::denied(reason));
             }
+        }
+    } else {
+        None
+    };
+    if let Some(invocation) = request.verb.clone() {
+        let rendered = {
+            let cat = catalog_lease
+                .as_ref()
+                .expect("gated verb rendering holds catalog authority");
             cat.render(&invocation.name, &invocation.params)
                 .map(|r| (r, cat.version()))
         };
@@ -998,57 +1284,91 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
         return Ok(VerbResolution::none());
     }
 
-    let (raw_matches, version, definition_digests) = {
-        let mut cat = server.state.verbs.write().await;
-        if let Err(e) = cat.reload_if_stale() {
-            tracing::warn!("verb catalog reload failed, using previous: {}", e);
-        }
-        let plain = request
-            .env
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let secrets = request
-            .secrets
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let secret_files = request
-            .secret_files
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let raw_matches = cat.match_command_all_with_environment_and_cwd(
-            &request.binary,
-            &request.args,
-            &plain,
-            &secrets,
-            &secret_files,
-            request.cwd.as_deref(),
-        );
-        // Captured under the same catalog read as the version, so a held
-        // approval binds to exactly the definition that produced the match.
-        let definition_digests = raw_matches
-            .iter()
-            .filter_map(|matched| {
-                cat.verb_definition_digest(&matched.rendered.name)
-                    .map(|digest| (matched.rendered.name.clone(), digest))
-            })
-            .collect::<BTreeMap<_, _>>();
-        (raw_matches, cat.version(), definition_digests)
-    };
-    if raw_matches.is_empty() {
+    let resolution = compose_verb_authority(
+        server,
+        request,
+        catalog_lease
+            .as_ref()
+            .expect("gated reverse matching holds catalog authority"),
+    )
+    .await;
+    if resolution.matches.is_empty() {
         return Ok(VerbResolution::none());
     }
+    // The composed resolution carries the selected coverage's revert plan
+    // exactly when it produced a verb context; apply it to the pending
+    // request so the gate sees the operator-authored rollback.
+    if resolution.context.is_some() {
+        request.revert = resolution
+            .revert
+            .clone()
+            .map(|(binary, args)| RevertSpec::new(binary, args));
+    }
+    Ok(resolution)
+}
+
+async fn compose_verb_authority(
+    server: &ServerContext,
+    request: &ExecuteRequest,
+    catalog: &VerbCatalog,
+) -> VerbResolution {
+    compose_verb_authority_with_session(server, request, catalog, None).await
+}
+
+async fn compose_verb_authority_with_session(
+    server: &ServerContext,
+    request: &ExecuteRequest,
+    catalog: &VerbCatalog,
+    sessions: Option<&SessionRegistry>,
+) -> VerbResolution {
+    let plain = request
+        .env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let secrets = request
+        .secrets
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let secret_files = request
+        .secret_files
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let raw_matches = catalog.match_command_all_with_environment_and_cwd(
+        &request.binary,
+        &request.args,
+        &plain,
+        &secrets,
+        &secret_files,
+        request.cwd.as_deref(),
+    );
+    if raw_matches.is_empty() {
+        return VerbResolution::none();
+    }
+
+    let definition_digests = raw_matches
+        .iter()
+        .filter_map(|matched| {
+            catalog
+                .verb_definition_digest(&matched.rendered.name)
+                .map(|digest| (matched.rendered.name.clone(), digest))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let (activated, override_markers) = if let Some(token) = request.session_token.as_deref() {
-        server
-            .state
-            .sessions
-            .read()
-            .await
-            .verb_scope_for(token)
-            .unwrap_or_default()
+        if let Some(sessions) = sessions {
+            sessions.verb_scope_for(token).unwrap_or_default()
+        } else {
+            server
+                .state
+                .sessions
+                .read()
+                .await
+                .verb_scope_for(token)
+                .unwrap_or_default()
+        }
     } else {
         (Vec::new(), Vec::new())
     };
@@ -1092,26 +1412,44 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             overridden,
         });
     }
-    let mut resolution = resolve_scoped_matches(scoped, version);
+    let mut resolution = resolve_scoped_matches(scoped, catalog.version());
     if let Some(context) = resolution.context.as_mut() {
         context.verb_digest = definition_digests.get(&context.name).cloned();
+        let selected_definitions = resolution
+            .matches
+            .iter()
+            .filter(|matched| matched.selected)
+            .filter_map(|matched| {
+                definition_digests
+                    .get(&matched.verb)
+                    .map(|digest| (matched.verb.clone(), digest.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let material = serde_json::json!({
+            "decision": resolution.decision,
+            "matches": resolution.matches,
+            "selected_definitions": selected_definitions,
+            "class": context.class,
+            "params": context.params,
+            "revert": resolution.revert,
+            "access_evaluation_override_eligible": context.access_evaluation_override_eligible,
+        });
+        let canonical = serde_json::to_vec(&material).expect("verb authority material serializes");
+        context.composition_digest = Some(
+            Sha256::digest(canonical)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        );
     }
-    // The composed resolution carries the selected coverage's revert plan
-    // exactly when it produced a verb context; apply it to the pending
-    // request so the gate sees the operator-authored rollback.
-    if resolution.context.is_some() {
-        request.revert = resolution
-            .revert
-            .clone()
-            .map(|(binary, args)| RevertSpec::new(binary, args));
-    }
-    Ok(resolution)
+    resolution
 }
 
 /// Static request validation before any policy decision: recursion depth,
 /// binary-name shape, and injection validation. Returns the recursion depth
-/// and the reconstructed command line, which the session short-circuit and
-/// the evaluator must share.
+/// and the reconstructed command line used by local policy, cache identity,
+/// and learning. Provider projection separately retains structured argv long
+/// enough to apply binary-specific redaction.
 async fn validate_exec_request<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &ExecuteRequest,
@@ -1126,7 +1464,6 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            request.binary.clone(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1140,7 +1477,6 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            request.binary.clone(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1154,16 +1490,33 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            request.binary.clone(),
             SessionDecisionSource::Validation,
             None,
             reason,
         )
         .await);
     }
+    let trusted_secrets = phase
+        .server
+        .config
+        .redact_secrets
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if command_contains_exact_secrets(&request.binary, &request.args, &trusted_secrets) {
+        return Err(deny_and_record(
+            phase,
+            request,
+            SessionDecisionSource::Validation,
+            None,
+            "command contains a daemon-managed credential literal; use a managed secret binding"
+                .to_string(),
+        )
+        .await);
+    }
 
-    // Reconstruct full command line early so session short-circuit and
-    // evaluator share the same command text.
+    // Reconstruct the local-policy command line. The provider path receives
+    // the structured binary and argv separately.
     let command_line = command_line(&request.binary, &request.args);
 
     if let Err(reason) =
@@ -1172,7 +1525,6 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line.clone(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1194,7 +1546,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
     verb_ctx: &Option<VerbContext>,
-    command_line: &str,
     depth: u32,
     force_evaluate: bool,
 ) -> Result<ExecuteRequest, ExecuteResult> {
@@ -1291,7 +1642,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             return Err(deny_and_record(
                 phase,
                 &request,
-                command_line.to_string(),
                 SessionDecisionSource::SessionDeny,
                 None,
                 reason,
@@ -1304,7 +1654,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                     return Err(deny_and_record(
                         phase,
                         &request,
-                        command_line.to_string(),
                         SessionDecisionSource::SessionDeny,
                         None,
                         reason,
@@ -1342,7 +1691,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                             return Err(deny_and_record(
                                 phase,
                                 &request,
-                                command_line.to_string(),
                                 SessionDecisionSource::SessionDeny,
                                 None,
                                 reason,
@@ -1364,7 +1712,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                         phase,
                         request,
                         inputs,
-                        command_line.to_string(),
                         SessionDecisionSource::SessionAllow,
                         depth,
                     )
@@ -1383,7 +1730,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             return Err(deny_and_record(
                 phase,
                 &request,
-                command_line.to_string(),
                 SessionDecisionSource::SessionStaticOnly,
                 None,
                 reason,
@@ -1399,7 +1745,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
 async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &ExecuteRequest,
-    command_line: &str,
 ) -> Result<(), ExecuteResult> {
     let server = phase.server;
     // Server-wide binary allow-list: a hard floor enforced before evaluation on
@@ -1413,7 +1758,6 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line.to_string(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1429,7 +1773,6 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line.to_string(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1442,7 +1785,6 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
             return Err(deny_and_record(
                 phase,
                 request,
-                command_line.to_string(),
                 SessionDecisionSource::Validation,
                 None,
                 reason,
@@ -1464,7 +1806,6 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
 async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
-    command_line: &str,
     depth: u32,
 ) -> Result<ExecuteRequest, ExecuteResult> {
     let server = phase.server;
@@ -1498,7 +1839,6 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
                     return Err(deny_and_record(
                         phase,
                         &request,
-                        command_line.to_string(),
                         SessionDecisionSource::SessionDeny,
                         None,
                         reason,
@@ -1520,7 +1860,6 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
                 phase,
                 request,
                 inputs,
-                command_line.to_string(),
                 SessionDecisionSource::StaticPolicy,
                 depth,
             )
@@ -1578,7 +1917,6 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
     verb_ctx: &Option<VerbContext>,
-    command_line: &str,
     depth: u32,
 ) -> Result<ExecuteRequest, ExecuteResult> {
     if let Some(vc) = verb_ctx.clone() {
@@ -1606,7 +1944,6 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
                     return Err(deny_and_record(
                         phase,
                         &request,
-                        command_line.to_string(),
                         SessionDecisionSource::SessionDeny,
                         None,
                         reason,
@@ -1628,7 +1965,6 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
                 phase,
                 request,
                 inputs,
-                command_line.to_string(),
                 SessionDecisionSource::StaticPolicy,
                 depth,
             )
@@ -1661,7 +1997,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             return deny_and_record(
                 phase,
                 &request,
-                command_line,
                 SessionDecisionSource::SessionDeny,
                 None,
                 reason,
@@ -1680,7 +2015,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             return deny_and_record(
                 phase,
                 &request,
-                command_line,
                 SessionDecisionSource::EvaluatorError,
                 None,
                 reason.to_string(),
@@ -1696,8 +2030,9 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
     let eval_result = server
         .state
         .evaluator
-        .evaluate_scoped(
-            &command_line,
+        .evaluate_scoped_argv(
+            &request.binary,
+            &request.args,
             evaluation_prompt.as_deref(),
             request.reevaluate,
             evaluation_prompt.is_some(),
@@ -1759,7 +2094,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             deny_and_record(
                 phase,
                 &request,
-                command_line,
                 session_source_from_eval(source),
                 risk,
                 reason,
@@ -1772,7 +2106,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             deny_and_record(
                 phase,
                 &request,
-                command_line,
                 SessionDecisionSource::EvaluatorError,
                 None,
                 reason,
@@ -1885,7 +2218,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 phase,
                 request,
                 inputs,
-                command_line,
                 session_source_from_eval(source),
                 depth,
             )
@@ -1969,15 +2301,12 @@ fn caller_environment_subject(request: &ExecuteRequest) -> Option<String> {
     ))
 }
 
-/// Render a command line for an audit event with secret-shaped values
-/// masked. Argv routinely carries inline credentials (`--password=...`,
-/// `Authorization: Bearer <token>`, connection URLs); the audit trail needs
-/// the command shape, not the values, and the daemon log must not become a
-/// secret store. The value is stored raw in the typed event: the JSONL sink
-/// JSON-encodes it (no physical-line forgery is possible), and the stderr
-/// projection applies `audit_escape` at render time.
+/// Render a command line for an audit event with secret-shaped values masked.
+/// Classification runs while argv boundaries are intact, and the typed event
+/// stores only the resulting redacted display line. JSONL encoding and the
+/// stderr projection separately prevent physical-line record forgery.
 pub(super) fn audit_command_line(binary: &str, args: &[String]) -> String {
-    redact_output(&command_line(binary, args))
+    redact_command_line(binary, args)
 }
 
 pub(super) async fn persist_session_snapshot(
@@ -1988,6 +2317,87 @@ pub(super) async fn persist_session_snapshot(
         store.persist_registry(&snapshot).await?;
     }
     Ok(())
+}
+
+/// Resolve one tool mapping without retaining the global registry lock across
+/// secret-backend I/O. A mapping change during resolution invalidates the
+/// result, so callers never use secret values selected by stale authority.
+pub(super) async fn resolve_current_tool_env(
+    server: &ServerContext,
+    binary: &str,
+    principal: Option<&guard::principal::PrincipalKey>,
+    user_key: Option<&str>,
+) -> Result<ResolvedCurrentToolEnv> {
+    let snapshot = {
+        let mut registry = server.state.tool_registry.write().await;
+        registry.reload_if_stale()?;
+        registry.clone()
+    };
+    let resolved = snapshot
+        .resolve_env(binary, &server.state.secrets, principal, user_key)
+        .await?;
+    let current = {
+        let mut registry = server.state.tool_registry.write().await;
+        registry.reload_if_stale()?;
+        registry.same_authority(&snapshot)
+    };
+    if !current {
+        bail!("tool environment authority changed during secret resolution");
+    }
+    Ok(ResolvedCurrentToolEnv {
+        resolved,
+        authority: snapshot,
+    })
+}
+
+pub(super) struct ResolvedCurrentToolEnv {
+    resolved: ResolvedToolEnv,
+    authority: ToolRegistry,
+}
+
+impl std::fmt::Debug for ResolvedCurrentToolEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedCurrentToolEnv")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvedCurrentToolEnv {
+    pub(super) fn into_resolved(self) -> ResolvedToolEnv {
+        self.resolved
+    }
+}
+
+impl std::ops::Deref for ResolvedCurrentToolEnv {
+    type Target = ResolvedToolEnv;
+
+    fn deref(&self) -> &Self::Target {
+        &self.resolved
+    }
+}
+
+struct ToolMappingSpawnLease {
+    _registry: tokio::sync::OwnedRwLockWriteGuard<ToolRegistry>,
+}
+
+async fn acquire_tool_mapping_spawn_lease(
+    server: &ServerContext,
+    expected: &ToolRegistry,
+) -> Result<ToolMappingSpawnLease> {
+    let mut registry = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.state.tool_registry.clone().write_owned(),
+    )
+    .await
+    .context("timed out acquiring tool mapping authority")?;
+    registry.reload_if_stale()?;
+    if !registry.same_authority(expected) {
+        bail!("tool environment authority changed before process start");
+    }
+    Ok(ToolMappingSpawnLease {
+        _registry: registry,
+    })
 }
 
 /// Validate access authority at the execution-admission boundary and consume
@@ -2006,57 +2416,88 @@ pub(super) async fn admit_access_use(
     let Some(token) = request.session_token.as_deref() else {
         return Ok(None);
     };
-    let mut sessions = server.state.sessions.write().await;
-    if !sessions.is_access_managed(token) {
-        return Ok(None);
-    }
-    let mut reloaded_after_conflict = false;
-    loop {
-        if !sessions.is_access_managed(token) {
-            return Err(
-                "access session expired or was revoked during durable admission".to_string(),
-            );
-        }
-        let mut staged = sessions.clone();
-        let admission = staged.consume_access_use(token, selected_verbs, preferred_requests)?;
-        let persist_result =
-            persist_session_snapshot(server.state.session_store.clone(), staged.clone()).await;
-        match persist_result {
-            Ok(()) => {
-                *sessions = staged;
-            }
-            Err(error)
-                if !reloaded_after_conflict
-                    && SessionStore::is_registry_generation_conflict(&error) =>
-            {
-                let Some(store) = &server.state.session_store else {
-                    return Err(format!("failed to persist access admission: {error}"));
-                };
-                *sessions = store.load_registry().await.map_err(|reload_error| {
-                    format!(
-                        "failed to reload sessions after a concurrent access admission: {reload_error}"
+    let server = server.clone();
+    let token = token.to_string();
+    let selected_verbs = selected_verbs.to_vec();
+    let preferred_requests = preferred_requests.map(ToOwned::to_owned);
+    let task = tokio::spawn(async move {
+        #[cfg(test)]
+        server
+            .state
+            .session_transition_attempt_events
+            .add_permits(1);
+        let _transition = server.state.grant_request_transition_gate.lock().await;
+        let mut reloaded_after_conflict = false;
+        loop {
+            let baseline = server.state.sessions.read().await.clone();
+            if !baseline.is_access_managed(&token) {
+                return if reloaded_after_conflict {
+                    Err(
+                        "access session expired or was revoked during durable admission"
+                            .to_string(),
                     )
-                })?;
-                reloaded_after_conflict = true;
-                continue;
+                } else {
+                    Ok(None)
+                };
             }
-            Err(error) => {
-                return Err(format!("failed to persist access admission: {error}"));
+            let mut staged = baseline.clone();
+            let admission = staged.consume_access_use(
+                &token,
+                &selected_verbs,
+                preferred_requests.as_deref(),
+            )?;
+            let persist_result =
+                persist_session_snapshot(server.state.session_store.clone(), staged.clone()).await;
+            match persist_result {
+                Ok(()) => {
+                    let mut sessions = server.state.sessions.write().await;
+                    if sessions.revision() != baseline.revision() {
+                        return Err(
+                            "access authority changed while durable admission was committing"
+                                .to_string(),
+                        );
+                    }
+                    *sessions = staged;
+                }
+                Err(error)
+                    if !reloaded_after_conflict
+                        && SessionStore::is_registry_generation_conflict(&error) =>
+                {
+                    let Some(store) = &server.state.session_store else {
+                        return Err(format!("failed to persist access admission: {error}"));
+                    };
+                    let durable = store.load_registry().await.map_err(|reload_error| {
+                        format!(
+                            "failed to reload sessions after a concurrent access admission: {reload_error}"
+                        )
+                    })?;
+                    let mut sessions = server.state.sessions.write().await;
+                    if sessions.revision() == baseline.revision() {
+                        *sessions = durable;
+                    }
+                    reloaded_after_conflict = true;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!("failed to persist access admission: {error}"));
+                }
             }
+            for consumption in &admission.consumptions {
+                if let Some(remaining_uses) = consumption.remaining_uses {
+                    server.emit_audit_ungated(
+                        guard::audit::AuditEvent::new(guard::audit::AuditKind::SessionGrant)
+                            .session_fingerprint(audit_session_fingerprint(Some(&token)))
+                            .field("event", "access_use_consumed")
+                            .field("access_request", &consumption.request)
+                            .field("remaining_uses", format!("{remaining_uses}")),
+                    );
+                }
+            }
+            return Ok(Some(admission));
         }
-        for consumption in &admission.consumptions {
-            if let Some(remaining_uses) = consumption.remaining_uses {
-                server.emit_audit_ungated(
-                    guard::audit::AuditEvent::new(guard::audit::AuditKind::SessionGrant)
-                        .session_fingerprint(audit_session_fingerprint(Some(token)))
-                        .field("event", "access_use_consumed")
-                        .field("access_request", &consumption.request)
-                        .field("remaining_uses", format!("{remaining_uses}")),
-                );
-            }
-        }
-        return Ok(Some(admission));
-    }
+    });
+    task.await
+        .map_err(|error| format!("access admission task failed: {error}"))?
 }
 
 #[cfg(test)]
@@ -2420,18 +2861,21 @@ impl AnsibleInventoryDiagnostics {
     }
 }
 
-fn append_bounded_diagnostic(output: Option<String>, diagnostic: &str) -> Option<String> {
-    let mut output = output.unwrap_or_default();
-    let reserved = diagnostic.len().min(MAX_OUTPUT_BYTES);
-    let maximum_existing = MAX_OUTPUT_BYTES.saturating_sub(reserved);
-    if output.len() > maximum_existing {
-        let mut boundary = maximum_existing;
-        while boundary > 0 && !output.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        output.truncate(boundary);
+fn append_accounted_diagnostic(
+    output: Option<String>,
+    diagnostic: &str,
+    retained_total: &AtomicUsize,
+) -> Option<String> {
+    let separator_len: usize = output
+        .as_deref()
+        .filter(|value| !value.is_empty() && !value.ends_with('\n'))
+        .map_or(0, |_| 1);
+    let additional = separator_len.saturating_add(diagnostic.len());
+    if reserve_bounded_output(retained_total, additional).is_err() {
+        return output;
     }
-    if !output.is_empty() && !output.ends_with('\n') {
+    let mut output = output.unwrap_or_default();
+    if separator_len != 0 {
         output.push('\n');
     }
     output.push_str(diagnostic);
@@ -2478,25 +2922,51 @@ pub(super) fn permission_denied_path(output: &str) -> Option<String> {
 /// deny-list, session rules, evaluator, pinned TTL ACL, full audit) and retry
 /// the command. A denied or failed grant returns the original failure
 /// untouched; each round must unblock a new path or the loop stops.
+#[cfg(all(test, unix))]
 pub(super) async fn exec_with_read_grant_retry_with_secret_authority<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     allow_reason: String,
     authority: Option<Option<Vec<String>>>,
 ) -> ExecuteResult {
+    exec_with_read_grant_retry_with_command_authority(
+        context,
+        request,
+        allow_reason,
+        authority,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn exec_with_read_grant_retry_with_command_authority<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
+    request: ExecuteRequest,
+    allow_reason: String,
+    authority: Option<Option<Vec<String>>>,
+    command_authority: Option<CommandAuthorization>,
+) -> ExecuteResult {
     #[cfg(not(unix))]
     {
-        exec_after_approval_with_secret_authority(context, request, allow_reason, authority).await
+        exec_after_approval_with_command_authority(
+            context,
+            request,
+            allow_reason,
+            authority,
+            command_authority,
+        )
+        .await
     }
     #[cfg(unix)]
     {
         let server = context.server;
         let caller = context.caller;
-        let mut result = exec_after_approval_with_secret_authority(
+        let mut result = exec_after_approval_with_command_authority(
             context,
             request.clone(),
             allow_reason.clone(),
             authority.clone(),
+            command_authority.clone(),
         )
         .await;
         let mut granted: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2545,11 +3015,12 @@ pub(super) async fn exec_with_read_grant_retry_with_secret_authority<W: AsyncWri
                     .field("path", &path)
                     .field("ttl", format!("{AUTO_READ_GRANT_TTL_SECS}s")),
             );
-            result = exec_after_approval_with_secret_authority(
+            result = exec_after_approval_with_command_authority(
                 context,
                 request.clone(),
                 allow_reason.clone(),
                 authority.clone(),
+                command_authority.clone(),
             )
             .await;
         }
@@ -2565,13 +3036,23 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
     // `Some(Some(selectors))` replays the immutable saved-grant entitlement.
     authority: Option<Option<Vec<String>>>,
 ) -> ExecuteResult {
+    exec_after_approval_with_command_authority(context, request, allow_reason, authority, None)
+        .await
+}
+
+pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
+    request: ExecuteRequest,
+    allow_reason: String,
+    authority: Option<Option<Vec<String>>>,
+    command_authority: Option<CommandAuthorization>,
+) -> ExecuteResult {
     let server = context.server;
     let caller = context.caller;
     if server.config.dry_run {
         tracing::info!(
-            "Dry-run: not executing {} {:?} ({})",
-            request.binary,
-            request.args,
+            "Dry-run: not executing {} ({})",
+            redact_command_line(&request.binary, &request.args),
             caller
         );
         // Under gating, even the execute-now (reversible) path reports honest
@@ -2585,23 +3066,28 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
 
     let user_key = caller.user_key();
     let caller_principal = caller.principal();
-    let tool_env = {
-        let mut reg = server.state.tool_registry.write().await;
-        let _ = reg.reload_if_stale();
-        reg.resolve_env(
-            &request.binary,
-            &server.state.secrets,
-            caller_principal.as_ref(),
-            user_key.as_deref(),
-        )
-        .await
-    };
+    let tool_env = resolve_current_tool_env(
+        server,
+        &request.binary,
+        caller_principal.as_ref(),
+        user_key.as_deref(),
+    )
+    .await;
     let tool_env = match tool_env {
         Ok(env) => env,
         Err(e) => {
             return ExecuteResult::exec_failed(allow_reason, format!("tool config error: {}", e));
         }
     };
+    let ResolvedCurrentToolEnv {
+        resolved: tool_env,
+        authority: tool_authority,
+    } = tool_env;
+    let mut exact_output_secrets = tool_env
+        .secret_sources
+        .keys()
+        .filter_map(|key| tool_env.env.get(key).cloned())
+        .collect::<Vec<_>>();
     let trusted_tool_env = tool_env.env;
     let mut exposed_secret_refs = tool_env.secret_refs;
     exposed_secret_refs.extend(request.secrets.values().cloned());
@@ -2740,6 +3226,7 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
                     );
                 }
             };
+            exact_output_secrets.push(value.clone());
             request_env.insert(env_var.clone(), value);
         }
     }
@@ -2779,10 +3266,10 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
                     );
                 }
             };
+            exact_output_secrets.push(value.clone());
             secret_file_values.push((env_var.clone(), value));
         }
     }
-
     let daemon_child_env: HashMap<String, String> = server
         .config
         .extra_child_env
@@ -2820,9 +3307,8 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
     }
 
     tracing::info!(
-        "Executing: {} {:?} ({}) cwd={}",
-        request.binary,
-        request.args,
+        "Executing: {} ({}) cwd={}",
+        redact_command_line(&request.binary, &request.args),
         caller,
         request
             .cwd
@@ -2950,18 +3436,47 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
     #[cfg(unix)]
     cmd.as_std_mut().process_group(0);
 
+    // Learned deny, composed verb authority, and live session state are held
+    // only through the finite process-start handoff. A revocation that commits
+    // first prevents spawn; a revocation after spawn applies to later uses.
+    let initiation_lease = match acquire_command_initiation_lease(
+        server,
+        &request,
+        command_authority.as_ref(),
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(reason) => return ExecuteResult::denied(reason),
+    };
+    let tool_mapping_lease = match acquire_tool_mapping_spawn_lease(server, &tool_authority).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            return ExecuteResult::denied(format!(
+                "tool mapping authority is unavailable before process start: {error}"
+            ))
+        }
+    };
+
     if context.stream_output {
         let result = execute_spawn_streaming(
             cmd,
             allow_reason,
             server,
-            &redaction_env,
+            OutputRedactionContext {
+                environment: &redaction_env,
+                exact_secrets: &exact_output_secrets,
+            },
             SpawnAuditContext {
                 caller,
                 request: &request,
                 exposed_secret_refs,
             },
             &mut *context.stream_writer,
+            ProcessInitiationLeases {
+                command: initiation_lease,
+                tool_mapping: tool_mapping_lease,
+            },
         )
         .await;
         drop(secret_file_lease);
@@ -2970,7 +3485,7 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             return ExecuteResult::exec_failed(
@@ -2979,12 +3494,50 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
             );
         }
     };
-    let process_guard = child
+    drop(tool_mapping_lease);
+    drop(initiation_lease);
+    #[cfg(all(test, unix))]
+    signal_command_started_for_test(server);
+    let mut process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
     audit_secret_exposure(server, caller, &request, &exposed_secret_refs);
-    let output = match child.wait_with_output().await {
-        Ok(output) => output,
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let exact_secrets = server
+        .config
+        .redact_secrets
+        .iter()
+        .chain(exact_output_secrets.iter())
+        .map(|secret| secret.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let raw_total = Arc::new(AtomicUsize::new(0));
+    let stdout_secrets = exact_secrets.clone();
+    let stdout_total = raw_total.clone();
+    let stdout_reader = async move {
+        match stdout_pipe {
+            Some(pipe) => read_bounded_redacted_output(pipe, stdout_secrets, stdout_total).await,
+            None => Ok(Vec::new()),
+        }
+    };
+    let stderr_reader = async move {
+        match stderr_pipe {
+            Some(pipe) => read_bounded_redacted_output(pipe, exact_secrets, raw_total).await,
+            None => Ok(Vec::new()),
+        }
+    };
+    let buffered_output = collect_bounded_output_pair(stdout_reader, stderr_reader).await;
+    if let Err(error) = buffered_output {
+        if let Some(guard) = process_guard.take() {
+            guard.terminate();
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+            .with_exposed_secret_refs(exposed_secret_refs);
+    }
+    let status = match child.wait().await {
+        Ok(status) => status,
         Err(e) => {
             return ExecuteResult::exec_failed_after_start(
                 allow_reason,
@@ -2997,31 +3550,59 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
         guard.complete();
     }
 
-    let stdout = if output.stdout.is_empty() {
+    let (stdout_bytes, stderr_bytes) = buffered_output.expect("checked above");
+    let retained_total = Arc::new(AtomicUsize::new(0));
+    let stdout = if stdout_bytes.is_empty() {
         None
     } else {
-        let raw = &output.stdout[..output.stdout.len().min(MAX_OUTPUT_BYTES)];
-        let s = String::from_utf8_lossy(raw).to_string();
-        Some(redact_command_text(server, &redaction_env, s))
+        let redacted = match redact_bounded_buffered_output(
+            server,
+            &redaction_env,
+            &exact_output_secrets,
+            String::from_utf8_lossy(&stdout_bytes).to_string(),
+            &retained_total,
+        ) {
+            Ok(redacted) => redacted,
+            Err(error) => {
+                return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            }
+        };
+        Some(redacted)
     };
 
-    let mut stderr = if output.stderr.is_empty() {
+    let mut stderr = if stderr_bytes.is_empty() {
         None
     } else {
-        let raw = &output.stderr[..output.stderr.len().min(MAX_OUTPUT_BYTES)];
-        let s = String::from_utf8_lossy(raw).to_string();
-        Some(redact_command_text(server, &redaction_env, s))
+        let redacted = match redact_bounded_buffered_output(
+            server,
+            &redaction_env,
+            &exact_output_secrets,
+            String::from_utf8_lossy(&stderr_bytes).to_string(),
+            &retained_total,
+        ) {
+            Ok(redacted) => redacted,
+            Err(error) => {
+                return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            }
+        };
+        Some(redacted)
     };
 
-    let mut exit_code = output.status.code();
+    let mut exit_code = status.code();
     if let Some(mut diagnostics) =
         AnsibleInventoryDiagnostics::for_command(&request.binary, &request.args)
     {
-        diagnostics.observe(&String::from_utf8_lossy(&output.stdout));
-        diagnostics.observe(&String::from_utf8_lossy(&output.stderr));
+        diagnostics.observe(&String::from_utf8_lossy(&stdout_bytes));
+        diagnostics.observe(&String::from_utf8_lossy(&stderr_bytes));
         if diagnostics.normalizes_success_to_failure(exit_code) {
             exit_code = Some(1);
-            stderr = append_bounded_diagnostic(stderr, ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC);
+            stderr = append_accounted_diagnostic(
+                stderr,
+                ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC,
+                &retained_total,
+            );
         }
     }
 
@@ -3030,19 +3611,304 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
         .with_exposed_secret_refs(exposed_secret_refs)
 }
 
-#[derive(Debug)]
-struct StreamChunk {
-    stream: OutputStream,
-    data: String,
+fn truncate_utf8_bytes(value: &mut String, limit: usize) {
+    if value.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
 }
 
+#[derive(Debug)]
+enum BoundedOutputError {
+    OutputLimit,
+    RedactionContext,
+    PipeIo(String),
+}
+
+impl std::fmt::Display for BoundedOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutputLimit => {
+                formatter.write_str("command output exceeded the bounded byte limit")
+            }
+            Self::RedactionContext => {
+                formatter.write_str("command redaction context exceeded its resource limit")
+            }
+            Self::PipeIo(detail) => write!(formatter, "command output pipe failed: {detail}"),
+        }
+    }
+}
+
+fn bounded_error_detail(error: impl std::fmt::Display) -> String {
+    let mut detail = error.to_string();
+    detail.retain(|character| !character.is_control());
+    truncate_utf8_bytes(&mut detail, 160);
+    detail
+}
+
+fn reserve_bounded_output(total: &AtomicUsize, amount: usize) -> Result<(), BoundedOutputError> {
+    let reserved = total.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current
+            .checked_add(amount)
+            .filter(|next| *next <= MAX_OUTPUT_BYTES)
+    });
+    reserved
+        .map(|_| ())
+        .map_err(|_| BoundedOutputError::OutputLimit)
+}
+
+fn redact_bounded_buffered_output(
+    server: &ServerContext,
+    tool_env: &HashMap<String, String>,
+    exact_output_secrets: &[String],
+    text: String,
+    retained_total: &AtomicUsize,
+) -> Result<String, BoundedOutputError> {
+    let redacted = redact_command_text(server, tool_env, exact_output_secrets, text);
+    reserve_bounded_output(retained_total, redacted.len())?;
+    Ok(redacted)
+}
+
+async fn read_bounded_redacted_output<R>(
+    mut reader: R,
+    exact_secrets: Vec<Vec<u8>>,
+    raw_total: Arc<AtomicUsize>,
+) -> Result<Vec<u8>, BoundedOutputError>
+where
+    R: AsyncRead + Unpin,
+{
+    const CHUNK_BYTES: usize = 8 * 1024;
+    let mut redactor = ExactSecretStreamRedactor::new(exact_secrets, MAX_OUTPUT_BYTES)
+        .map_err(|_| BoundedOutputError::RedactionContext)?;
+    let mut output = Vec::new();
+    let mut buffer = vec![0_u8; CHUNK_BYTES];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| BoundedOutputError::PipeIo(bounded_error_detail(error)))?;
+        if read == 0 {
+            output.extend(
+                redactor
+                    .finish()
+                    .map_err(|_| BoundedOutputError::OutputLimit)?,
+            );
+            return Ok(output);
+        }
+        reserve_bounded_output(&raw_total, read)?;
+        output.extend(
+            redactor
+                .push(&buffer[..read])
+                .map_err(|_| BoundedOutputError::OutputLimit)?,
+        );
+    }
+}
+
+async fn collect_bounded_output_pair(
+    stdout_reader: impl std::future::Future<Output = Result<Vec<u8>, BoundedOutputError>>,
+    stderr_reader: impl std::future::Future<Output = Result<Vec<u8>, BoundedOutputError>>,
+) -> Result<(Vec<u8>, Vec<u8>), BoundedOutputError> {
+    tokio::pin!(stdout_reader);
+    tokio::pin!(stderr_reader);
+    tokio::select! {
+        stdout = &mut stdout_reader => match stdout {
+            Ok(stdout) => match stderr_reader.await {
+                Ok(stderr) => Ok((stdout, stderr)),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        stderr = &mut stderr_reader => match stderr {
+            Ok(stderr) => match stdout_reader.await {
+                Ok(stdout) => Ok((stdout, stderr)),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StreamChunk {
+    Data {
+        stream: OutputStream,
+        data: Vec<u8>,
+    },
+    LimitExceeded,
+    PipeError {
+        stream: OutputStream,
+        detail: String,
+    },
+}
+
+struct StreamReaderTask {
+    stream: OutputStream,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct StreamTaskJoinError {
+    stream: OutputStream,
+    detail: &'static str,
+}
+
+struct StreamTaskCleanup {
+    tasks: Vec<StreamReaderTask>,
+}
+
+impl StreamTaskCleanup {
+    async fn join(&mut self) -> Result<(), StreamTaskJoinError> {
+        while let Some(task) = self.tasks.pop() {
+            if let Err(error) = task.handle.await {
+                let detail = if error.is_panic() {
+                    "reader task panicked"
+                } else if error.is_cancelled() {
+                    "reader task was cancelled"
+                } else {
+                    "reader task failed"
+                };
+                return Err(StreamTaskJoinError {
+                    stream: task.stream,
+                    detail,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn abort_and_join(&mut self) {
+        for task in &self.tasks {
+            task.handle.abort();
+        }
+        while let Some(task) = self.tasks.pop() {
+            let _ = task.handle.await;
+        }
+    }
+}
+
+impl Drop for StreamTaskCleanup {
+    fn drop(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.handle.abort();
+        }
+    }
+}
+
+async fn cleanup_streaming_failure(
+    child: &mut tokio::process::Child,
+    process_guard: &mut Option<ProcessGuard>,
+    stream_tasks: &mut StreamTaskCleanup,
+) {
+    stream_tasks.abort_and_join().await;
+    if let Some(guard) = process_guard.take() {
+        guard.terminate();
+    } else {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
+}
+
+fn output_stream_name(stream: OutputStream) -> &'static str {
+    match stream {
+        OutputStream::Stdout => "stdout",
+        OutputStream::Stderr => "stderr",
+    }
+}
+
+fn reserve_emitted_output(total: &mut usize, amount: usize) -> bool {
+    let Some(next) = total.checked_add(amount) else {
+        return false;
+    };
+    if next > MAX_OUTPUT_BYTES {
+        return false;
+    }
+    *total = next;
+    true
+}
+
+#[derive(Default)]
+struct StreamingHeuristicRedactor {
+    pending_line: Vec<u8>,
+    state: RedactionState,
+}
+
+impl StreamingHeuristicRedactor {
+    fn push<F>(&mut self, data: &[u8], mut redact_line: F) -> Result<String, BoundedOutputError>
+    where
+        F: FnMut(String, &mut RedactionState) -> String,
+    {
+        let mut output = String::new();
+        let mut remaining = data;
+        while let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
+            let line_end = newline + 1;
+            self.append_pending(&remaining[..line_end])?;
+            remaining = &remaining[line_end..];
+
+            let line =
+                String::from_utf8_lossy(&std::mem::take(&mut self.pending_line)).into_owned();
+            let redacted = redact_line(line, &mut self.state);
+            Self::append_output(&mut output, &redacted)?;
+        }
+        self.append_pending(remaining)?;
+        Ok(output)
+    }
+
+    fn finish<F>(&mut self, mut redact_line: F) -> Result<String, BoundedOutputError>
+    where
+        F: FnMut(String, &mut RedactionState) -> String,
+    {
+        if self.pending_line.is_empty() {
+            return Ok(String::new());
+        }
+        let line = String::from_utf8_lossy(&std::mem::take(&mut self.pending_line)).into_owned();
+        let redacted = redact_line(line, &mut self.state);
+        if redacted.len() > MAX_OUTPUT_BYTES {
+            return Err(BoundedOutputError::OutputLimit);
+        }
+        Ok(redacted)
+    }
+
+    fn append_pending(&mut self, data: &[u8]) -> Result<(), BoundedOutputError> {
+        let Some(next) = self.pending_line.len().checked_add(data.len()) else {
+            return Err(BoundedOutputError::OutputLimit);
+        };
+        if next > MAX_OUTPUT_BYTES {
+            return Err(BoundedOutputError::OutputLimit);
+        }
+        self.pending_line.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn append_output(output: &mut String, data: &str) -> Result<(), BoundedOutputError> {
+        let Some(next) = output.len().checked_add(data.len()) else {
+            return Err(BoundedOutputError::OutputLimit);
+        };
+        if next > MAX_OUTPUT_BYTES {
+            return Err(BoundedOutputError::OutputLimit);
+        }
+        output.push_str(data);
+        Ok(())
+    }
+}
+
+struct OutputRedactionContext<'a> {
+    environment: &'a HashMap<String, String>,
+    exact_secrets: &'a [String],
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     mut cmd: Command,
     allow_reason: String,
     server: &ServerContext,
-    tool_env: &HashMap<String, String>,
+    redaction: OutputRedactionContext<'_>,
     audit: SpawnAuditContext<'_>,
     writer: &mut W,
+    leases: ProcessInitiationLeases,
 ) -> ExecuteResult {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -3056,6 +3922,10 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
             );
         }
     };
+    drop(leases.tool_mapping);
+    drop(leases.command);
+    #[cfg(all(test, unix))]
+    signal_command_started_for_test(server);
     let mut process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
@@ -3067,26 +3937,57 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     );
 
     let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
-    let mut stream_tasks = Vec::new();
+    let mut stream_tasks = StreamTaskCleanup { tasks: Vec::new() };
+    let raw_total = Arc::new(AtomicUsize::new(0));
 
     if let Some(stdout) = child.stdout.take() {
         let tx = tx.clone();
-        stream_tasks.push(tokio::spawn(async move {
-            forward_stream_lines(stdout, OutputStream::Stdout, tx).await;
-        }));
+        let raw_total = raw_total.clone();
+        stream_tasks.tasks.push(StreamReaderTask {
+            stream: OutputStream::Stdout,
+            handle: tokio::spawn(async move {
+                forward_stream_chunks(stdout, OutputStream::Stdout, tx, raw_total).await;
+            }),
+        });
     }
 
     if let Some(stderr) = child.stderr.take() {
         let tx = tx.clone();
-        stream_tasks.push(tokio::spawn(async move {
-            forward_stream_lines(stderr, OutputStream::Stderr, tx).await;
-        }));
+        let raw_total = raw_total.clone();
+        stream_tasks.tasks.push(StreamReaderTask {
+            stream: OutputStream::Stderr,
+            handle: tokio::spawn(async move {
+                forward_stream_chunks(stderr, OutputStream::Stderr, tx, raw_total).await;
+            }),
+        });
     }
 
     drop(tx);
 
-    let mut stdout_redaction = RedactionState::default();
-    let mut stderr_redaction = RedactionState::default();
+    let mut stdout_redaction = StreamingHeuristicRedactor::default();
+    let mut stderr_redaction = StreamingHeuristicRedactor::default();
+    let exact_secrets = server
+        .config
+        .redact_secrets
+        .iter()
+        .chain(redaction.exact_secrets)
+        .map(|secret| secret.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let mut stdout_exact =
+        match ExactSecretStreamRedactor::new(exact_secrets.clone(), MAX_OUTPUT_BYTES) {
+            Ok(redactor) => redactor,
+            Err(_) => {
+                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                return ExecuteResult::exec_failed_after_start(
+                    allow_reason,
+                    "command redaction context exceeded its resource limit".to_string(),
+                )
+                .with_exposed_secret_refs(audit.exposed_secret_refs);
+            }
+        };
+    let mut stderr_exact = ExactSecretStreamRedactor::new(exact_secrets, MAX_OUTPUT_BYTES)
+        .expect("the same bounded redaction context was already validated");
+    let mut emitted_total = 0usize;
     let mut ansible_diagnostics =
         AnsibleInventoryDiagnostics::for_command(&audit.request.binary, &audit.request.args);
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -3094,27 +3995,59 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         tokio::select! {
             maybe_chunk = rx.recv() => {
                 match maybe_chunk {
-                    Some(chunk) => {
+                    Some(StreamChunk::Data { stream, data }) => {
                     if let Some(diagnostics) = &mut ansible_diagnostics {
-                        diagnostics.observe(&chunk.data);
+                        diagnostics.observe(&String::from_utf8_lossy(&data));
                     }
-                    let redaction_state = match chunk.stream {
-                        OutputStream::Stdout => &mut stdout_redaction,
-                        OutputStream::Stderr => &mut stderr_redaction,
+                    let (heuristic_redactor, exact_redactor) = match stream {
+                        OutputStream::Stdout => (&mut stdout_redaction, &mut stdout_exact),
+                        OutputStream::Stderr => (&mut stderr_redaction, &mut stderr_exact),
                     };
-                    let data = redact_command_text_with_state(server, tool_env, chunk.data, redaction_state);
-                    let message = match chunk.stream {
+                    let Ok(data) = exact_redactor.push(&data) else {
+                        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                        return ExecuteResult::exec_failed_after_start(
+                            allow_reason,
+                            "command output exceeded the redacted byte limit".to_string(),
+                        )
+                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                    };
+                    let data = match heuristic_redactor.push(&data, |line, state| {
+                        redact_command_text_with_state(
+                            server,
+                            redaction.environment,
+                            redaction.exact_secrets,
+                            line,
+                            state,
+                        )
+                    }) {
+                        Ok(data) => data,
+                        Err(_) => {
+                            cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                            return ExecuteResult::exec_failed_after_start(
+                                allow_reason,
+                                "command output exceeded the redacted byte limit".to_string(),
+                            )
+                            .with_exposed_secret_refs(audit.exposed_secret_refs);
+                        }
+                    };
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if !reserve_emitted_output(&mut emitted_total, data.len()) {
+                        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                        return ExecuteResult::exec_failed_after_start(
+                            allow_reason,
+                            "command output exceeded the redacted byte limit".to_string(),
+                        )
+                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                    }
+                    let message = match stream {
                         OutputStream::Stdout => ExecuteStreamMessage::Stdout { data },
                         OutputStream::Stderr => ExecuteStreamMessage::Stderr { data },
                     };
 
                     if let Err(e) = write_stream_message(writer, &message).await {
-                        if let Some(guard) = process_guard.take() {
-                            guard.terminate();
-                        } else {
-                            let _ = child.kill().await;
-                        }
-                        let _ = child.wait().await;
+                        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                         return ExecuteResult::exec_failed_after_start(
                             allow_reason,
                             format!("client stream error: {}", e),
@@ -3122,17 +4055,133 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                         .with_exposed_secret_refs(audit.exposed_secret_refs);
                     }
                     }
-                    None => break,
+                    Some(StreamChunk::LimitExceeded) => {
+                        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                        return ExecuteResult::exec_failed_after_start(
+                            allow_reason,
+                            "command output exceeded the byte limit".to_string(),
+                        )
+                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                    }
+                    Some(StreamChunk::PipeError { stream, detail }) => {
+                        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                        return ExecuteResult::exec_failed_after_start(
+                            allow_reason,
+                            format!(
+                                "command {} output pipe failed: {}",
+                                output_stream_name(stream),
+                                detail
+                            ),
+                        )
+                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                    }
+                    None => {
+                        for (stream, exact_redactor, heuristic_redactor) in [
+                            (
+                                OutputStream::Stdout,
+                                &mut stdout_exact,
+                                &mut stdout_redaction,
+                            ),
+                            (
+                                OutputStream::Stderr,
+                                &mut stderr_exact,
+                                &mut stderr_redaction,
+                            ),
+                        ] {
+                            let Ok(data) = exact_redactor.finish() else {
+                                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                return ExecuteResult::exec_failed_after_start(
+                                    allow_reason,
+                                    "command output exceeded the redacted byte limit".to_string(),
+                                )
+                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            };
+                            let mut data = match heuristic_redactor.push(&data, |line, state| {
+                                redact_command_text_with_state(
+                                    server,
+                                    redaction.environment,
+                                    redaction.exact_secrets,
+                                    line,
+                                    state,
+                                )
+                            }) {
+                                Ok(data) => data,
+                                Err(_) => {
+                                    cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                    return ExecuteResult::exec_failed_after_start(
+                                        allow_reason,
+                                        "command output exceeded the redacted byte limit".to_string(),
+                                    )
+                                    .with_exposed_secret_refs(audit.exposed_secret_refs);
+                                }
+                            };
+                            let tail = match heuristic_redactor.finish(|line, state| {
+                                redact_command_text_with_state(
+                                    server,
+                                    redaction.environment,
+                                    redaction.exact_secrets,
+                                    line,
+                                    state,
+                                )
+                            }) {
+                                Ok(tail) => tail,
+                                Err(_) => {
+                                    cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                    return ExecuteResult::exec_failed_after_start(
+                                        allow_reason,
+                                        "command output exceeded the redacted byte limit".to_string(),
+                                    )
+                                    .with_exposed_secret_refs(audit.exposed_secret_refs);
+                                }
+                            };
+                            let Some(total_len) = data.len().checked_add(tail.len()) else {
+                                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                return ExecuteResult::exec_failed_after_start(
+                                    allow_reason,
+                                    "command output exceeded the redacted byte limit".to_string(),
+                                )
+                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            };
+                            if total_len > MAX_OUTPUT_BYTES {
+                                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                return ExecuteResult::exec_failed_after_start(
+                                    allow_reason,
+                                    "command output exceeded the redacted byte limit".to_string(),
+                                )
+                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            }
+                            data.push_str(&tail);
+                            if data.is_empty() {
+                                continue;
+                            }
+                            if !reserve_emitted_output(&mut emitted_total, data.len()) {
+                                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                return ExecuteResult::exec_failed_after_start(
+                                    allow_reason,
+                                    "command output exceeded the redacted byte limit".to_string(),
+                                )
+                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            }
+                            let message = match stream {
+                                OutputStream::Stdout => ExecuteStreamMessage::Stdout { data },
+                                OutputStream::Stderr => ExecuteStreamMessage::Stderr { data },
+                            };
+                            if let Err(error) = write_stream_message(writer, &message).await {
+                                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                                return ExecuteResult::exec_failed_after_start(
+                                    allow_reason,
+                                    format!("client stream error: {error}"),
+                                )
+                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            }
+                        }
+                        break;
+                    },
                 }
             }
             _ = keepalive.tick() => {
                 if let Err(e) = write_stream_message(writer, &ExecuteStreamMessage::Keepalive).await {
-                    if let Some(guard) = process_guard.take() {
-                        guard.terminate();
-                    } else {
-                        let _ = child.kill().await;
-                    }
-                    let _ = child.wait().await;
+                    cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
                     return ExecuteResult::exec_failed_after_start(
                         allow_reason,
                         format!("client stream error: {}", e),
@@ -3143,8 +4192,17 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         }
     }
 
-    for task in stream_tasks {
-        let _ = task.await;
+    if let Err(error) = stream_tasks.join().await {
+        cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+        return ExecuteResult::exec_failed_after_start(
+            allow_reason,
+            format!(
+                "command {} output {}",
+                output_stream_name(error.stream),
+                error.detail
+            ),
+        )
+        .with_exposed_secret_refs(audit.exposed_secret_refs);
     }
 
     let status = match child.wait().await {
@@ -3167,15 +4225,20 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         .is_some_and(|diagnostics| diagnostics.normalizes_success_to_failure(exit_code))
     {
         exit_code = Some(1);
-        let diagnostic = ExecuteStreamMessage::Stderr {
-            data: ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC.to_string(),
-        };
-        if let Err(e) = write_stream_message(writer, &diagnostic).await {
-            return ExecuteResult::exec_failed_after_start(
-                allow_reason,
-                format!("client stream error: {}", e),
-            )
-            .with_exposed_secret_refs(audit.exposed_secret_refs);
+        if reserve_emitted_output(
+            &mut emitted_total,
+            ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC.len(),
+        ) {
+            let diagnostic = ExecuteStreamMessage::Stderr {
+                data: ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC.to_string(),
+            };
+            if let Err(e) = write_stream_message(writer, &diagnostic).await {
+                return ExecuteResult::exec_failed_after_start(
+                    allow_reason,
+                    format!("client stream error: {}", e),
+                )
+                .with_exposed_secret_refs(audit.exposed_secret_refs);
+            }
         }
     }
 
@@ -3202,32 +4265,53 @@ fn audit_secret_exposure(
             guard::audit::AuditEvent::new(guard::audit::AuditKind::SecretExposed)
                 .caller(caller)
                 .session_fingerprint(audit_session_fingerprint(request.session_token.as_deref()))
-                .cmd(audit_command_line(&request.binary, &request.args))
+                .cmd(server.redact_command_line(&request.binary, &request.args))
                 .field("secret", secret_name),
         );
     }
 }
 
-async fn forward_stream_lines<R>(reader: R, stream: OutputStream, tx: mpsc::Sender<StreamChunk>)
-where
+async fn forward_stream_chunks<R>(
+    mut reader: R,
+    stream: OutputStream,
+    tx: mpsc::Sender<StreamChunk>,
+    total: Arc<AtomicUsize>,
+) where
     R: AsyncRead + Unpin,
 {
-    let mut reader = BufReader::new(reader);
-
+    const CHUNK_BYTES: usize = 8 * 1024;
+    let mut stream_bytes = 0usize;
+    let mut buffer = vec![0_u8; CHUNK_BYTES];
     loop {
-        let mut data = String::new();
-        match reader.read_line(&mut data).await {
+        match reader.read(&mut buffer).await {
             Ok(0) => break,
-            Ok(_) => {
-                if tx.send(StreamChunk { stream, data }).await.is_err() {
+            Ok(read) => {
+                stream_bytes = stream_bytes.saturating_add(read);
+                let reserved = total.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current
+                        .checked_add(read)
+                        .filter(|next| *next <= MAX_OUTPUT_BYTES)
+                });
+                if stream_bytes > MAX_OUTPUT_BYTES || reserved.is_err() {
+                    let _ = tx.send(StreamChunk::LimitExceeded).await;
+                    break;
+                }
+                if tx
+                    .send(StreamChunk::Data {
+                        stream,
+                        data: buffer[..read].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
             Err(e) => {
                 let _ = tx
-                    .send(StreamChunk {
-                        stream: OutputStream::Stderr,
-                        data: format!("guard stream read error: {}\n", e),
+                    .send(StreamChunk::PipeError {
+                        stream,
+                        detail: bounded_error_detail(e),
                     })
                     .await;
                 break;
@@ -3239,40 +4323,44 @@ where
 fn redact_command_text(
     server: &ServerContext,
     tool_env: &HashMap<String, String>,
+    exact_output_secrets: &[String],
     text: String,
 ) -> String {
-    redact_command_text_inner(server, tool_env, text, None)
+    redact_command_text_inner(server, tool_env, exact_output_secrets, text, None)
 }
 
 fn redact_command_text_with_state(
     server: &ServerContext,
     tool_env: &HashMap<String, String>,
+    exact_output_secrets: &[String],
     text: String,
     state: &mut RedactionState,
 ) -> String {
-    redact_command_text_inner(server, tool_env, text, Some(state))
+    redact_command_text_inner(server, tool_env, exact_output_secrets, text, Some(state))
 }
 
 fn redact_command_text_inner(
     server: &ServerContext,
     tool_env: &HashMap<String, String>,
+    exact_output_secrets: &[String],
     text: String,
     state: Option<&mut RedactionState>,
 ) -> String {
-    if !server.config.redact {
-        return text;
-    }
-
-    let secret_refs: Vec<&str> = server
+    let trusted_secret_refs: Vec<&str> = server
         .config
         .redact_secrets
         .iter()
         .map(|s| s.as_str())
-        .chain(tool_env.values().map(|s| s.as_str()))
+        .chain(exact_output_secrets.iter().map(String::as_str))
         .collect();
 
     // First: exact-match redaction catches bare secret values in output.
-    let text = redact_exact_secrets(&text, &secret_refs);
+    let text = redact_exact_secrets(&text, &trusted_secret_refs);
+    if !server.config.redact {
+        return text;
+    }
+    let heuristic_exact_refs = tool_env.values().map(String::as_str).collect::<Vec<_>>();
+    let text = redact_exact_secrets(&text, &heuristic_exact_refs);
     // Then: regex and context-based redaction catches KEY=value, YAML env
     // pairs, PEM blocks, etc.
     if let Some(state) = state {
@@ -3312,7 +4400,7 @@ pub(super) fn merge_envelope_context(
     let check = revert
         .confirm_check
         .as_ref()
-        .map(|check| command_line(&check.binary, &check.args))
+        .map(|check| redact_command_line(&check.binary, &check.args))
         .unwrap_or_else(|| "none; deadline always rolls back".to_string());
     let control_path = revert.control_path.as_deref().unwrap_or(
         "daemon-inferred from the forward, check, rollback, credential, and transport commands",
@@ -3323,8 +4411,8 @@ pub(super) fn merge_envelope_context(
         .clamp(1, MAX_CONFIRM_WITHIN_SECS);
     let envelope = format!(
         "{REVERT_AVAILABLE_CONTEXT}\nForward: {}\nRollback: {}\nConfirmation check: {}\nDeadline: {} seconds\nRequired control path: {}\nTreat the entire forward, check, rollback, and control-path chain as one safety decision. HOLD by denying when the forward action can plausibly sever the SSH, API, socket, credential, daemon, or local authority needed to verify or roll back.",
-        command_line(&request.binary, &request.args),
-        command_line(&revert.binary, &revert.args),
+        redact_command_line(&request.binary, &request.args),
+        redact_command_line(&revert.binary, &revert.args),
         check,
         window,
         control_path
@@ -3339,6 +4427,351 @@ pub(super) fn merge_envelope_context(
 mod decision_trace_feature_tests {
     use super::*;
     use guard::gating::verb::CoverageAction;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    #[test]
+    fn buffered_output_truncation_preserves_utf8_and_the_byte_cap() {
+        let mut output = "x".repeat(MAX_OUTPUT_BYTES - 1);
+        output.push('µ');
+        truncate_utf8_bytes(&mut output, MAX_OUTPUT_BYTES);
+        assert!(output.len() <= MAX_OUTPUT_BYTES);
+        assert!(output.is_char_boundary(output.len()));
+        assert!(!output.ends_with('µ'));
+    }
+
+    #[tokio::test]
+    async fn unterminated_stream_is_chunked_and_stopped_at_the_total_byte_limit() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let total = Arc::new(AtomicUsize::new(0));
+        let reader =
+            tokio::io::AsyncReadExt::take(tokio::io::repeat(b'x'), (MAX_OUTPUT_BYTES + 1) as u64);
+        let task = tokio::spawn(forward_stream_chunks(
+            reader,
+            OutputStream::Stdout,
+            tx,
+            total,
+        ));
+        let mut retained = 0usize;
+        let mut limited = false;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Data { data, .. } => {
+                    assert!(data.len() <= 8 * 1024);
+                    retained += data.len();
+                }
+                StreamChunk::LimitExceeded => limited = true,
+                StreamChunk::PipeError { .. } => panic!("unexpected pipe error"),
+            }
+        }
+        task.await.unwrap();
+        assert!(limited);
+        assert!(retained <= MAX_OUTPUT_BYTES);
+    }
+
+    fn redact_complete_test_line(line: String, state: &mut RedactionState) -> String {
+        let had_trailing_newline = line.ends_with('\n');
+        let line = line.strip_suffix('\n').unwrap_or(&line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let mut redacted = redact_output_with_state(line, state);
+        if had_trailing_newline {
+            redacted.push('\n');
+        }
+        redacted
+    }
+
+    #[test]
+    fn streaming_heuristic_redaction_holds_a_split_credential_field_until_line_end() {
+        const CHUNK_BYTES: usize = 8 * 1024;
+        const FIELD_PREFIX: &[u8] = b" API_TO";
+        const SENSITIVE_VALUE: &str = "fixture-sensitive-value";
+
+        let mut first_chunk = vec![b'x'; CHUNK_BYTES - FIELD_PREFIX.len()];
+        first_chunk.extend_from_slice(FIELD_PREFIX);
+        assert_eq!(first_chunk.len(), CHUNK_BYTES);
+        let second_chunk = format!("KEN={SENSITIVE_VALUE}\n");
+
+        let mut exact = ExactSecretStreamRedactor::new(Vec::new(), MAX_OUTPUT_BYTES).unwrap();
+        let mut heuristic = StreamingHeuristicRedactor::default();
+        let first = exact.push(&first_chunk).unwrap();
+        assert!(heuristic
+            .push(&first, redact_complete_test_line)
+            .unwrap()
+            .is_empty());
+
+        let second = exact.push(second_chunk.as_bytes()).unwrap();
+        let mut output = heuristic.push(&second, redact_complete_test_line).unwrap();
+        output.push_str(
+            &heuristic
+                .push(&exact.finish().unwrap(), redact_complete_test_line)
+                .unwrap(),
+        );
+        output.push_str(&heuristic.finish(redact_complete_test_line).unwrap());
+
+        assert!(!output.contains(SENSITIVE_VALUE));
+        assert!(output.contains("API_TOKEN=[REDACTED]"));
+    }
+
+    #[test]
+    fn streaming_heuristic_redaction_rejects_an_oversized_unterminated_line() {
+        let mut redactor = StreamingHeuristicRedactor::default();
+        assert!(redactor
+            .push(&vec![b'x'; MAX_OUTPUT_BYTES], redact_complete_test_line,)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            redactor.push(b"x", redact_complete_test_line),
+            Err(BoundedOutputError::OutputLimit)
+        ));
+    }
+
+    #[tokio::test]
+    async fn buffered_child_output_is_bounded_before_collection() {
+        let reader =
+            tokio::io::AsyncReadExt::take(tokio::io::repeat(b'x'), (MAX_OUTPUT_BYTES + 1) as u64);
+        assert!(
+            read_bounded_redacted_output(reader, Vec::new(), Arc::new(AtomicUsize::new(0)),)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn buffered_output_budget_is_shared_across_stdout_and_stderr() {
+        let total = AtomicUsize::new(0);
+        assert!(reserve_bounded_output(&total, MAX_OUTPUT_BYTES - 1).is_ok());
+        assert!(matches!(
+            reserve_bounded_output(&total, 2),
+            Err(BoundedOutputError::OutputLimit)
+        ));
+    }
+
+    struct FailingOutputReader;
+
+    impl AsyncRead for FailingOutputReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "bounded output test pipe",
+            )))
+        }
+    }
+
+    struct PendingOutputReader;
+
+    impl AsyncRead for PendingOutputReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    struct OneByteOutputReader {
+        emitted: bool,
+    }
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl AsyncRead for OneByteOutputReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.emitted {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.emitted = true;
+            buf.put_slice(b"x");
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_task_cleanup_aborts_and_joins_pending_reader() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _signal = DropSignal(task_dropped);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let mut cleanup = StreamTaskCleanup {
+            tasks: vec![StreamReaderTask {
+                stream: OutputStream::Stdout,
+                handle: task,
+            }],
+        };
+        started_rx.await.expect("reader task must start");
+
+        cleanup.abort_and_join().await;
+
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(cleanup.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_task_join_reports_a_panicking_reader() {
+        let task = tokio::spawn(async {
+            panic!("injected reader task panic");
+        });
+        let mut cleanup = StreamTaskCleanup {
+            tasks: vec![StreamReaderTask {
+                stream: OutputStream::Stderr,
+                handle: task,
+            }],
+        };
+
+        let error = cleanup.join().await.unwrap_err();
+
+        assert!(matches!(error.stream, OutputStream::Stderr));
+        assert_eq!(error.detail, "reader task panicked");
+        assert!(cleanup.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_pipe_error_preserves_originating_stream() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let task = tokio::spawn(forward_stream_chunks(
+            FailingOutputReader,
+            OutputStream::Stdout,
+            tx,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+
+        match rx.recv().await {
+            Some(StreamChunk::PipeError { stream, detail }) => {
+                assert!(matches!(stream, OutputStream::Stdout));
+                assert!(detail.contains("bounded output test pipe"));
+            }
+            other => panic!("unexpected stream result: {other:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn diagnostics_consume_the_shared_output_budgets() {
+        let diagnostic = ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC;
+        let retained_total = AtomicUsize::new(MAX_OUTPUT_BYTES - 1);
+        let existing = Some("x".to_string());
+        assert_eq!(
+            append_accounted_diagnostic(existing.clone(), diagnostic, &retained_total,),
+            existing
+        );
+        assert_eq!(retained_total.load(Ordering::Acquire), MAX_OUTPUT_BYTES - 1);
+
+        let mut emitted_total = MAX_OUTPUT_BYTES - diagnostic.len();
+        assert!(reserve_emitted_output(&mut emitted_total, diagnostic.len()));
+        assert_eq!(emitted_total, MAX_OUTPUT_BYTES);
+        assert!(!reserve_emitted_output(&mut emitted_total, 1));
+        assert_eq!(emitted_total, MAX_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn buffered_output_coordinator_kills_pending_sibling_on_stdout_limit() {
+        let total = Arc::new(AtomicUsize::new(MAX_OUTPUT_BYTES));
+        let stdout = read_bounded_redacted_output(
+            OneByteOutputReader { emitted: false },
+            Vec::new(),
+            total.clone(),
+        );
+        let stderr = read_bounded_redacted_output(PendingOutputReader, Vec::new(), total);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_bounded_output_pair(stdout, stderr),
+        )
+        .await
+        .expect("stdout limit must not wait for a pending stderr reader")
+        .unwrap_err();
+        assert!(matches!(error, BoundedOutputError::OutputLimit));
+    }
+
+    #[tokio::test]
+    async fn buffered_output_coordinator_kills_pending_sibling_on_stderr_limit() {
+        let total = Arc::new(AtomicUsize::new(MAX_OUTPUT_BYTES));
+        let stdout = read_bounded_redacted_output(PendingOutputReader, Vec::new(), total.clone());
+        let stderr =
+            read_bounded_redacted_output(OneByteOutputReader { emitted: false }, Vec::new(), total);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_bounded_output_pair(stdout, stderr),
+        )
+        .await
+        .expect("stderr limit must not wait for a pending stdout reader")
+        .unwrap_err();
+        assert!(matches!(error, BoundedOutputError::OutputLimit));
+    }
+
+    #[tokio::test]
+    async fn buffered_output_coordinator_preserves_first_failure_from_either_stream() {
+        let stdout = read_bounded_redacted_output(
+            FailingOutputReader,
+            Vec::new(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let stderr = read_bounded_redacted_output(
+            PendingOutputReader,
+            Vec::new(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_bounded_output_pair(stdout, stderr),
+        )
+        .await
+        .expect("stdout failure must not wait for a pending stderr reader")
+        .unwrap_err();
+        assert!(matches!(error, BoundedOutputError::PipeIo(_)));
+        assert!(error.to_string().contains("bounded output test pipe"));
+
+        let stdout = read_bounded_redacted_output(
+            PendingOutputReader,
+            Vec::new(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let stderr = read_bounded_redacted_output(
+            FailingOutputReader,
+            Vec::new(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_bounded_output_pair(stdout, stderr),
+        )
+        .await
+        .expect("stderr failure must not wait for a pending stdout reader")
+        .unwrap_err();
+        assert!(matches!(error, BoundedOutputError::PipeIo(_)));
+        assert!(error.to_string().contains("bounded output test pipe"));
+    }
+
+    #[tokio::test]
+    async fn buffered_output_reports_pipe_failures_as_typed_diagnostics() {
+        let error = read_bounded_redacted_output(
+            FailingOutputReader,
+            Vec::new(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, BoundedOutputError::PipeIo(_)));
+        assert!(error.to_string().len() <= 220);
+    }
 
     #[test]
     fn persisted_trace_drops_legacy_observed_argument_values() {
@@ -3368,6 +4801,150 @@ mod decision_trace_feature_tests {
 #[cfg(test)]
 mod transactional_access_tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct PausingSecretBackend {
+        reached: std::sync::Arc<tokio::sync::Semaphore>,
+        release: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::secrets::SecretBackend for PausingSecretBackend {
+        fn name(&self) -> &str {
+            "pausing-test-backend"
+        }
+
+        async fn get(
+            &self,
+            _principal: &guard::principal::PrincipalKey,
+            _key: &str,
+        ) -> Result<Option<String>> {
+            self.reached.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(Some("resolved-value".to_string()))
+        }
+
+        async fn list(&self, _principal: &guard::principal::PrincipalKey) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_all(&self) -> Result<Vec<(guard::principal::PrincipalKey, String)>> {
+            Ok(Vec::new())
+        }
+
+        async fn set(
+            &self,
+            _principal: &guard::principal::PrincipalKey,
+            _key: &str,
+            _value: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete(
+            &self,
+            _principal: &guard::principal::PrincipalKey,
+            _key: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_resolution_releases_tool_registry_and_rejects_stale_mapping() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("tools.yaml");
+        let mut registry = crate::tool_config::ToolRegistry::load(path).unwrap();
+        registry
+            .set(
+                "fixture-tool",
+                crate::tool_config::ToolConfig {
+                    secrets: HashMap::from([(
+                        "FIXTURE_VARIABLE".to_string(),
+                        "fixture-reference".to_string(),
+                    )]),
+                    ..crate::tool_config::ToolConfig::default()
+                },
+            )
+            .unwrap();
+        *server.state.tool_registry.write().await = registry;
+        let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        server.state.secrets = std::sync::Arc::new(crate::secrets::SecretManager::with_backend(
+            PausingSecretBackend {
+                reached: reached.clone(),
+                release: release.clone(),
+            },
+        ));
+        let principal = guard::principal::PrincipalKey::from_uid(1001);
+        let resolving = tokio::spawn({
+            let server = server.clone();
+            let principal = principal.clone();
+            async move {
+                resolve_current_tool_env(&server, "fixture-tool", Some(&principal), Some("1001"))
+                    .await
+            }
+        });
+        reached.acquire().await.unwrap().forget();
+
+        let mut live = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.state.tool_registry.write(),
+        )
+        .await
+        .expect("secret lookup must not retain the tool-registry writer");
+        live.set("fixture-tool", crate::tool_config::ToolConfig::default())
+            .unwrap();
+        drop(live);
+
+        release.add_permits(1);
+        let error = resolving.await.unwrap().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("authority changed during secret resolution"));
+    }
+
+    #[tokio::test]
+    async fn final_tool_mapping_lease_rejects_post_resolution_replacement() {
+        let server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("tools.yaml");
+        let mut registry = crate::tool_config::ToolRegistry::load(path).unwrap();
+        registry
+            .set(
+                "fixture-tool",
+                crate::tool_config::ToolConfig {
+                    env: HashMap::from([("FIXTURE_MODE".to_string(), "first".to_string())]),
+                    ..crate::tool_config::ToolConfig::default()
+                },
+            )
+            .unwrap();
+        *server.state.tool_registry.write().await = registry;
+
+        let resolved = resolve_current_tool_env(&server, "fixture-tool", None, None)
+            .await
+            .unwrap();
+        server
+            .state
+            .tool_registry
+            .write()
+            .await
+            .set(
+                "fixture-tool",
+                crate::tool_config::ToolConfig {
+                    env: HashMap::from([("FIXTURE_MODE".to_string(), "second".to_string())]),
+                    ..crate::tool_config::ToolConfig::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            acquire_tool_mapping_spawn_lease(&server, &resolved.authority)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn bounded_admission_reloads_once_after_unrelated_daemon_write() {
@@ -3527,5 +5104,102 @@ mod transactional_access_tests {
 
         assert!(error.contains("expired or was revoked"));
         assert!(!server.state.sessions.read().await.has(&token));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_access_admission_releases_sessions_and_cannot_publish_over_newer_state() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        let token = "stalled-admission".to_string();
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            token.clone(),
+            crate::session::SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: vec!["host-inspect".to_string()],
+                override_markers: Vec::new(),
+                scope: crate::session::IssuedGrantScope {
+                    access_managed: true,
+                    ..crate::session::IssuedGrantScope::default()
+                },
+                expires_at: None,
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                granted_at: 1,
+                static_only: true,
+                auto_amend: false,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
+            },
+        );
+        registry.install_access_grant(
+            &token,
+            Some(1),
+            "access-use".to_string(),
+            vec!["host-inspect".to_string()],
+        );
+        store.persist_registry(&registry).await.unwrap();
+        *server.state.sessions.write().await = registry;
+        server.state.session_store = Some(store.clone());
+        let request = ExecuteRequest {
+            binary: "host-inspect".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_files: HashMap::new(),
+            stream: false,
+            session_token: Some(token.clone()),
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let (committed, release) = store.pause_registry_commit_for_test("session store persist");
+        let admission = tokio::spawn({
+            let server = server.clone();
+            async move { admit_access_use(&server, &request, &["host-inspect".to_string()], None).await }
+        });
+        committed.acquire().await.unwrap().forget();
+
+        let mut sessions = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.state.sessions.write(),
+        )
+        .await
+        .expect("durable admission must not retain the live sessions writer");
+        sessions.record_interaction(
+            &token,
+            SessionInteraction {
+                at_unix: guard::env::now_unix(),
+                command: "newer interaction".to_string(),
+                allowed: false,
+                source: SessionDecisionSource::StaticPolicy,
+                reason: "newer authority state".to_string(),
+                risk: Some(10),
+                exec_status: SessionExecStatus::NotAttempted,
+                exit_code: None,
+                exposed_secret_refs: Vec::new(),
+                decision_trace: None,
+            },
+        );
+        let newer_revision = sessions.revision();
+        drop(sessions);
+
+        release.add_permits(1);
+        let error = admission.await.unwrap().unwrap_err();
+        assert!(error.contains("authority changed"));
+        let sessions = server.state.sessions.read().await;
+        assert_eq!(sessions.revision(), newer_revision);
+        assert_eq!(sessions.show(&token, 10).unwrap().stats.denied, 1);
     }
 }

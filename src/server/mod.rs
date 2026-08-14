@@ -23,6 +23,9 @@ use guard::gating::ssh_readonly::{
 };
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
+use guard::learned_rules::{
+    acquire_async_authority_use_lease, run_async_durable_store_operation, AuthorityUseLease,
+};
 use guard::policy::PolicyMode;
 use guard::principal::PrincipalKey;
 
@@ -111,7 +114,7 @@ pub(crate) use wire::{
     EXECUTE_PROTOCOL_VERSION,
 };
 
-use execute::{audit_command_line, audit_session_fingerprint};
+use execute::audit_session_fingerprint;
 use guard::audit::{AuditEvent, AuditKind};
 use wire::CallerIdentity;
 
@@ -258,18 +261,32 @@ impl Default for ServerConfig {
 /// shared, so cloning the state clones handles, not contents.
 #[derive(Clone)]
 struct ServerState {
+    /// Keeps daemon-configured exact literals registered only for this daemon
+    /// instance. Per-command values remain scoped to their execution context.
+    _trusted_exact_secret_scope: guard::redact::TrustedExactSecretScope,
     evaluator: Arc<Evaluator>,
     secrets: Arc<SecretManager>,
     tool_registry: Arc<RwLock<ToolRegistry>>,
     /// Session grant registry. Grants here extend or narrow the policy
     /// decision for a specific session token.
     sessions: Arc<RwLock<SessionRegistry>>,
+    #[cfg(test)]
+    session_publication_events: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    session_transition_attempt_events: Arc<tokio::sync::Semaphore>,
     session_store: Option<SessionStore>,
     /// Shared task-ownership guard. Cloned contexts can start session
     /// maintenance at most once for this daemon instance.
     session_maintenance_started: Arc<AtomicBool>,
     /// Containment-envelope state (recoverable provisionals).
     provisional: Arc<RwLock<ProvisionalRegistry>>,
+    /// Serializes durable transitions for the same provisional handle without
+    /// coupling unrelated containment lifecycles through storage latency.
+    provisional_transition_gates: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+        >,
+    >,
     /// Operator-approval state (held irreversible commands).
     approvals: Arc<RwLock<ApprovalRegistry>>,
     /// Operator-authored verb catalog (the typed, least-expressive interface).
@@ -323,13 +340,21 @@ impl ServerState {
         session_store: Option<SessionStore>,
     ) -> Self {
         Self {
+            _trusted_exact_secret_scope: guard::redact::TrustedExactSecretScope::default(),
             evaluator: Arc::new(evaluator),
             secrets: Arc::new(secrets),
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             sessions: Arc::new(RwLock::new(sessions)),
+            #[cfg(test)]
+            session_publication_events: Arc::new(tokio::sync::Semaphore::new(0)),
+            #[cfg(test)]
+            session_transition_attempt_events: Arc::new(tokio::sync::Semaphore::new(0)),
             session_store,
             session_maintenance_started: Arc::new(AtomicBool::new(false)),
             provisional: Arc::new(RwLock::new(ProvisionalRegistry::new())),
+            provisional_transition_gates: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             approvals: Arc::new(RwLock::new(ApprovalRegistry::new())),
             verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
             verb_previews: Arc::new(RwLock::new(admin::VerbPreviewCache::default())),
@@ -359,6 +384,33 @@ struct ServerContext {
     state: ServerState,
 }
 
+impl ServerContext {
+    fn redact_command_line(&self, binary: &str, args: &[String]) -> String {
+        let secrets = self
+            .config
+            .redact_secrets
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        guard::redact::redact_command_line_with_exact_secrets(binary, args, &secrets)
+    }
+
+    fn provisional_transition_gate(&self, handle: &str) -> Arc<Mutex<()>> {
+        let mut gates = self
+            .state
+            .provisional_transition_gates
+            .lock()
+            .expect("provisional transition gate registry is not poisoned");
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(handle).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(handle.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+}
+
 /// Per-request execution context threaded from the policy layer into gate
 /// routing and process spawn: the daemon context, the authenticated caller,
 /// the recursion depth, and the client output stream.
@@ -371,7 +423,70 @@ struct RequestContext<'a, W> {
 }
 
 impl ServerContext {
-    pub(super) fn emit_event(&self, event: runtime::NotifyEvent) {
+    async fn mutate_verb_catalog<T, F>(&self, task: &'static str, mutation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut VerbCatalog) -> Result<T> + Send + 'static,
+    {
+        run_async_durable_store_operation(&self.state.verbs, task, mutation).await
+    }
+
+    async fn refresh_verb_catalog_for_decision(&self) -> Result<()> {
+        run_async_durable_store_operation(&self.state.verbs, "verb catalog refresh", |candidate| {
+            *candidate = candidate.refreshed_copy()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn lease_verb_catalog_for_use(
+        &self,
+        task: &'static str,
+    ) -> Result<AuthorityUseLease<VerbCatalog>> {
+        let lease = acquire_async_authority_use_lease(&self.state.verbs, task).await?;
+        #[cfg(all(test, unix))]
+        let hook = verb_authority_lease_hooks()
+            .lock()
+            .unwrap()
+            .remove(&(Arc::as_ptr(&self.state.verbs) as usize, task));
+        #[cfg(all(test, unix))]
+        if let Some((acquired, release)) = hook {
+            acquired.add_permits(1);
+            release.acquire().await?.forget();
+        }
+        Ok(lease)
+    }
+
+    async fn refresh_and_lease_verb_catalog_for_use(
+        &self,
+        task: &'static str,
+    ) -> Result<AuthorityUseLease<VerbCatalog>> {
+        self.refresh_verb_catalog_for_decision().await?;
+        self.lease_verb_catalog_for_use(task).await
+    }
+
+    pub(super) fn emit_event(&self, mut event: runtime::NotifyEvent) {
+        let secrets = self
+            .config
+            .redact_secrets
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        for value in [
+            &mut event.handle,
+            &mut event.session_fingerprint,
+            &mut event.requester_principal,
+            &mut event.reason,
+            &mut event.status,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *value = guard::redact::redact_exact_and_registered_secrets(value, &secrets);
+        }
+        if let Some(behavior) = event.behavior.as_mut() {
+            guard::redact::redact_json_exact_secrets(behavior, &secrets);
+        }
         if let Some(hook) = &self.state.notify_hook {
             hook.emit(event);
         }
@@ -444,6 +559,13 @@ impl ServerContext {
     /// append; callers gating auditable actions must then fail closed.
     #[must_use]
     pub(super) fn emit_audit(&self, event: AuditEvent) -> bool {
+        let secrets = self
+            .config
+            .redact_secrets
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let event = event.redact_exact_secrets(&secrets);
         guard::audit::emit(self.state.audit.as_deref(), &event)
     }
 
@@ -479,7 +601,7 @@ impl ServerContext {
             AuditEvent::new(kind)
                 .caller(caller)
                 .session_fingerprint(audit_session_fingerprint(session_token))
-                .cmd(audit_command_line(binary, args))
+                .cmd(self.redact_command_line(binary, args))
                 .reason(reason),
         )
     }
@@ -530,10 +652,37 @@ impl ServerContext {
             AuditEvent::new(AuditKind::ExecFailed)
                 .caller(caller)
                 .session_fingerprint(audit_session_fingerprint(session_token))
-                .cmd(audit_command_line(binary, args))
+                .cmd(self.redact_command_line(binary, args))
                 .reason(reason),
         );
     }
+}
+
+#[cfg(all(test, unix))]
+type VerbAuthorityLeaseHook = (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>);
+
+#[cfg(all(test, unix))]
+fn verb_authority_lease_hooks() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<(usize, &'static str), VerbAuthorityLeaseHook>,
+> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<(usize, &'static str), VerbAuthorityLeaseHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(all(test, unix))]
+fn pause_verb_authority_lease_for_test(
+    server: &ServerContext,
+    task: &'static str,
+) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+    let acquired = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    verb_authority_lease_hooks().lock().unwrap().insert(
+        (Arc::as_ptr(&server.state.verbs) as usize, task),
+        (acquired.clone(), release.clone()),
+    );
+    (acquired, release)
 }
 
 /// The daemon's own principal: its uid on Unix, its process SID on Windows.

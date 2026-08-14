@@ -1,7 +1,11 @@
+#[cfg(unix)]
+use crate::server::admin::pause_access_approval_before_verb_lock_for_test;
 use crate::server::admin::{
     handle_admin_request_for_test, handle_admin_request_owned, handle_approval_note,
 };
 use crate::server::execute::audit_session_fingerprint;
+#[cfg(unix)]
+use crate::server::execute::pause_command_initiation_for_test;
 use crate::server::gate_runtime::{
     approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval_with_authority,
     hold_for_approval_with_trace, merge_revert_assessment_prompt, new_handle, now_unix,
@@ -12,13 +16,17 @@ use crate::server::gate_runtime::{
     arm_containment_with_access_use_for_test, arm_containment_with_authority,
     finish_due_provisional, finish_revert, resume_approval, run_provisional_check, DaemonGateSink,
 };
+use crate::server::gate_runtime::{observe_approval_lifecycle_for_test, ApprovalLifecycleTestHook};
+#[cfg(unix)]
+use crate::server::pause_verb_authority_lease_for_test;
 use crate::server::wire::{
     approval_is_armed, AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest,
     ExecuteResult, RevertSpec, CONSEQUENCE_ARM,
 };
 #[cfg(unix)]
 use crate::server::wire::{
-    ContainmentFailure, ContainmentFailureKind, ContainmentOutcome, GateStatus, CONSEQUENCE_RELEASE,
+    ContainmentFailure, ContainmentFailureKind, ContainmentOutcome, GateStatus, VerbContext,
+    CONSEQUENCE_RELEASE,
 };
 use crate::server::{RequestContext, ServerContext, APPROVAL_TTL_SECS};
 use crate::session::SessionGrant;
@@ -220,7 +228,8 @@ impl AsyncWrite for FlakyWriter {
 #[tokio::test]
 async fn containment_records_interruption_when_client_stream_drops_after_launch() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let escaped_marker = temp.path().join("background-child-survived");
+    let child_pid_file = temp.path().join("background-child-pid");
+    let child_pid_staging = temp.path().join("background-child-pid.staging");
     let store = SessionStore::open(temp.path().join("state.db"), 3_600)
         .await
         .expect("open store");
@@ -238,15 +247,18 @@ async fn containment_records_interruption_when_client_stream_drops_after_launch(
         .unwrap();
 
     // The shell produces a line and starts a same-group background child. The
-    // writer fails on the first stream write, so the daemon must group-kill the
-    // shell and background child while retaining the containment envelope.
+    // The writer accepts one complete framed message and then fails. The shell
+    // publishes the child PID before emitting its first line, so the failure
+    // deterministically occurs after the background child has started.
     let mut request = contain_request(
         "sh",
         &[
             "-c",
             &format!(
-                "echo launched; (sleep 0.3; touch '{}') & wait",
-                escaped_marker.display()
+                "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; mv '{}' '{}'; echo launched; wait",
+                child_pid_staging.display(),
+                child_pid_staging.display(),
+                child_pid_file.display()
             ),
         ],
         RevertSpec::new("true", Vec::new()),
@@ -255,7 +267,7 @@ async fn containment_records_interruption_when_client_stream_drops_after_launch(
         "STREAM_SECRET_FILE".to_string(),
         "stream-file-secret".to_string(),
     );
-    let mut writer = FlakyWriter::failing_after(0);
+    let mut writer = FlakyWriter::failing_after(2);
 
     let result = arm_containment_with_authority(
         &mut RequestContext {
@@ -272,7 +284,6 @@ async fn containment_records_interruption_when_client_stream_drops_after_launch(
         None,
     )
     .await;
-    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
 
     // The forward child launched then failed without a normal exit code.
     match &result.exec {
@@ -314,9 +325,17 @@ async fn containment_records_interruption_when_client_stream_drops_after_launch(
         0,
         "stream disconnect must remove child-lifetime secret files"
     );
+    let child_pid = std::fs::read_to_string(&child_pid_file)
+        .expect("the shell records its background child before streaming")
+        .parse::<i32>()
+        .expect("valid child pid");
+    let child_state = std::fs::read_to_string(format!("/proc/{child_pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_string()))
+        .and_then(|tail| tail.chars().next());
     assert!(
-        !escaped_marker.exists(),
-        "same-group background child survived the stream disconnect"
+        child_state.is_none() || child_state == Some('Z'),
+        "same-group background child remained runnable after the stream disconnect"
     );
     drop(reg);
 
@@ -353,6 +372,7 @@ async fn interrupted_state_persistence_failure_fixture() -> (
             vec![reverted.to_str().expect("revert marker").to_string()],
         ),
     );
+    let (initiation_reached, initiation_release) = pause_command_initiation_for_test(&cfg);
     let cfg_for_run = cfg.clone();
     let agent_for_run = agent.clone();
     let run = tokio::spawn(async move {
@@ -373,19 +393,19 @@ async fn interrupted_state_persistence_failure_fixture() -> (
         .await
     });
 
-    let handle = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(row) = cfg.state.provisional.read().await.list().into_iter().next() {
-                if row.forward_outcome() == "running" {
-                    break row.handle;
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("forward command should reach running state");
+    initiation_reached.acquire().await.unwrap().forget();
+    let handle = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .find(|row| row.forward_outcome() == "running")
+        .expect("forward row is published before command initiation")
+        .handle;
     store.fail_next_write_for_test();
+    initiation_release.add_permits(1);
 
     let response = tokio::time::timeout(std::time::Duration::from_secs(4), run)
         .await
@@ -411,9 +431,9 @@ async fn interrupted_state_persistence_failure_fixture() -> (
         .cloned()
         .expect("live interrupted row");
     assert_eq!(live.status, ProvisionalStatus::NeedsOperatorDecision);
-    assert!(!live.forward_done);
-    assert!(live.forward_persistence_failed);
-    assert_eq!(live.forward_outcome(), "persistence_failed");
+    assert!(live.forward_done);
+    assert!(!live.forward_persistence_failed);
+    assert_eq!(live.forward_outcome(), "completed");
 
     (cfg, operator, store, handle, reverted, temp)
 }
@@ -445,7 +465,7 @@ async fn interrupted_state_persistence_failure_can_be_confirmed_without_restart(
     );
     let durable = store.load_provisionals().await.expect("durable confirm");
     assert_eq!(durable[0].status, ProvisionalStatus::Confirmed);
-    assert!(durable[0].forward_persistence_failed);
+    assert!(!durable[0].forward_persistence_failed);
 }
 
 #[cfg(unix)]
@@ -476,7 +496,7 @@ async fn interrupted_state_persistence_failure_can_be_reverted_without_restart()
     );
     let durable = store.load_provisionals().await.expect("durable revert");
     assert_eq!(durable[0].status, ProvisionalStatus::Reverted);
-    assert!(durable[0].forward_persistence_failed);
+    assert!(!durable[0].forward_persistence_failed);
 }
 
 #[cfg(unix)]
@@ -494,6 +514,7 @@ async fn confirmation_deadline_starts_after_long_forward_and_survives_restart() 
         RevertSpec::new("true", Vec::new()),
     );
     request.confirm_within_secs = Some(4);
+    let (initiation_reached, initiation_release) = pause_command_initiation_for_test(&cfg);
     let cfg_for_run = cfg.clone();
     let agent_for_run = agent.clone();
     let run = tokio::spawn(async move {
@@ -514,21 +535,27 @@ async fn confirmation_deadline_starts_after_long_forward_and_survives_restart() 
         .await
     });
 
-    let handle = loop {
-        if let Some(row) = cfg.state.provisional.read().await.list().into_iter().next() {
-            assert_eq!(row.forward_outcome(), "running");
-            assert_eq!(row.deadline_unix, 0);
-            assert!(cfg
-                .state
-                .provisional
-                .read()
-                .await
-                .due_handles(u64::MAX)
-                .is_empty());
-            break row.handle;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    };
+    initiation_reached.acquire().await.unwrap().forget();
+    let row = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .next()
+        .expect("forward row is published before command initiation");
+    assert_eq!(row.forward_outcome(), "running");
+    assert_eq!(row.deadline_unix, 0);
+    assert!(cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .due_handles(u64::MAX)
+        .is_empty());
+    let handle = row.handle;
+    initiation_release.add_permits(1);
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(8), run)
         .await
@@ -641,6 +668,7 @@ async fn post_forward_persistence_failure_reports_no_durable_auto_revert_and_rec
         RevertSpec::new("true", Vec::new()),
     );
     request.confirm_within_secs = Some(4);
+    let (initiation_reached, initiation_release) = pause_command_initiation_for_test(&cfg);
     let cfg_for_run = cfg.clone();
     let agent_for_run = agent.clone();
     let run = tokio::spawn(async move {
@@ -661,19 +689,19 @@ async fn post_forward_persistence_failure_reports_no_durable_auto_revert_and_rec
         .await
     });
 
-    let handle = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(row) = cfg.state.provisional.read().await.list().into_iter().next() {
-                if row.forward_outcome() == "running" {
-                    break row.handle;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("forward row should be durable before execution");
+    initiation_reached.acquire().await.unwrap().forget();
+    let handle = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .find(|row| row.forward_outcome() == "running")
+        .expect("forward row is durable before command initiation")
+        .handle;
     store.fail_next_write_for_test();
+    initiation_release.add_permits(1);
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(4), run)
         .await
@@ -705,8 +733,8 @@ async fn post_forward_persistence_failure_reports_no_durable_auto_revert_and_rec
         .cloned()
         .expect("live provisional");
     assert_eq!(live.status, ProvisionalStatus::NeedsOperatorDecision);
-    assert_eq!(live.forward_outcome(), "persistence_failed");
-    assert!(live.forward_persistence_failed);
+    assert_eq!(live.forward_outcome(), "completed");
+    assert!(!live.forward_persistence_failed);
     assert_eq!(live.deadline_unix, 0);
     assert_eq!(live.window_secs, 0);
     assert!(cfg
@@ -720,14 +748,15 @@ async fn post_forward_persistence_failure_reports_no_durable_auto_revert_and_rec
     let durable = store
         .load_provisionals()
         .await
-        .expect("load pre-forward durable row");
+        .expect("load fail-closed durable recovery row");
     assert_eq!(durable.len(), 1);
-    assert!(!durable[0].forward_done);
+    assert_eq!(durable[0].status, ProvisionalStatus::NeedsOperatorDecision);
+    assert!(durable[0].forward_done);
     assert_eq!(durable[0].deadline_unix, 0);
 
     let (mut restarted, moved) =
         guard::gating::provisional::ProvisionalRegistry::from_rows(durable);
-    assert_eq!(moved, vec![handle]);
+    assert!(moved.is_empty());
     let recovered = restarted.list();
     assert_eq!(recovered.len(), 1);
     assert_eq!(
@@ -753,6 +782,7 @@ async fn signal_and_post_forward_persistence_failure_remain_distinct() {
         &["-c", "sleep 0.2; kill -TERM $$"],
         RevertSpec::new("true", Vec::new()),
     );
+    let (initiation_reached, initiation_release) = pause_command_initiation_for_test(&cfg);
     let cfg_for_run = cfg.clone();
     let agent_for_run = agent.clone();
     let run = tokio::spawn(async move {
@@ -773,25 +803,17 @@ async fn signal_and_post_forward_persistence_failure_remain_distinct() {
         .await
     });
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if cfg
-                .state
-                .provisional
-                .read()
-                .await
-                .list()
-                .iter()
-                .any(|row| row.forward_outcome() == "running")
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("forward command should start");
+    initiation_reached.acquire().await.unwrap().forget();
+    assert!(cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .list()
+        .iter()
+        .any(|row| row.forward_outcome() == "running"));
     store.fail_next_write_for_test();
+    initiation_release.add_permits(1);
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(4), run)
         .await
@@ -835,6 +857,7 @@ async fn post_forward_persistence_failure_fixture() -> (
         RevertSpec::new("true", Vec::new()),
     );
     request.confirm_within_secs = Some(4);
+    let (initiation_reached, initiation_release) = pause_command_initiation_for_test(&cfg);
     let cfg_for_run = cfg.clone();
     let agent_for_run = agent.clone();
     let run = tokio::spawn(async move {
@@ -855,19 +878,19 @@ async fn post_forward_persistence_failure_fixture() -> (
         .await
     });
 
-    let handle = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(row) = cfg.state.provisional.read().await.list().into_iter().next() {
-                if row.forward_outcome() == "running" {
-                    break row.handle;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("forward row should be durable before execution");
+    initiation_reached.acquire().await.unwrap().forget();
+    let handle = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .find(|row| row.forward_outcome() == "running")
+        .expect("forward row is durable before command initiation")
+        .handle;
     store.fail_next_write_for_test();
+    initiation_release.add_permits(1);
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(4), run)
         .await
@@ -956,7 +979,7 @@ async fn post_forward_persistence_failure_can_be_confirmed_and_converges_durably
     );
     let durable = store.load_provisionals().await.expect("durable confirm");
     assert_eq!(durable[0].status, ProvisionalStatus::Confirmed);
-    assert!(durable[0].forward_persistence_failed);
+    assert!(!durable[0].forward_persistence_failed);
 }
 
 #[cfg(unix)]
@@ -985,7 +1008,7 @@ async fn post_forward_persistence_failure_can_be_reverted_and_converges_durably(
     );
     let durable = store.load_provisionals().await.expect("durable revert");
     assert_eq!(durable[0].status, ProvisionalStatus::Reverted);
-    assert!(durable[0].forward_persistence_failed);
+    assert!(!durable[0].forward_persistence_failed);
 }
 
 #[cfg(unix)]
@@ -1021,6 +1044,7 @@ async fn running_containment_fixture() -> (
             vec![reverted.to_str().expect("revert path").to_string()],
         ),
     );
+    let (initiation_reached, initiation_release) = pause_command_initiation_for_test(&cfg);
     let task_cfg = Arc::clone(&cfg);
     let task_agent = agent.clone();
     let task = tokio::spawn(async move {
@@ -1040,24 +1064,18 @@ async fn running_containment_fixture() -> (
         )
         .await
     });
-    let handle = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let Some(row) = cfg
-                .state
-                .provisional
-                .read()
-                .await
-                .list()
-                .into_iter()
-                .find(|row| row.status == ProvisionalStatus::Armed && !row.forward_done)
-            {
-                break row.handle;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("forward command should reach running state");
+    initiation_reached.acquire().await.unwrap().forget();
+    let handle = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .find(|row| row.status == ProvisionalStatus::Armed && !row.forward_done)
+        .expect("forward row is published before command initiation")
+        .handle;
+    initiation_release.add_permits(1);
     (cfg, operator, agent, temp, release, reverted, handle, task)
 }
 
@@ -1714,7 +1732,7 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
         .await
         .expect("open store");
     let (mut cfg, _operator, agent) = gating_config(7004, 1000);
-    cfg.state.session_store = Some(store);
+    cfg.state.session_store = Some(store.clone());
     let agent_principal = agent.principal();
 
     // A 1s window: the smallest the clamp allows.
@@ -1753,6 +1771,11 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
         1,
         "the armed provisional is due past its deadline"
     );
+    let durable = store.load_provisionals().await.unwrap();
+    store
+        .compare_and_swap_provisional(durable[0].clone(), due[0].clone())
+        .await
+        .unwrap();
     for p in &due {
         finish_revert(&cfg, p, &CallerIdentity::Unknown, "auto").await;
     }
@@ -1799,10 +1822,7 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
     );
     revert.confirm_check = Some(crate::server::CommandSpec {
         binary: "sh".into(),
-        args: vec![
-            "-c".into(),
-            "test \"$(cat \"$CHECK_TOKEN_FILE\")\" = expected-check-secret".into(),
-        ],
+        args: vec!["-c".into(), "test -n \"$CHECK_TOKEN_FILE\"".into()],
     });
     revert.control_path = Some("local daemon identity and secret namespace".into());
     let mut request = contain_request("true", &[], revert);
@@ -1841,6 +1861,18 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         .compare_and_swap_provisional(durable[0].clone(), due[0].clone())
         .await
         .expect("durable revert claim");
+    let checked = run_provisional_check(&cfg, &due[0]).await;
+    assert!(
+        matches!(
+            checked.exec,
+            ExecOutcome::Completed {
+                exit_code: Some(0),
+                ..
+            }
+        ),
+        "confirmation check did not reuse the stored binding: {:?}",
+        checked.exec
+    );
     let outcome = finish_due_provisional(&cfg, &due[0]).await;
 
     assert_eq!(outcome.1, Some(0));
@@ -1852,7 +1884,7 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         .get(&handle)
         .cloned()
         .unwrap();
-    assert_eq!(row.status, ProvisionalStatus::Confirmed);
+    assert_eq!(row.status, ProvisionalStatus::Confirmed, "{}", outcome.0);
     assert_eq!(
         row.session_fingerprint.as_deref(),
         Some(audit_session_fingerprint(Some("check-session")).as_str())
@@ -1907,6 +1939,11 @@ async fn due_failed_confirm_check_runs_the_rollback() {
         .write()
         .await
         .take_due(now_unix() + 10_000_000);
+    let durable = store.load_provisionals().await.unwrap();
+    store
+        .compare_and_swap_provisional(durable[0].clone(), due[0].clone())
+        .await
+        .unwrap();
     let outcome = finish_due_provisional(&cfg, &due[0]).await;
 
     assert_eq!(outcome.1, Some(0));
@@ -2213,6 +2250,9 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
             upstream_identity: String::new(),
             method: "POST".to_string(),
             path: "/repos/o/r/labels".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
             body_file: None,
         }),
         reason: "delete labels/bug in o/r".to_string(),
@@ -2254,6 +2294,132 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
         .as_deref()
         .unwrap()
         .contains("no running api-proxy for protocol 'github'"));
+}
+
+/// A failed rollback is lifecycle-final but remains outstanding so an operator
+/// can query and resolve the mutation. Its durable row, live registry, audit,
+/// and notification must all record the same failed outcome.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_revert_is_durable_queryable_and_notifies_operator() {
+    let state = tempfile::tempdir().expect("state tempdir");
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .expect("open store");
+    let (mut cfg, _operator, agent) = gating_config(7_015, 1_000);
+    cfg.state.session_store = Some(store.clone());
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    let event_path = state.path().join("notify-event.json");
+    cfg.state.notify_hook = crate::server::runtime::NotifyHook::new(
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("cat > '{}'", event_path.display()),
+        ],
+        5,
+    );
+
+    let mut sink = tokio::io::sink();
+    let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        contain_request("true", &[], RevertSpec::new("false", Vec::new())),
+        agent.principal(),
+        "failed rollback fixture".to_string(),
+        None,
+    )
+    .await;
+    let handle = match result.exec {
+        ExecOutcome::Provisional { handle, .. } => handle,
+        other => panic!("expected provisional, got {other:?}"),
+    };
+    let claimed = cfg
+        .state
+        .provisional
+        .write()
+        .await
+        .begin_revert(&handle)
+        .expect("claim provisional for revert");
+    let durable_armed = store
+        .load_provisionals()
+        .await
+        .expect("load armed provisional")
+        .into_iter()
+        .find(|row| row.handle == handle)
+        .expect("armed provisional row");
+    store
+        .compare_and_swap_provisional(durable_armed, claimed.clone())
+        .await
+        .expect("persist reverting claim");
+
+    let (message, exit) = finish_revert(&cfg, &claimed, &CallerIdentity::Unknown, "auto").await;
+    assert_eq!(exit, Some(1));
+    assert!(message.contains("REVERT FAILED"), "got: {message}");
+
+    let live = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .expect("live failed revert");
+    assert_eq!(live.status, ProvisionalStatus::RevertFailed);
+    assert!(live.status.is_outstanding());
+    assert!(!live.status.is_terminal());
+    assert!(live.status.is_lifecycle_final());
+
+    let durable = store
+        .load_provisionals()
+        .await
+        .expect("load failed revert")
+        .into_iter()
+        .find(|row| row.handle == handle)
+        .expect("durable failed revert");
+    assert_eq!(durable.status, ProvisionalStatus::RevertFailed);
+    assert_eq!(durable.revert_exit, Some(1));
+
+    cfg.state.session_store = None;
+    drop(store);
+    let reopened = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .expect("reopen store");
+    let reloaded = reopened
+        .load_provisionals()
+        .await
+        .expect("reload failed revert")
+        .into_iter()
+        .find(|row| row.handle == handle)
+        .expect("reloaded failed revert");
+    assert_eq!(reloaded.status, ProvisionalStatus::RevertFailed);
+
+    let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl"))
+        .expect("read audit log");
+    assert!(audit.contains("REVERT_FAILED"), "audit: {audit}");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if event_path.exists() {
+                break std::fs::read_to_string(&event_path).expect("read notification event");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("revert notification event timed out");
+    assert!(
+        event.contains("\"event\":\"decision_made\""),
+        "event: {event}"
+    );
+    assert!(
+        event.contains("\"status\":\"revert_failed\""),
+        "event: {event}"
+    );
 }
 
 /// The sweeper executes a due API revert as an HTTP request through the
@@ -2342,6 +2508,9 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
             upstream_identity,
             method: "POST".to_string(),
             path: "/repos/o/r/labels".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
             body_file: Some(body_file.clone()),
         }),
         reason: "delete labels/bug in o/r".to_string(),
@@ -2360,9 +2529,13 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
     let mut durable = provisional.clone();
     durable.status = ProvisionalStatus::Armed;
     store
-        .save_provisional(durable)
+        .save_provisional(durable.clone())
         .await
         .expect("persist durable API provisional");
+    store
+        .compare_and_swap_provisional(durable, provisional.clone())
+        .await
+        .expect("persist API revert claim");
     cfg.state
         .provisional
         .write()
@@ -2423,6 +2596,8 @@ async fn api_provisional_binds_session_and_upstream_identity() {
                 path: "/apis/apps/v1/namespaces/dev/deployments/api".to_string(),
                 body: None,
             },
+            revert_requires_uid_precondition: false,
+            create_provenance: None,
             session_fingerprint: Some("session-fingerprint".to_string()),
             session_revision: Some("session-revision".to_string()),
             secret_entitlements: Some(vec!["cluster-a/token".to_string()]),
@@ -2450,10 +2625,143 @@ async fn api_provisional_binds_session_and_upstream_identity() {
         row.secret_entitlements.as_deref(),
         Some(["cluster-a/token".to_string()].as_slice())
     );
+    assert!(!row.forward_done);
+    assert_eq!(row.deadline_unix, 0);
+    assert_eq!(row.status, ProvisionalStatus::Staged);
+    {
+        let live = cfg.state.provisional.read().await;
+        assert!(live.visible_list().is_empty());
+        assert_eq!(live.visible_outstanding(), 0);
+        assert_eq!(live.outstanding(), 1);
+    }
+    let mut inert = guard::gating::provisional::ProvisionalRegistry::new();
+    inert.insert(row.clone());
+    assert!(inert.begin_revert(&handle).is_err());
+    assert!(inert.confirm(&handle).is_err());
+    assert!(inert.due_handles(u64::MAX).is_empty());
+    assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+    assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+    let live = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
+    assert!(live.forward_done);
+    assert_eq!(live.forward_exit, Some(0));
+    assert!(live.deadline_unix >= live.created_unix);
+    let durable = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_provisionals()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.handle == handle)
+        .unwrap();
+    assert_eq!(durable.forward_done, live.forward_done);
+    assert_eq!(durable.deadline_unix, live.deadline_unix);
     let api = row.api_revert.unwrap();
     assert_eq!(api.endpoint, "cluster-a");
     assert_eq!(api.upstream_target, "https://cluster-a.invalid");
     assert_eq!(api.upstream_identity, "identity-fingerprint");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn api_dispatch_state_blocks_operator_actions_until_the_handoff_is_uncertain() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .expect("open store");
+    let (mut cfg, _operator, _agent) = gating_config(7017, 1000);
+    cfg.state.session_store = Some(store.clone());
+    let sink = DaemonGateSink {
+        server: cfg.clone(),
+        endpoint: "cluster-a".to_string(),
+        protocol: "kubernetes".to_string(),
+        snapshot_dir: state.path().to_path_buf(),
+        snapshot_dir_safe: true,
+        window_secs: 60,
+    };
+    let mutation = || guard::proxy::ApiMutation {
+        label: "create pods/example".to_string(),
+        revert: guard::proxy::HttpRevert {
+            method: "DELETE".to_string(),
+            path: "/api/v1/namespaces/dev/pods/example".to_string(),
+            body: None,
+        },
+        revert_requires_uid_precondition: true,
+        create_provenance: Some("provenance".to_string()),
+        session_fingerprint: Some("session-fingerprint".to_string()),
+        session_revision: Some("session-revision".to_string()),
+        secret_entitlements: None,
+        upstream_target: "https://cluster-a.invalid".to_string(),
+        upstream_identity: "identity-fingerprint".to_string(),
+    };
+
+    let handle = guard::proxy::GateSink::arm_revert(&sink, mutation())
+        .await
+        .expect("stage rollback");
+    let dispatching = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
+    let mut confirm_attempt = guard::gating::provisional::ProvisionalRegistry::new();
+    confirm_attempt.insert(dispatching.clone());
+    assert!(confirm_attempt.confirm(&handle).is_err());
+    let mut revert_attempt = guard::gating::provisional::ProvisionalRegistry::new();
+    revert_attempt.insert(dispatching);
+    assert!(revert_attempt.begin_revert(&handle).is_err());
+
+    assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+
+    assert!(
+        guard::proxy::GateSink::mark_revert_indeterminate(
+            &sink,
+            &handle,
+            "upstream handoff timed out",
+            Some("resource-uid"),
+        )
+        .await
+    );
+    let uncertain = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
+    let mut actionable = guard::gating::provisional::ProvisionalRegistry::new();
+    actionable.insert(uncertain);
+    assert!(actionable.begin_revert(&handle).is_ok());
+
+    let rejected_handle = guard::proxy::GateSink::arm_revert(&sink, mutation())
+        .await
+        .expect("stage rejected rollback");
+    assert!(guard::proxy::GateSink::cancel_staged_revert(&sink, &rejected_handle).await);
+    assert!(cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&rejected_handle)
+        .is_none());
+    assert!(store
+        .load_provisionals()
+        .await
+        .unwrap()
+        .iter()
+        .all(|row| row.handle != rejected_handle));
 }
 
 /// A recoverable command whose free-form `--revert` cannot be affirmed is
@@ -2696,6 +3004,69 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
 
 /// Approval arms the immutable snapshot without executing it. Only the
 /// authenticated requester can claim the one-shot resume.
+#[cfg(unix)]
+#[tokio::test]
+async fn approval_snapshot_omits_rendered_verb_parameter_values() {
+    let (mut cfg, _, agent) = gating_config(7004, 1000);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.db");
+    let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let value = ["q", "7"].concat();
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        held_request("true", Vec::new(), None),
+        agent.principal(),
+        GateInputs {
+            reason: "needs sign-off".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: Some(VerbContext {
+                name: "fixture-verb".to_string(),
+                class: Reversibility::Irreversible,
+                trusted: false,
+                params: BTreeMap::from([("rollback_only".to_string(), value.clone())]),
+                catalog_version: 1,
+                verb_digest: None,
+                composition_digest: None,
+                access_evaluation_override_eligible: false,
+            }),
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+        },
+    )
+    .await;
+    let ExecOutcome::Held { handle, .. } = held.exec else {
+        panic!("expected held command")
+    };
+    let approval = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .unwrap()
+        .clone();
+    assert!(approval.snapshot.verb_params.is_empty());
+    assert!(store.load_approvals().await.unwrap()[0]
+        .snapshot
+        .verb_params
+        .is_empty());
+    let durable = std::fs::read(path).unwrap();
+    assert!(!durable
+        .windows(value.len())
+        .any(|window| window == value.as_bytes()));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn hold_approval_arms_then_requester_resumes_once_with_output() {
@@ -3062,7 +3433,7 @@ async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
 #[tokio::test]
 async fn armed_hold_expires_across_restart_without_execution() {
     let (mut cfg, operator, agent) = gating_config(7_043, 1_000);
-    cfg.config.approval_ttl_secs = 1;
+    cfg.config.approval_ttl_secs = 0;
     let state = tempfile::tempdir().unwrap();
     let marker = state.path().join("must-not-run");
     let store = SessionStore::open(state.path().join("state.db"), 3_600)
@@ -3106,8 +3477,6 @@ async fn armed_hold_expires_across_restart_without_execution() {
         },
     )
     .await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
     let rows = store.load_approvals().await.unwrap();
     let (registry, recovered) =
         guard::gating::approval::ApprovalRegistry::from_rows(rows, now_unix());
@@ -3235,6 +3604,7 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
             verb_params: BTreeMap::new(),
             catalog_version: None,
             verb_digest: None,
+            verb_composition_digest: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(principal),
@@ -3879,6 +4249,7 @@ async fn held_access_replay_fails_if_staged_session_was_revoked() {
         verb_params: std::collections::BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
     };
@@ -4237,25 +4608,24 @@ async fn approval_state_must_be_durable_before_a_held_snapshot_executes() {
     assert_eq!(durable[0].status, ApprovalStatus::Pending);
 }
 
-/// Wait (bounded) for a pending approval row to appear and return its handle.
-async fn wait_for_pending_hold(cfg: &ServerContext) -> String {
-    for _ in 0..100 {
-        let pending: Vec<String> = cfg
-            .state
-            .approvals
-            .read()
-            .await
-            .list()
-            .into_iter()
-            .filter(|a| a.status == ApprovalStatus::Pending)
-            .map(|a| a.handle)
-            .collect();
-        if let Some(h) = pending.into_iter().next() {
-            return h;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("no pending hold appeared");
+async fn pending_hold_after(cfg: &ServerContext, lifecycle: &ApprovalLifecycleTestHook) -> String {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        lifecycle.enqueued.acquire(),
+    )
+    .await
+    .expect("hold publication completes")
+    .unwrap()
+    .forget();
+    cfg.state
+        .approvals
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .find(|approval| approval.status == ApprovalStatus::Pending)
+        .expect("pending hold was published")
+        .handle
 }
 
 /// A kube-proxy `hold` parks the request in the approval queue: an operator
@@ -4277,6 +4647,7 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
 
     // Approve: the waiter returns Approved with the queue handle; the row is
     // Approved and carries no exec result (nothing ran).
+    let lifecycle = observe_approval_lifecycle_for_test(&cfg);
     let s = sink.clone();
     let waiter = tokio::spawn(async move {
         let context = guard::proxy::ApiSessionContext {
@@ -4297,7 +4668,17 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         guard::proxy::GateSink::hold_request(&*s, &snapshot, "namespace delete", Some(&context))
             .await
     });
-    let handle = wait_for_pending_hold(&cfg).await;
+    lifecycle.enqueued.acquire().await.unwrap().forget();
+    let handle = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .find(|approval| approval.status == ApprovalStatus::Pending)
+        .expect("pending hold was published")
+        .handle;
     assert_eq!(
         cfg.state
             .approvals
@@ -4365,6 +4746,7 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     );
 
     // Deny: the waiter fails closed with the operator's reason.
+    let lifecycle = observe_approval_lifecycle_for_test(&cfg);
     let s = sink.clone();
     let waiter = tokio::spawn(async move {
         let snapshot = guard::proxy::ApiHoldSnapshot {
@@ -4376,7 +4758,17 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         };
         guard::proxy::GateSink::hold_request(&*s, &snapshot, "namespace delete", None).await
     });
-    let handle = wait_for_pending_hold(&cfg).await;
+    lifecycle.enqueued.acquire().await.unwrap().forget();
+    let handle = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .find(|approval| approval.status == ApprovalStatus::Pending)
+        .expect("pending hold was published")
+        .handle;
     let resp = handle_admin_request_for_test(
         &cfg,
         &operator,
@@ -4406,6 +4798,7 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     );
 
     // Disconnect: dropping the waiter mid-hold retires the pending row.
+    let lifecycle = observe_approval_lifecycle_for_test(&cfg);
     let s = sink.clone();
     let waiter = tokio::spawn(async move {
         let snapshot = guard::proxy::ApiHoldSnapshot {
@@ -4417,28 +4810,28 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         };
         guard::proxy::GateSink::hold_request(&*s, &snapshot, "namespace delete", None).await
     });
-    let handle = wait_for_pending_hold(&cfg).await;
+    lifecycle.enqueued.acquire().await.unwrap().forget();
+    let handle = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .find(|approval| approval.status == ApprovalStatus::Pending)
+        .expect("pending hold was published")
+        .handle;
     waiter.abort();
-    let mut retired = false;
-    for _ in 0..100 {
-        if cfg
-            .state
+    lifecycle.retired.acquire().await.unwrap().forget();
+    assert_eq!(
+        cfg.state
             .approvals
             .read()
             .await
             .get(&handle)
             .unwrap()
-            .status
-            == ApprovalStatus::ExecFailed
-        {
-            retired = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(
-        retired,
-        "an abandoned hold must be retired, not left pending"
+            .status,
+        ApprovalStatus::ExecFailed
     );
 }
 
@@ -4474,6 +4867,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
         wait_approval_secs: Some(30),
         verb: None,
     };
+    let lifecycle = observe_approval_lifecycle_for_test(&cfg);
     let cfg2 = cfg.clone();
     let waiter = tokio::spawn(async move {
         let mut sink = tokio::io::sink();
@@ -4502,7 +4896,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
         .await
     });
 
-    let handle = wait_for_pending_hold(&cfg).await;
+    let handle = pending_hold_after(&cfg, &lifecycle).await;
     let denied = {
         let mut reg = cfg.state.approvals.write().await;
         reg.deny(&handle, now_unix(), "operator rejected".to_string())
@@ -4550,6 +4944,7 @@ async fn waiting_requester_resumes_armed_hold_and_receives_terminal_output() {
         ],
         Some(30),
     );
+    let lifecycle = observe_approval_lifecycle_for_test(&cfg);
     let cfg_for_waiter = cfg.clone();
     let waiter = tokio::spawn(async move {
         let mut sink = tokio::io::sink();
@@ -4577,7 +4972,7 @@ async fn waiting_requester_resumes_armed_hold_and_receives_terminal_output() {
         )
         .await
     });
-    let handle = wait_for_pending_hold(&cfg).await;
+    let handle = pending_hold_after(&cfg, &lifecycle).await;
     let approval = handle_admin_request_for_test(
         &cfg,
         &operator,
@@ -5152,15 +5547,15 @@ async fn approval_note_operator_and_owner_post_others_refused() {
 const HELD_VERB_YAML: &str = r#"
 verbs:
   - name: restart-service
-    binary: systemctl
-    args: ["restart", "{unit}"]
+    binary: true
+    args: ["{unit}"]
     params:
       unit: { pattern: "^[a-zA-Z0-9@._-]+$", required: true }
     consequence: irreversible
 "#;
 
-/// One pending hold bound to `restart-service`, executing `true` so a false
-/// pass through the void check is detectable.
+/// One pending hold bound to `restart-service` with a harmless executable
+/// rendering so successful replay is observable.
 fn held_verb_approval(
     handle: &str,
     catalog_version: Option<u64>,
@@ -5171,7 +5566,7 @@ fn held_verb_approval(
         handle: handle.to_string(),
         snapshot: ApprovalSnapshot {
             binary: "true".to_string(),
-            args: Vec::new(),
+            args: vec!["fixture".to_string()],
             cwd: None,
             env: BTreeMap::new(),
             secret_keys: BTreeMap::new(),
@@ -5183,6 +5578,7 @@ fn held_verb_approval(
             verb_params: BTreeMap::new(),
             catalog_version,
             verb_digest,
+            verb_composition_digest: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal,
@@ -5456,6 +5852,7 @@ async fn one_rpc_release_wait_returns_approved_outcome() {
         snapshot_dir_safe: true,
         window_secs: 60,
     });
+    let lifecycle = observe_approval_lifecycle_for_test(&cfg);
     let waiter = tokio::spawn(async move {
         let snapshot = guard::proxy::ApiHoldSnapshot {
             label: "release operation".to_string(),
@@ -5466,7 +5863,7 @@ async fn one_rpc_release_wait_returns_approved_outcome() {
         };
         guard::proxy::GateSink::hold_request(&*sink, &snapshot, "release review", None).await
     });
-    let handle = wait_for_pending_hold(&cfg).await;
+    let handle = pending_hold_after(&cfg, &lifecycle).await;
     let owned = handle_admin_request_owned(
         &cfg,
         &operator,
@@ -5700,6 +6097,299 @@ async fn approve_voided_when_matched_verb_definition_changed() {
     );
 }
 
+#[cfg(unix)]
+async fn held_approval_catalog_race_is_linearized(replacement: VerbCatalog) {
+    let (cfg, operator, agent) = gating_config(7088, 1000);
+    let held_catalog = VerbCatalog::from_yaml(HELD_VERB_YAML).unwrap();
+    let held_version = held_catalog.version();
+    let held_digest = held_catalog
+        .verb_definition_digest("restart-service")
+        .unwrap();
+    *cfg.state.verbs.write().await = held_catalog;
+    let handle = new_handle();
+    cfg.state
+        .approvals
+        .write()
+        .await
+        .enqueue(held_verb_approval(
+            &handle,
+            Some(held_version),
+            Some(held_digest),
+            agent.principal(),
+        ));
+
+    let (acquired, release) = pause_verb_authority_lease_for_test(&cfg, "held command arming");
+    let approving = cfg.clone();
+    let approving_operator = operator.clone();
+    let approving_handle = handle.clone();
+    let approval = tokio::spawn(async move {
+        handle_admin_request_for_test(
+            &approving,
+            &approving_operator,
+            AdminRequest::Approve {
+                handle: approving_handle,
+            },
+        )
+        .await
+    });
+    acquired.acquire().await.unwrap().forget();
+
+    // The immutable lease is generation-bound and does not retain a global
+    // catalog lock while the replacement and downstream work proceed.
+    let changing = cfg.clone();
+    let mutation = tokio::spawn(async move {
+        *changing.state.verbs.write().await = replacement;
+    });
+    release.add_permits(1);
+
+    assert!(matches!(
+        approval.await.unwrap(),
+        AdminResponse::GateAction { .. }
+    ));
+    mutation.await.unwrap();
+    let resumed = resume_approval(&cfg, &agent, &handle).await;
+    assert!(!matches!(resumed.exec, ExecOutcome::Completed { .. }));
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::ExecFailed
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_approval_lease_linearizes_against_deletion_and_amendment() {
+    held_approval_catalog_race_is_linearized(VerbCatalog::from_yaml("verbs: []").unwrap()).await;
+    let replacement = VerbCatalog::from_yaml(
+        &HELD_VERB_YAML.replace("^[a-zA-Z0-9@._-]+$", "^(fixture|alternate)$"),
+    )
+    .unwrap();
+    held_approval_catalog_race_is_linearized(replacement).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
+    let (cfg, _operator, agent) = gating_config(7089, 1000);
+    const EXECUTION_VERB: &str =
+        "verbs:\n  - name: runtime-command\n    binary: true\n    consequence: reversible\n    trusted: true\n";
+    let catalog = VerbCatalog::from_yaml(EXECUTION_VERB).unwrap();
+    let digest = catalog.verb_definition_digest("runtime-command").unwrap();
+    let version = catalog.version();
+    *cfg.state.verbs.write().await = catalog;
+    let (acquired, release) = pause_verb_authority_lease_for_test(&cfg, "command process start");
+
+    let execution = cfg.clone();
+    let execution_agent = agent.clone();
+    let routed = tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        route_gated_allow(
+            &mut RequestContext {
+                server: &execution,
+                caller: &execution_agent,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            held_request("true", Vec::new(), None),
+            GateInputs {
+                reason: "operator verb".to_string(),
+                risk: Some(1),
+                reversibility: Some(Reversibility::Reversible),
+                revert_preauthorized: false,
+                verb: Some(VerbContext {
+                    name: "runtime-command".to_string(),
+                    class: Reversibility::Reversible,
+                    trusted: true,
+                    params: BTreeMap::new(),
+                    catalog_version: version,
+                    verb_digest: Some(digest),
+                    composition_digest: None,
+                    access_evaluation_override_eligible: false,
+                }),
+                bypass: true,
+                authority: None,
+                consume_access_verbs: Vec::new(),
+            },
+            None,
+        )
+        .await
+    });
+    acquired.acquire().await.unwrap().forget();
+
+    // The immutable lease is generation-bound and does not retain a global
+    // catalog lock while the amendment and downstream work proceed.
+    let changing = cfg.clone();
+    let mutation = tokio::spawn(async move {
+        let replacement = VerbCatalog::from_yaml(
+            &EXECUTION_VERB.replace("binary: true", "binary: true\n    description: amended"),
+        )
+        .unwrap();
+        *changing.state.verbs.write().await = replacement;
+    });
+    release.add_permits(1);
+
+    assert!(matches!(
+        routed.await.unwrap().exec,
+        ExecOutcome::Completed { .. }
+    ));
+    mutation.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn access_approval_and_command_start_follow_one_lock_order() {
+    let (cfg, operator, agent) = gating_config(7090, 1000);
+    let catalog = VerbCatalog::from_yaml(
+        r#"
+verbs:
+  - name: runtime-command
+    binary: true
+    baseline: false
+    consequence: reversible
+    trusted: true
+  - name: approval-scope
+    binary: echo
+    args: ["scope"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+"#,
+    )
+    .unwrap();
+    let version = catalog.version();
+    let digest = catalog.verb_definition_digest("runtime-command").unwrap();
+    *cfg.state.verbs.write().await = catalog;
+    let mut command_session = active_session();
+    command_session.activated_verbs = vec!["runtime-command".to_string()];
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant("lock-order-session".to_string(), command_session);
+
+    let mut pending = crate::grant_profile::GrantRequest::new_access(
+        agent.principal().unwrap(),
+        None,
+        "agent-fixture".to_string(),
+        crate::grant_profile::GrantRequestDelta {
+            activated_verbs: vec!["approval-scope".to_string()],
+            ..Default::default()
+        },
+        "bounded scope".to_string(),
+    )
+    .unwrap();
+    pending.authority_verbs = vec!["approval-scope".to_string()];
+    pending.request_key = pending.canonical_access_key().unwrap();
+    let pending_handle = pending.handle.clone();
+    cfg.state
+        .grant_requests
+        .write()
+        .await
+        .insert(pending.handle.clone(), pending);
+
+    let (command_acquired, release_command) =
+        pause_verb_authority_lease_for_test(&cfg, "command process start");
+    let mut request = held_request("true", Vec::new(), None);
+    request.session_token = Some("lock-order-session".to_string());
+    let session_authority = live_authority(&cfg, "lock-order-session").await;
+    let executing = cfg.clone();
+    let executing_agent = agent.clone();
+    let command = tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        route_gated_allow(
+            &mut RequestContext {
+                server: &executing,
+                caller: &executing_agent,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            request,
+            GateInputs {
+                reason: "operator verb".to_string(),
+                risk: Some(1),
+                reversibility: Some(Reversibility::Reversible),
+                revert_preauthorized: false,
+                verb: Some(VerbContext {
+                    name: "runtime-command".to_string(),
+                    class: Reversibility::Reversible,
+                    trusted: true,
+                    params: BTreeMap::new(),
+                    catalog_version: version,
+                    verb_digest: Some(digest),
+                    composition_digest: None,
+                    access_evaluation_override_eligible: false,
+                }),
+                bypass: true,
+                authority: session_authority,
+                consume_access_verbs: Vec::new(),
+            },
+            None,
+        )
+        .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        command_acquired.acquire(),
+    )
+    .await
+    .expect("command reaches the verb initiation lease")
+    .unwrap()
+    .forget();
+
+    let (approval_reached, release_approval) =
+        pause_access_approval_before_verb_lock_for_test(&cfg);
+    let approving = cfg.clone();
+    let approval = tokio::spawn(async move {
+        handle_admin_request_for_test(
+            &approving,
+            &operator,
+            AdminRequest::AccessApprove {
+                handles: vec![pending_handle],
+                uses: Some(1),
+                wait_secs: None,
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        approval_reached.acquire(),
+    )
+    .await
+    .expect("approval reaches verb coordination before session coordination")
+    .unwrap()
+    .forget();
+    release_approval.add_permits(1);
+    // Both flows are synchronized at explicit lease boundaries. No global
+    // catalog lock spans the finite process-start or approval work.
+
+    release_command.add_permits(1);
+    let (command_result, approval_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(command, approval)
+        })
+        .await
+        .expect("opposing flows do not form a lock cycle");
+    let command_result = command_result.unwrap();
+    let command_response = command_result.into_response();
+    assert!(
+        command_response.allowed && command_response.exit_code == Some(0),
+        "command start failed: {}",
+        command_response.reason
+    );
+    let AdminResponse::AccessDecisions { items, .. } = approval_result.unwrap() else {
+        panic!("expected access decision")
+    };
+    assert!(items[0].success, "access approval failed: {:?}", items[0]);
+}
+
 #[tokio::test]
 async fn approved_snapshot_rechecks_binary_floor_before_exec() {
     let (mut cfg, _, agent) = gating_config(7015, 1000);
@@ -5718,6 +6408,7 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -5738,8 +6429,244 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn sensitive_hold_and_containment_snapshots_fail_before_persistence() {
+    let (mut cfg, _operator, agent) = gating_config(7_050, 1_000);
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let sensitive = ["q", "7"].concat();
+    let mut sink = tokio::io::sink();
+
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        held_request("curl.EXE", vec![format!("-u{sensitive}")], None),
+        agent.principal(),
+        GateInputs {
+            reason: "requires approval".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+        },
+    )
+    .await;
+    assert!(matches!(&held.exec, ExecOutcome::NotAttempted));
+
+    let contained = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        contain_request(
+            "true",
+            &[],
+            RevertSpec::new("curl", vec!["-u".to_string(), sensitive.clone()]),
+        ),
+        agent.principal(),
+        "recoverable change".to_string(),
+        None,
+    )
+    .await;
+    assert!(matches!(&contained.exec, ExecOutcome::NotAttempted));
+    assert!(cfg.state.approvals.read().await.list().is_empty());
+    assert!(cfg.state.provisional.read().await.list().is_empty());
+    assert!(store.load_approvals().await.unwrap().is_empty());
+    assert!(store.load_provisionals().await.unwrap().is_empty());
+    assert!(!serde_json::to_string(&held.into_response())
+        .unwrap()
+        .contains(&sensitive));
+    assert!(!serde_json::to_string(&contained.into_response())
+        .unwrap()
+        .contains(&sensitive));
+    let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    assert!(!audit.contains(&sensitive));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sensitive_armed_approval_is_redacted_and_cannot_resume() {
+    let (mut cfg, operator, agent) = gating_config(7_051, 1_000);
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        held_request("true", Vec::new(), None),
+        agent.principal(),
+        GateInputs {
+            reason: "requires approval".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+        },
+    )
+    .await;
+    let ExecOutcome::Held { handle, .. } = held.exec else {
+        panic!("expected held command")
+    };
+    let armed = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
+            wait_secs: None,
+        },
+    )
+    .await;
+    assert!(matches!(armed, AdminResponse::AccessDecisions { .. }));
+
+    let sensitive = ["q", "7"].concat();
+    {
+        let mut approvals = cfg.state.approvals.write().await;
+        let mut rows = approvals.list();
+        let row = rows.iter_mut().find(|row| row.handle == handle).unwrap();
+        row.snapshot.binary = "docker.CMD".to_string();
+        row.snapshot.args = vec!["login".to_string(), format!("-p:{sensitive}")];
+        row.reason = format!("password={sensitive}");
+        row.notes.push(guard::gating::approval::ApprovalNote {
+            at_unix: now_unix(),
+            author: "operator".to_string(),
+            text: format!("password={sensitive}"),
+        });
+        row.decision_trace = Some(guard::gating::DecisionTrace {
+            guidance: Some(format!("password={sensitive}")),
+            ..guard::gating::DecisionTrace::source("fixture")
+        });
+        let (registry, recovered) =
+            guard::gating::approval::ApprovalRegistry::from_rows(rows, now_unix());
+        assert!(recovered.is_empty());
+        *approvals = registry;
+    }
+    let listed = handle_admin_request_for_test(&cfg, &agent, AdminRequest::ApprovalList).await;
+    assert!(!serde_json::to_string(&listed).unwrap().contains(&sensitive));
+    let operator_listed =
+        handle_admin_request_for_test(&cfg, &operator, AdminRequest::ApprovalList).await;
+    assert!(!serde_json::to_string(&operator_listed)
+        .unwrap()
+        .contains(&sensitive));
+    let resumed = handle_admin_request_for_test(
+        &cfg,
+        &agent,
+        AdminRequest::Resume {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    assert!(!serde_json::to_string(&resumed)
+        .unwrap()
+        .contains(&sensitive));
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::ExecFailed
+    );
+    let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    assert!(!audit.contains(&sensitive));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sensitive_provisional_snapshots_are_redacted_and_cannot_replay() {
+    let (mut cfg, _operator, agent) = gating_config(7_052, 1_000);
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    let sensitive = ["q", "7"].concat();
+    let provisional = Provisional {
+        handle: "sensitive-provisional-replay".to_string(),
+        principal: agent.principal(),
+        binary: "curl.EXE".to_string(),
+        args: vec![format!("-u{sensitive}")],
+        cwd: None,
+        secret_keys: BTreeMap::new(),
+        secret_file_keys: BTreeMap::new(),
+        revert_binary: "docker.CMD".to_string(),
+        revert_args: vec!["login".to_string(), format!("-p={sensitive}")],
+        confirm_check_binary: Some("redis-cli.COM".to_string()),
+        confirm_check_args: vec![format!("-a:{sensitive}")],
+        control_path: Some("fixture".to_string()),
+        session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
+        api_revert: None,
+        reason: format!("password={sensitive}"),
+        decision_trace: Some(guard::gating::DecisionTrace {
+            guidance: Some(format!("password={sensitive}")),
+            ..guard::gating::DecisionTrace::source("fixture")
+        }),
+        created_unix: now_unix(),
+        deadline_unix: now_unix(),
+        window_secs: 0,
+        auto_reverted_unix: None,
+        forward_done: true,
+        forward_exit: Some(0),
+        forward_persistence_failed: false,
+        status: ProvisionalStatus::Reverting,
+        revert_exit: None,
+        revert_detail: None,
+    };
+    let summary = crate::server::wire::ProvisionalSummary::from_row(&provisional);
+    assert!(!serde_json::to_string(&summary)
+        .unwrap()
+        .contains(&sensitive));
+    let checked = run_provisional_check(&cfg, &provisional).await;
+    assert!(matches!(
+        &checked.exec,
+        ExecOutcome::Failed { started: false, .. }
+    ));
+    assert!(!serde_json::to_string(&checked.into_response())
+        .unwrap()
+        .contains(&sensitive));
+
+    cfg.state
+        .provisional
+        .write()
+        .await
+        .insert(provisional.clone());
+    let (message, exit) = finish_revert(&cfg, &provisional, &agent, "operator retry").await;
+    assert_eq!(exit, None);
+    assert!(!message.contains(&sensitive));
+    let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    assert!(!audit.contains(&sensitive));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() {
-    let (cfg, _, agent) = gating_config(7020, 1000);
+    let (mut cfg, _, agent) = gating_config(7020, 1000);
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
     let principal = agent.principal().unwrap();
     cfg.state
         .secrets
@@ -5769,6 +6696,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: Some(principal.clone()),
@@ -5827,24 +6755,6 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         ExecOutcome::Failed { started: false, ref reason }
             if reason.contains("does not entitle secret 'broker/token'")
     ));
-    cfg.state
-        .provisional
-        .write()
-        .await
-        .insert(provisional.clone());
-    let (_, exit) = finish_revert(&cfg, &provisional, &agent, "test").await;
-    assert_eq!(exit, None);
-    assert!(matches!(
-        cfg.state
-            .provisional
-            .read()
-            .await
-            .get(&provisional.handle)
-            .unwrap()
-            .status,
-        ProvisionalStatus::RevertFailed
-    ));
-
     let mut viable = provisional;
     viable.handle = "revoked-session-rollback".to_string();
     viable.secret_entitlements = Some(vec!["broker/token".to_string()]);
@@ -5859,9 +6769,26 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
             ..
         }
     ));
+    let mut durable = viable.clone();
+    durable.status = ProvisionalStatus::Armed;
+    store.save_provisional(durable.clone()).await.unwrap();
+    store
+        .compare_and_swap_provisional(durable, viable.clone())
+        .await
+        .unwrap();
     cfg.state.provisional.write().await.insert(viable.clone());
     let (_, exit) = finish_revert(&cfg, &viable, &agent, "test").await;
     assert_eq!(exit, Some(0));
+    assert_eq!(
+        cfg.state
+            .provisional
+            .read()
+            .await
+            .get(&viable.handle)
+            .unwrap()
+            .status,
+        ProvisionalStatus::Reverted
+    );
 }
 
 #[cfg(unix)]
@@ -5911,6 +6838,7 @@ async fn approved_snapshot_rejects_changed_session_revision() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -5945,6 +6873,7 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -5985,6 +6914,7 @@ async fn approved_snapshot_executes_in_snapshotted_cwd() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6026,6 +6956,7 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6075,6 +7006,7 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),

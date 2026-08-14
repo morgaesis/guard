@@ -221,42 +221,17 @@ struct AuditEventSerializationView {
 
 impl AuditEvent {
     fn serialization_view(&self) -> AuditEventSerializationView {
-        let redact_detail = self.kind == AuditKind::SecretExposed;
+        let projected = redact_secret_exposure(self);
         AuditEventSerializationView {
-            kind: self.kind,
-            handle: self.handle.clone(),
-            caller: self.caller.clone(),
-            session_fingerprint: self.session_fingerprint.clone(),
-            cwd: self.cwd.clone(),
-            cmd: self.cmd.as_ref().map(|value| {
-                if redact_detail {
-                    "[redacted]".to_string()
-                } else {
-                    value.clone()
-                }
-            }),
-            reason: self.reason.as_ref().map(|value| {
-                if redact_detail {
-                    "[redacted]".to_string()
-                } else {
-                    value.clone()
-                }
-            }),
-            decision_source: self.decision_source.clone(),
-            fields: self
-                .fields
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        key.clone(),
-                        if redact_detail {
-                            "[redacted]".to_string()
-                        } else {
-                            value.clone()
-                        },
-                    )
-                })
-                .collect(),
+            kind: projected.kind,
+            handle: projected.handle,
+            caller: projected.caller,
+            session_fingerprint: projected.session_fingerprint,
+            cwd: projected.cwd,
+            cmd: projected.cmd,
+            reason: projected.reason,
+            decision_source: projected.decision_source,
+            fields: projected.fields,
         }
     }
 }
@@ -271,6 +246,26 @@ impl Serialize for AuditEvent {
 }
 
 impl AuditEvent {
+    pub fn redact_exact_secrets(mut self, secrets: &[&str]) -> Self {
+        fn redact(value: &mut Option<String>, secrets: &[&str]) {
+            if let Some(value) = value {
+                *value = crate::redact::redact_exact_and_registered_secrets(value, secrets);
+            }
+        }
+        redact(&mut self.handle, secrets);
+        redact(&mut self.caller, secrets);
+        redact(&mut self.session_fingerprint, secrets);
+        redact(&mut self.cwd, secrets);
+        redact(&mut self.cmd, secrets);
+        redact(&mut self.reason, secrets);
+        redact(&mut self.decision_source, secrets);
+        for (key, value) in &mut self.fields {
+            *key = crate::redact::redact_exact_and_registered_secrets(key, secrets);
+            *value = crate::redact::redact_exact_and_registered_secrets(value, secrets);
+        }
+        self
+    }
+
     pub fn new(kind: AuditKind) -> Self {
         Self {
             kind,
@@ -367,19 +362,32 @@ impl AuditEvent {
 }
 
 fn redact_secret_exposure(event: &AuditEvent) -> AuditEvent {
-    if event.kind != AuditKind::SecretExposed {
-        return event.clone();
-    }
-
     let mut redacted = event.clone();
-    redacted.cmd = redacted.cmd.map(|_| "[redacted]".to_string());
-    redacted.reason = redacted.reason.map(|_| "[redacted]".to_string());
-    redacted.fields = redacted
-        .fields
-        .into_iter()
-        .map(|(key, _)| (key, "[redacted]".to_string()))
-        .collect();
-    redacted
+    if event.kind == AuditKind::SecretExposed {
+        redacted.cmd = redacted.cmd.map(|_| "[redacted]".to_string());
+        redacted.reason = redacted.reason.map(|_| "[redacted]".to_string());
+        redacted.fields = redacted
+            .fields
+            .into_iter()
+            .map(|(key, _)| (key, "[redacted]".to_string()))
+            .collect();
+    } else {
+        redacted.cwd = redacted
+            .cwd
+            .map(|value| crate::redact::redact_output_text(&value));
+        redacted.cmd = redacted
+            .cmd
+            .map(|value| crate::redact::redact_output_text(&value));
+        redacted.reason = redacted
+            .reason
+            .map(|value| crate::redact::redact_output_text(&value));
+        redacted.fields = redacted
+            .fields
+            .into_iter()
+            .map(|(key, value)| (key, crate::redact::redact_output_text(&value)))
+            .collect();
+    }
+    redacted.redact_exact_secrets(&[])
 }
 
 fn push_field(line: &mut String, key: &str, value: &str, quoted: bool) {
@@ -822,6 +830,21 @@ mod tests {
     }
 
     #[test]
+    fn central_audit_projection_redacts_registered_exact_literals_in_all_fields() {
+        let value = ["audit", "-exact-fixture"].concat();
+        let _scope =
+            crate::redact::register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
+        let event = AuditEvent::new(AuditKind::Denied)
+            .handle(format!("handle-{value}"))
+            .caller(format!("caller-{value}"))
+            .field(format!("key-{value}"), format!("value-{value}"));
+        let redacted = redact_secret_exposure(&event);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(!serialized.contains(&value));
+        assert!(!redacted.render_line().contains(&value));
+    }
+
+    #[test]
     fn chain_round_trip_verifies_intact() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
@@ -833,6 +856,23 @@ mod tests {
         assert!(verification.intact, "{verification:?}");
         assert_eq!(verification.records, 10);
         assert_eq!(verification.broken_at_seq, None);
+    }
+
+    #[test]
+    fn evaluator_and_execution_failure_prose_is_sanitized_in_both_projections() {
+        let value = ["q", "7"].concat();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        for kind in [AuditKind::Evaluate, AuditKind::ExecFailed] {
+            let event = AuditEvent::new(kind)
+                .cmd(format!("password={value}"))
+                .reason(format!("password={value}"))
+                .field("detail", format!("password={value}"));
+            assert!(!event.render_line().contains(&value));
+            log.append(&event).unwrap();
+        }
+        assert!(!std::fs::read_to_string(path).unwrap().contains(&value));
     }
 
     #[test]
@@ -984,6 +1024,22 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_policy_events_sanitize_evaluator_prose() {
+        for kind in [AuditKind::Allowed, AuditKind::Denied] {
+            let value = ["sk-", &"Ab1".repeat(8)].concat();
+            let event = AuditEvent::new(kind).reason(format!("model rationale {value}"));
+            let rendered = event.render_line();
+            assert!(!rendered.contains(&value));
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            AuditLog::open(&path).unwrap().append(&event).unwrap();
+            let durable = std::fs::read_to_string(path).unwrap();
+            assert!(!durable.contains(&value));
+        }
+    }
+
+    #[test]
     fn render_line_escapes_control_characters() {
         let line = AuditEvent::new(AuditKind::Denied)
             .cmd("x\n[AUDIT] ALLOWED forged")
@@ -1006,6 +1062,21 @@ mod tests {
         assert!(line.contains("cmd=\"[redacted]\""));
         assert!(line.contains("reason=\"[redacted]\""));
         assert!(line.contains("secret=[redacted]"));
+    }
+
+    #[test]
+    fn audit_projections_sanitize_gate_prose_and_trace_fields() {
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+        let event = AuditEvent::new(AuditKind::Approved)
+            .reason(contaminated.clone())
+            .field("trace", contaminated);
+        let line = event.render_line();
+        let json = serde_json::to_vec(&event).unwrap();
+        assert!(!line.contains(&value));
+        assert!(!json
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
     }
 
     #[test]

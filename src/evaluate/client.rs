@@ -15,6 +15,11 @@ use std::time::Duration;
 /// Per-attempt backoff schedule (seconds). Index = attempt number (0 = first retry).
 /// The initial attempt is not delayed.
 const BACKOFF_SECONDS: [f64; 3] = [0.5, 1.5, 4.5];
+pub(super) const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_PROVIDER_JSON_DEPTH: usize = 32;
+pub(super) const MAX_PROVIDER_CONTAINER_ITEMS: usize = 1024;
+pub(super) const MAX_PROVIDER_STRING_BYTES: usize = 64 * 1024;
+pub(super) const MAX_PROVIDER_DIAGNOSTIC_BYTES: usize = 4096;
 
 /// Classifies why a single LLM attempt failed, so the retry loop can decide
 /// whether to retry at all and whether to downgrade from function-calling to
@@ -49,6 +54,16 @@ impl std::fmt::Display for AttemptError {
 }
 
 impl AttemptError {
+    fn sanitized(self) -> Self {
+        match self {
+            Self::RateLimited { retry_after } => Self::RateLimited { retry_after },
+            Self::ServerError(value) => Self::ServerError(sanitize_provider_error(value)),
+            Self::Transport(value) => Self::Transport(sanitize_provider_error(value)),
+            Self::ParseError(value) => Self::ParseError(sanitize_provider_error(value)),
+            Self::ClientError(value) => Self::ClientError(sanitize_provider_error(value)),
+        }
+    }
+
     /// Retriable means "try again within the per-model budget". Client errors
     /// (401/403/404) are NOT retriable because retrying with the same key/model
     /// won't help.
@@ -109,24 +124,40 @@ impl Evaluator {
             }
             Ok(resp) => {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                tracing::warn!("LLM API returned {}: {}", status, body);
+                let body = bounded_response_text(resp).await.unwrap_or_default();
+                tracing::warn!(
+                    "LLM API returned {}: {}",
+                    status,
+                    provider_error_excerpt(&body, 200)
+                );
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!("LLM connectivity check failed: {}", e);
-                Err(e.into())
+                let error = sanitize_provider_error(e);
+                tracing::warn!("LLM connectivity check failed: {}", error);
+                anyhow::bail!(error)
             }
         }
     }
 
     /// Top-level LLM evaluation: walks the model-fallback chain and, per model,
-    /// runs the retry loop. The LLM NEVER sees the unredacted command; only the
-    /// caller's audit log does.
+    /// runs the retry loop. Structured command callers apply argv-aware
+    /// redaction before any provider request body is built.
     #[tracing::instrument(skip(self, command, prompt_append), fields(command_len = command.len()))]
+    #[cfg(test)]
     pub(super) async fn evaluate_llm(
         &self,
         command: &str,
+        prompt_append: Option<&str>,
+    ) -> EvalResult {
+        self.evaluate_llm_with_argv(command, None, prompt_append)
+            .await
+    }
+
+    pub(super) async fn evaluate_llm_with_argv(
+        &self,
+        command: &str,
+        structured_command: Option<(&str, &[String])>,
         prompt_append: Option<&str>,
     ) -> EvalResult {
         let api_key = match &self.llm_config.api_key {
@@ -139,10 +170,11 @@ impl Evaluator {
             }
         };
 
-        // Redact secret-shaped substrings BEFORE the command text enters any LLM
-        // payload. The audit log, on the other hand, sees the original - that
-        // happens in the caller's layer, not here.
-        let redacted_command = redact_for_llm(command);
+        // Preserve argv boundaries for binary-specific option classification
+        // before applying the free-text model-boundary redactor.
+        let structured_redacted = structured_command
+            .map(|(binary, args)| crate::redact::redact_command_line(binary, args));
+        let redacted_command = redact_for_llm(structured_redacted.as_deref().unwrap_or(command));
         if redacted_command != command {
             // debug, not info: with the broadened redaction surface this
             // fires on most commands carrying any high-entropy argument and
@@ -176,9 +208,10 @@ impl Evaluator {
                 .await
             {
                 Ok(decision) => {
+                    let reason = crate::redact::redact_output_text(&decision.reason);
                     if decision.decision.eq_ignore_ascii_case("APPROVE") {
                         return EvalResult::Allow {
-                            reason: decision.reason,
+                            reason,
                             source: EvalSource::Llm,
                             risk: Some(decision.risk),
                             // Carry the model's class through only when gating is
@@ -191,13 +224,14 @@ impl Evaluator {
                         };
                     } else {
                         return EvalResult::Deny {
-                            reason: decision.reason,
+                            reason,
                             source: EvalSource::Llm,
                             risk: Some(decision.risk),
                         };
                     }
                 }
                 Err(e) => {
+                    let e = e.sanitized();
                     tracing::warn!(
                         "model {} exhausted retry budget: {} - trying next in chain",
                         model,
@@ -284,6 +318,7 @@ impl Evaluator {
                     return Ok(decision);
                 }
                 Err(e) => {
+                    let e = e.sanitized();
                     let status_tag = e.status_tag();
                     // Log failed attempt usage (zero tokens we know of; still visible in audit).
                     log_usage(model, attempt_num, &TokenUsage::default(), status_tag);
@@ -344,10 +379,9 @@ impl Evaluator {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
 
-        let response_text = response
-            .text()
+        let response_text = bounded_response_text(response)
             .await
-            .map_err(|e| AttemptError::Transport(e.to_string()))?;
+            .map_err(AttemptError::Transport)?;
 
         if status.as_u16() == 429 {
             return Err(AttemptError::RateLimited { retry_after });
@@ -356,7 +390,7 @@ impl Evaluator {
             return Err(AttemptError::ServerError(format!(
                 "{}: {}",
                 status,
-                truncate(&response_text, 200)
+                provider_error_excerpt(&response_text, 200)
             )));
         }
         if status.is_client_error() {
@@ -368,25 +402,26 @@ impl Evaluator {
             if use_function_calling && response_text.to_ascii_lowercase().contains("tool_choice") {
                 return Err(AttemptError::ParseError(format!(
                     "tool calling unsupported by provider: {}",
-                    truncate(&response_text, 200)
+                    provider_error_excerpt(&response_text, 200)
                 )));
             }
             return Err(AttemptError::ClientError(format!(
                 "{}: {}",
                 status,
-                truncate(&response_text, 200)
+                provider_error_excerpt(&response_text, 200)
             )));
         }
         if !status.is_success() {
             return Err(AttemptError::Transport(format!(
                 "unexpected status {}: {}",
                 status,
-                truncate(&response_text, 200)
+                provider_error_excerpt(&response_text, 200)
             )));
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| AttemptError::ParseError(format!("non-JSON response: {}", e)))?;
+        let parsed = parse_provider_json(&response_text).map_err(|error| {
+            AttemptError::ParseError(truncate(&error, MAX_PROVIDER_DIAGNOSTIC_BYTES))
+        })?;
 
         let usage = extract_usage(&parsed);
 
@@ -400,7 +435,10 @@ impl Evaluator {
         }
 
         let decision = parse_decision_response(&parsed, use_function_calling).map_err(|e| {
-            AttemptError::ParseError(format!("{}; {}", e, response_shape_summary(&parsed)))
+            AttemptError::ParseError(truncate(
+                &format!("{}; {}", e, response_shape_summary(&parsed)),
+                MAX_PROVIDER_DIAGNOSTIC_BYTES,
+            ))
         })?;
 
         Ok((decision, usage))
@@ -461,9 +499,129 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Sanitize provider-controlled diagnostics before they become errors, logs,
+/// audit detail, or caller-visible text.
+pub(super) fn sanitize_provider_error(value: impl std::fmt::Display) -> String {
+    crate::redact::redact_output_text(&value.to_string())
+}
+
+/// Sanitize a provider response body while it is still identifiable as
+/// untrusted, then apply the requested display bound.
+pub(super) fn provider_error_excerpt(body: &str, max: usize) -> String {
+    truncate(&sanitize_provider_error(body), max)
+}
+
+pub(super) async fn bounded_response_text(
+    mut response: reqwest::Response,
+) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+    {
+        return Err("provider response exceeded the bounded byte limit".to_string());
+    }
+    let mut bytes = Vec::with_capacity(MAX_PROVIDER_RESPONSE_BYTES.min(8192));
+    while let Some(chunk) = response.chunk().await.map_err(sanitize_provider_error)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err("provider response exceeded the bounded byte limit".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| "provider response was not valid UTF-8 within the byte limit".to_string())
+}
+
+pub(super) fn parse_provider_json(text: &str) -> Result<serde_json::Value, String> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let mut quoted = false;
+    for byte in text.bytes() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                if depth > MAX_PROVIDER_JSON_DEPTH {
+                    return Err(
+                        "provider response JSON nesting exceeded the structure limit".to_string(),
+                    );
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if quoted || depth != 0 {
+        return Err("provider response JSON was incomplete".to_string());
+    }
+    let value = serde_json::from_str(text)
+        .map_err(|error| format!("provider response JSON was invalid: {error}"))?;
+    validate_provider_json_shape(&value, 0)?;
+    Ok(value)
+}
+
+fn validate_provider_json_shape(value: &serde_json::Value, depth: usize) -> Result<(), String> {
+    if depth > MAX_PROVIDER_JSON_DEPTH {
+        return Err("provider response JSON nesting exceeded the structure limit".to_string());
+    }
+    match value {
+        serde_json::Value::Array(values) => {
+            if values.len() > MAX_PROVIDER_CONTAINER_ITEMS {
+                return Err("provider response JSON array exceeded the structure limit".to_string());
+            }
+            for value in values {
+                validate_provider_json_shape(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if values.len() > MAX_PROVIDER_CONTAINER_ITEMS {
+                return Err(
+                    "provider response JSON object exceeded the structure limit".to_string()
+                );
+            }
+            for (key, value) in values {
+                if key.len() > MAX_PROVIDER_STRING_BYTES {
+                    return Err(
+                        "provider response JSON key exceeded the structure limit".to_string()
+                    );
+                }
+                validate_provider_json_shape(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::String(value) if value.len() > MAX_PROVIDER_STRING_BYTES => {
+            return Err("provider response JSON string exceeded the structure limit".to_string());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{parse_provider_json, MAX_PROVIDER_STRING_BYTES};
     use crate::evaluate::{EvalConfig, EvalResult, Evaluator};
+
+    #[test]
+    fn provider_json_shape_limits_string_and_container_growth() {
+        let oversized = serde_json::json!({
+            "choices": [{"message": {"content": "x".repeat(MAX_PROVIDER_STRING_BYTES + 1)}}]
+        });
+        assert!(parse_provider_json(&oversized.to_string()).is_err());
+
+        let many = serde_json::json!({
+            "items": (0..=1024).collect::<Vec<_>>()
+        });
+        assert!(parse_provider_json(&many.to_string()).is_err());
+    }
 
     // --- Retry loop tests using a mock HTTP server ---
 
@@ -541,6 +699,45 @@ mod tests {
         }
     }
 
+    async fn run_mock_capture(
+        listener: tokio::net::TcpListener,
+        response_body: String,
+        captured: tokio::sync::oneshot::Sender<Vec<u8>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        while let Ok(read) = stream.read(&mut chunk).await {
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(header_end) = find_subslice(&request, b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .split("\r\n")
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length: ")
+                            .or_else(|| line.strip_prefix("content-length: "))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        let _ = captured.send(request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
@@ -564,6 +761,86 @@ mod tests {
             }}"#,
             decision
         )
+    }
+
+    fn tool_call_body_with_reason(decision: &str, reason: &str) -> String {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "decide",
+                            "arguments": serde_json::json!({
+                                "decision": decision,
+                                "reason": reason,
+                                "risk": 1
+                            }).to_string()
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn provider_rationale_is_sanitized_at_the_evaluator_boundary() {
+        let value = ["q", "7"].concat();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock = tokio::spawn(run_mock(
+            listener,
+            vec![(
+                200,
+                tool_call_body_with_reason("APPROVE", &format!("password={value}")),
+                None,
+            )],
+        ));
+        let evaluator = mock_server_evaluator(port, 0, vec![]).await;
+
+        let result = evaluator.evaluate("fixturectl status").await;
+        assert!(result.is_allow());
+        assert!(!result.reason().contains(&value));
+        assert!(result.reason().contains("[REDACTED]"));
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_argv_is_redacted_before_provider_payload_construction() {
+        for (binary, args, sensitive) in [
+            (
+                "curl",
+                vec!["-u".to_string(), ["q", "7"].concat()],
+                ["q", "7"].concat(),
+            ),
+            (
+                "mysqlsh.exe",
+                vec![format!("-p{}", ["r", "8"].concat())],
+                ["r", "8"].concat(),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let mock = tokio::spawn(run_mock_capture(
+                listener,
+                tool_call_body("APPROVE"),
+                sender,
+            ));
+            let evaluator = mock_server_evaluator(port, 0, vec![]).await;
+            let result = evaluator
+                .evaluate_scoped_argv(binary, &args, None, false, false, Some("fixture"))
+                .await;
+            assert!(result.is_allow());
+            let payload = receiver.await.unwrap();
+            assert!(!payload
+                .windows(sensitive.len())
+                .any(|part| part == sensitive.as_bytes()));
+            assert!(String::from_utf8_lossy(&payload).contains("[REDACTED]"));
+            mock.await.unwrap();
+        }
     }
 
     #[tokio::test]

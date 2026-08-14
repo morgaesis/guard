@@ -3,7 +3,8 @@
 Verbs are Guard's typed operation interface. A verb fixes a binary, validates
 parameters, describes credential and execution plans, declares consequence, and
 optionally supplies rollback. The daemon loads an operator catalog through
-`--verbs` or `GUARD_VERBS` and hot-reloads it on change.
+`--verbs` or `GUARD_VERBS`. Foreground servers hot-reload catalog changes. The
+packaged Windows service loads its administrator-owned catalog once at startup.
 
 ```bash
 guard verb list
@@ -28,6 +29,10 @@ catalog before atomically replacing the catalog file. The replacement must
 retain the requested name. Runtime-generated, automatically promoted, and
 reserved-namespace verbs cannot be amended through this command. Like other
 catalog mutations, amend requires the admin bearer.
+
+The packaged Windows service treats the installed catalog as immutable process
+input and disables automatic promotion. Administrators update that catalog
+while the service is stopped, then restart the service to load the new bytes.
 
 ## Command templates
 
@@ -172,14 +177,19 @@ operator-authored catalog is unchanged. Equivalent typed shapes are reused
 instead of duplicated.
 
 With consequence gating active, repeated eligible evaluator approvals can
-promote exact observed shapes into trusted verbs. Parameter patterns contain
-only escaped values supported by evidence. Irreversible shapes are ineligible;
-recoverable shapes require validated rollback. Promotion records the evaluator
-regime, and a model or prompt change sends stale coverage back to evaluation.
+promote exact observed, statically read-only shapes into trusted verbs. Parameter
+patterns contain only escaped values supported by evidence. Irreversible and
+recoverable shapes are not auto-promoted: mutating commands remain under
+consequence gating or operator review, and a model-proposed rollback never
+creates unattended authority. Promotion records the evaluator regime, and a
+model or prompt change sends stale coverage back to evaluation.
 
 API traffic uses the same verb vocabulary. Generated API cells bind endpoint,
-session fingerprint, operation, namespace, body shape, regime, and expiry.
-Value-bearing mutations remain evaluator-routed. Inspect or reset them with:
+session fingerprint, full session revision, operation, namespace, body shape,
+protocol authority selectors, evaluator regime, and expiry. Authority selector
+identity includes attached option aliases, so changing an attached alias or the
+session revision requires a fresh evaluation. Value-bearing mutations remain
+evaluator-routed. Inspect or reset generated cells with:
 
 ```bash
 guard verb coverage list

@@ -171,7 +171,7 @@ async fn read_gauges(state: &ServerState) -> Gauges {
         .into_iter()
         .filter(|approval| approval.status.is_pending())
         .count() as u64;
-    let provisionals = state.provisional.read().await.list();
+    let provisionals = state.provisional.read().await.visible_list();
     let provisionals_armed = provisionals
         .iter()
         .filter(|row| row.status == ProvisionalStatus::Armed)

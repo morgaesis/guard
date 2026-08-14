@@ -1,11 +1,18 @@
 //! Verb-promotion confirmation: LLM vetting and naming of mechanically derived verb templates.
 
-use super::client::truncate;
+use super::client::{
+    bounded_response_text, parse_provider_json, provider_error_excerpt, sanitize_provider_error,
+    truncate,
+};
 use super::redact::redact_for_llm;
 use super::Evaluator;
 use crate::gating::allow_promotion::{self, AllowPromotionOutcome};
-use crate::gating::verb::{validate_auto_promoted_verb_safety, ParamSpec, Verb, VerbCommand};
+use crate::gating::verb::{
+    canonical_auto_promoted_consequence, validate_auto_promoted_verb_durable_safety,
+    validate_auto_promoted_verb_safety, ParamSpec, Verb, VerbCommand,
+};
 use crate::gating::Reversibility;
+use crate::learned_rules::run_async_durable_store_operation;
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -16,7 +23,9 @@ use std::time::Duration;
 /// pattern is a plain alternation of the exact values actually observed, not
 /// a regex you write. Your only job is to name it, describe it, judge
 /// whether generalizing over the given varying positions is coherent for
-/// this binary, and, for a recoverable shape, propose a structured revert.
+/// this binary, and, for a recoverable shape, state a structured revert for
+/// analysis. Recoverable and irreversible shapes are never eligible for
+/// unattended promotion.
 pub(super) const SYSTEM_PROMPT_CONFIRM_VERB_PROMOTION: &str = "A guard daemon derived a candidate verb \
 template mechanically from repeated LLM approvals of the same shape of command. The binary, the \
 argv template, every parameter's exact allowed values, and the consequence class are already fixed \
@@ -26,9 +35,10 @@ genuinely safe and coherent for this specific binary and subcommand regardless o
 already-enumerated values is used (decline, confident=false, if the position could plausibly carry \
 materially different risk depending on which enumerated value is present, e.g. a resource name where \
 one value happens to be more sensitive than another); (2) a short kebab-case name and one-line \
-description for the verb; (3) if -- and only if -- the shape is classified recoverable, a structured \
-revert command (binary + argv template using the SAME {param} placeholders already in the forward \
-template) that would undo the forward command's effect; leave revert unset for a reversible shape. \
+description for the verb; (3) for a recoverable shape, optionally state a structured revert for \
+analysis (binary + argv template using the SAME {param} placeholders already in the forward \
+template) that would undo the forward command's effect; this proposal never authorizes unattended \
+promotion. Leave revert unset for a reversible shape. \
 Always answer by calling confirm_verb_promotion.";
 
 impl Evaluator {
@@ -62,8 +72,14 @@ impl Evaluator {
         let Some(store) = &self.allow_promotion else {
             return Ok(None);
         };
-        let mut guard = store.write().await;
-        guard.record_approval(binary, args, command, risk, reversibility, reason)
+        let binary = binary.to_string();
+        let args = args.to_vec();
+        let command = command.to_string();
+        let reason = reason.to_string();
+        run_async_durable_store_operation(store, "allow-promotion observation", move |candidate| {
+            candidate.record_approval(&binary, &args, &command, risk, reversibility, &reason)
+        })
+        .await
     }
 
     /// Permanently exclude `outcome`'s bucket from further promotion
@@ -79,13 +95,14 @@ impl Evaluator {
         let Some(store) = &self.allow_promotion else {
             return Ok(());
         };
-        let mut guard = store.write().await;
-        guard.mark_resolved(
-            &outcome.service,
-            &outcome.binary,
-            &outcome.subcommand,
-            outcome.arity,
-        )
+        let service = outcome.service.clone();
+        let binary = outcome.binary.clone();
+        let subcommand = outcome.subcommand.clone();
+        let arity = outcome.arity;
+        run_async_durable_store_operation(store, "allow-promotion resolution", move |candidate| {
+            candidate.mark_resolved(&service, &binary, &subcommand, arity)
+        })
+        .await
     }
 
     /// Attempt to confirm and build a promotable verb from an outcome flagged
@@ -95,11 +112,12 @@ impl Evaluator {
     /// literal bucket (no varying position) needs no model judgment and is
     /// built directly. Otherwise the model is consulted once, purely to name
     /// the verb, write its description, confirm the generalization is
-    /// coherent for this binary, and -- for a `Recoverable` outcome -- propose
-    /// a revert. The result is re-validated from scratch by
+    /// coherent for this binary. Rollbacks are never accepted as unattended
+    /// promotion authority. The result is re-validated from scratch by
     /// `validate_auto_promoted_verb_safety` regardless of what the model
-    /// returned. Returns `Ok(None)` when the model declined or nothing
-    /// changed (not an error: the bucket keeps accumulating for next time).
+    /// returned. Returns `Ok(None)` when the model declined, the consequence
+    /// class is not eligible, or nothing changed (not an error: the bucket
+    /// keeps accumulating for next time).
     pub async fn try_confirm_verb_promotion(
         &self,
         outcome: &AllowPromotionOutcome,
@@ -107,10 +125,17 @@ impl Evaluator {
         let Some(slots) = allow_promotion::derive_template(&outcome.samples) else {
             return Ok(None);
         };
+        if outcome.class == Reversibility::Irreversible {
+            return Ok(None);
+        }
         let (args, params) = allow_promotion::build_args_and_params(&slots);
         let promotion_stamp = self.verb_promotion_stamp.clone();
+        let fully_literal = allow_promotion::is_fully_literal(&slots);
+        if fully_literal && outcome.class == Reversibility::Recoverable {
+            return Ok(None);
+        }
 
-        let verb = if allow_promotion::is_fully_literal(&slots) {
+        let verb = if fully_literal {
             let name = allow_promotion::choose_verb_name(
                 None,
                 &outcome.service,
@@ -173,7 +198,7 @@ impl Evaluator {
                         break;
                     }
                     Err(e) => {
-                        last_err = e.to_string();
+                        last_err = sanitize_provider_error(e);
                         tracing::warn!(
                             "verb-promotion confirmation attempt {}/{} failed: {}",
                             attempt,
@@ -186,7 +211,7 @@ impl Evaluator {
                     }
                 }
             }
-            let Some((name, description, revert, model_evidence)) = confirmed else {
+            let Some((name, description, _revert, model_evidence)) = confirmed else {
                 if !last_err.is_empty() {
                     tracing::warn!(
                         "verb-promotion confirmation failed after {attempts} attempts: {last_err}"
@@ -194,20 +219,11 @@ impl Evaluator {
                 }
                 return Ok(None);
             };
-            if outcome.class == Reversibility::Recoverable && revert.is_none() {
-                // The model didn't propose a revert for a recoverable shape;
-                // nothing safe to promote without one.
+            if outcome.class == Reversibility::Recoverable {
+                // A model response cannot independently validate rollback
+                // authority for unattended promotion.
                 return Ok(None);
             }
-            // A reversible shape has no use for a revert (it executes
-            // immediately regardless -- see `decide_gate`); discard one if
-            // the model attached one anyway rather than trust it followed
-            // the "leave revert unset" instruction.
-            let revert = if outcome.class == Reversibility::Reversible {
-                None
-            } else {
-                revert
-            };
             let name = allow_promotion::choose_verb_name(
                 Some(&name),
                 &outcome.service,
@@ -225,13 +241,22 @@ impl Evaluator {
                 args,
                 params,
                 outcome.class,
-                revert,
+                None,
                 evidence,
                 promotion_stamp,
             )
         };
 
+        // Promotion authority must not be created from a model's consequence
+        // label. The local matcher classifier is deliberately fail-closed:
+        // only a statically read-only command can skip live evaluation. A
+        // mutating command remains under operator review, and a model-proposed
+        // rollback is never granted unattended authority.
+        if canonical_auto_promoted_consequence(&verb) != outcome.class {
+            return Ok(None);
+        }
         validate_auto_promoted_verb_safety(&verb, &outcome.samples)?;
+        validate_auto_promoted_verb_durable_safety(&verb)?;
         Ok(Some(verb))
     }
 
@@ -251,23 +276,30 @@ impl Evaluator {
             .await
             .map_err(|e| anyhow::anyhow!("transport error: {e}"))?;
         let status = response.status();
-        let text = response
-            .text()
+        let text = bounded_response_text(response)
             .await
             .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
         if !status.is_success() {
-            bail!("LLM call failed ({}): {}", status, truncate(&text, 200));
+            bail!(
+                "LLM call failed ({}): {}",
+                status,
+                provider_error_excerpt(&text, 200)
+            );
         }
-        let parsed: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
+        let parsed = parse_provider_json(&text)
+            .map_err(|e| anyhow::anyhow!("non-JSON response: {}", truncate(&e, 4096)))?;
         let args_str = parsed
             .pointer("/choices/0/message/tool_calls/0/function/arguments")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 anyhow::anyhow!("model did not return a confirm_verb_promotion tool call")
             })?;
-        let args: serde_json::Value = serde_json::from_str(args_str)
-            .map_err(|e| anyhow::anyhow!("tool-call arguments were not valid JSON: {e}"))?;
+        let args = parse_provider_json(args_str).map_err(|e| {
+            anyhow::anyhow!(
+                "tool-call arguments were not valid JSON: {}",
+                truncate(&e, 4096)
+            )
+        })?;
         let confident = args
             .get("confident")
             .and_then(|v| v.as_bool())
@@ -363,7 +395,7 @@ fn build_confirm_verb_promotion_body(
                                 "binary": {"type": "string"},
                                 "args": {"type": "array", "items": {"type": "string"}}
                             },
-                            "description": "required only when the consequence class is recoverable: the structured inverse, reusing the same {param} placeholders"
+                            "description": "optional analysis metadata for a recoverable shape; never an unattended promotion authority, and reuse the same {param} placeholders"
                         },
                         "evidence": {"type": "string", "description": "one sentence justifying this decision"}
                     },
@@ -382,6 +414,37 @@ mod tests {
     use crate::gating::Reversibility;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn confirmation_provider_failure_is_sanitized() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let value = ["q", "7"].concat();
+        let body = format!("password={value}");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let evaluator = Evaluator::new(EvalConfig::default()).unwrap();
+        let error = evaluator
+            .confirm_verb_promotion_once(
+                "fixture",
+                &format!("http://{address}"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        task.await.unwrap();
+        assert!(!error.to_string().contains(&value));
+    }
 
     #[tokio::test]
     async fn allow_promotion_observation_without_store_is_noop() {
@@ -420,7 +483,7 @@ mod tests {
     async fn mark_allow_promotion_resolved_permanently_excludes_the_bucket() {
         use crate::gating::allow_promotion::{AllowPromotionConfig, AllowPromotionStore};
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut config = AllowPromotionConfig::new(temp.path().join("allow.yaml"));
         config.min_approvals = 2;
         let store = AllowPromotionStore::load(config).unwrap();
@@ -560,11 +623,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_confirm_verb_promotion_recoverable_literal_without_revert_is_rejected() {
-        // The literal-shape path never asks the model for a revert, so a
-        // recoverable outcome with no varying position (and hence no chance
-        // to obtain one) must fail the safety gate rather than promote an
-        // unrevertible recoverable verb.
+    async fn try_confirm_verb_promotion_recoverable_literal_without_revert_declines_safely() {
+        // A recoverable literal shape has no independently validated rollback,
+        // so it must decline without turning safe non-promotion into an error.
         let evaluator = Evaluator::new(EvalConfig::default().llm_enabled(false)).unwrap();
         let outcome = allow_promotion_outcome(
             vec![
@@ -573,10 +634,81 @@ mod tests {
             ],
             Reversibility::Recoverable,
         );
-        let result = evaluator.try_confirm_verb_promotion(&outcome).await;
-        assert!(
-            result.is_err(),
-            "a recoverable verb without a revert must be rejected, got {result:?}"
+        let result = evaluator
+            .try_confirm_verb_promotion(&outcome)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_confirm_verb_promotion_model_proposed_revert_is_declined() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "arguments": serde_json::json!({
+                                "confident": true,
+                                "name": "restart-service",
+                                "description": "Restart a service",
+                                "revert": {
+                                    "binary": "systemctl",
+                                    "args": ["stop", "{param}"]
+                                },
+                                "evidence": "The varying value is a service name"
+                            }).to_string()
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let evaluator = Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(format!("http://{address}"))
+                .llm_retries(0),
+        )
+        .unwrap();
+        let outcome = allow_promotion_outcome(
+            vec![
+                vec![
+                    "restart".to_string(),
+                    "nginx".to_string(),
+                    "-n".to_string(),
+                    "foo".to_string(),
+                ],
+                vec![
+                    "restart".to_string(),
+                    "nginx".to_string(),
+                    "-n".to_string(),
+                    "bar".to_string(),
+                ],
+            ],
+            Reversibility::Recoverable,
         );
+        let result = evaluator
+            .try_confirm_verb_promotion(&outcome)
+            .await
+            .unwrap();
+        task.await.unwrap();
+        assert!(result.is_none());
     }
 }

@@ -1,12 +1,20 @@
 use crate::server::admin::handle_admin_request_for_test;
 use crate::server::execute::execute_command;
+#[cfg(unix)]
+use crate::server::execute::{observe_command_started_for_test, pause_command_initiation_for_test};
+#[cfg(unix)]
+use crate::server::gate_runtime::resume_approval;
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest, GateStatus, VerbInvocation,
 };
 use crate::server::ServerContext;
 use crate::session::SessionGrant;
+#[cfg(unix)]
+use crate::session::{SessionDecisionSource, SessionExecStatus, SessionInteraction};
 use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::approval::ApprovalStatus;
+#[cfg(unix)]
+use guard::gating::deny_shape::{canonical_argv, DenyLearningConfig, DenyShapeStore};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
@@ -15,6 +23,27 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::make_test_config;
+
+fn authority_tempdir() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("catalog test dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("harden catalog test dir");
+    }
+    directory
+}
+
+fn write_authority_file(path: &std::path::Path, content: impl AsRef<[u8]>) {
+    std::fs::write(path, content).expect("write catalog test file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("harden catalog test file");
+    }
+}
 
 fn raw_request(binary: &str, args: &[&str], session_token: Option<&str>) -> ExecuteRequest {
     ExecuteRequest {
@@ -35,6 +64,29 @@ fn raw_request(binary: &str, args: &[&str], session_token: Option<&str>) -> Exec
         wait_approval_secs: None,
         verb: None,
     }
+}
+
+#[cfg(unix)]
+fn revision_bound_session() -> SessionGrant {
+    let mut grant = SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: Vec::new(),
+        override_markers: Vec::new(),
+        scope: Default::default(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1000)),
+    };
+    grant.scope.saved_grant = Some("scoped".to_string());
+    grant.scope.secret_names = vec!["first-binding".to_string()];
+    grant
 }
 
 #[tokio::test]
@@ -80,6 +132,523 @@ verbs:
     assert!(!response.verb_matches[0].selected);
     assert!(response.verb_matches[1].selected);
     assert!(response.verb_guidance.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_composed_match_rejects_nonprimary_amendment_and_new_deny() {
+    const ORIGINAL: &str = r#"
+verbs:
+  - name: first-check
+    binary: true
+    args: ["--check"]
+    consequence: reversible
+    trusted: true
+  - name: second-check
+    binary: true
+    args: ["--check"]
+    consequence: reversible
+    trusted: true
+"#;
+    let replacements = [
+        ORIGINAL.replace(
+            "name: second-check\n    binary: true",
+            "name: second-check\n    binary: true\n    description: amended",
+        ),
+        format!(
+            "{ORIGINAL}\n  - name: late-deny\n    binary: true\n    args: [\"--check\"]\n    consequence: reversible\n    coverage:\n      - name: deny-check\n        action: deny\n"
+        ),
+    ];
+
+    for replacement in replacements {
+        let (mut server, _buffer) = make_test_config();
+        server.config.gate = GateMode::Consequence;
+        server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(ORIGINAL).unwrap()));
+        let (reached, release) = pause_command_initiation_for_test(&server);
+        let executing_server = server.clone();
+        let execution = tokio::spawn(async move {
+            execute_command(
+                raw_request("true", &["--check"], None),
+                &executing_server,
+                &CallerIdentity::Unix { uid: 1000 },
+            )
+            .await
+            .into_response()
+        });
+        reached.acquire().await.unwrap().forget();
+        *server.state.verbs.write().await = VerbCatalog::from_yaml(&replacement).unwrap();
+        release.add_permits(1);
+
+        let response = execution.await.unwrap();
+        assert!(!response.allowed, "changed composed authority must deny");
+        assert!(response.exit_code.is_none());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verb_lease_ends_after_process_start_while_child_is_running() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority_directory = authority_tempdir();
+    let deny_config = DenyLearningConfig::new(authority_directory.path().join("deny.yaml"));
+    let deny_store = DenyShapeStore::load(deny_config.clone()).unwrap();
+    let release_child = directory.path().join("release");
+    let script = format!(
+        "while [ ! -e {} ]; do sleep 0.01; done",
+        release_child.display()
+    );
+    let yaml = format!(
+        "verbs:\n  - name: finite-start\n    binary: sh\n    args: [\"-c\", {}]\n    consequence: reversible\n    trusted: true\n",
+        serde_json::to_string(&script).unwrap()
+    );
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.state.evaluator = Arc::new(
+        Evaluator::new(EvalConfig::default().deny_shapes(Arc::new(RwLock::new(deny_store))))
+            .unwrap(),
+    );
+    server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(&yaml).unwrap()));
+    let command_started = observe_command_started_for_test(&server);
+    let executing_server = server.clone();
+    let executing_script = script.clone();
+    let execution = tokio::spawn(async move {
+        execute_command(
+            raw_request("sh", &["-c", &executing_script], None),
+            &executing_server,
+            &CallerIdentity::Unix { uid: 1000 },
+        )
+        .await
+        .into_response()
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        command_started.acquire(),
+    )
+    .await
+    .expect("child process reaches the finite start boundary")
+    .unwrap()
+    .forget();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut catalog = server.state.verbs.write().await;
+        *catalog = VerbCatalog::from_yaml("verbs: []").unwrap();
+    })
+    .await
+    .expect("catalog mutation is not held for the child lifetime");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            let mut independent = DenyShapeStore::load(deny_config).unwrap();
+            let evidence = canonical_argv(&["-c".to_string()]);
+            independent
+                .promote_shape(
+                    "fixture",
+                    "sh",
+                    &format!("^{}$", regex::escape(&evidence)),
+                    &[evidence],
+                    "blocked",
+                    1,
+                )
+                .unwrap();
+        }),
+    )
+    .await
+    .expect("learned deny mutation is not held for the child lifetime")
+    .unwrap();
+    std::fs::write(&release_child, b"release").unwrap();
+    assert!(execution.await.unwrap().allowed);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn learned_deny_committed_after_initial_allow_prevents_process_start() {
+    let directory = authority_tempdir();
+    let path = directory.path().join("deny.yaml");
+    let deny_config = DenyLearningConfig::new(path.clone());
+    let deny_store = DenyShapeStore::load(deny_config.clone()).unwrap();
+    let evaluator =
+        Evaluator::new(EvalConfig::default().deny_shapes(Arc::new(RwLock::new(deny_store))))
+            .unwrap();
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.state.evaluator = Arc::new(evaluator);
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: checked\n    binary: true\n    args: [\"--check\"]\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let executing_server = server.clone();
+    let execution = tokio::spawn(async move {
+        execute_command(
+            raw_request("true", &["--check"], None),
+            &executing_server,
+            &CallerIdentity::Unix { uid: 1000 },
+        )
+        .await
+        .into_response()
+    });
+    reached.acquire().await.unwrap().forget();
+    let mut independent = DenyShapeStore::load(deny_config).unwrap();
+    let evidence = canonical_argv(&["--check".to_string()]);
+    independent
+        .promote_shape(
+            "fixture",
+            "true",
+            &format!("^{}$", regex::escape(&evidence)),
+            &[evidence],
+            "blocked",
+            1,
+        )
+        .unwrap();
+    release.add_permits(1);
+
+    let response = execution.await.unwrap();
+    assert!(!response.allowed);
+    assert!(response.exit_code.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_entitlement_amendment_before_process_start_denies_execution() {
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: session-check\n    binary: true\n    args: [\"--check\"]\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let token = "revision-bound-command";
+    assert!(server
+        .state
+        .sessions
+        .write()
+        .await
+        .grant(token.to_string(), revision_bound_session()));
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let executing_server = server.clone();
+    let execution = tokio::spawn(async move {
+        execute_command(
+            raw_request("true", &["--check"], Some(token)),
+            &executing_server,
+            &CallerIdentity::Unix { uid: 1000 },
+        )
+        .await
+        .into_response()
+    });
+    reached.acquire().await.unwrap().forget();
+    server.state.sessions.write().await.apply_delta(
+        token,
+        &crate::grant_profile::GrantRequestDelta {
+            secret_names: vec!["second-binding".to_string()],
+            ..Default::default()
+        },
+    );
+    release.add_permits(1);
+
+    let response = execution.await.unwrap();
+    assert!(!response.allowed);
+    assert!(response.exit_code.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interaction_suspension_before_process_start_denies_execution() {
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.config.behavior_limits.max_denials = Some(1);
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: session-check\n    binary: true\n    args: [\"--check\"]\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let token = "suspension-bound-command";
+    assert!(server
+        .state
+        .sessions
+        .write()
+        .await
+        .grant(token.to_string(), revision_bound_session()));
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let executing_server = server.clone();
+    let execution = tokio::spawn(async move {
+        execute_command(
+            raw_request("true", &["--check"], Some(token)),
+            &executing_server,
+            &CallerIdentity::Unix { uid: 1000 },
+        )
+        .await
+        .into_response()
+    });
+    reached.acquire().await.unwrap().forget();
+    server.state.sessions.write().await.record_interaction(
+        token,
+        SessionInteraction {
+            at_unix: guard::env::now_unix(),
+            command: "denied command".to_string(),
+            allowed: false,
+            source: SessionDecisionSource::SessionDeny,
+            reason: "denied".to_string(),
+            risk: None,
+            exec_status: SessionExecStatus::NotAttempted,
+            exit_code: None,
+            exposed_secret_refs: Vec::new(),
+            decision_trace: None,
+        },
+    );
+    release.add_permits(1);
+
+    let response = execution.await.unwrap();
+    assert!(!response.allowed);
+    assert!(response.exit_code.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_replay_rejects_session_revision_amendment_before_process_start() {
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.config.daemon_uid = 777;
+    server.config.daemon_principal = PrincipalKey::from_uid(777);
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: held-session-check\n    binary: true\n    args: [\"--check\"]\n    consequence: irreversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let token = "revision-bound-held-command";
+    assert!(server
+        .state
+        .sessions
+        .write()
+        .await
+        .grant(token.to_string(), revision_bound_session()));
+    let mut request = raw_request("true", &["--check"], Some(token));
+    request.require_approval = Some(true);
+    let held = execute_command(request, &server, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    let handle = held.handle.expect("held command has an approval handle");
+    assert!(matches!(
+        handle_admin_request_for_test(
+            &server,
+            &CallerIdentity::UnixAdmin { uid: 777 },
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await,
+        AdminResponse::GateAction { .. }
+    ));
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let resuming = server.clone();
+    let resuming_handle = handle.clone();
+    let replay = tokio::spawn(async move {
+        resume_approval(
+            &resuming,
+            &CallerIdentity::Unix { uid: 1000 },
+            &resuming_handle,
+        )
+        .await
+    });
+    reached.acquire().await.unwrap().forget();
+    server.state.sessions.write().await.apply_delta(
+        token,
+        &crate::grant_profile::GrantRequestDelta {
+            secret_names: vec!["second-binding".to_string()],
+            ..Default::default()
+        },
+    );
+    release.add_permits(1);
+
+    assert!(!matches!(
+        replay.await.unwrap().exec,
+        crate::server::wire::ExecOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        server
+            .state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::ExecFailed
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_replay_rejects_interaction_suspension_before_process_start() {
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.config.behavior_limits.max_denials = Some(1);
+    server.config.daemon_uid = 777;
+    server.config.daemon_principal = PrincipalKey::from_uid(777);
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: held-session-check\n    binary: true\n    args: [\"--check\"]\n    consequence: irreversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let token = "suspension-bound-held-command";
+    assert!(server
+        .state
+        .sessions
+        .write()
+        .await
+        .grant(token.to_string(), revision_bound_session()));
+    let mut request = raw_request("true", &["--check"], Some(token));
+    request.require_approval = Some(true);
+    let held = execute_command(request, &server, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    let handle = held.handle.expect("held command has an approval handle");
+    assert!(matches!(
+        handle_admin_request_for_test(
+            &server,
+            &CallerIdentity::UnixAdmin { uid: 777 },
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await,
+        AdminResponse::GateAction { .. }
+    ));
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let resuming = server.clone();
+    let resuming_handle = handle.clone();
+    let replay = tokio::spawn(async move {
+        resume_approval(
+            &resuming,
+            &CallerIdentity::Unix { uid: 1000 },
+            &resuming_handle,
+        )
+        .await
+    });
+    reached.acquire().await.unwrap().forget();
+    server.state.sessions.write().await.record_interaction(
+        token,
+        SessionInteraction {
+            at_unix: guard::env::now_unix(),
+            command: "denied command".to_string(),
+            allowed: false,
+            source: SessionDecisionSource::SessionDeny,
+            reason: "denied".to_string(),
+            risk: None,
+            exec_status: SessionExecStatus::NotAttempted,
+            exit_code: None,
+            exposed_secret_refs: Vec::new(),
+            decision_trace: None,
+        },
+    );
+    release.add_permits(1);
+
+    assert!(!matches!(
+        replay.await.unwrap().exec,
+        crate::server::wire::ExecOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        server
+            .state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::ExecFailed
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_replay_revalidates_the_complete_composed_match_before_start() {
+    const ORIGINAL: &str = r#"
+verbs:
+  - name: first-held-check
+    binary: true
+    args: ["--check"]
+    consequence: irreversible
+    trusted: true
+  - name: second-held-check
+    binary: true
+    args: ["--check"]
+    consequence: irreversible
+    trusted: true
+"#;
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.config.daemon_uid = 777;
+    server.config.daemon_principal = PrincipalKey::from_uid(777);
+    server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(ORIGINAL).unwrap()));
+    let mut request = raw_request("true", &["--check"], None);
+    request.require_approval = Some(true);
+    let held = execute_command(request, &server, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert_eq!(held.status, Some(GateStatus::Held));
+    let handle = held.handle.expect("held command has an approval handle");
+    assert!(server
+        .state
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .unwrap()
+        .snapshot
+        .verb_composition_digest
+        .is_some());
+
+    assert!(matches!(
+        handle_admin_request_for_test(
+            &server,
+            &CallerIdentity::UnixAdmin { uid: 777 },
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await,
+        AdminResponse::GateAction { .. }
+    ));
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let resuming = server.clone();
+    let resuming_handle = handle.clone();
+    let replay = tokio::spawn(async move {
+        resume_approval(
+            &resuming,
+            &CallerIdentity::Unix { uid: 1000 },
+            &resuming_handle,
+        )
+        .await
+    });
+    reached.acquire().await.unwrap().forget();
+    let amended = ORIGINAL.replace(
+        "name: second-held-check\n    binary: true",
+        "name: second-held-check\n    binary: true\n    description: amended",
+    );
+    *server.state.verbs.write().await = VerbCatalog::from_yaml(&amended).unwrap();
+    release.add_permits(1);
+
+    assert!(!matches!(
+        replay.await.unwrap().exec,
+        crate::server::wire::ExecOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        server
+            .state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::ExecFailed
+    );
 }
 
 #[tokio::test]
@@ -779,6 +1348,35 @@ fn nonfinite_synthesis_arguments(_request: &str) -> serde_json::Value {
     })
 }
 
+fn synthesis_arguments_with_sensitive_prose(_request: &str) -> serde_json::Value {
+    let value = ["q", "7"].concat();
+    serde_json::json!({
+        "name": "check-compiler",
+        "description": format!("password={value}"),
+        "binary": "rustc",
+        "args": ["--version"],
+        "params": {},
+        "consequence": "reversible",
+        "trusted": false,
+        "prompt_context": format!("password={value}"),
+        "evidence": format!("password={value}")
+    })
+}
+
+fn synthesis_arguments_with_sensitive_name(_request: &str) -> serde_json::Value {
+    let value = ["q", "7"].concat();
+    serde_json::json!({
+        "name": format!("password={value}"),
+        "description": "Inspect compiler version",
+        "binary": "rustc",
+        "args": ["--version"],
+        "params": {},
+        "consequence": "reversible",
+        "trusted": false,
+        "evidence": "The exact compiler version command is read only."
+    })
+}
+
 fn relative_file_synthesis_arguments(_request: &str) -> serde_json::Value {
     serde_json::json!({
         "name": "apply-fixture",
@@ -793,17 +1391,17 @@ fn relative_file_synthesis_arguments(_request: &str) -> serde_json::Value {
 }
 
 fn file_backed_catalog() -> (tempfile::TempDir, VerbCatalog) {
-    let dir = tempfile::tempdir().expect("catalog test dir");
+    let dir = authority_tempdir();
     let path = dir.path().join("verbs.yaml");
-    std::fs::write(&path, "verbs: []\n").expect("write empty catalog");
+    write_authority_file(&path, "verbs: []\n");
     let catalog = VerbCatalog::load(&path).expect("load empty catalog");
     (dir, catalog)
 }
 
 fn amend_test_catalog() -> (tempfile::TempDir, std::path::PathBuf, VerbCatalog) {
-    let dir = tempfile::tempdir().expect("catalog test dir");
+    let dir = authority_tempdir();
     let path = dir.path().join("verbs.yaml");
-    std::fs::write(
+    write_authority_file(
         &path,
         r#"verbs:
   - name: inspect-fixture
@@ -818,10 +1416,72 @@ fn amend_test_catalog() -> (tempfile::TempDir, std::path::PathBuf, VerbCatalog) 
     binary: true
     consequence: reversible
 "#,
-    )
-    .unwrap();
+    );
     let catalog = VerbCatalog::load(&path).unwrap();
     (dir, path, catalog)
+}
+
+#[tokio::test]
+async fn unavailable_catalog_disables_invocation_reverse_match_and_session_activation() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let directory = authority_tempdir();
+    let path = directory.path().join("verbs.yaml");
+    write_authority_file(
+        &path,
+        "verbs:\n  - name: session-safe\n    binary: true\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+    );
+    cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::load(&path).unwrap()));
+    write_authority_file(&path, "verbs:\n  - malformed\n");
+
+    let mut invocation = raw_request("", &[], None);
+    invocation.verb = Some(VerbInvocation {
+        name: "session-safe".to_string(),
+        params: Default::default(),
+    });
+    let invoked = execute_command(invocation, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(!invoked.allowed);
+    assert!(invoked.reason.contains("catalog authority is unavailable"));
+
+    let reversed = execute_command(
+        raw_request("true", &[], None),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+    assert!(!reversed.allowed);
+    assert!(reversed.reason.contains("catalog authority is unavailable"));
+
+    let session = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::UnixAdmin { uid: 777 },
+        AdminRequest::SessionGrant {
+            token: "catalog-unavailable".to_string(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            activated_verbs: vec!["session-safe".to_string()],
+            override_markers: Vec::new(),
+            ttl_secs: None,
+            prompt_append: None,
+            prose: None,
+            saved_grant: None,
+            profile: None,
+            evaluation_mode: None,
+            static_only: false,
+            auto_amend: false,
+            owner: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        session,
+        AdminResponse::Error { message } if message.contains("catalog authority is unavailable")
+    ));
 }
 
 #[tokio::test]
@@ -1050,6 +1710,97 @@ async fn preview_digest_round_trip_installs_the_exact_reviewed_candidate() {
 }
 
 #[tokio::test]
+async fn successful_synthesis_sanitizes_preview_persistence_and_admin_projection() {
+    let value = ["q", "7"].concat();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        synthesis_arguments_with_sensitive_prose,
+    ));
+    let (mut cfg, daemon) = synthesis_test_config(url);
+    let (catalog_dir, catalog) = file_backed_catalog();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: format!("Inspect compiler version with password={value}."),
+            binary_hint: Some("rustc".to_string()),
+            preview: true,
+            gate_feedback: Vec::new(),
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated {
+        verb,
+        preview_digest: Some(digest),
+        ..
+    } = response
+    else {
+        panic!("expected sanitized preview");
+    };
+    assert!(!serde_json::to_string(&verb).unwrap().contains(&value));
+    assert_eq!(verb.definition_digest(), digest);
+
+    let _policy = install_static_synthesis_policy(&mut cfg, "allow");
+    let installed = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreateFromPreview { digest },
+    )
+    .await;
+    assert!(!serde_json::to_string(&installed).unwrap().contains(&value));
+    let shown = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbShow {
+            name: "check-compiler".to_string(),
+        },
+    )
+    .await;
+    assert!(!serde_json::to_string(&shown).unwrap().contains(&value));
+    let catalog_path = catalog_dir.path().join("verbs.yaml");
+    assert!(!std::fs::read_to_string(catalog_path)
+        .unwrap()
+        .contains(&value));
+}
+
+#[tokio::test]
+async fn sensitive_synthesized_name_never_reaches_preview_catalog_or_response() {
+    let value = ["q", "7"].concat();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        synthesis_arguments_with_sensitive_name,
+    ));
+    let (mut cfg, daemon) = synthesis_test_config(url);
+    let (catalog_dir, catalog) = file_backed_catalog();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: "Inspect compiler version.".to_string(),
+            binary_hint: Some("rustc".to_string()),
+            preview: true,
+            gate_feedback: Vec::new(),
+        },
+    )
+    .await;
+    assert!(matches!(response, AdminResponse::Error { .. }));
+    assert!(!serde_json::to_string(&response).unwrap().contains(&value));
+    assert_eq!(
+        std::fs::read_to_string(catalog_dir.path().join("verbs.yaml")).unwrap(),
+        "verbs: []\n"
+    );
+    assert!(cfg.state.verb_previews.read().await.is_empty());
+}
+
+#[tokio::test]
 async fn from_preview_rejects_unknown_and_malformed_digests() {
     let (mut cfg, _buf) = make_test_config();
     cfg.config.daemon_principal = PrincipalKey::from_uid(cfg.config.daemon_uid);
@@ -1201,13 +1952,12 @@ async fn rejected_direct_create_leaves_a_pending_hold_and_catalog_unchanged() {
     ));
     let (mut cfg, daemon) = synthesis_test_config(url);
     cfg.config.gate = GateMode::Consequence;
-    let dir = tempfile::tempdir().expect("catalog test dir");
+    let dir = authority_tempdir();
     let path = dir.path().join("verbs.yaml");
-    std::fs::write(
+    write_authority_file(
         &path,
         "verbs:\n  - name: held-fixture\n    binary: true\n    consequence: irreversible\n    trusted: true\n",
-    )
-    .unwrap();
+    );
     cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::load(&path).unwrap()));
     let original_version = cfg.state.verbs.read().await.version();
 

@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
 
-use super::{DecisionTrace, GateError, Reversibility};
+use super::{sanitize_gate_text, DecisionTrace, GateError, Reversibility};
 use crate::principal::{scope_eq, PrincipalKey};
 
 /// Optional binding of held secret VALUES to the artifact the operator reviewed.
@@ -93,10 +93,11 @@ pub struct ApprovalSnapshot {
     /// env-var -> secret-key mapping materialized as child-lifetime files.
     #[serde(default)]
     pub secret_file_keys: BTreeMap<String, String>,
-    /// If this hold originated from a verb, the verb name and the validated
-    /// params, plus the catalog version it was rendered against. The version
-    /// is the staleness fallback for rows without a `verb_digest`, where any
-    /// catalog change voids the approval.
+    /// If this hold originated from a verb, the verb name and catalog version.
+    /// `verb_params` remains for schema compatibility and is always empty;
+    /// replay uses the rendered immutable argv above. The version is the
+    /// staleness fallback for rows without a `verb_digest`, where any catalog
+    /// change voids the approval.
     pub verb_name: Option<String>,
     pub verb_params: BTreeMap<String, String>,
     pub catalog_version: Option<u64>,
@@ -106,6 +107,11 @@ pub struct ApprovalSnapshot {
     /// Absent on rows written before the digest existed.
     #[serde(default)]
     pub verb_digest: Option<String>,
+    /// Canonical digest of the complete composed matcher selection. Rows
+    /// without this field use the conservative single-verb compatibility
+    /// check at replay.
+    #[serde(default)]
+    pub verb_composition_digest: Option<String>,
     /// Session-scoped access verbs selected when this immutable hold was
     /// created. Approval consumes their original bounded authority.
     #[serde(default)]
@@ -131,7 +137,21 @@ pub struct ApprovalSnapshot {
 
 impl ApprovalSnapshot {
     pub fn command_line(&self) -> String {
-        crate::redact::command_line(&self.binary, &self.args)
+        crate::redact::redact_command_line(&self.binary, &self.args)
+    }
+
+    pub fn contains_sensitive_literals(&self) -> bool {
+        crate::redact::command_contains_sensitive_literals(&self.binary, &self.args)
+    }
+
+    /// Remove literal-sensitive argv after the row has become non-replayable.
+    pub fn scrub_sensitive_literals(&mut self) -> bool {
+        if !self.contains_sensitive_literals() {
+            return false;
+        }
+        self.binary = "<unavailable>".to_string();
+        self.args.clear();
+        true
     }
 
     /// Short, stable fingerprint shown to the operator so two visually-similar
@@ -229,6 +249,40 @@ pub struct Approval {
 impl Approval {
     pub fn deadline_unix(&self) -> u64 {
         self.created_unix.saturating_add(self.ttl_secs)
+    }
+
+    /// Canonicalize all non-authoritative text before it reaches a registry,
+    /// durable store, audit projection, or wire response.
+    pub fn sanitize_explanatory_text(&mut self) -> bool {
+        fn sanitize(value: &mut String) -> bool {
+            let sanitized = sanitize_gate_text(value);
+            if sanitized == *value {
+                return false;
+            }
+            *value = sanitized;
+            true
+        }
+
+        let mut changed = sanitize(&mut self.reason);
+        if let Some(trace) = self.decision_trace.as_mut() {
+            changed |= trace.sanitize_explanatory_text();
+        }
+        if let Some(reason) = self.decided_reason.as_mut() {
+            changed |= sanitize(reason);
+        }
+        for note in &mut self.notes {
+            changed |= sanitize(&mut note.author);
+            changed |= sanitize(&mut note.text);
+        }
+        let original_stdout = self.result_stdout.take();
+        let original_stderr = self.result_stderr.take();
+        let stdout = bound_approval_transcript(original_stdout.clone()).0;
+        let stderr = bound_approval_transcript(original_stderr.clone()).0;
+        let stdout_changed = stdout != original_stdout;
+        let stderr_changed = stderr != original_stderr;
+        self.result_stdout = stdout;
+        self.result_stderr = stderr;
+        changed | stdout_changed | stderr_changed
     }
 }
 
@@ -350,8 +404,7 @@ impl ApprovalRegistry {
         let mut items = HashMap::new();
         let mut recovered = Vec::new();
         for mut row in rows {
-            row.result_stdout = bound_approval_transcript(row.result_stdout).0;
-            row.result_stderr = bound_approval_transcript(row.result_stderr).0;
+            row.sanitize_explanatory_text();
             if row.status == ApprovalStatus::Approving {
                 row.status = ApprovalStatus::ExecFailed;
                 row.decided_unix = Some(now);
@@ -373,7 +426,8 @@ impl ApprovalRegistry {
     }
 
     /// Enqueue a hold and return its notifier so a blocking waiter can await it.
-    pub fn enqueue(&mut self, approval: Approval) -> Arc<Notify> {
+    pub fn enqueue(&mut self, mut approval: Approval) -> Arc<Notify> {
+        approval.sanitize_explanatory_text();
         let notify = Arc::new(Notify::new());
         self.notifiers
             .insert(approval.handle.clone(), notify.clone());
@@ -425,6 +479,7 @@ impl ApprovalRegistry {
     pub fn set_decision_trace(&mut self, handle: &str, trace: DecisionTrace) -> Option<Approval> {
         let approval = self.items.get_mut(handle)?;
         approval.decision_trace = Some(trace);
+        approval.sanitize_explanatory_text();
         Some(approval.clone())
     }
 
@@ -521,6 +576,7 @@ impl ApprovalRegistry {
             a.result_exit = exit;
             a.result_stdout = stdout;
             a.result_stderr = stderr;
+            a.sanitize_explanatory_text();
         }
         self.wake(handle);
     }
@@ -531,6 +587,7 @@ impl ApprovalRegistry {
             a.status = ApprovalStatus::ExecFailed;
             a.decided_unix = Some(now);
             a.decided_reason = Some(detail);
+            a.sanitize_explanatory_text();
         }
         self.wake(handle);
     }
@@ -561,6 +618,7 @@ impl ApprovalRegistry {
             author: author.to_string(),
             text: text.to_string(),
         });
+        approval.sanitize_explanatory_text();
         Ok(approval)
     }
 
@@ -585,13 +643,15 @@ impl ApprovalRegistry {
         approval.status = ApprovalStatus::Denied;
         approval.decided_unix = Some(now);
         approval.decided_reason = Some(reason);
+        approval.sanitize_explanatory_text();
         Ok(approval)
     }
 
     /// Install a row after its durable transition commits. Existing notifier
     /// identity is preserved; terminal transitions wake the waiter only after
     /// SQLite is authoritative.
-    pub fn install_persisted(&mut self, approval: Approval, wake: bool) {
+    pub fn install_persisted(&mut self, mut approval: Approval, wake: bool) {
+        approval.sanitize_explanatory_text();
         let handle = approval.handle.clone();
         self.items.insert(handle.clone(), approval);
         if wake {
@@ -689,6 +749,7 @@ mod tests {
             verb_params: BTreeMap::new(),
             catalog_version: None,
             verb_digest: None,
+            verb_composition_digest: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(PrincipalKey::from_uid(1001)),
@@ -887,15 +948,15 @@ mod tests {
     async fn waiter_is_woken_on_decision() {
         let mut r = ApprovalRegistry::new();
         let notify = r.enqueue(held("h1", 100, 3600));
-        // Spawn a waiter; then decide and ensure it wakes.
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
         let waiter = tokio::spawn(async move {
-            notify.notified().await;
+            let mut notified = Box::pin(notify.notified());
+            notified.as_mut().enable();
+            let _ = registered_tx.send(());
+            notified.await;
         });
-        // Ensure the waiter has parked on notified() before we wake it;
-        // notify_waiters() only wakes tasks already awaiting.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        registered_rx.await.unwrap();
         r.deny("h1", 150, "no".into()).unwrap();
-        // notify_waiters wakes those currently awaiting; the spawned task should finish.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
             .await
             .expect("waiter should have been woken");

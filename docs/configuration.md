@@ -32,7 +32,7 @@ not in command-line arguments.
 | `GUARD_ACCESS_TTL_SECS` | `3600` | Lifetime in seconds for access-managed sessions. |
 | `GUARD_NOTIFY_CMD` | unset | Operator command receiving one JSON gate-lifecycle event on stdin. |
 | `GUARD_NOTIFY_TIMEOUT_SECS` | `10` | Notify command timeout in seconds, from 1 to 60. |
-| `GUARD_VERBS` | state directory when promotion needs it | Typed verb catalog. |
+| `GUARD_VERBS` | state directory when promotion needs it | Typed verb catalog. The packaged Windows service requires an explicit administrator-owned catalog, loads it once, and disables promotion. |
 | `GUARD_GRANTS` | unset | Reusable saved-grant catalog. |
 
 `--system-prompt <path>` replaces the compiled mode prompt.

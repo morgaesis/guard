@@ -15,12 +15,20 @@
 
 use super::coverage::reversibility_rank;
 use super::Reversibility;
+use crate::learned_rules::{
+    load_immutable_learning_file_snapshot, load_learning_file_snapshot,
+    rewrite_learning_file_bounded, write_learning_file_atomically_for_locked_snapshot,
+    AsyncDurableStore, LearningFileSnapshot,
+};
+use crate::redact::{
+    command_contains_sensitive_literals, named_value_contains_sensitive_literals,
+    text_contains_sensitive_literals, SENSITIVE_ARGV_REPLAY_GUIDANCE,
+};
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -55,6 +63,7 @@ pub enum ParamValueType {
 const SINGLE_ARGV_PATTERN_PREFIX: &str = "\0guard-single-argv:";
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParamSpecWire {
     pattern: String,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
@@ -198,6 +207,7 @@ fn default_environment_source() -> EnvironmentBindingSource {
 /// anchored `pattern` supports bounded path-like inputs. Omitting both permits
 /// any value for this exact source and environment variable name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentConstraint {
     pub name: String,
     #[serde(
@@ -218,6 +228,7 @@ fn is_plain_source(source: &EnvironmentBindingSource) -> bool {
 /// Select one or more argv values either by option spelling or by exact argv
 /// position. Option spellings accept both `--name value` and `--name=value`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValueConstraint {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
@@ -238,13 +249,54 @@ pub struct ValueConstraint {
 }
 
 /// A bound on a list-valued target selector such as Ansible `--limit a,b`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FanoutConstraint {
     #[serde(flatten)]
     pub selector: ValueConstraint,
     pub max: usize,
     #[serde(default = "default_fanout_separator")]
     pub separator: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FanoutConstraintWire {
+    #[serde(default)]
+    options: Vec<String>,
+    #[serde(default)]
+    position: Option<usize>,
+    #[serde(default)]
+    values: Vec<String>,
+    #[serde(default)]
+    allow_dash: bool,
+    #[serde(default = "default_true")]
+    required: bool,
+    #[serde(default)]
+    allow_multiple: bool,
+    max: usize,
+    #[serde(default = "default_fanout_separator")]
+    separator: String,
+}
+
+impl<'de> Deserialize<'de> for FanoutConstraint {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FanoutConstraintWire::deserialize(deserializer)?;
+        Ok(Self {
+            selector: ValueConstraint {
+                options: wire.options,
+                position: wire.position,
+                values: wire.values,
+                allow_dash: wire.allow_dash,
+                required: wire.required,
+                allow_multiple: wire.allow_multiple,
+            },
+            max: wire.max,
+            separator: wire.separator,
+        })
+    }
 }
 
 fn default_fanout_separator() -> String {
@@ -254,6 +306,7 @@ fn default_fanout_separator() -> String {
 /// One typed region of a verb's command space. Constraints are conjunctive.
 /// Required and forbidden argv tokens are exact argv elements, never globs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerbCoverageCell {
     pub name: String,
     pub action: CoverageAction,
@@ -305,6 +358,7 @@ pub struct VerbCoverageCell {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoverageProvenance {
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -318,6 +372,7 @@ pub struct CoverageProvenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoverageProbe {
     pub dimension: String,
     pub args: Vec<String>,
@@ -361,6 +416,7 @@ pub struct ValueDomain {
 
 /// A structured command template (binary + argv templates). No shell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerbCommand {
     pub binary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -369,6 +425,7 @@ pub struct VerbCommand {
 
 /// One catalog verb.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Verb {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -453,6 +510,13 @@ struct CatalogFile {
     verbs: Vec<Verb>,
 }
 
+fn is_synthesized_verb(verb: &Verb) -> bool {
+    verb.auto_promoted
+        || verb.source_prose.is_some()
+        || verb.evidence.is_some()
+        || verb.promotion_stamp.is_some()
+}
+
 /// The result of rendering a verb invocation: a concrete command ready to gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedVerb {
@@ -465,7 +529,8 @@ pub struct RenderedVerb {
     pub prompt_context: Option<String>,
     pub baseline: bool,
     pub credential_plan: Option<String>,
-    /// Validated params, recorded into the approval snapshot for the binding.
+    /// Validated params used while rendering and resolving coverage. Approval
+    /// snapshots bind the resulting immutable argv and do not persist values.
     pub params: BTreeMap<String, String>,
     /// Mirrors `Verb::auto_promoted` / `Verb::promotion_stamp`. The caller
     /// (`server::execute_command_inner`) downgrades `trusted` to `false` when
@@ -483,6 +548,7 @@ pub struct VerbCatalog {
     version: u64,
     path: Option<PathBuf>,
     mtime: Option<SystemTime>,
+    snapshot: Option<LearningFileSnapshot>,
 }
 
 impl VerbCatalog {
@@ -496,6 +562,9 @@ impl VerbCatalog {
     /// authority; the original candidate remains unchanged.
     pub fn for_admission_preview(candidate: &Verb) -> Result<Self> {
         let mut verb = candidate.clone();
+        if is_synthesized_verb(&verb) {
+            validate_canonical_synthesized_verb_envelope(&verb)?;
+        }
         verb.baseline = true;
         verb.trusted = false;
         validate_verb(&verb)?;
@@ -508,6 +577,7 @@ impl VerbCatalog {
             version: u64::from_be_bytes(version_bytes),
             path: None,
             mtime: None,
+            snapshot: None,
         })
     }
 
@@ -555,10 +625,18 @@ impl VerbCatalog {
     /// duplicate names, non-anchored param patterns, invalid regexes, and
     /// template placeholders that reference an undeclared param.
     pub fn from_yaml(text: &str) -> Result<Self> {
+        Self::from_yaml_with_repair(text).map(|(catalog, _)| catalog)
+    }
+
+    fn from_yaml_with_repair(text: &str) -> Result<(Self, Option<String>)> {
         let file: CatalogFile =
             serde_yaml_ng::from_str(text).context("failed to parse verb catalog")?;
         let mut verbs = BTreeMap::new();
+        let mut repaired = false;
         for mut verb in file.verbs {
+            if is_synthesized_verb(&verb) && text_contains_sensitive_literals(&verb.name) {
+                bail!("generated verb name contains sensitive material");
+            }
             if verb.name.starts_with("grant-") {
                 bail!(
                     "verb name '{}' uses the reserved saved-grant namespace",
@@ -571,30 +649,72 @@ impl VerbCatalog {
                     verb.name
                 );
             }
+            if is_synthesized_verb(&verb) {
+                let original = serde_json::to_value(&verb)?;
+                verb = canonicalize_generated_authority_envelope(verb)?;
+                repaired |= original != serde_json::to_value(&verb)?;
+            }
             normalize_operator_boundaries(&mut verb);
             validate_verb(&verb)?;
+            if verb.auto_promoted {
+                validate_auto_promoted_verb_durable_safety(&verb)?;
+            }
             if verbs.insert(verb.name.clone(), verb.clone()).is_some() {
                 bail!("duplicate verb name: '{}'", verb.name);
             }
         }
-        let digest = Sha256::digest(text.as_bytes());
+        let canonical = repaired
+            .then(|| canonical_catalog_yaml(text, verbs.values()))
+            .transpose()?;
+        let version_text = canonical.as_deref().unwrap_or(text);
+        let digest = Sha256::digest(version_text.as_bytes());
         let mut version_bytes = [0u8; 8];
         version_bytes.copy_from_slice(&digest[..8]);
-        Ok(Self {
-            verbs,
-            version: u64::from_be_bytes(version_bytes),
-            path: None,
-            mtime: None,
-        })
+        Ok((
+            Self {
+                verbs,
+                version: u64::from_be_bytes(version_bytes),
+                path: None,
+                mtime: None,
+                snapshot: None,
+            },
+            canonical,
+        ))
     }
 
     /// Load a catalog from a file, recording its path and mtime for reloads.
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read verb catalog {}", path.display()))?;
-        let mut catalog = Self::from_yaml(&text)?;
+        let (mut catalog, snapshot, warning) = rewrite_learning_file_bounded(path, |snapshot| {
+            let bytes = snapshot.content().context("verb catalog does not exist")?;
+            let text = std::str::from_utf8(bytes)
+                .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
+            let (catalog, repair) = Self::from_yaml_with_repair(text)?;
+            Ok((repair, catalog))
+        })?;
+        if let Some(error) = warning {
+            tracing::warn!("catalog repair committed with a durability warning: {error}");
+        }
         catalog.path = Some(path.to_path_buf());
-        catalog.mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        catalog.mtime = snapshot.modified();
+        catalog.snapshot = Some(snapshot);
+        Ok(catalog)
+    }
+
+    /// Load an operator-owned catalog as immutable process input. This mode
+    /// never creates a transaction lock beside the catalog and never observes
+    /// later path changes, so a read-only packaged configuration directory
+    /// does not become writable by the daemon.
+    pub fn load_immutable(path: &Path) -> Result<Self> {
+        let snapshot = load_immutable_learning_file_snapshot(path)?;
+        let bytes = snapshot.content().context("verb catalog does not exist")?;
+        let text = std::str::from_utf8(bytes)
+            .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
+        let (catalog, repair) = Self::from_yaml_with_repair(text)?;
+        if repair.is_some() {
+            anyhow::bail!(
+                "immutable verb catalog requires canonical repair; update it before starting the service"
+            );
+        }
         Ok(catalog)
     }
 
@@ -604,10 +724,12 @@ impl VerbCatalog {
         let Some(path) = self.path.clone() else {
             return Ok(false);
         };
-        let current = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        if current == self.mtime {
+        let current = load_learning_file_snapshot(&path)?;
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| current.same_authority(snapshot))
+        {
             return Ok(false);
         }
         let runtime_verbs = self
@@ -631,6 +753,49 @@ impl VerbCatalog {
         }
         *self = reloaded;
         Ok(true)
+    }
+
+    #[doc(hidden)]
+    pub fn refreshed_copy(&self) -> Result<Self> {
+        let Some(path) = self.path.clone() else {
+            return Ok(self.clone());
+        };
+        let runtime_verbs = self
+            .verbs
+            .values()
+            .filter(|verb| reserved_verb_name(&verb.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut reloaded = Self::load(&path)?;
+        for mut verb in runtime_verbs {
+            if verb.name.starts_with("grant-") {
+                reloaded.upsert_saved_grant_verb(verb)?;
+            } else {
+                verb.trusted = false;
+                reloaded.upsert_access_verb(verb)?;
+            }
+        }
+        Ok(reloaded)
+    }
+
+    #[doc(hidden)]
+    pub fn adopt_refreshed_file_authority(&mut self, mut refreshed: Self) -> Result<()> {
+        refreshed.verbs.retain(|name, _| !reserved_verb_name(name));
+        for mut verb in self
+            .verbs
+            .values()
+            .filter(|verb| reserved_verb_name(&verb.name))
+            .cloned()
+        {
+            if verb.name.starts_with("grant-") {
+                refreshed.upsert_saved_grant_verb(verb)?;
+            } else {
+                verb.trusted = false;
+                refreshed.upsert_access_verb(verb)?;
+            }
+        }
+        *self = refreshed;
+        Ok(())
     }
 
     /// Render a verb invocation into a concrete, gated command. Each param is
@@ -702,6 +867,14 @@ impl VerbCatalog {
             }
             None => None,
         };
+        if verb.name.starts_with("access-generated-")
+            && (command_contains_sensitive_literals(&binary, &args)
+                || revert.as_ref().is_some_and(|(revert_binary, revert_args)| {
+                    command_contains_sensitive_literals(revert_binary, revert_args)
+                }))
+        {
+            bail!("{SENSITIVE_ARGV_REPLAY_GUIDANCE}");
+        }
 
         Ok(RenderedVerb {
             name: name.to_string(),
@@ -781,6 +954,11 @@ impl VerbCatalog {
         let mut matches = Vec::new();
         for verb in self.verbs.values() {
             if !binary_names_match(binary, &verb.binary) {
+                continue;
+            }
+            if verb.name.starts_with("access-generated-")
+                && command_contains_sensitive_literals(binary, args)
+            {
                 continue;
             }
 
@@ -872,26 +1050,44 @@ impl VerbCatalog {
     /// reflect the write. Requires the catalog to be file-backed. Nothing is
     /// written if validation fails.
     pub fn append_verb(&mut self, verb: &Verb) -> Result<()> {
+        let canonical;
+        let verb = if is_synthesized_verb(verb) {
+            canonical = canonicalize_generated_authority_envelope(verb.clone())?;
+            &canonical
+        } else {
+            verb
+        };
         self.validate_candidate(verb)?;
         let path = self.path.clone().ok_or_else(|| {
             anyhow::anyhow!("verb catalog is not backed by a file; cannot persist a new verb")
         })?;
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let snapshot = load_learning_file_snapshot(&path)?;
+        let existing = snapshot
+            .content()
+            .map(std::str::from_utf8)
+            .transpose()
+            .context("verb catalog is not UTF-8")?
+            .unwrap_or_default()
+            .to_string();
         let new_content = compose_appended_catalog(&existing, verb)?;
         // Validate the COMBINED catalog in memory BEFORE touching the file, so a
         // bad or duplicate verb can never corrupt the catalog on disk.
-        let validated = Self::from_yaml(&new_content)
+        let (validated, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("appending this verb would make the catalog invalid")?;
-        std::fs::write(&path, &new_content)
-            .with_context(|| format!("failed to write verb catalog {}", path.display()))?;
+        let durable_content = canonical.as_deref().unwrap_or(&new_content);
+        let outcome =
+            write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, durable_content)?;
+        let (committed, warning) = outcome.into_parts();
         // Adopt the already-validated content rather than re-reading the file: a
         // post-write reload failure would otherwise report an error to the
         // operator even though the write landed, desyncing memory from disk.
         self.verbs = validated.verbs;
         self.version = validated.version;
-        self.mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
+        self.mtime = committed.modified();
+        self.snapshot = Some(committed);
+        if let Some(error) = warning {
+            tracing::warn!("catalog append committed with a durability warning: {error}");
+        }
         Ok(())
     }
 
@@ -929,8 +1125,11 @@ impl VerbCatalog {
         let path = self.path.clone().ok_or_else(|| {
             anyhow::anyhow!("verb catalog is not backed by a file; cannot amend a verb")
         })?;
-        let existing = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read verb catalog {}", path.display()))?;
+        let snapshot = load_learning_file_snapshot(&path)?;
+        let existing =
+            std::str::from_utf8(snapshot.content().context("verb catalog does not exist")?)
+                .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?
+                .to_string();
         let disk_catalog = Self::from_yaml(&existing)?;
         let current = disk_catalog
             .get(name)
@@ -950,8 +1149,9 @@ impl VerbCatalog {
         }
 
         let new_content = compose_replaced_catalog(&existing, name, replacement)?;
-        let mut validated = Self::from_yaml(&new_content)
+        let (mut validated, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("amending this verb would make the catalog invalid")?;
+        let durable_content = canonical.as_deref().unwrap_or(&new_content);
 
         let runtime_verbs = self
             .verbs
@@ -970,12 +1170,15 @@ impl VerbCatalog {
         // Every fallible catalog adoption step completes before the durable
         // rewrite. After this point, success requires only the atomic file
         // replacement and assigning the already validated state.
-        atomic_replace_if_unchanged(&path, existing.as_bytes(), new_content.as_bytes())?;
+        let outcome = atomic_replace_if_unchanged(&path, &snapshot, durable_content.as_bytes())?;
+        let (committed, warning) = outcome.into_parts();
         validated.path = Some(path.clone());
-        validated.mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok());
+        validated.mtime = committed.modified();
+        validated.snapshot = Some(committed);
         *self = validated;
+        if let Some(error) = warning {
+            tracing::warn!("catalog amendment committed with a durability warning: {error}");
+        }
         Ok(current)
     }
 
@@ -984,6 +1187,7 @@ impl VerbCatalog {
     /// persisted with the grant definition rather than mixed into the catalog
     /// file. Names outside the reserved `grant-` namespace cannot be replaced.
     pub fn upsert_saved_grant_verb(&mut self, verb: Verb) -> Result<()> {
+        let verb = canonicalize_generated_authority_envelope(verb)?;
         validate_verb(&verb)?;
         if !verb.name.starts_with("grant-") {
             bail!(
@@ -1006,33 +1210,31 @@ impl VerbCatalog {
         Ok(())
     }
 
-    /// Install approved prose-generated access coverage without writing the
+    /// Install approved generated access coverage without writing the
     /// operator-authored catalog. The exact candidate remains durable in its
     /// approved access request and is restored from SQLite at startup.
-    pub fn upsert_access_verb(&mut self, mut verb: Verb) -> Result<()> {
-        validate_synthesized_safety(&verb)?;
+    pub fn canonical_generated_access_verb(&self, verb: Verb) -> Result<Verb> {
+        let mut verb = normalize_generated_access_verb(verb)?;
         if verb.baseline {
             bail!("generated access coverage must not be baseline");
         }
-        if !verb.name.starts_with("access-generated-") {
-            bail!(
-                "generated access verb '{}' must use the reserved 'access-generated-' prefix",
-                verb.name
-            );
+        if verb.name != generated_access_verb_name(&verb) {
+            bail!("generated access coverage name does not match its matcher digest");
         }
-        // Synthesis proposes the matcher, not its safety class. Promotion may
-        // make the exact matcher deterministic, but consequence routing is
-        // derived locally so a model cannot label a mutation reversible. A
-        // matcher that provably wraps operator-reviewed catalog coverage
-        // inherits that coverage's class instead of the irreversible default,
-        // so wrapping a reversible verb does not hold every run for approval.
-        verb.consequence = if synthesized_access_is_statically_read_only(&verb) {
-            Reversibility::Reversible
-        } else {
-            self.wrapped_operator_consequence(&verb)
-                .unwrap_or(Reversibility::Irreversible)
-        };
-        verb.revert = None;
+        // Synthesis proposes the matcher, not its safety class. Consequence
+        // routing is derived locally from the matcher and exact operator
+        // coverage, so provenance and model metadata cannot affect it.
+        verb.consequence = canonical_generated_access_consequence(&verb);
+        if verb.consequence == Reversibility::Irreversible {
+            if let Some(inherited) = self.wrapped_operator_consequence(&verb) {
+                verb.consequence = inherited;
+            }
+        }
+        Ok(verb)
+    }
+
+    pub fn upsert_access_verb(&mut self, verb: Verb) -> Result<()> {
+        let mut verb = self.canonical_generated_access_verb(verb)?;
         verb.trusted = true;
         if let Some(existing) = self.verbs.get(&verb.name) {
             if serde_json::to_value(existing)? == serde_json::to_value(&verb)? {
@@ -1046,6 +1248,37 @@ impl VerbCatalog {
         self.verbs.insert(verb.name.clone(), verb);
         self.refresh_version()?;
         Ok(())
+    }
+
+    /// Inherit an operator-reviewed consequence only when every concrete argv
+    /// admitted by the generated matcher reverse-matches compatible catalog
+    /// coverage. Non-enumerable or broader matchers inherit nothing and stay
+    /// at the fail-closed generated default.
+    fn wrapped_operator_consequence(&self, candidate: &Verb) -> Option<Reversibility> {
+        if !candidate.coverage.is_empty() || candidate.binary.contains('{') {
+            return None;
+        }
+        let mut inherited: Option<Reversibility> = None;
+        for args in enumerate_matcher_commands(candidate)? {
+            let class = self
+                .match_command_all(&candidate.binary, &args)
+                .into_iter()
+                .filter(|matched| {
+                    matched.action != CoverageAction::Deny
+                        && matched.rendered.name != candidate.name
+                        && !matched.rendered.name.starts_with("grant-")
+                        && !matched.rendered.name.starts_with("access-generated-")
+                })
+                .map(|matched| matched.rendered.consequence)
+                .max_by_key(|class| reversibility_rank(*class))?;
+            inherited = Some(match inherited {
+                Some(previous) if reversibility_rank(previous) >= reversibility_rank(class) => {
+                    previous
+                }
+                _ => class,
+            });
+        }
+        inherited
     }
 
     pub fn remove_saved_grant_verbs(&mut self, grant_name: &str) -> Result<usize> {
@@ -1075,55 +1308,29 @@ impl VerbCatalog {
         let path = self.path.clone().ok_or_else(|| {
             anyhow::anyhow!("verb catalog is not backed by a file; cannot delete a verb")
         })?;
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let snapshot = load_learning_file_snapshot(&path)?;
+        let existing = snapshot
+            .content()
+            .map(std::str::from_utf8)
+            .transpose()
+            .context("verb catalog is not UTF-8")?
+            .unwrap_or_default()
+            .to_string();
         let new_content = compose_removed_catalog(&existing, name)?;
-        let validated = Self::from_yaml(&new_content)
+        let (validated, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("deleting this verb would make the catalog invalid")?;
-        std::fs::write(&path, &new_content)
-            .with_context(|| format!("failed to write verb catalog {}", path.display()))?;
+        let durable_content = canonical.as_deref().unwrap_or(&new_content);
+        let outcome =
+            write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, durable_content)?;
+        let (committed, warning) = outcome.into_parts();
         self.verbs = validated.verbs;
         self.version = validated.version;
-        self.mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
+        self.mtime = committed.modified();
+        self.snapshot = Some(committed);
+        if let Some(error) = warning {
+            tracing::warn!("catalog deletion committed with a durability warning: {error}");
+        }
         Ok(verb)
-    }
-
-    /// Consequence inherited from operator catalog coverage that a generated
-    /// access matcher wraps. A wrap holds only when every concrete command
-    /// the matcher admits reverse-matches a non-generated catalog verb,
-    /// proven by enumerating the matcher's parameter space and replaying each
-    /// command through the catalog's own reverse match; a matcher broader
-    /// than the operator-reviewed coverage, or one whose parameters are not
-    /// plain literal enumerations, inherits nothing. Each command takes the
-    /// most conservative class among its matches and the wrap takes the most
-    /// conservative class across commands, so inheritance can never assign a
-    /// class less restrictive than the wrapped verb's own.
-    fn wrapped_operator_consequence(&self, candidate: &Verb) -> Option<Reversibility> {
-        if !candidate.coverage.is_empty() || candidate.binary.contains('{') {
-            return None;
-        }
-        let mut inherited: Option<Reversibility> = None;
-        for args in enumerate_matcher_commands(candidate)? {
-            let class = self
-                .match_command_all(&candidate.binary, &args)
-                .into_iter()
-                .filter(|matched| {
-                    matched.action != CoverageAction::Deny
-                        && matched.rendered.name != candidate.name
-                        && !matched.rendered.name.starts_with("grant-")
-                        && !matched.rendered.name.starts_with("access-generated-")
-                })
-                .map(|matched| matched.rendered.consequence)
-                .max_by_key(|class| reversibility_rank(*class))?;
-            inherited = Some(match inherited {
-                Some(previous) if reversibility_rank(previous) >= reversibility_rank(class) => {
-                    previous
-                }
-                _ => class,
-            });
-        }
-        inherited
     }
 
     fn refresh_version(&mut self) -> Result<()> {
@@ -1137,6 +1344,21 @@ impl VerbCatalog {
         self.version = u64::from_be_bytes(version_bytes);
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn catalog_repair_warning(
+    canonical: &str,
+    outcome: crate::learned_rules::LearningWriteOutcome,
+) -> Result<Option<anyhow::Error>> {
+    if outcome.committed_snapshot().content() != Some(canonical.as_bytes()) {
+        bail!("committed catalog repair does not match its canonical candidate");
+    }
+    let (_, warning) = outcome.into_parts();
+    let Some(error) = warning else {
+        return Ok(None);
+    };
+    Ok(Some(error))
 }
 
 /// Compose the new catalog text by adding one verb to the top-level `verbs:`
@@ -1179,6 +1401,27 @@ fn compose_appended_catalog(existing: &str, verb: &Verb) -> Result<String> {
         bail!("the catalog's `verbs` key is not a sequence");
     }
     serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
+}
+
+fn canonical_catalog_yaml<'a>(
+    existing: &str,
+    verbs: impl Iterator<Item = &'a Verb>,
+) -> Result<String> {
+    let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
+    let mut document: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(body).context("the existing verb catalog is not valid YAML")?;
+    let mapping = document
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("verb catalog is not a YAML mapping"))?;
+    let values = verbs
+        .map(serde_yaml_ng::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to serialize canonical verbs")?;
+    mapping.insert(
+        serde_yaml_ng::Value::String("verbs".to_string()),
+        serde_yaml_ng::Value::Sequence(values),
+    );
+    serde_yaml_ng::to_string(&document).context("failed to serialize the canonical catalog")
 }
 
 fn compose_removed_catalog(existing: &str, name: &str) -> Result<String> {
@@ -1240,46 +1483,14 @@ fn reserved_verb_name(name: &str) -> bool {
     name.starts_with("grant-") || name.starts_with("access-generated-")
 }
 
-fn atomic_replace_if_unchanged(path: &Path, expected: &[u8], replacement: &[u8]) -> Result<()> {
-    let current = std::fs::read(path)
-        .with_context(|| format!("failed to reread verb catalog {}", path.display()))?;
-    if current != expected {
-        bail!("verb catalog changed before the atomic rewrite; retry the amend");
-    }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
-        format!(
-            "failed to create a temporary catalog in {}",
-            parent.display()
-        )
-    })?;
-    temporary
-        .as_file_mut()
-        .write_all(replacement)
-        .with_context(|| format!("failed to write replacement catalog for {}", path.display()))?;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        temporary
-            .as_file()
-            .set_permissions(metadata.permissions())
-            .with_context(|| format!("failed to preserve permissions for {}", path.display()))?;
-    }
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync replacement catalog for {}", path.display()))?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| {
-            format!(
-                "failed to atomically replace verb catalog {}",
-                path.display()
-            )
-        })?;
-    Ok(())
+fn atomic_replace_if_unchanged(
+    path: &Path,
+    expected: &LearningFileSnapshot,
+    replacement: &[u8],
+) -> Result<crate::learned_rules::LearningWriteOutcome> {
+    let replacement =
+        std::str::from_utf8(replacement).context("catalog replacement is not UTF-8")?;
+    write_learning_file_atomically_for_locked_snapshot(path, expected, replacement)
 }
 
 /// Binaries a synthesized verb may not use: shells and interpreters where a
@@ -1698,6 +1909,31 @@ fn synthesized_access_is_statically_read_only(verb: &Verb) -> bool {
         }
         _ => false,
     }
+}
+
+/// Derive the fail-closed consequence permitted for generated access coverage
+/// before any exact operator coverage refinement is considered.
+///
+/// This function intentionally reads only executable matcher authority. It is
+/// shared by pending reductions, durable proposal parsing, approval
+/// projection, and installation, so provenance and model-supplied metadata
+/// cannot make the same matcher converge to different gate behavior.
+pub fn canonical_generated_access_consequence(verb: &Verb) -> Reversibility {
+    if synthesized_access_is_statically_read_only(verb) {
+        Reversibility::Reversible
+    } else {
+        Reversibility::Irreversible
+    }
+}
+
+/// Derive the only consequence an automatically promoted command may carry.
+/// Auto-promoted verbs also contain coverage metadata for display, but that
+/// metadata is not executable matcher authority and must not make a command
+/// appear safer than its binary and argv shape prove.
+pub fn canonical_auto_promoted_consequence(verb: &Verb) -> Reversibility {
+    let mut matcher = verb.clone();
+    matcher.coverage.clear();
+    canonical_generated_access_consequence(&matcher)
 }
 
 /// Every concrete argv a generated matcher's template admits, or `None` when
@@ -2211,6 +2447,287 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
     Ok(())
 }
 
+/// Canonical authority-bearing fields for generated access coverage. This
+/// stable shape identifies the matcher shown to an operator.
+pub fn generated_access_matcher_shape(verb: &Verb) -> serde_json::Value {
+    let coverage = verb
+        .coverage
+        .iter()
+        .cloned()
+        .map(|mut cell| {
+            cell.provenance = None;
+            cell
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "binary": verb.binary,
+        "args": verb.args,
+        "coverage": coverage,
+        "credential_plan": verb.credential_plan,
+        "params": verb.params,
+    })
+}
+
+pub fn generated_access_matcher_digest(matcher: &serde_json::Value) -> String {
+    Sha256::digest(serde_json::to_vec(matcher).expect("access matcher serializes"))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn generated_access_verb_name(verb: &Verb) -> String {
+    let digest = generated_access_matcher_digest(&generated_access_matcher_shape(verb));
+    format!("access-generated-{}", &digest[..16])
+}
+
+/// Deterministic operator-facing description derived only from the generated
+/// matcher's authority-bearing shape.
+pub fn generated_access_description(verb: &Verb) -> String {
+    let pinned = verb
+        .args
+        .iter()
+        .filter(|argument| !argument.contains('{'))
+        .cloned()
+        .collect::<Vec<_>>();
+    let parameters = verb.params.keys().cloned().collect::<Vec<_>>();
+    let mut description = format!("Runs {}", verb.binary);
+    if !pinned.is_empty() {
+        description.push_str(&format!(" with pinned arguments {}", pinned.join(" ")));
+    }
+    match parameters.len() {
+        0 => description.push_str(" and no caller-supplied values"),
+        1 => description.push_str(&format!(
+            " and one caller-supplied value ({})",
+            parameters[0]
+        )),
+        count => description.push_str(&format!(
+            " and {count} caller-supplied values ({})",
+            parameters.join(", ")
+        )),
+    }
+    description.push('.');
+    description
+}
+
+fn value_constraint_contains_sensitive_literal(constraint: &ValueConstraint) -> bool {
+    constraint
+        .options
+        .iter()
+        .any(|option| text_contains_sensitive_literals(option))
+        || constraint.values.iter().any(|value| {
+            text_contains_sensitive_literals(value)
+                || constraint.options.iter().any(|option| {
+                    command_contains_sensitive_literals(
+                        "generated-access-parameter",
+                        &[option.clone(), value.clone()],
+                    )
+                })
+        })
+}
+
+fn generated_authority_contains_sensitive_literal(verb: &Verb) -> bool {
+    if text_contains_sensitive_literals(&verb.name)
+        || command_contains_sensitive_literals(&verb.binary, &verb.args)
+        || verb
+            .revert
+            .as_ref()
+            .is_some_and(|revert| command_contains_sensitive_literals(&revert.binary, &revert.args))
+        || verb
+            .credential_plan
+            .as_deref()
+            .is_some_and(text_contains_sensitive_literals)
+        || verb
+            .promotion_stamp
+            .as_deref()
+            .is_some_and(text_contains_sensitive_literals)
+    {
+        return true;
+    }
+    for (name, specification) in &verb.params {
+        if named_value_contains_sensitive_literals(name, specification.pattern_text())
+            || specification.default.as_deref().is_some_and(|value| {
+                named_value_contains_sensitive_literals(name, value)
+                    || text_contains_sensitive_literals(value)
+            })
+        {
+            return true;
+        }
+    }
+    verb.coverage.iter().any(|cell| {
+        text_contains_sensitive_literals(&cell.name)
+            || command_contains_sensitive_literals(&verb.binary, &cell.required_args)
+            || command_contains_sensitive_literals(&verb.binary, &cell.forbidden_args)
+            || cell
+                .options
+                .iter()
+                .any(value_constraint_contains_sensitive_literal)
+            || cell
+                .target
+                .as_ref()
+                .is_some_and(value_constraint_contains_sensitive_literal)
+            || cell
+                .inventory
+                .as_ref()
+                .is_some_and(value_constraint_contains_sensitive_literal)
+            || cell
+                .namespace
+                .as_ref()
+                .is_some_and(value_constraint_contains_sensitive_literal)
+            || cell.fanout.as_ref().is_some_and(|fanout| {
+                text_contains_sensitive_literals(&fanout.separator)
+                    || value_constraint_contains_sensitive_literal(&fanout.selector)
+            })
+            || cell
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| text_contains_sensitive_literals(&cwd.to_string_lossy()))
+            || cell
+                .override_marker
+                .as_deref()
+                .is_some_and(text_contains_sensitive_literals)
+            || cell.environment.iter().any(|environment| {
+                text_contains_sensitive_literals(&environment.name)
+                    || environment.values.iter().any(|value| {
+                        text_contains_sensitive_literals(value)
+                            || named_value_contains_sensitive_literals(&environment.name, value)
+                    })
+                    || environment.pattern.as_deref().is_some_and(|pattern| {
+                        text_contains_sensitive_literals(pattern)
+                            || named_value_contains_sensitive_literals(&environment.name, pattern)
+                    })
+            })
+            || cell.provenance.as_ref().is_some_and(|provenance| {
+                text_contains_sensitive_literals(&provenance.source)
+                    || provenance
+                        .evidence
+                        .iter()
+                        .any(|evidence| text_contains_sensitive_literals(evidence))
+                    || text_contains_sensitive_literals(&provenance.regime_stamp)
+                    || text_contains_sensitive_literals(&provenance.prompt_stamp)
+                    || text_contains_sensitive_literals(&provenance.model_stamp)
+                    || provenance
+                        .probes
+                        .iter()
+                        .any(|probe| command_contains_sensitive_literals(&verb.binary, &probe.args))
+            })
+    })
+}
+
+/// Canonicalize the explanatory envelope of a model-synthesized verb and
+/// reject literal-sensitive authority without changing what the verb can run.
+/// This invariant is applied before preview identity, persistence, reload, and
+/// projection.
+fn sanitize_synthesized_verb_prose(verb: &mut Verb) {
+    verb.description = crate::redact::redact_output_text(&verb.description);
+    verb.prompt_context = verb
+        .prompt_context
+        .take()
+        .map(|value| crate::redact::redact_output_text(&value));
+    verb.source_prose = verb
+        .source_prose
+        .take()
+        .map(|value| crate::redact::redact_output_text(&value));
+    verb.evidence = verb
+        .evidence
+        .take()
+        .map(|value| crate::redact::redact_output_text(&value));
+    for cell in &mut verb.coverage {
+        if let Some(provenance) = &mut cell.provenance {
+            provenance.source = crate::redact::redact_output_text(&provenance.source);
+            for evidence in &mut provenance.evidence {
+                *evidence = crate::redact::redact_output_text(evidence);
+            }
+            for probe in &mut provenance.probes {
+                probe.dimension = crate::redact::redact_output_text(&probe.dimension);
+            }
+        }
+    }
+}
+
+pub fn canonicalize_synthesized_verb_envelope(mut verb: Verb) -> Result<Verb> {
+    verb = canonicalize_generated_authority_envelope(verb)?;
+    validate_synthesized_safety(&verb)?;
+    Ok(verb)
+}
+
+/// Canonicalize the complete generated-authority envelope without changing
+/// executable authority. Saved grants and catalog synthesis share this gate.
+pub fn canonicalize_generated_authority_envelope(mut verb: Verb) -> Result<Verb> {
+    sanitize_synthesized_verb_prose(&mut verb);
+    if generated_authority_contains_sensitive_literal(&verb) {
+        bail!(
+            "generated verb contains sensitive authority metadata or literal credential argv and cannot be persisted"
+        );
+    }
+    Ok(verb)
+}
+
+pub fn validate_canonical_synthesized_verb_envelope(verb: &Verb) -> Result<()> {
+    let canonical = canonicalize_synthesized_verb_envelope(verb.clone())?;
+    if serde_json::to_value(canonical)? != serde_json::to_value(verb)? {
+        bail!("generated verb metadata is not in canonical sanitized form");
+    }
+    Ok(())
+}
+
+/// Normalize and validate a matcher proposed for a principal-bound access
+/// request. Model-authored rollback commands are never part of generated
+/// access authority, so remove that untrusted envelope before any structural
+/// validation, canonicalization, persistence, or installation. Ordinary
+/// operator-authored verbs continue to use `validate_verb` and retain their
+/// rollback semantics.
+pub fn normalize_generated_access_verb(mut verb: Verb) -> Result<Verb> {
+    verb.revert = None;
+    verb.baseline = false;
+    verb.trusted = false;
+    verb.prompt_context = None;
+    verb.source_prose = None;
+    verb.evidence = None;
+    verb.auto_promoted = false;
+    verb.promotion_stamp = None;
+    if generated_authority_contains_sensitive_literal(&verb) {
+        bail!(
+            "generated access coverage contains sensitive authority metadata or literal argv and cannot be persisted"
+        );
+    }
+    sanitize_synthesized_verb_prose(&mut verb);
+    if generated_authority_contains_sensitive_literal(&verb) {
+        bail!(
+            "generated access coverage is not in canonical secret-free form and cannot be persisted"
+        );
+    }
+    verb.description = generated_access_description(&verb);
+    validate_synthesized_safety(&verb)?;
+    Ok(verb)
+}
+
+/// Parse one durable generated-access proposal and prove that its serialized
+/// form already satisfies every normalization and namespace invariant. Durable
+/// state is rejected rather than rewritten because normalization can change
+/// authority.
+pub fn parse_normalized_generated_access_verb(value: &serde_json::Value) -> Result<Verb> {
+    let verb =
+        serde_json::from_value::<Verb>(value.clone()).context("decode proposed access coverage")?;
+    let normalized = normalize_generated_access_verb(verb)?;
+    if normalized.baseline {
+        bail!("generated access coverage must not be baseline");
+    }
+    if normalized.name != generated_access_verb_name(&normalized) {
+        bail!("generated access coverage name does not match its matcher digest");
+    }
+    if canonical_generated_access_consequence(&normalized) != normalized.consequence {
+        bail!(
+            "generated access coverage consequence does not match the locally derived matcher consequence"
+        );
+    }
+    if serde_json::to_value(&normalized).context("encode normalized proposed access coverage")?
+        != *value
+    {
+        bail!("proposed access coverage is not in normalized form");
+    }
+    Ok(normalized)
+}
+
 /// One sentence of operator guidance for a terminal synthesis-gate rejection.
 /// The operator wrote prose and the model wrote the rejected artifact, so the
 /// guidance names the prose change that steers the next synthesis away from
@@ -2256,10 +2773,9 @@ pub fn gate_rejection_guidance(reason: &str) -> Option<&'static str> {
 ///   for operator approval regardless of `trusted`, so promoting one buys no
 ///   latency and only discards the per-instance LLM reasoning a human would
 ///   otherwise see in the hold queue.
-/// - A `Recoverable` verb must carry a `revert`, and the revert's binary is
-///   held to the same shell/interpreter denylist as the forward command --
-///   the auto-revert envelope is what makes trusting a recoverable shape
-///   defensible, so an unverified or shell-based revert defeats the point.
+/// - Model-generated rollback authority is never auto-promoted. Recoverable
+///   candidates are declined here; caller-driven recoverable commands remain
+///   under live inverse assessment or operator review.
 /// - Every parameter pattern must be a plain alternation of the exact,
 ///   regex-escaped values observed in `evidence` (never a model-authored
 ///   regex) and every evidence sample must re-match its own template -- this
@@ -2276,12 +2792,23 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
              LLM reasoning a human reviewer would otherwise see"
         );
     }
+    if verb.consequence == Reversibility::Recoverable {
+        bail!(
+            "a recoverable verb may not be auto-promoted; its rollback requires live assessment or operator review"
+        );
+    }
     if verb
         .coverage
         .iter()
         .any(|cell| !cell.environment.is_empty())
     {
         bail!("an auto-promoted verb may not authorize caller environment bindings");
+    }
+    if canonical_auto_promoted_consequence(verb) != verb.consequence {
+        bail!(
+            "auto-promoted verb '{}' consequence does not match its independently derived matcher safety",
+            verb.name
+        );
     }
     if !is_kebab_name(&verb.name) {
         bail!(
@@ -2290,24 +2817,21 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
         );
     }
     validate_binary_not_shell(&verb.binary, "auto-promoted verb")?;
+    if command_contains_sensitive_literals(&verb.binary, &verb.args) {
+        bail!("an auto-promoted verb may not contain literal credential argv");
+    }
     for (pname, spec) in &verb.params {
         validate_param_not_overbroad(pname, spec, "auto-promoted verb")?;
     }
-    match verb.consequence {
-        Reversibility::Recoverable => {
-            let Some(revert) = &verb.revert else {
-                bail!("a recoverable verb may not be auto-promoted without a validated revert");
-            };
-            validate_binary_not_shell(&revert.binary, "auto-promoted verb revert")?;
-        }
-        Reversibility::Reversible => {}
-        Reversibility::Irreversible => unreachable!("rejected above"),
-    }
+    debug_assert_eq!(verb.consequence, Reversibility::Reversible);
     // Re-render every evidence sample against the verb's own template and
     // confirm it reproduces exactly that sample -- never trust that the
     // caller-supplied template and params actually correspond to the
     // evidence they were derived from.
     for sample in evidence {
+        if command_contains_sensitive_literals(&verb.binary, sample) {
+            bail!("auto-promotion evidence may not contain literal credential argv");
+        }
         let rendered = render_args(&verb.args, &render_map_for(verb, sample)?, &verb.name)?;
         if &rendered != sample {
             bail!(
@@ -2319,6 +2843,109 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
             );
         }
     }
+    Ok(())
+}
+
+/// Validate the subset of promotion safety that can be proven from a durable
+/// catalog row without replaying model evidence. Durable auto-promotion is
+/// deliberately narrower than the in-memory evidence proof: it admits only
+/// the mechanically generated preauthorized read shape and never persists a
+/// model-proposed rollback or caller-controlled boundary.
+pub fn validate_auto_promoted_verb_durable_safety(verb: &Verb) -> Result<()> {
+    validate_auto_promoted_verb_safety(verb, &[])?;
+    if verb.revert.is_some() {
+        bail!(
+            "auto-promoted verb '{}' may not persist rollback authority",
+            verb.name
+        );
+    }
+    let referenced: BTreeSet<String> = verb
+        .args
+        .iter()
+        .flat_map(|token| placeholders(token))
+        .collect();
+    if referenced.len() != verb.params.len() {
+        bail!(
+            "auto-promoted verb '{}' durable matcher must reference every declared parameter",
+            verb.name
+        );
+    }
+    for pname in &referenced {
+        let spec = verb.params.get(pname).ok_or_else(|| {
+            anyhow::anyhow!(
+                "auto-promoted verb '{}' durable matcher references undeclared parameter '{}'",
+                verb.name,
+                pname
+            )
+        })?;
+        if spec.value_type() != ParamValueType::Token {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' must use token semantics",
+                verb.name,
+                pname
+            );
+        }
+        if !spec.required || spec.default.is_some() {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' must be required and have no default",
+                verb.name,
+                pname
+            );
+        }
+        let literals = enumerate_pattern_literals(spec.pattern_text()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "auto-promoted verb '{}' durable parameter '{}' must be a finite plain literal alternation",
+                verb.name,
+                pname
+            )
+        })?;
+        let canonical_pattern = format!(
+            "^({})$",
+            literals
+                .iter()
+                .map(|value| regex::escape(value))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        if spec.pattern_text() != canonical_pattern {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' pattern does not match the generator-canonical exact pattern",
+                verb.name,
+                pname
+            );
+        }
+        if spec.allow_dash != literals.iter().any(|value| value.starts_with('-')) {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' has inconsistent allow_dash generator metadata",
+                verb.name,
+                pname
+            );
+        }
+    }
+    let concrete_commands = enumerate_matcher_commands(verb).ok_or_else(|| {
+        anyhow::anyhow!(
+            "auto-promoted verb '{}' durable matcher must have a bounded finite command set",
+            verb.name
+        )
+    })?;
+    for args in concrete_commands {
+        let mut concrete = verb.clone();
+        concrete.args = args;
+        concrete.params.clear();
+        concrete.coverage.clear();
+        if !synthesized_access_is_statically_read_only(&concrete) {
+            bail!(
+                "auto-promoted verb '{}' durable matcher expands to a command that is not independently read-only",
+                verb.name
+            );
+        }
+    }
+    // Coverage is display and matching metadata, not an independent source
+    // of executable consequence. Existing durable promotions may omit it;
+    // when present, the ordinary catalog validator has already checked its
+    // structure and the checks above reject caller-controlled environment
+    // bindings. The executable matcher and its parameters remain the source
+    // of the independently derived consequence.
     Ok(())
 }
 
@@ -2344,6 +2971,24 @@ fn validate_verb(verb: &Verb) -> Result<()> {
     }
     if verb.credential_plan.as_deref().is_some_and(str::is_empty) {
         bail!("verb '{}' has an empty credential_plan", verb.name);
+    }
+    if verb.auto_promoted {
+        if command_contains_sensitive_literals(&verb.binary, &verb.args) {
+            bail!(
+                "auto-promoted verb '{}' contains literal credential argv",
+                verb.name
+            );
+        }
+        if verb
+            .revert
+            .as_ref()
+            .is_some_and(|revert| command_contains_sensitive_literals(&revert.binary, &revert.args))
+        {
+            bail!(
+                "auto-promoted verb '{}' revert contains literal credential argv",
+                verb.name
+            );
+        }
     }
     if !verb.coverage.is_empty() && verb.args.is_empty() && !verb.params.is_empty() {
         bail!(
@@ -2872,6 +3517,55 @@ fn match_args_template(
     Some(params)
 }
 
+impl VerbCatalog {
+    fn same_file_generation(&self, other: &Self) -> bool {
+        match (&self.snapshot, &other.snapshot) {
+            (Some(left), Some(right)) => left.same_authority(right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn same_catalog_epoch(&self, other: &Self) -> bool {
+        self.same_file_generation(other)
+            && self.version == other.version
+            && serde_json::to_vec(&self.verbs).ok() == serde_json::to_vec(&other.verbs).ok()
+    }
+}
+
+impl AsyncDurableStore for VerbCatalog {
+    fn authority_name(&self) -> &'static str {
+        "verb catalog"
+    }
+
+    fn durable_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    fn same_durable_snapshot(&self, snapshot: &LearningFileSnapshot) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|current| current.same_authority(snapshot))
+    }
+
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.same_catalog_epoch(other)
+    }
+
+    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
+        if self.same_catalog_epoch(&result) {
+            return Ok(());
+        }
+        if self.same_catalog_epoch(baseline) || self.same_file_generation(baseline) {
+            return self.adopt_refreshed_file_authority(result);
+        }
+        if self.same_file_generation(&result) {
+            return Ok(());
+        }
+        anyhow::bail!("verb catalog authority changed during asynchronous file I/O")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3079,9 +3773,9 @@ verbs:
 
     #[test]
     fn append_verb_persists_provenance_and_pins() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             "verbs:\n  - name: existing\n    binary: echo\n    consequence: reversible\n",
         )
@@ -3140,10 +3834,10 @@ verbs:
 
     #[test]
     fn append_verb_rejects_duplicate_and_invalid_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
         let initial = "verbs:\n  - name: dup\n    binary: echo\n    consequence: reversible\n";
-        std::fs::write(&path, initial).unwrap();
+        crate::learned_rules::write_authority_file(&path, initial).unwrap();
         let mut cat = VerbCatalog::load(&path).unwrap();
 
         let mk = |name: &str, pattern: Option<&str>| {
@@ -3191,13 +3885,13 @@ verbs:
 
     #[test]
     fn append_tolerates_bom_and_keeps_one_verbs_key() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
         // Seed with a leading UTF-8 BOM, as a Windows editor or PowerShell's
         // utf8 mode would write it.
         let seed =
             "\u{feff}verbs:\n  - name: existing\n    binary: echo\n    consequence: reversible\n";
-        std::fs::write(&path, seed).unwrap();
+        crate::learned_rules::write_authority_file(&path, seed).unwrap();
         let mut cat = VerbCatalog::load(&path).unwrap();
 
         let v = Verb {
@@ -3268,6 +3962,277 @@ verbs:
             auto_promoted: false,
             promotion_stamp: None,
         }
+    }
+
+    #[test]
+    fn successful_synthesis_canonicalizes_all_explanatory_metadata_before_identity() {
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
+        verb.description = contaminated.clone();
+        verb.prompt_context = Some(contaminated.clone());
+        verb.source_prose = Some(contaminated.clone());
+        verb.evidence = Some(contaminated.clone());
+        verb.coverage.push(VerbCoverageCell {
+            name: "safe".to_string(),
+            action: CoverageAction::Evaluate,
+            required_args: Vec::new(),
+            forbidden_args: Vec::new(),
+            min_args: None,
+            max_args: None,
+            options: Vec::new(),
+            target: None,
+            inventory: None,
+            namespace: None,
+            fanout: None,
+            cwd: None,
+            environment: Vec::new(),
+            override_marker: None,
+            sticky: false,
+            provenance: Some(CoverageProvenance {
+                source: contaminated.clone(),
+                evidence: vec![contaminated.clone()],
+                regime_stamp: "safe-regime".to_string(),
+                prompt_stamp: "safe-prompt".to_string(),
+                model_stamp: "safe-model".to_string(),
+                generated_unix: 1,
+                probes: vec![CoverageProbe {
+                    dimension: contaminated.clone(),
+                    args: vec!["status".to_string()],
+                    expected_match: true,
+                    observed_match: true,
+                }],
+            }),
+        });
+
+        let canonical = canonicalize_synthesized_verb_envelope(verb).unwrap();
+        validate_canonical_synthesized_verb_envelope(&canonical).unwrap();
+        let serialized = serde_json::to_string(&canonical).unwrap();
+        assert!(!serialized.contains(&value));
+        let digest = canonical.definition_digest();
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            verbs: vec![canonical],
+        })
+        .unwrap();
+        let reloaded = VerbCatalog::from_yaml(&yaml).unwrap();
+        let reloaded = reloaded.get("inspect-fixture").unwrap();
+        assert_eq!(reloaded.definition_digest(), digest);
+        assert!(!serde_json::to_string(reloaded).unwrap().contains(&value));
+    }
+
+    #[test]
+    fn catalog_load_durably_repairs_synthesized_metadata_and_is_idempotent() {
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
+        verb.source_prose = Some(contaminated.clone());
+        verb.evidence = Some(contaminated.clone());
+        verb.promotion_stamp = Some("regime-safe".to_string());
+        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+
+        let mut first = VerbCatalog::load(&path).unwrap();
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(!repaired.contains(&value));
+        assert!(!serde_json::to_string(&first.list())
+            .unwrap()
+            .contains(&value));
+        assert_eq!(
+            first
+                .get("inspect-fixture")
+                .unwrap()
+                .promotion_stamp
+                .as_deref(),
+            Some("regime-safe")
+        );
+
+        let second = VerbCatalog::load(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
+        assert_eq!(first.list().len(), second.list().len());
+
+        let appended = synth_verb("true", None, false, "safe-appended");
+        first.append_verb(&appended).unwrap();
+        assert!(!std::fs::read_to_string(path).unwrap().contains(&value));
+    }
+
+    #[test]
+    fn safe_catalog_load_preserves_exact_bytes() {
+        let yaml = "# operator comment\nverbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+        VerbCatalog::load(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn immutable_catalog_load_creates_no_sibling_state_and_retains_no_live_path() {
+        let yaml = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+
+        let mut catalog = VerbCatalog::load_immutable(&path).unwrap();
+        assert!(catalog.get("safe").is_some());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        std::fs::write(&path, "verbs: []\n").unwrap();
+        assert!(!catalog.reload_if_stale().unwrap());
+        assert!(catalog.get("safe").is_some());
+        assert!(catalog
+            .append_verb(&synth_verb("true", None, false, "later"))
+            .unwrap_err()
+            .to_string()
+            .contains("not backed by a file"));
+    }
+
+    #[test]
+    fn immutable_catalog_rejects_required_repair_without_writing() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
+        verb.source_prose = Some(format!("password={value}"));
+        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, &yaml).unwrap();
+
+        let error = VerbCatalog::load_immutable(&path).unwrap_err();
+        assert!(error.to_string().contains("requires canonical repair"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn committed_catalog_repair_warning_adopts_only_verified_canonical_bytes() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        let canonical = "verbs: []\n";
+        crate::learned_rules::write_authority_file(&path, canonical).unwrap();
+        let snapshot = load_learning_file_snapshot(&path).unwrap();
+        let warning = catalog_repair_warning(
+            canonical,
+            crate::learned_rules::LearningWriteOutcome::committed_with_warning_for_test(
+                snapshot,
+                anyhow::anyhow!("simulated cleanup warning"),
+            ),
+        )
+        .unwrap();
+        assert!(warning.is_some());
+        assert!(VerbCatalog::from_yaml(canonical).is_ok());
+
+        crate::learned_rules::write_authority_file(&path, "verbs:\n  - invalid\n").unwrap();
+        let snapshot = load_learning_file_snapshot(&path).unwrap();
+        assert!(catalog_repair_warning(
+            canonical,
+            crate::learned_rules::LearningWriteOutcome::committed_with_warning_for_test(
+                snapshot,
+                anyhow::anyhow!("simulated cleanup warning"),
+            ),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stale_catalog_instances_reapply_nonconflicting_appends() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, "verbs: []\n").unwrap();
+        let mut first = VerbCatalog::load(&path).unwrap();
+        let mut second = VerbCatalog::load(&path).unwrap();
+
+        first
+            .append_verb(&synth_verb(
+                "fixturectl",
+                Some("^(one)$"),
+                false,
+                "safe-one",
+            ))
+            .unwrap();
+        second
+            .append_verb(&synth_verb(
+                "fixturectl",
+                Some("^(two)$"),
+                false,
+                "safe-two",
+            ))
+            .unwrap();
+
+        let loaded = VerbCatalog::load(&path).unwrap();
+        assert!(loaded.get("safe-one").is_some());
+        assert!(loaded.get("safe-two").is_some());
+    }
+
+    #[test]
+    fn successor_catalog_commit_does_not_turn_the_first_commit_into_failure() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, "verbs: []\n").unwrap();
+        let mut first = VerbCatalog::load(&path).unwrap();
+        let mut successor = VerbCatalog::load(&path).unwrap();
+        let (committed, release) =
+            crate::learned_rules::pause_post_commit_adoption_for_test("safe-race-first");
+        let first_thread = std::thread::spawn(move || {
+            first
+                .append_verb(&synth_verb(
+                    "fixturectl",
+                    Some("^(first)$"),
+                    false,
+                    "safe-race-first",
+                ))
+                .unwrap();
+            first
+        });
+        committed.wait();
+        successor
+            .append_verb(&synth_verb(
+                "fixturectl",
+                Some("^(second)$"),
+                false,
+                "safe-race-second",
+            ))
+            .unwrap();
+        release.wait();
+        let first = first_thread.join().unwrap();
+        assert!(first.get("safe-race-first").is_some());
+
+        let loaded = VerbCatalog::load(&path).unwrap();
+        assert!(loaded.get("safe-race-first").is_some());
+        assert!(loaded.get("safe-race-second").is_some());
+    }
+
+    #[test]
+    fn sensitive_synthesized_name_fails_before_preview_or_catalog_load() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "safe");
+        verb.name = format!("password={value}");
+        verb.source_prose = Some("generated inspection".to_string());
+        assert!(generated_authority_contains_sensitive_literal(&verb));
+        assert!(VerbCatalog::for_admission_preview(&verb).is_err());
+
+        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, &yaml).unwrap();
+        assert!(VerbCatalog::load(&path).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn generated_catalog_envelope_rejects_sensitive_stamps_and_unknown_metadata() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "safe");
+        verb.promotion_stamp = Some(format!("password={value}"));
+        assert!(canonicalize_generated_authority_envelope(verb.clone()).is_err());
+
+        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        assert!(VerbCatalog::from_yaml(&yaml).is_err());
+
+        let unknown_nested = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n    future_metadata: true\n";
+        assert!(VerbCatalog::from_yaml(unknown_nested).is_err());
+        assert!(
+            serde_yaml_ng::from_str::<FanoutConstraint>("max: 2\nfuture_metadata: true\n").is_err()
+        );
     }
 
     #[test]
@@ -3581,64 +4546,60 @@ verbs:
         let mut catalog = VerbCatalog::default();
         let candidate = |name: &str, binary: &str, args: &[&str], consequence| {
             let mut verb = synth_verb(binary, None, false, name);
-            verb.name = format!("access-generated-{name}");
             verb.args = args
                 .iter()
                 .map(|argument| (*argument).to_string())
                 .collect();
             verb.baseline = false;
             verb.consequence = consequence;
-            verb
+            canonical_generated_access_verb(verb)
         };
 
-        catalog
-            .upsert_access_verb(candidate(
-                "kubectl-delete",
-                "kubectl",
-                &["delete", "pod", "fixture"],
-                Reversibility::Reversible,
-            ))
-            .unwrap();
-        catalog
-            .upsert_access_verb(candidate(
-                "systemctl-stop",
-                "systemctl",
-                &["stop", "fixture.service"],
-                Reversibility::Reversible,
-            ))
-            .unwrap();
-        catalog
-            .upsert_access_verb(candidate(
-                "kubectl-get",
-                "kubectl",
-                &["get", "pods"],
+        let cases = [
+            (
+                candidate(
+                    "kubectl-delete",
+                    "kubectl",
+                    &["delete", "pod", "fixture"],
+                    Reversibility::Reversible,
+                ),
                 Reversibility::Irreversible,
-            ))
-            .unwrap();
-        catalog
-            .upsert_access_verb(candidate(
-                "rustc-version",
-                "rustc",
-                &["--version"],
+            ),
+            (
+                candidate(
+                    "systemctl-stop",
+                    "systemctl",
+                    &["stop", "fixture.service"],
+                    Reversibility::Reversible,
+                ),
                 Reversibility::Irreversible,
-            ))
-            .unwrap();
-
-        for name in [
-            "access-generated-kubectl-delete",
-            "access-generated-systemctl-stop",
-        ] {
-            let installed = catalog.get(name).unwrap();
+            ),
+            (
+                candidate(
+                    "kubectl-get",
+                    "kubectl",
+                    &["get", "pods"],
+                    Reversibility::Irreversible,
+                ),
+                Reversibility::Reversible,
+            ),
+            (
+                candidate(
+                    "rustc-version",
+                    "rustc",
+                    &["--version"],
+                    Reversibility::Irreversible,
+                ),
+                Reversibility::Reversible,
+            ),
+        ];
+        for (candidate, expected) in cases {
+            let candidate = catalog.canonical_generated_access_verb(candidate).unwrap();
+            let name = candidate.name.clone();
+            catalog.upsert_access_verb(candidate).unwrap();
+            let installed = catalog.get(&name).unwrap();
             assert!(installed.trusted);
-            assert_eq!(installed.consequence, Reversibility::Irreversible);
-        }
-        for name in [
-            "access-generated-kubectl-get",
-            "access-generated-rustc-version",
-        ] {
-            let diagnostic = catalog.get(name).unwrap();
-            assert!(diagnostic.trusted);
-            assert_eq!(diagnostic.consequence, Reversibility::Reversible);
+            assert_eq!(installed.consequence, expected);
         }
     }
 
@@ -3675,53 +4636,162 @@ verbs:
             },
         );
         wrapper.consequence = Reversibility::Irreversible;
-        wrapper
+        canonical_generated_access_verb(wrapper)
     }
 
     #[test]
-    fn generated_access_matcher_wrapping_catalog_verb_inherits_its_consequence() {
+    fn generated_access_matcher_inherits_exact_catalog_consequence() {
         let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
-        catalog
-            .upsert_access_verb(toolbox_wrapper("^(status|df)$"))
-            .unwrap();
+        let wrapper = toolbox_wrapper("^(status|df)$");
+        let wrapper = catalog.canonical_generated_access_verb(wrapper).unwrap();
+        let name = wrapper.name.clone();
+        catalog.upsert_access_verb(wrapper).unwrap();
         assert_eq!(
-            catalog
-                .get("access-generated-ceph-read")
-                .unwrap()
-                .consequence,
+            catalog.get(&name).unwrap().consequence,
             Reversibility::Reversible,
             "every admitted command reverse-matches the reversible catalog verb"
         );
     }
 
     #[test]
-    fn generated_access_matcher_broader_than_catalog_coverage_stays_irreversible() {
-        // One admitted value escapes the wrapped verb's own pattern, so the
-        // matcher is broader than the operator-reviewed coverage and keeps
-        // the fail-closed default.
-        let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
-        catalog
-            .upsert_access_verb(toolbox_wrapper("^(status|osd-purge)$"))
-            .unwrap();
+    fn generated_access_rejects_a_forged_consequence_after_normalization() {
+        let mut verb = synth_verb("kubectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = args_vec(&["get", "pods"]);
+        verb.consequence = Reversibility::Irreversible;
+        verb.name = generated_access_verb_name(&verb);
+        let mut serialized = serde_json::to_value(canonical_generated_access_verb(verb)).unwrap();
+        serialized["consequence"] = serde_json::json!("irreversible");
+        assert!(parse_normalized_generated_access_verb(&serialized)
+            .unwrap_err()
+            .to_string()
+            .contains("locally derived matcher consequence"));
+
+        let mut destructive = synth_verb("kubectl", None, false, "access-generated-fixture");
+        destructive.baseline = false;
+        destructive.args = args_vec(&["delete", "pods"]);
+        destructive.consequence = Reversibility::Reversible;
+        destructive.name = generated_access_verb_name(&destructive);
+        let mut serialized =
+            serde_json::to_value(canonical_generated_access_verb(destructive)).unwrap();
+        serialized["consequence"] = serde_json::json!("reversible");
+        assert!(parse_normalized_generated_access_verb(&serialized)
+            .unwrap_err()
+            .to_string()
+            .contains("locally derived matcher consequence"));
+    }
+
+    #[test]
+    fn generated_access_identity_converges_when_all_provenance_fields_vary() {
+        let mut first = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        first.baseline = false;
+        first.args = args_vec(&["inspect", "{item}"]);
+        first.params.insert(
+            "item".to_string(),
+            ParamSpec {
+                pattern: "^[a-z]+$".to_string(),
+                required: true,
+                default: None,
+                allow_dash: false,
+            },
+        );
+        let mut second = first.clone();
+        for (verb, source, evidence, regime, prompt, model, dimension, generated_unix) in [
+            (
+                &mut first,
+                "source-one",
+                "evidence-one",
+                "regime-one",
+                "prompt-one",
+                "model-one",
+                "dimension-one",
+                1,
+            ),
+            (
+                &mut second,
+                "source-two",
+                "evidence-two",
+                "regime-two",
+                "prompt-two",
+                "model-two",
+                "dimension-two",
+                2,
+            ),
+        ] {
+            verb.coverage = vec![VerbCoverageCell {
+                name: "item".to_string(),
+                action: CoverageAction::Evaluate,
+                required_args: Vec::new(),
+                forbidden_args: Vec::new(),
+                min_args: None,
+                max_args: None,
+                options: Vec::new(),
+                target: None,
+                inventory: None,
+                namespace: None,
+                fanout: None,
+                cwd: None,
+                environment: Vec::new(),
+                override_marker: None,
+                sticky: false,
+                provenance: Some(CoverageProvenance {
+                    source: source.to_string(),
+                    evidence: vec![evidence.to_string()],
+                    regime_stamp: regime.to_string(),
+                    prompt_stamp: prompt.to_string(),
+                    model_stamp: model.to_string(),
+                    generated_unix,
+                    probes: vec![CoverageProbe {
+                        dimension: dimension.to_string(),
+                        args: args_vec(&["inspect", "item"]),
+                        expected_match: true,
+                        observed_match: true,
+                    }],
+                }),
+            }];
+            verb.consequence = Reversibility::Irreversible;
+            verb.name = generated_access_verb_name(verb);
+        }
+        let first = canonical_generated_access_verb(first);
+        let second = canonical_generated_access_verb(second);
         assert_eq!(
-            catalog
-                .get("access-generated-ceph-read")
-                .unwrap()
-                .consequence,
+            generated_access_matcher_shape(&first),
+            generated_access_matcher_shape(&second)
+        );
+        assert_eq!(
+            generated_access_verb_name(&first),
+            generated_access_verb_name(&second)
+        );
+        assert_eq!(
+            generated_access_matcher_digest(&generated_access_matcher_shape(&first)),
+            generated_access_matcher_digest(&generated_access_matcher_shape(&second))
+        );
+        assert_eq!(first.consequence, second.consequence);
+    }
+
+    #[test]
+    fn generated_access_matcher_with_mutating_shape_stays_irreversible() {
+        // A kubectl exec wrapper is not one of the statically proven read-only
+        // shapes, so the local consequence remains fail-closed regardless of
+        // the operator catalog's unrelated coverage.
+        let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
+        let wrapper = toolbox_wrapper("^(status|osd-purge)$");
+        let wrapper = catalog.canonical_generated_access_verb(wrapper).unwrap();
+        let name = wrapper.name.clone();
+        catalog.upsert_access_verb(wrapper).unwrap();
+        assert_eq!(
+            catalog.get(&name).unwrap().consequence,
             Reversibility::Irreversible
         );
 
-        // A free-text parameter is not enumerable, so nothing is inherited
-        // even though every actually-valid value would match the catalog verb.
+        // The same rule applies to a free-text parameter.
         let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
-        catalog
-            .upsert_access_verb(toolbox_wrapper("^[a-z]+$"))
-            .unwrap();
+        let wrapper = toolbox_wrapper("^[a-z]+$");
+        let wrapper = catalog.canonical_generated_access_verb(wrapper).unwrap();
+        let name = wrapper.name.clone();
+        catalog.upsert_access_verb(wrapper).unwrap();
         assert_eq!(
-            catalog
-                .get("access-generated-ceph-read")
-                .unwrap()
-                .consequence,
+            catalog.get(&name).unwrap().consequence,
             Reversibility::Irreversible
         );
     }
@@ -3771,7 +4841,8 @@ verbs:
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy();
             if name.starts_with("verbs") && name.ends_with(".yaml") {
-                VerbCatalog::load(&path)
+                let yaml = std::fs::read_to_string(&path).unwrap();
+                VerbCatalog::from_yaml(&yaml)
                     .unwrap_or_else(|e| panic!("{} failed to load: {e}", path.display()));
                 checked += 1;
             }
@@ -3791,9 +4862,9 @@ verbs:
             "verbs:\n  - name: a\n    binary: echo\n    consequence: reversible\ndefaults:\n  timeout: 30\n",
         ];
         for seed in seeds {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::learned_rules::authority_tempdir();
             let path = dir.path().join("verbs.yaml");
-            std::fs::write(&path, seed).unwrap();
+            crate::learned_rules::write_authority_file(&path, seed).unwrap();
             let mut cat = VerbCatalog::load(&path).unwrap();
             cat.append_verb(&v)
                 .unwrap_or_else(|e| panic!("append failed for seed {seed:?}: {e}"));
@@ -4306,7 +5377,7 @@ verbs:
 
     #[test]
     fn auto_promoted_verb_cannot_authorize_caller_environment() {
-        let catalog = VerbCatalog::from_yaml(
+        let error = VerbCatalog::from_yaml(
             r#"
 verbs:
   - name: generated-check
@@ -4323,20 +5394,151 @@ verbs:
             values: ["/srv/automation/ansible.cfg"]
 "#,
         )
-        .unwrap();
-        let verb = catalog.get("generated-check").unwrap();
-
-        let error = validate_auto_promoted_verb_safety(verb, &[]).unwrap_err();
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("may not authorize caller environment bindings"));
     }
 
     #[test]
+    fn auto_promoted_verb_rejects_literal_sensitive_authority() {
+        let value = ["q", "7"].concat();
+        let yaml = format!(
+            r#"
+verbs:
+  - name: generated-auth
+    binary: redis-cli
+    args: ["-a", "{value}"]
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+"#
+        );
+        let error = VerbCatalog::from_yaml(&yaml).unwrap_err();
+        assert!(error.to_string().contains("literal credential argv"));
+    }
+
+    #[test]
+    fn forged_auto_promoted_consequence_is_rejected_at_catalog_load() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-delete
+    binary: kubectl
+    args: ["delete", "pods"]
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+    coverage:
+      - name: evidence-backed
+        action: preauthorized
+        required_args: ["delete", "pods"]
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("consequence does not match"));
+    }
+
+    #[test]
+    fn forged_auto_promoted_parameter_cannot_smuggle_a_mutating_subcommand() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-pod-read
+    binary: kubectl
+    args: ["--namespace", "get", "{operation}", "pods", "--all"]
+    params:
+      operation:
+        pattern: "^(delete)$"
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("expands to a command that is not independently read-only"));
+    }
+
+    #[test]
+    fn auto_promoted_safe_finite_parameter_commands_remain_valid() {
+        let catalog = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-pod-read
+    binary: kubectl
+    args: ["get", "pods", "--namespace", "{namespace}"]
+    params:
+      namespace:
+        pattern: "^(dev|staging)$"
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap();
+        assert!(catalog.get("generated-pod-read").is_some());
+    }
+
+    #[test]
+    fn forged_auto_promoted_broad_regex_is_rejected_at_catalog_load() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-prod-get
+    binary: kubectl
+    args: ["get", "pods", "{target}"]
+    params:
+      target:
+        pattern: "^prod-[a-z]+$"
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("finite plain literal alternation"));
+    }
+
+    #[test]
+    fn forged_auto_promoted_regex_escape_is_rejected_at_catalog_load() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-digit-get
+    binary: kubectl
+    args: ["get", "pods", "{target}"]
+    params:
+      target:
+        pattern: '^(\d)$'
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("generator-canonical exact pattern"));
+    }
+
+    #[test]
     fn cwd_coverage_matches_only_the_operator_approved_canonical_directory() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::learned_rules::authority_tempdir();
         let root = root.path().canonicalize().unwrap();
-        let other = tempfile::tempdir().unwrap();
+        let other = crate::learned_rules::authority_tempdir();
         let root_yaml = serde_yaml_ng::to_string(&root.to_string_lossy().to_string()).unwrap();
         let yaml = format!(
             r#"
@@ -4384,7 +5586,7 @@ verbs:
     #[cfg(unix)]
     #[test]
     fn cwd_coverage_rejects_a_symlink_instead_of_approving_its_target() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = crate::learned_rules::authority_tempdir();
         let project = parent.path().join("project");
         let alias = parent.path().join("project-link");
         std::fs::create_dir(&project).unwrap();
@@ -4468,9 +5670,9 @@ verbs:
 
     #[test]
     fn hot_reload_preserves_daemon_owned_coverage() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             "verbs:\n  - name: operator-one\n    binary: uptime\n    consequence: reversible\n",
         )
@@ -4488,9 +5690,11 @@ verbs:
         );
         access.name = "access-generated-live".to_string();
         access.baseline = false;
+        access = canonical_generated_access_verb(access);
+        let access_name = access.name.clone();
         catalog.upsert_access_verb(access).unwrap();
 
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             "verbs:\n  - name: operator-two\n    binary: hostname\n    consequence: reversible\n",
         )
@@ -4501,8 +5705,13 @@ verbs:
         assert!(catalog.get("operator-two").is_some());
         assert!(catalog.get("grant-live").is_some());
         assert!(catalog
-            .get("access-generated-live")
+            .get(&access_name)
             .is_some_and(|verb| verb.trusted && !verb.baseline));
+    }
+
+    fn canonical_generated_access_verb(mut verb: Verb) -> Verb {
+        verb.name = generated_access_verb_name(&verb);
+        verb
     }
 
     fn args_vec(v: &[&str]) -> Vec<String> {
@@ -4543,6 +5752,308 @@ verbs:
     revert: { binary: systemctl, args: ["disable", "--{scope}", "{unit}"] }
 "#;
         assert!(VerbCatalog::from_yaml(yaml).is_ok());
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_rollback_only_parameters() {
+        let mut verb = synth_verb("kubectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = args_vec(&["annotate", "pod/example"]);
+        verb.params.insert(
+            "overwrite".to_string(),
+            ParamSpec {
+                pattern: "^(true|false)$".to_string(),
+                required: false,
+                default: Some("true".to_string()),
+                allow_dash: false,
+            },
+        );
+        verb.revert = Some(VerbCommand {
+            binary: "kubectl".to_string(),
+            args: args_vec(&["annotate", "pod/example", "--overwrite={overwrite}"]),
+        });
+        assert!(normalize_generated_access_verb(verb).is_err());
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_unknown_forward_placeholders() {
+        let mut verb = synth_verb("kubectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = args_vec(&["apply", "-f", "{manifest}"]);
+        assert!(normalize_generated_access_verb(verb).is_err());
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_sensitive_literals_without_echoing_them() {
+        let sensitive = ["sk-", &"Ab1".repeat(8)].concat();
+        let mut argument = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        argument.baseline = false;
+        argument.args = vec![sensitive.clone()];
+        let argument_error = normalize_generated_access_verb(argument).unwrap_err();
+        assert!(!argument_error.to_string().contains(&sensitive));
+
+        let mut binary = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        binary.baseline = false;
+        binary.binary = sensitive.clone();
+        let binary_error = normalize_generated_access_verb(binary).unwrap_err();
+        assert!(!binary_error.to_string().contains(&sensitive));
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_sensitive_parameter_authority() {
+        let value = ["q", "7"].concat();
+
+        let mut default = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        default.baseline = false;
+        default.args = vec!["inspect".to_string(), "{password}".to_string()];
+        default.params.insert(
+            "password".to_string(),
+            ParamSpec {
+                pattern: "^[a-z0-9]+$".to_string(),
+                required: false,
+                default: Some(value.clone()),
+                allow_dash: false,
+            },
+        );
+        let error = normalize_generated_access_verb(default).unwrap_err();
+        assert!(error.to_string().contains("sensitive authority metadata"));
+        assert!(!error.to_string().contains(&value));
+
+        let mut pattern = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        pattern.baseline = false;
+        pattern.args = vec!["inspect".to_string(), "{target}".to_string()];
+        pattern.params.insert(
+            "target".to_string(),
+            ParamSpec {
+                pattern: format!("^--password={value}$"),
+                required: true,
+                default: None,
+                allow_dash: true,
+            },
+        );
+        let error = normalize_generated_access_verb(pattern).unwrap_err();
+        assert!(error.to_string().contains("sensitive authority metadata"));
+        assert!(!error.to_string().contains(&value));
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_sensitive_constraint_values() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = vec!["inspect".to_string()];
+        verb.coverage.push(VerbCoverageCell {
+            name: "bounded".to_string(),
+            action: CoverageAction::Evaluate,
+            required_args: Vec::new(),
+            forbidden_args: Vec::new(),
+            min_args: None,
+            max_args: None,
+            options: vec![ValueConstraint {
+                options: vec!["--password".to_string()],
+                position: None,
+                values: vec![value.clone()],
+                allow_dash: false,
+                required: true,
+                allow_multiple: false,
+            }],
+            target: None,
+            inventory: None,
+            namespace: None,
+            fanout: None,
+            cwd: None,
+            environment: Vec::new(),
+            override_marker: None,
+            sticky: false,
+            provenance: None,
+        });
+        let error = normalize_generated_access_verb(verb).unwrap_err();
+        assert!(error.to_string().contains("sensitive authority metadata"));
+        assert!(!error.to_string().contains(&value));
+    }
+
+    #[test]
+    fn sensitive_generated_defaults_cannot_install_or_render() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = vec!["inspect".to_string(), "{password}".to_string()];
+        verb.params.insert(
+            "password".to_string(),
+            ParamSpec {
+                pattern: "^[a-z0-9]+$".to_string(),
+                required: false,
+                default: Some(value.clone()),
+                allow_dash: false,
+            },
+        );
+        verb.name = generated_access_verb_name(&verb);
+        let name = verb.name.clone();
+        let mut catalog = VerbCatalog::empty();
+        let error = catalog.upsert_access_verb(verb).unwrap_err();
+        assert!(!error.to_string().contains(&value));
+        assert!(catalog.render(&name, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn generated_access_reclassifies_concrete_parameter_argv_before_use() {
+        fn install(
+            binary: &str,
+            templates: Vec<String>,
+            params: BTreeMap<String, ParamSpec>,
+        ) -> (VerbCatalog, String) {
+            let mut verb = synth_verb(binary, None, false, "access-generated-fixture");
+            verb.baseline = false;
+            verb.args = templates;
+            verb.params = params;
+            verb.consequence = canonical_generated_access_consequence(&verb);
+            verb.name = generated_access_verb_name(&verb);
+            let name = verb.name.clone();
+            let mut catalog = VerbCatalog::empty();
+            catalog.upsert_access_verb(verb).unwrap();
+            (catalog, name)
+        }
+        fn spec(pattern: &str, allow_dash: bool) -> ParamSpec {
+            ParamSpec {
+                pattern: pattern.to_string(),
+                required: true,
+                default: None,
+                allow_dash,
+            }
+        }
+
+        let value = ["q", "7"].concat();
+        let (split_catalog, split_name) = install(
+            "fixturectl",
+            args_vec(&["{option}", "{operand}"]),
+            BTreeMap::from([
+                ("option".to_string(), spec("^--[a-z]{8}$", true)),
+                ("operand".to_string(), spec("^[a-z0-9]{2}$", false)),
+            ]),
+        );
+        let split_params = BTreeMap::from([
+            ("option".to_string(), "--password".to_string()),
+            ("operand".to_string(), value.clone()),
+        ]);
+        assert!(split_catalog.render(&split_name, &split_params).is_err());
+        assert!(split_catalog
+            .match_command("fixturectl", &["--password".to_string(), value.clone()])
+            .is_none());
+        let benign_params = BTreeMap::from([
+            ("option".to_string(), "--endpoint".to_string()),
+            ("operand".to_string(), value.clone()),
+        ]);
+        assert!(split_catalog.render(&split_name, &benign_params).is_ok());
+
+        for (binary, pattern, argument) in [
+            (
+                "fixturectl",
+                "^--[a-z]{8}=[a-z0-9]{2}$",
+                format!("--password={value}"),
+            ),
+            ("mysql", "^-[a-z][a-z0-9]{2}$", format!("-p{value}")),
+        ] {
+            let (catalog, name) = install(
+                binary,
+                args_vec(&["{argument}"]),
+                BTreeMap::from([("argument".to_string(), spec(pattern, true))]),
+            );
+            let params = BTreeMap::from([("argument".to_string(), argument.clone())]);
+            assert!(catalog.render(&name, &params).is_err());
+            assert!(catalog.match_command(binary, &[argument]).is_none());
+        }
+    }
+
+    #[test]
+    fn generated_access_rejects_sensitive_provenance_stamps() {
+        let value = ["q", "7"].concat();
+        for stamp in ["source", "evidence", "regime", "prompt", "model"] {
+            let mut verb = synth_verb("fixturectl", None, false, "access-generated-fixture");
+            verb.baseline = false;
+            verb.args = args_vec(&["status"]);
+            verb.coverage = vec![VerbCoverageCell {
+                name: "exact".to_string(),
+                action: CoverageAction::Evaluate,
+                required_args: Vec::new(),
+                forbidden_args: Vec::new(),
+                min_args: Some(1),
+                max_args: Some(1),
+                options: Vec::new(),
+                target: None,
+                inventory: None,
+                namespace: None,
+                fanout: None,
+                cwd: None,
+                environment: Vec::new(),
+                override_marker: None,
+                sticky: false,
+                provenance: Some(CoverageProvenance {
+                    source: if stamp == "source" {
+                        format!("password={value}")
+                    } else {
+                        "fixture".to_string()
+                    },
+                    evidence: (stamp == "evidence")
+                        .then(|| format!("password={value}"))
+                        .into_iter()
+                        .collect(),
+                    regime_stamp: if stamp == "regime" {
+                        format!("password={value}")
+                    } else {
+                        "safe-regime".to_string()
+                    },
+                    prompt_stamp: if stamp == "prompt" {
+                        format!("password={value}")
+                    } else {
+                        "safe-prompt".to_string()
+                    },
+                    model_stamp: if stamp == "model" {
+                        format!("password={value}")
+                    } else {
+                        "safe-model".to_string()
+                    },
+                    generated_unix: 1,
+                    probes: Vec::new(),
+                }),
+            }];
+            let error = normalize_generated_access_verb(verb).unwrap_err();
+            assert!(!error.to_string().contains(&value));
+        }
+    }
+
+    #[test]
+    fn generated_access_normalization_preserves_argv_elements_exactly() {
+        let mut verb = synth_verb("ansible", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.consequence = Reversibility::Irreversible;
+        verb.args = vec![
+            "host".to_string(),
+            "-m".to_string(),
+            "shell".to_string(),
+            "-a".to_string(),
+            "echo one \"two\" \\ three, UTF-8 π".to_string(),
+        ];
+        let normalized =
+            canonical_generated_access_verb(normalize_generated_access_verb(verb).unwrap());
+        let mut catalog = VerbCatalog::empty();
+        catalog.upsert_access_verb(normalized).unwrap();
+        let original = vec![
+            "host".to_string(),
+            "-m".to_string(),
+            "shell".to_string(),
+            "-a".to_string(),
+            "echo one \"two\" \\ three, UTF-8 π".to_string(),
+        ];
+        assert_eq!(catalog.match_command_all("ansible", &original).len(), 1);
+        assert!(catalog
+            .match_command_all(
+                "ansible",
+                &original
+                    .iter()
+                    .flat_map(|arg| arg.split_whitespace().map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )
+            .is_empty());
     }
 
     #[test]
@@ -4603,5 +6114,129 @@ verbs:
         );
 
         assert_eq!(gate_rejection_guidance("the daemon has no LLM key"), None);
+    }
+}
+#[cfg(test)]
+mod asynchronous_adoption_tests {
+    use super::*;
+    use crate::learned_rules::{
+        acquire_async_authority_use_lease, run_async_durable_store_operation,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn delayed_refresh_cannot_restore_a_durably_deleted_verb() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(
+            &path,
+            r#"verbs:
+  - name: inspect-object
+    binary: fixturectl
+    args: ["status"]
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let baseline = VerbCatalog::load(&path).unwrap();
+        let delayed_refresh = baseline.clone();
+        let mut current = baseline.clone();
+        current.delete_verb("inspect-object").unwrap();
+
+        assert!(current
+            .adopt_async_result(&baseline, delayed_refresh)
+            .is_err());
+        assert!(current.get("inspect-object").is_none());
+    }
+
+    fn file_backed_catalog() -> (tempfile::TempDir, PathBuf, VerbCatalog) {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(
+            &path,
+            r#"verbs:
+  - name: inspect-object
+    description: Inspect an object
+    binary: fixturectl
+    args: ["status"]
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let catalog = VerbCatalog::load(&path).unwrap();
+        (directory, path, catalog)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_lease_linearizes_against_external_verb_deletion() {
+        let (_directory, path, catalog) = file_backed_catalog();
+        let store = Arc::new(RwLock::new(catalog));
+        let lease = acquire_async_authority_use_lease(&store, "verb execution test")
+            .await
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut independent = VerbCatalog::load(&path).unwrap();
+            independent.delete_verb("inspect-object").unwrap();
+            send.send(()).unwrap();
+        });
+
+        assert!(receive.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(lease.render("inspect-object", &BTreeMap::new()).is_ok());
+        drop(lease);
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+
+        assert!(
+            acquire_async_authority_use_lease(&store, "stale verb execution")
+                .await
+                .is_err()
+        );
+        run_async_durable_store_operation(&store, "verb refresh test", |candidate| {
+            *candidate = candidate.refreshed_copy()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(store.read().await.get("inspect-object").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_lease_linearizes_against_external_verb_amendment() {
+        let (_directory, path, catalog) = file_backed_catalog();
+        let original_digest = catalog.verb_definition_digest("inspect-object").unwrap();
+        let store = Arc::new(RwLock::new(catalog));
+        let lease = acquire_async_authority_use_lease(&store, "verb execution test")
+            .await
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut independent = VerbCatalog::load(&path).unwrap();
+            let mut replacement = independent.get("inspect-object").unwrap().clone();
+            replacement.description = "Inspect one object safely".to_string();
+            independent
+                .amend_verb_if_digest("inspect-object", &original_digest, &replacement)
+                .unwrap();
+            send.send(()).unwrap();
+        });
+
+        assert!(receive.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(
+            lease
+                .get("inspect-object")
+                .map(|verb| verb.description.as_str()),
+            Some("Inspect an object")
+        );
+        drop(lease);
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+
+        assert!(
+            acquire_async_authority_use_lease(&store, "stale verb execution")
+                .await
+                .is_err()
+        );
     }
 }

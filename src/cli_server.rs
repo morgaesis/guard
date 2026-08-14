@@ -10,7 +10,9 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use guard::env::guard_env;
-use guard::learned_rules::{AutoShimMode, LearnedRuleStore, LearningConfig};
+use guard::learned_rules::{
+    create_hardened_file_if_absent, AutoShimMode, LearnedRuleStore, LearningConfig,
+};
 use guard::policy::PolicyMode;
 use std::io::Write;
 use std::path::PathBuf;
@@ -202,6 +204,28 @@ fn default_api_promotion_state_path() -> Option<PathBuf> {
 /// operator to hand-create a state file first.
 fn default_verbs_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("verbs.yaml"))
+}
+
+fn should_create_default_verbs_path(
+    allow_promotion_enabled: bool,
+    gate_enabled: bool,
+    immutable_service_catalog: bool,
+) -> bool {
+    allow_promotion_enabled && gate_enabled && !immutable_service_catalog
+}
+
+fn allow_promotion_for_catalog(requested: bool, immutable_service_catalog: bool) -> bool {
+    requested && !immutable_service_catalog
+}
+
+fn require_explicit_service_verbs_path(
+    path: Option<PathBuf>,
+    immutable_service_catalog: bool,
+) -> Result<Option<PathBuf>> {
+    if immutable_service_catalog && path.is_none() {
+        anyhow::bail!("the packaged Windows service requires an explicit verb catalog");
+    }
+    Ok(path)
 }
 
 /// Parse a `--metrics-addr` value: a full `ADDR:PORT` socket address, or a bare
@@ -430,6 +454,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 admin_token_stdin,
                 configured_admin_token.is_some(),
             )?;
+            let immutable_service_catalog = cfg!(windows) && service;
             let admin_token = if admin_token_stdin {
                 Some(read_admin_token_stdin()?)
             } else {
@@ -750,13 +775,20 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 eval_config = eval_config.deny_shapes(Arc::new(RwLock::new(store)));
             }
 
-            let allow_promotion_enabled = if no_learn_allow {
+            let requested_allow_promotion = if no_learn_allow {
                 false
             } else {
                 learn_allow
                     .or_else(|| guard_env("LEARN_ALLOW").map(|v| parse_env_bool(&v)))
                     .unwrap_or(true)
             };
+            let allow_promotion_enabled =
+                allow_promotion_for_catalog(requested_allow_promotion, immutable_service_catalog);
+            if requested_allow_promotion && immutable_service_catalog {
+                tracing::info!(
+                    "Auto-verb promotion disabled because the packaged service catalog is immutable"
+                );
+            }
             if allow_promotion_enabled {
                 let learn_allow_state_path = learn_allow_state
                     .or_else(|| {
@@ -1037,6 +1069,12 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             if let Some(ref token) = auth_token {
                 redact_secrets.push(token.clone());
             }
+            if let Some(ref token) = admin_token {
+                redact_secrets.push(token.clone());
+            }
+            let _trusted_exact_secret_scope =
+                guard::redact::register_trusted_exact_secrets(&redact_secrets)
+                    .context("register daemon exact-redaction literals")?;
 
             let history_retention_secs =
                 resolve_history_retention(history_retention, guard_env("HISTORY_RETENTION_SECS"))?;
@@ -1197,40 +1235,26 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             // inert without consequence gating (see `AllowPromotionStore::
             // record_approval`), so there is no reason to create a live,
             // trust-bearing catalog file a daemon running without --gate
-            // could never populate.
+            // could never populate. The packaged Windows service receives an
+            // explicit administrator-owned catalog from its installer. It
+            // does not create a profile-local catalog because service
+            // configuration is immutable process input.
+            let explicit_verbs_path = require_explicit_service_verbs_path(
+                explicit_verbs_path,
+                immutable_service_catalog,
+            )?;
             let verbs_path = match explicit_verbs_path {
                 Some(path) => Some(path),
-                None if allow_promotion_enabled && gate_mode.is_on() => {
+                None if should_create_default_verbs_path(
+                    allow_promotion_enabled,
+                    gate_mode.is_on(),
+                    immutable_service_catalog,
+                ) =>
+                {
                     let path = default_verbs_path()
                         .ok_or_else(|| anyhow::anyhow!("could not determine default verbs path"))?;
                     if !path.exists() {
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent).with_context(|| {
-                                format!("failed to create {}", parent.display())
-                            })?;
-                        }
-                        std::fs::write(&path, "verbs: []\n")
-                            .with_context(|| format!("failed to create {}", path.display()))?;
-                        // This file grants real, permanent LLM-bypassing
-                        // trust once auto-promotion populates it -- harden
-                        // its permissions explicitly rather than relying on
-                        // process umask, since this path is created
-                        // automatically rather than only when an operator
-                        // deliberately opted in via --verbs.
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            if let Err(e) = std::fs::set_permissions(
-                                &path,
-                                std::fs::Permissions::from_mode(0o600),
-                            ) {
-                                tracing::warn!(
-                                    "failed to set restrictive permissions on {}: {}",
-                                    path.display(),
-                                    e
-                                );
-                            }
-                        }
+                        create_hardened_file_if_absent(&path, "verbs: []\n")?;
                         tracing::info!(
                             "Created empty verb catalog at {} for auto-verb-promotion",
                             path.display()
@@ -1241,7 +1265,15 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 None => None,
             };
             if let Some(path) = verbs_path {
-                let catalog = guard::gating::verb::VerbCatalog::load(&path)
+                #[cfg(windows)]
+                let catalog = if immutable_service_catalog {
+                    guard::gating::verb::VerbCatalog::load_immutable(&path)
+                } else {
+                    guard::gating::verb::VerbCatalog::load(&path)
+                };
+                #[cfg(not(windows))]
+                let catalog = guard::gating::verb::VerbCatalog::load(&path);
+                let catalog = catalog
                     .with_context(|| format!("failed to load verb catalog {}", path.display()))?;
                 tracing::info!(
                     "Loaded verb catalog from {} ({} verb(s), version {})",
@@ -1559,11 +1591,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 let proxy = Arc::new(proxy);
                 let mut api_judge_attached = false;
                 if let Some(coverage) = api_promotion_store.clone() {
-                    proxy.attach_judge(server::DaemonApiJudge::build_coverage_only(
-                        &api_judge_llm,
-                        policy_intent.as_deref(),
-                        coverage,
-                    ));
+                    proxy
+                        .attach_judge(server::DaemonApiJudge::build_coverage_only(
+                            &api_judge_llm,
+                            policy_intent.as_deref(),
+                            coverage,
+                        ))
+                        .await;
                 }
                 if api_judge_llm.enabled
                     && api_judge_llm
@@ -1594,7 +1628,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         );
                     proxy.attach_judge_builder(builder.clone());
                     if let Some(judge) = builder(policy_intent) {
-                        proxy.attach_judge(judge);
+                        proxy.attach_judge(judge).await;
                         api_judge_attached = true;
                         tracing::info!(
                             "API proxy evaluator attached for {}",
@@ -1666,7 +1700,8 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     api_judge_cache_ttl,
                     api_promotion_store.clone(),
                     api_judge_spend.clone(),
-                )?;
+                )
+                .await?;
                 tracing::info!(
                     "API endpoint '{}' enabled for {} on {}",
                     name,
@@ -1829,7 +1864,7 @@ fn is_supported_api_loopback(ip: std::net::IpAddr) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_named_api_proxy(
+async fn build_named_api_proxy(
     spec: ApiEndpointSpec,
     llm: &guard::evaluate::LlmConfig,
     cache_enabled: bool,
@@ -1958,11 +1993,13 @@ fn build_named_api_proxy(
     let proxy = Arc::new(proxy);
     let mut judge_attached = false;
     if let Some(store) = coverage.clone() {
-        proxy.attach_judge(server::DaemonApiJudge::build_coverage_only(
-            llm,
-            policy_intent.as_deref(),
-            store,
-        ));
+        proxy
+            .attach_judge(server::DaemonApiJudge::build_coverage_only(
+                llm,
+                policy_intent.as_deref(),
+                store,
+            ))
+            .await;
     }
     if llm.enabled && llm.api_key.as_ref().is_some_and(|key| !key.is_empty()) {
         let llm = llm.clone();
@@ -1985,7 +2022,7 @@ fn build_named_api_proxy(
         });
         proxy.attach_judge_builder(builder.clone());
         if let Some(judge) = builder(policy_intent) {
-            proxy.attach_judge(judge);
+            proxy.attach_judge(judge).await;
             judge_attached = true;
         }
     }
@@ -2055,6 +2092,41 @@ fn session_aliases_upstream(proxy: &guard::proxy::ApiProxy, token: &str) -> bool
 }
 
 #[cfg(test)]
+mod verb_catalog_path_tests {
+    use std::path::PathBuf;
+
+    use super::{
+        allow_promotion_for_catalog, require_explicit_service_verbs_path,
+        should_create_default_verbs_path,
+    };
+
+    #[test]
+    fn immutable_service_requires_an_explicit_catalog() {
+        assert!(!should_create_default_verbs_path(true, true, true));
+        assert!(should_create_default_verbs_path(true, true, false));
+        assert!(!should_create_default_verbs_path(false, true, false));
+        assert!(!should_create_default_verbs_path(true, false, false));
+        assert!(!allow_promotion_for_catalog(true, true));
+        assert!(allow_promotion_for_catalog(true, false));
+        assert!(!allow_promotion_for_catalog(false, false));
+
+        let configured = PathBuf::from("configured-verbs.yaml");
+        assert_eq!(
+            require_explicit_service_verbs_path(Some(configured.clone()), true).unwrap(),
+            Some(configured)
+        );
+        assert!(require_explicit_service_verbs_path(None, true)
+            .unwrap_err()
+            .to_string()
+            .contains("requires an explicit verb catalog"));
+        assert_eq!(
+            require_explicit_service_verbs_path(None, false).unwrap(),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
 mod api_endpoint_tests {
     use super::*;
 
@@ -2089,8 +2161,8 @@ mod api_endpoint_tests {
         }
     }
 
-    #[test]
-    fn builds_multiple_named_listeners_for_the_same_protocol() {
+    #[tokio::test]
+    async fn builds_multiple_named_listeners_for_the_same_protocol() {
         let temp = tempfile::tempdir().unwrap();
         let kubeconfig = temp.path().join("upstream.yaml");
         std::fs::write(
@@ -2119,6 +2191,7 @@ mod api_endpoint_tests {
                 server::ApiJudgeSpendConfig::default(),
             )),
         )
+        .await
         .unwrap();
         let second = build_named_api_proxy(
             endpoint("second", kubeconfig),
@@ -2131,6 +2204,7 @@ mod api_endpoint_tests {
                 server::ApiJudgeSpendConfig::default(),
             )),
         )
+        .await
         .unwrap();
         assert_eq!(first.0, "first");
         assert_eq!(second.0, "second");
