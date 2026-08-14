@@ -419,8 +419,11 @@ jobs:
             }
             New-Item -ItemType Directory -Path $apiRoot -Force | Out-Null
             $apiBody = Join-Path $apiRoot 'api-revert-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.body'
-            [IO.File]::WriteAllBytes($apiBody, [byte[]](1, 2, 3, 4, 5))
             Protect-PrivateServiceTree -Path $apiRoot -GuardSid $guardSid
+            # API-revert bodies are authority only while referenced by durable
+            # provisional state, so startup prunes an owned orphan. Keep this
+            # end-to-end rollback baseline empty; the Pester contract covers a
+            # nonempty snapshot round trip through the backup helpers.
             $baselineApiReverts = Get-ApiRevertHashes -GuardSid $guardSid
             Start-Service -Name $ServiceName
 
