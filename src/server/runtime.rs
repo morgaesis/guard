@@ -529,9 +529,9 @@ impl ProcessGuard {
         self.armed = false;
     }
 
-    pub(super) fn terminate(mut self) {
+    pub(super) async fn terminate_gracefully(mut self) {
         if self.tracker.take(self.pid, self.generation) {
-            terminate_process_tree(self.pid);
+            terminate_process_tree_gracefully(self.pid).await;
         }
         self.armed = false;
     }
@@ -555,6 +555,15 @@ fn terminate_process_tree(pid: u32) {
     }
 }
 
+#[cfg(unix)]
+async fn terminate_process_tree_gracefully(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    terminate_process_tree(pid);
+}
+
 #[cfg(windows)]
 fn terminate_process_tree(pid: u32) {
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
@@ -567,8 +576,16 @@ fn terminate_process_tree(pid: u32) {
     }
 }
 
+#[cfg(windows)]
+async fn terminate_process_tree_gracefully(pid: u32) {
+    terminate_process_tree(pid);
+}
+
 #[cfg(not(any(unix, windows)))]
 fn terminate_process_tree(_pid: u32) {}
+
+#[cfg(not(any(unix, windows)))]
+async fn terminate_process_tree_gracefully(_pid: u32) {}
 
 #[cfg(test)]
 mod tests {
@@ -692,10 +709,40 @@ mod tests {
         command.as_std_mut().process_group(0);
         let mut child = command.spawn().expect("spawn process group");
         let guard = ProcessTracker::default().track(child.id().expect("child pid"));
-        guard.terminate();
+        drop(guard);
         let _ = child.wait().await;
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
         assert!(!marker.exists(), "the grandchild escaped its owned group");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn graceful_termination_sends_sigterm_before_sigkill() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("term-observed");
+        let ready = temp.path().join("trap-ready");
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(format!(
+            "trap 'printf term > {}; exit 0' TERM; printf ready > {}; while :; do sleep 1; done",
+            marker.display(),
+            ready.display()
+        ));
+        command.as_std_mut().process_group(0);
+        let mut child = command.spawn().expect("spawn process group");
+        let guard = ProcessTracker::default().track(child.id().expect("child pid"));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell installed its SIGTERM trap");
+
+        guard.terminate_gracefully().await;
+        let _ = child.wait().await.expect("reap terminated process");
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "term");
     }
 
     #[test]

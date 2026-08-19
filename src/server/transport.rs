@@ -247,6 +247,7 @@ mod admin_response_lease_tests {
                 catalog_version: None,
                 verb_digest: None,
                 verb_composition_digest: None,
+                exec_timeout_secs: None,
                 access_verbs: Vec::new(),
                 access_requests: Vec::new(),
                 principal: None,

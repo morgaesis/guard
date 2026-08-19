@@ -297,6 +297,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             metrics_addr,
             history_retention,
             exec_as_caller,
+            exec_timeout_secs,
             system_prompt,
             system_prompt_append,
             gate,
@@ -569,6 +570,10 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     tracing::info!("Approved commands will execute as the connecting unix uid");
                 }
             }
+            let exec_timeout_secs = exec_timeout_secs
+                .map(Some)
+                .unwrap_or(guard_env_u64("EXEC_TIMEOUT_SECS")?)
+                .unwrap_or(0);
 
             let llm_enabled = resolve_bool_flag(llm, no_llm, true);
             if !llm_enabled {
@@ -1114,6 +1119,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 redact_secrets,
                 preflight,
                 exec_as_caller,
+                exec_timeout_secs,
                 state_db_path,
                 audit_log_path,
                 ..server::ServerConfig::default()

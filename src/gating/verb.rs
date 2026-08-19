@@ -458,6 +458,10 @@ pub struct Verb {
     /// evaluated (untrusted verbs only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_context: Option<String>,
+    /// Optional wall-clock execution limit. A present value overrides the
+    /// daemon default, including zero to select unbounded execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_timeout_secs: Option<u64>,
     /// Operator prose this verb was generated from (`guard verb create
     /// --prompt`), stored for posterity. Metadata only; never used in rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -527,6 +531,7 @@ pub struct RenderedVerb {
     pub revert: Option<(String, Vec<String>)>,
     pub trusted: bool,
     pub prompt_context: Option<String>,
+    pub exec_timeout_secs: Option<u64>,
     pub baseline: bool,
     pub credential_plan: Option<String>,
     /// Validated params used while rendering and resolving coverage. Approval
@@ -884,6 +889,7 @@ impl VerbCatalog {
             revert,
             trusted: verb.trusted,
             prompt_context: verb.prompt_context.clone(),
+            exec_timeout_secs: verb.exec_timeout_secs,
             baseline: verb.baseline,
             credential_plan: verb.credential_plan.clone(),
             params: resolved,
@@ -3805,6 +3811,7 @@ verbs:
             revert: None,
             trusted: true,
             prompt_context: None,
+            exec_timeout_secs: None,
             source_prose: Some("read-only cmk listing of zones, networks, vms".to_string()),
             evidence: Some("read-only; resource pinned to an allow-list; reversible".to_string()),
             auto_promoted: false,
@@ -3868,6 +3875,7 @@ verbs:
                 revert: None,
                 trusted: false,
                 prompt_context: None,
+                exec_timeout_secs: None,
                 source_prose: None,
                 evidence: None,
                 auto_promoted: false,
@@ -3907,6 +3915,7 @@ verbs:
             revert: None,
             trusted: false,
             prompt_context: None,
+            exec_timeout_secs: None,
             source_prose: None,
             evidence: None,
             auto_promoted: false,
@@ -3957,6 +3966,7 @@ verbs:
             revert: None,
             trusted,
             prompt_context: None,
+            exec_timeout_secs: None,
             source_prose: None,
             evidence: None,
             auto_promoted: false,

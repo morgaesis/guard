@@ -30,6 +30,7 @@ pub struct VerbContext {
     pub name: String,
     pub class: Reversibility,
     pub trusted: bool,
+    pub exec_timeout_secs: Option<u64>,
     pub params: std::collections::BTreeMap<String, String>,
     pub catalog_version: u64,
     /// Definition digest of the matched verb, captured by the caller from the
@@ -279,11 +280,16 @@ pub fn resolve_scoped_matches(
             .max_by_key(|class| reversibility_rank(*class))
             .expect("selected matches are non-empty");
         let revert = selected[0].matched.rendered.revert.clone();
+        let exec_timeout_secs = selected
+            .iter()
+            .filter_map(|matched| matched.matched.rendered.exec_timeout_secs)
+            .min_by_key(|timeout| if *timeout == 0 { u64::MAX } else { *timeout });
         (
             Some(VerbContext {
                 name: first.matched.rendered.name.clone(),
                 class,
                 trusted: true,
+                exec_timeout_secs,
                 params: first.matched.rendered.params.clone(),
                 catalog_version,
                 verb_digest: None,
@@ -442,6 +448,7 @@ fn canonical_conflict_prompt(
                 "execution": {
                     "binary": scoped.matched.rendered.binary,
                     "args": scoped.matched.rendered.args,
+                    "exec_timeout_secs": scoped.matched.rendered.exec_timeout_secs,
                 },
                 "revert": scoped.matched.rendered.revert,
             })
@@ -487,6 +494,7 @@ mod verb_resolution_tests {
                     }),
                     trusted: true,
                     prompt_context: None,
+                    exec_timeout_secs: None,
                     baseline: scope == VerbMatchScope::Baseline,
                     credential_plan: credential_plan.map(str::to_string),
                     params: BTreeMap::new(),
@@ -552,6 +560,41 @@ mod verb_resolution_tests {
         assert_eq!(resolution.context.unwrap().name, "session-apply");
         assert!(!resolution.matches[0].selected);
         assert!(resolution.matches[1].selected);
+    }
+
+    #[test]
+    fn composed_verbs_use_the_shortest_explicit_timeout() {
+        let mut unbounded = scoped(
+            "unbounded",
+            "inspect",
+            VerbMatchScope::Baseline,
+            CoverageAction::Preauthorized,
+            &[],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        unbounded.matched.rendered.exec_timeout_secs = Some(0);
+        let mut bounded = scoped(
+            "bounded",
+            "inspect",
+            VerbMatchScope::Baseline,
+            CoverageAction::Preauthorized,
+            &[],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        bounded.matched.rendered.exec_timeout_secs = Some(5);
+
+        let resolution = resolve_scoped_matches(vec![unbounded, bounded], 17);
+
+        assert_eq!(resolution.decision, VerbDecision::Preauthorized);
+        assert_eq!(resolution.context.unwrap().exec_timeout_secs, Some(5));
     }
 
     #[test]
@@ -931,6 +974,7 @@ mod verb_resolution_properties {
                     revert: None,
                     trusted: true,
                     prompt_context: None,
+                    exec_timeout_secs: None,
                     baseline: scope == VerbMatchScope::Baseline,
                     credential_plan: None,
                     params: BTreeMap::new(),

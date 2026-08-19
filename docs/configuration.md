@@ -24,6 +24,7 @@ not in command-line arguments.
 | `GUARD_LLM_TIMEOUT` | `30` | Per-call timeout in seconds. |
 | `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid`. |
 | `GUARD_DRY_RUN` | `false` | Evaluate approved work without spawning it. |
+| `GUARD_EXEC_TIMEOUT_SECS` | `0` | Wall-clock limit for brokered commands. Zero is unlimited. `--exec-timeout-secs` takes precedence. |
 | `GUARD_PROMPT_APPEND` | unset | Additive evaluator prompt path. |
 | `GUARD_PREFLIGHT` | `false` | Deterministic executable and credential-disclosure checks. |
 | `GUARD_ALLOW_BIN` | unset | Comma-separated hard binary floor. |
@@ -79,6 +80,9 @@ verbs:
 
 The prompt supplement explains novel invocations. The typed verb is the
 enforcement surface for repeated commands whose executable shapes are finite.
+An optional `exec_timeout_secs` field applies a wall-clock limit to one verb and
+overrides `GUARD_EXEC_TIMEOUT_SECS`; setting the field to `0` makes that verb
+unlimited.
 
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
 enabled, policy allow patterns do not skip evaluation. `--no-evaluator` makes
@@ -97,6 +101,12 @@ credential plans, and rollback behavior.
 | `GUARD_AUTH_TOKEN` | none | Execution bearer required for TCP. |
 | `GUARD_ADMIN_TOKEN` | none | Separate bearer for TCP admin RPCs. |
 | `GUARD_MCP_TOKEN` | none | Bearer required by HTTP MCP. |
+| `GUARD_CLIENT_TIMEOUT_SECS` | `600` | MCP bridge deadline in seconds for each buffered execute or admin daemon round trip. |
+
+The MCP deadline stops the bridge from waiting for a response. Buffered
+execution remains daemon-owned after admission and can continue after the MCP
+deadline; `GUARD_EXEC_TIMEOUT_SECS` or a verb's `exec_timeout_secs` bounds the
+child itself.
 
 The client endpoint order is an explicit command option, environment, saved
 client configuration, then the default local endpoint. Use `guard config show`

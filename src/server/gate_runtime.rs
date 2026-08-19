@@ -1202,6 +1202,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             catalog_version: None,
             verb_digest: None,
             verb_composition_digest: None,
+            exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal,
@@ -1783,9 +1784,15 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             );
         }
     }
+    let exec_timeout_secs = inputs
+        .verb
+        .as_ref()
+        .and_then(|verb| verb.exec_timeout_secs)
+        .unwrap_or(server.config.exec_timeout_secs);
     let command_authority = Some(CommandAuthorization::routed(
         inputs.verb.as_ref(),
         inputs.authority.as_ref(),
+        exec_timeout_secs,
     ));
     let secret_authority = inputs
         .authority
@@ -2649,6 +2656,11 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
         verb_digest: verb.as_ref().and_then(|v| v.verb_digest.clone()),
         verb_composition_digest: verb.as_ref().and_then(|v| v.composition_digest.clone()),
+        exec_timeout_secs: Some(
+            verb.as_ref()
+                .and_then(|verb| verb.exec_timeout_secs)
+                .unwrap_or(server.config.exec_timeout_secs),
+        ),
         access_verbs: consume_access_verbs,
         access_requests,
         principal: caller_principal,
@@ -3400,6 +3412,7 @@ async fn execute_snapshot_request(
         Some(CommandAuthorization::replay(
             verb_authority,
             session_authority,
+            snapshot.exec_timeout_secs,
         )),
     )
     .await

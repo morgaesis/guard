@@ -1196,6 +1196,150 @@ fn basic_request(binary: &str, args: Vec<String>) -> ExecuteRequest {
 }
 
 #[cfg(unix)]
+fn process_state(pid: i32) -> Option<char> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_string()))
+        .and_then(|tail| tail.chars().next())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn buffered_exec_timeout_kills_the_process_group_and_is_audited() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_timeout_secs = 1;
+    let (_audit_dir, audit) = attach_test_audit_log(&mut cfg);
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let dir = tempfile::tempdir().unwrap();
+    let child_pid_file = dir.path().join("child.pid");
+    let request = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            format!(
+                "sleep 30 & child=$!; printf '%s' \"$child\" > {}; wait",
+                child_pid_file.display()
+            ),
+        ],
+    );
+    let mut sink = tokio::io::sink();
+    let result = exec_after_approval_with_secret_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &caller,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        "fixture allow".to_string(),
+        None,
+    )
+    .await;
+
+    let reason = match &result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(*started);
+            reason.clone()
+        }
+        other => panic!("expected timeout failure, got {other:?}"),
+    };
+    assert!(reason.starts_with("exec_timeout:"), "{reason}");
+    let child_pid = std::fs::read_to_string(&child_pid_file)
+        .expect("shell recorded its background child")
+        .parse::<i32>()
+        .expect("valid child pid");
+    let state = process_state(child_pid);
+    assert!(
+        state.is_none() || state == Some('Z'),
+        "same-group child remained runnable after timeout: {state:?}"
+    );
+
+    emit_audit_events(&cfg, &caller, "sh", &[], &result);
+    let response = result.into_response();
+    assert!(!response.allowed);
+    assert!(response.reason.contains("exec_timeout"));
+    assert!(std::fs::read_to_string(audit.path())
+        .unwrap()
+        .contains("exec_timeout"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn streaming_exec_timeout_does_not_reset_on_keepalive() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_timeout_secs = 1;
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let mut stream = Vec::new();
+    let request = basic_request("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
+    let result = exec_after_approval_with_secret_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &caller,
+            depth: 0,
+            stream_output: true,
+            stream_writer: &mut stream,
+        },
+        request,
+        "fixture allow".to_string(),
+        None,
+    )
+    .await;
+
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(started);
+            assert!(reason.starts_with("exec_timeout:"), "{reason}");
+        }
+        other => panic!("expected streaming timeout failure, got {other:?}"),
+    }
+    assert!(
+        String::from_utf8_lossy(&stream).contains("keepalive"),
+        "streaming execution should retain transport keepalives"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verb_exec_timeout_overrides_the_daemon_default() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.config.exec_timeout_secs = 30;
+    *cfg.state.verbs.write().await = VerbCatalog::from_yaml(
+        r#"
+verbs:
+  - name: bounded-sleep
+    binary: sh
+    args: ["-c", "sleep 30"]
+    consequence: reversible
+    trusted: true
+    exec_timeout_secs: 1
+"#,
+    )
+    .unwrap();
+    let mut request = basic_request("", Vec::new());
+    request.verb = Some(crate::server::VerbInvocation {
+        name: "bounded-sleep".to_string(),
+        params: Default::default(),
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }),
+    )
+    .await
+    .expect("the per-verb limit must override the longer daemon default");
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(started);
+            assert!(reason.contains("exec_timeout"), "{reason}");
+            assert!(reason.contains("1 seconds"), "{reason}");
+        }
+        other => panic!("expected per-verb timeout failure, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn approved_ansible_evaluate_verbs_bypass_denial_without_filing_another_request() {
     let _env_guard = TEST_ENV_LOCK.lock().await;

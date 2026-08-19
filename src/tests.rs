@@ -51,6 +51,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             metrics_addr,
             history_retention,
             exec_as_caller,
+            exec_timeout_secs,
             system_prompt,
             system_prompt_append,
             gate,
@@ -140,6 +141,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             metrics_addr,
             history_retention,
             exec_as_caller,
+            exec_timeout_secs,
             system_prompt,
             system_prompt_append,
             gate,
@@ -190,6 +192,17 @@ fn parse_start(args: &[&str]) -> ServerCommands {
         },
         _ => panic!("expected server start args"),
     }
+}
+
+#[test]
+fn parses_exec_timeout_secs() {
+    let ServerCommands::Start {
+        exec_timeout_secs, ..
+    } = parse_start(&["guard", "server", "start", "--exec-timeout-secs", "42"])
+    else {
+        panic!("expected server start");
+    };
+    assert_eq!(exec_timeout_secs, Some(42));
 }
 
 #[test]

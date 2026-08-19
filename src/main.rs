@@ -920,6 +920,11 @@ enum ServerCommands {
         #[arg(long = "exec-as-caller", action = ArgAction::SetTrue)]
         exec_as_caller: bool,
 
+        /// Wall-clock limit for brokered commands in seconds. Zero is unlimited.
+        /// Env: GUARD_EXEC_TIMEOUT_SECS.
+        #[arg(long = "exec-timeout-secs", value_name = "SECONDS")]
+        exec_timeout_secs: Option<u64>,
+
         /// Path to custom system prompt file for the LLM evaluator
         #[arg(long, value_name = "PATH")]
         system_prompt: Option<PathBuf>,

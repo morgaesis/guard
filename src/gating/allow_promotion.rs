@@ -795,6 +795,7 @@ pub(crate) fn build_candidate_verb(
         revert,
         trusted: true,
         prompt_context: None,
+        exec_timeout_secs: None,
         source_prose: None,
         evidence: Some(evidence),
         auto_promoted: true,

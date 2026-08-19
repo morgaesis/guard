@@ -3008,6 +3008,7 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
 #[tokio::test]
 async fn approval_snapshot_omits_rendered_verb_parameter_values() {
     let (mut cfg, _, agent) = gating_config(7004, 1000);
+    cfg.config.exec_timeout_secs = 17;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.db");
     let store = SessionStore::open(path.clone(), 3600).await.unwrap();
@@ -3033,6 +3034,7 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
                 name: "fixture-verb".to_string(),
                 class: Reversibility::Irreversible,
                 trusted: false,
+                exec_timeout_secs: None,
                 params: BTreeMap::from([("rollback_only".to_string(), value.clone())]),
                 catalog_version: 1,
                 verb_digest: None,
@@ -3057,10 +3059,17 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
         .unwrap()
         .clone();
     assert!(approval.snapshot.verb_params.is_empty());
+    assert_eq!(approval.snapshot.exec_timeout_secs, Some(17));
     assert!(store.load_approvals().await.unwrap()[0]
         .snapshot
         .verb_params
         .is_empty());
+    assert_eq!(
+        store.load_approvals().await.unwrap()[0]
+            .snapshot
+            .exec_timeout_secs,
+        Some(17)
+    );
     let durable = std::fs::read(path).unwrap();
     assert!(!durable
         .windows(value.len())
@@ -3605,6 +3614,7 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
             catalog_version: None,
             verb_digest: None,
             verb_composition_digest: None,
+            exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(principal),
@@ -4250,6 +4260,7 @@ async fn held_access_replay_fails_if_staged_session_was_revoked() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
     };
@@ -5579,6 +5590,7 @@ fn held_verb_approval(
             catalog_version,
             verb_digest,
             verb_composition_digest: None,
+            exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal,
@@ -6206,6 +6218,7 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
                     name: "runtime-command".to_string(),
                     class: Reversibility::Reversible,
                     trusted: true,
+                    exec_timeout_secs: None,
                     params: BTreeMap::new(),
                     catalog_version: version,
                     verb_digest: Some(digest),
@@ -6320,6 +6333,7 @@ verbs:
                     name: "runtime-command".to_string(),
                     class: Reversibility::Reversible,
                     trusted: true,
+                    exec_timeout_secs: None,
                     params: BTreeMap::new(),
                     catalog_version: version,
                     verb_digest: Some(digest),
@@ -6409,6 +6423,7 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6697,6 +6712,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: Some(principal.clone()),
@@ -6839,6 +6855,7 @@ async fn approved_snapshot_rejects_changed_session_revision() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6874,6 +6891,7 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6915,6 +6933,7 @@ async fn approved_snapshot_executes_in_snapshotted_cwd() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6957,6 +6976,7 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -7007,6 +7027,7 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),

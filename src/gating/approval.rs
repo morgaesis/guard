@@ -112,6 +112,9 @@ pub struct ApprovalSnapshot {
     /// check at replay.
     #[serde(default)]
     pub verb_composition_digest: Option<String>,
+    /// Effective execution timeout captured with the immutable approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_timeout_secs: Option<u64>,
     /// Session-scoped access verbs selected when this immutable hold was
     /// created. Approval consumes their original bounded authority.
     #[serde(default)]
@@ -750,6 +753,7 @@ mod tests {
             catalog_version: None,
             verb_digest: None,
             verb_composition_digest: None,
+            exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(PrincipalKey::from_uid(1001)),

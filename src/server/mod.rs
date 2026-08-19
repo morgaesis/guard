@@ -161,6 +161,9 @@ pub(crate) struct ServerConfig {
     /// When true, approved Unix-socket requests execute as the connecting
     /// user instead of the daemon UID.
     pub(crate) exec_as_caller: bool,
+    /// Default wall-clock limit for brokered child execution. Zero preserves
+    /// unbounded execution unless a matched verb supplies an override.
+    pub(crate) exec_timeout_secs: u64,
     /// Wall-clock unix seconds when the daemon started. Surfaced via the
     /// Status admin RPC so callers can compute uptime.
     pub(crate) started_at_unix: u64,
@@ -232,6 +235,7 @@ impl Default for ServerConfig {
             redact_secrets: Vec::new(),
             preflight: false,
             exec_as_caller: false,
+            exec_timeout_secs: 0,
             started_at_unix: guard::env::now_unix(),
             daemon_uid: current_uid(),
             daemon_principal: resolve_daemon_principal(),

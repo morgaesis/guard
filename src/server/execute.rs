@@ -960,28 +960,33 @@ pub(super) struct CommandAuthorization {
     check_learned_deny: bool,
     verb: Option<VerbAuthorityExpectation>,
     session: Option<SessionAuthoritySnapshot>,
+    exec_timeout_secs: Option<u64>,
 }
 
 impl CommandAuthorization {
     pub(super) fn routed(
         verb: Option<&VerbContext>,
         session: Option<&SessionAuthoritySnapshot>,
+        exec_timeout_secs: u64,
     ) -> Self {
         Self {
             check_learned_deny: true,
             verb: verb.map(VerbAuthorityExpectation::from_context),
             session: session.cloned(),
+            exec_timeout_secs: Some(exec_timeout_secs),
         }
     }
 
     pub(super) fn replay(
         verb: Option<VerbAuthorityExpectation>,
         session: Option<SessionAuthoritySnapshot>,
+        exec_timeout_secs: Option<u64>,
     ) -> Self {
         Self {
             check_learned_deny: true,
             verb,
             session,
+            exec_timeout_secs,
         }
     }
 }
@@ -1432,6 +1437,7 @@ async fn compose_verb_authority_with_session(
             "class": context.class,
             "params": context.params,
             "revert": resolution.revert,
+            "exec_timeout_secs": context.exec_timeout_secs,
             "access_evaluation_override_eligible": context.access_evaluation_override_eligible,
         });
         let canonical = serde_json::to_vec(&material).expect("verb authority material serializes");
@@ -3457,11 +3463,16 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             ))
         }
     };
+    let exec_timeout_secs = command_authority
+        .as_ref()
+        .and_then(|authority| authority.exec_timeout_secs)
+        .unwrap_or(server.config.exec_timeout_secs);
 
     if context.stream_output {
         let result = execute_spawn_streaming(
             cmd,
             allow_reason,
+            exec_timeout_secs,
             server,
             OutputRedactionContext {
                 environment: &redaction_env,
@@ -3526,19 +3537,52 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             None => Ok(Vec::new()),
         }
     };
-    let buffered_output = collect_bounded_output_pair(stdout_reader, stderr_reader).await;
-    if let Err(error) = buffered_output {
-        if let Some(guard) = process_guard.take() {
-            guard.terminate();
+    let execution_deadline =
+        tokio::time::sleep(std::time::Duration::from_secs(exec_timeout_secs.max(1)));
+    tokio::pin!(execution_deadline);
+    let buffered_output = if exec_timeout_secs == 0 {
+        Ok(collect_bounded_output_pair(stdout_reader, stderr_reader).await)
+    } else {
+        tokio::select! {
+            result = collect_bounded_output_pair(stdout_reader, stderr_reader) => Ok(result),
+            _ = &mut execution_deadline => Err(()),
         }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+    };
+    let buffered_output = match buffered_output {
+        Err(()) => {
+            terminate_spawned_child(&mut child, &mut process_guard).await;
+            return ExecuteResult::exec_failed_after_start(
+                allow_reason,
+                exec_timeout_reason(exec_timeout_secs),
+            )
             .with_exposed_secret_refs(exposed_secret_refs);
-    }
-    let status = match child.wait().await {
-        Ok(status) => status,
-        Err(e) => {
+        }
+        Ok(Err(error)) => {
+            terminate_spawned_child(&mut child, &mut process_guard).await;
+            return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+                .with_exposed_secret_refs(exposed_secret_refs);
+        }
+        Ok(Ok(output)) => output,
+    };
+    let wait_result = if exec_timeout_secs == 0 {
+        Ok(child.wait().await)
+    } else {
+        tokio::select! {
+            result = child.wait() => Ok(result),
+            _ = &mut execution_deadline => Err(()),
+        }
+    };
+    let status = match wait_result {
+        Err(()) => {
+            terminate_spawned_child(&mut child, &mut process_guard).await;
+            return ExecuteResult::exec_failed_after_start(
+                allow_reason,
+                exec_timeout_reason(exec_timeout_secs),
+            )
+            .with_exposed_secret_refs(exposed_secret_refs);
+        }
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
             return ExecuteResult::exec_failed_after_start(
                 allow_reason,
                 format!("failed to wait for '{}': {}", request.binary, e),
@@ -3550,7 +3594,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         guard.complete();
     }
 
-    let (stdout_bytes, stderr_bytes) = buffered_output.expect("checked above");
+    let (stdout_bytes, stderr_bytes) = buffered_output;
     let retained_total = Arc::new(AtomicUsize::new(0));
     let stdout = if stdout_bytes.is_empty() {
         None
@@ -3804,12 +3848,23 @@ async fn cleanup_streaming_failure(
     stream_tasks: &mut StreamTaskCleanup,
 ) {
     stream_tasks.abort_and_join().await;
+    terminate_spawned_child(child, process_guard).await;
+}
+
+async fn terminate_spawned_child(
+    child: &mut tokio::process::Child,
+    process_guard: &mut Option<ProcessGuard>,
+) {
     if let Some(guard) = process_guard.take() {
-        guard.terminate();
+        guard.terminate_gracefully().await;
     } else {
         let _ = child.kill().await;
     }
     let _ = child.wait().await;
+}
+
+fn exec_timeout_reason(timeout_secs: u64) -> String {
+    format!("exec_timeout: command exceeded the wall-clock limit of {timeout_secs} seconds")
 }
 
 fn output_stream_name(stream: OutputStream) -> &'static str {
@@ -3904,6 +3959,7 @@ struct OutputRedactionContext<'a> {
 async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     mut cmd: Command,
     allow_reason: String,
+    exec_timeout_secs: u64,
     server: &ServerContext,
     redaction: OutputRedactionContext<'_>,
     audit: SpawnAuditContext<'_>,
@@ -3991,8 +4047,19 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     let mut ansible_diagnostics =
         AnsibleInventoryDiagnostics::for_command(&audit.request.binary, &audit.request.args);
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(1));
+    let execution_deadline =
+        tokio::time::sleep(std::time::Duration::from_secs(exec_timeout_secs.max(1)));
+    tokio::pin!(execution_deadline);
     loop {
         tokio::select! {
+            _ = &mut execution_deadline, if exec_timeout_secs != 0 => {
+                cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
+                return ExecuteResult::exec_failed_after_start(
+                    allow_reason,
+                    exec_timeout_reason(exec_timeout_secs),
+                )
+                .with_exposed_secret_refs(audit.exposed_secret_refs);
+            }
             maybe_chunk = rx.recv() => {
                 match maybe_chunk {
                     Some(StreamChunk::Data { stream, data }) => {
@@ -4205,9 +4272,25 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         .with_exposed_secret_refs(audit.exposed_secret_refs);
     }
 
-    let status = match child.wait().await {
-        Ok(status) => status,
-        Err(e) => {
+    let wait_result = if exec_timeout_secs == 0 {
+        Ok(child.wait().await)
+    } else {
+        tokio::select! {
+            result = child.wait() => Ok(result),
+            _ = &mut execution_deadline => Err(()),
+        }
+    };
+    let status = match wait_result {
+        Err(()) => {
+            terminate_spawned_child(&mut child, &mut process_guard).await;
+            return ExecuteResult::exec_failed_after_start(
+                allow_reason,
+                exec_timeout_reason(exec_timeout_secs),
+            )
+            .with_exposed_secret_refs(audit.exposed_secret_refs);
+        }
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
             return ExecuteResult::exec_failed_after_start(
                 allow_reason,
                 format!("failed to wait for '{}': {}", audit.request.binary, e),

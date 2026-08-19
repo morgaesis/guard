@@ -52,6 +52,7 @@ const MAX_HTTP_SESSIONS: usize = 1024;
 const MAX_MCP_REQUEST_IDS: usize = 16 * 1024;
 const HTTP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Clone, Debug)]
 pub struct McpConfig {
@@ -66,6 +67,8 @@ pub struct McpConfig {
     /// Bearer token required on every HTTP request. Mandatory whenever
     /// `http_addr` is set; there is no unauthenticated network transport.
     pub http_token: Option<String>,
+    /// Deadline for one buffered daemon execute or admin round trip.
+    pub client_timeout_secs: u64,
 }
 
 impl McpConfig {
@@ -80,6 +83,9 @@ impl McpConfig {
 
         if self.tool_name.trim().is_empty() {
             bail!("MCP tool name cannot be empty");
+        }
+        if self.client_timeout_secs == 0 {
+            bail!("GUARD_CLIENT_TIMEOUT_SECS must be greater than zero");
         }
 
         if self.tool_name != DEFAULT_TOOL_NAME
@@ -126,6 +132,7 @@ impl Default for McpConfig {
             tool_name: DEFAULT_TOOL_NAME.to_string(),
             http_addr: None,
             http_token: None,
+            client_timeout_secs: DEFAULT_CLIENT_TIMEOUT_SECS,
         }
     }
 }
@@ -224,6 +231,7 @@ struct ClientExecutor {
     tcp_port: Option<u16>,
     auth_token: Option<String>,
     session_token: Option<String>,
+    client_timeout: Duration,
 }
 
 impl ClientExecutor {
@@ -243,9 +251,10 @@ impl ClientExecutor {
 #[async_trait]
 impl GuardAdmin for ClientExecutor {
     async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse> {
-        self.admin_client()
-            .send_admin(request)
+        let client = self.admin_client();
+        tokio::time::timeout(self.client_timeout, client.send_admin(request))
             .await
+            .map_err(|_| client_timeout_error("admin request", self.client_timeout, false))?
             .context("failed to query guard daemon")
     }
 
@@ -322,13 +331,37 @@ impl GuardExecutor for ClientExecutor {
             });
         }
 
-        let response = client
-            .execute_with_injections(&args.binary, &args.args, env, secrets, args.secret_files)
-            .await
-            .context("failed to execute command through guard server")?;
+        let response = tokio::time::timeout(
+            self.client_timeout,
+            client.execute_with_injections(
+                &args.binary,
+                &args.args,
+                env,
+                secrets,
+                args.secret_files,
+            ),
+        )
+        .await
+        .map_err(|_| client_timeout_error("execute request", self.client_timeout, true))?
+        .context("failed to execute command through guard server")?;
 
         Ok(response.into())
     }
+}
+
+fn client_timeout_error(
+    operation: &str,
+    timeout: Duration,
+    execution_may_continue: bool,
+) -> anyhow::Error {
+    let continuation = if execution_may_continue {
+        "; buffered daemon execution may continue after the MCP client stops waiting"
+    } else {
+        ""
+    };
+    anyhow::anyhow!(
+        "guard daemon {operation} exceeded the client deadline of {timeout:?} (GUARD_CLIENT_TIMEOUT_SECS){continuation}"
+    )
 }
 
 fn guard_tool_secret_map(
@@ -370,6 +403,7 @@ pub async fn serve(config: McpConfig) -> Result<()> {
         tcp_port: config.tcp_port,
         auth_token: config.auth_token.clone(),
         session_token: config.session_token.clone(),
+        client_timeout: Duration::from_secs(config.client_timeout_secs),
     });
     let surface = probe_mcp_surface(executor.as_ref(), &config).await;
     let server = McpServer::new(executor.clone(), executor, config.tool_name)
@@ -3611,6 +3645,7 @@ mod tests {
             tcp_port: None,
             auth_token: None,
             session_token: None,
+            client_timeout: Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS),
         };
         let args: GuardToolArgs = serde_json::from_value(json!({})).unwrap();
         let error = executor.execute(args).await.unwrap_err();
@@ -3646,6 +3681,7 @@ mod tests {
             tcp_port: Some(port),
             auth_token: Some("exec-auth-fixture".to_string()),
             session_token: Some("session-fixture".to_string()),
+            client_timeout: Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS),
         };
         let args: GuardToolArgs = serde_json::from_value(json!({ "binary": "true" })).unwrap();
         executor.execute(args).await.unwrap();
@@ -3653,6 +3689,72 @@ mod tests {
         let request = captured.await.unwrap();
         assert_eq!(request["execute"]["auth_token"], "exec-auth-fixture");
         assert_eq!(request["execute"]["session_token"], "session-fixture");
+    }
+
+    #[tokio::test]
+    async fn executor_deadline_bounds_a_stalled_daemon_execute() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            let _ = lines.next_line().await.unwrap().expect("execute request");
+            std::future::pending::<()>().await;
+        });
+        let executor = ClientExecutor {
+            socket_path: None,
+            tcp_port: Some(port),
+            auth_token: None,
+            session_token: None,
+            client_timeout: Duration::from_millis(50),
+        };
+        let args: GuardToolArgs = serde_json::from_value(json!({ "binary": "true" })).unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), executor.execute(args))
+            .await
+            .expect("MCP execute must honor its client deadline")
+            .unwrap_err();
+        assert!(error.to_string().contains("client deadline"), "{error:#}");
+        assert!(
+            error.to_string().contains("GUARD_CLIENT_TIMEOUT_SECS"),
+            "{error:#}"
+        );
+        stalled.abort();
+        let _ = stalled.await;
+    }
+
+    #[tokio::test]
+    async fn admin_deadline_bounds_a_stalled_daemon_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            let _ = lines.next_line().await.unwrap().expect("admin request");
+            std::future::pending::<()>().await;
+        });
+        let executor = ClientExecutor {
+            socket_path: None,
+            tcp_port: Some(port),
+            auth_token: None,
+            session_token: None,
+            client_timeout: Duration::from_millis(50),
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            executor.send_admin(server::AdminRequest::VerbList),
+        )
+        .await
+        .expect("MCP admin request must honor its client deadline")
+        .unwrap_err();
+        assert!(error.to_string().contains("client deadline"), "{error:#}");
+        assert!(
+            error.to_string().contains("GUARD_CLIENT_TIMEOUT_SECS"),
+            "{error:#}"
+        );
+        stalled.abort();
+        let _ = stalled.await;
     }
 
     #[tokio::test]
@@ -3679,6 +3781,7 @@ mod tests {
             tcp_port: Some(port),
             auth_token: Some("exec-auth-fixture".to_string()),
             session_token: None,
+            client_timeout: Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS),
         };
         let response = executor
             .send_admin(server::AdminRequest::VerbList)
@@ -4355,6 +4458,7 @@ mod tests {
             tool_name: DEFAULT_TOOL_NAME.to_string(),
             http_addr: Some("127.0.0.1:0".parse().unwrap()),
             http_token: None,
+            client_timeout_secs: DEFAULT_CLIENT_TIMEOUT_SECS,
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("bearer token"));
@@ -4366,6 +4470,11 @@ mod tests {
         config
             .validate()
             .expect("token present makes http config valid");
+
+        config.client_timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("GUARD_CLIENT_TIMEOUT_SECS"));
+        config.client_timeout_secs = DEFAULT_CLIENT_TIMEOUT_SECS;
 
         config.http_addr = Some("0.0.0.0:7333".parse().unwrap());
         let err = config.validate().unwrap_err();

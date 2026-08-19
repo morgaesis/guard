@@ -3093,6 +3093,15 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
             // HTTP MCP credentials never enter argv. validate() rejects HTTP
             // mode unless GUARD_MCP_TOKEN supplies a nonempty bearer.
             let http_token = guard_env("MCP_TOKEN").filter(|token| !token.is_empty());
+            let client_timeout_secs = guard_env("CLIENT_TIMEOUT_SECS")
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .context("GUARD_CLIENT_TIMEOUT_SECS must be a positive integer")
+                })
+                .transpose()?
+                .unwrap_or(mcp::DEFAULT_CLIENT_TIMEOUT_SECS);
 
             let mcp_config = mcp::McpConfig {
                 socket_path,
@@ -3102,6 +3111,7 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
                 tool_name,
                 http_addr,
                 http_token,
+                client_timeout_secs,
             };
 
             mcp::serve(mcp_config).await
