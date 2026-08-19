@@ -1792,8 +1792,12 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
         .as_ref()
         .map(|snapshot| snapshot.secret_entitlements.clone());
 
-    // Gating off, or an operator-authored static-policy allow: execute directly.
-    if !server.config.gate.is_on() || inputs.bypass {
+    let force_hold = request.require_approval.unwrap_or(false)
+        || inputs.verb.as_ref().is_some_and(|verb| verb.hold);
+
+    // Gating off, or an operator-authored static-policy allow with no matched
+    // per-verb hold requirement: execute directly.
+    if !server.config.gate.is_on() || (inputs.bypass && !force_hold) {
         if let Err(reason) =
             admit_access_use(server, &request, &inputs.consume_access_verbs, None).await
         {
@@ -1818,7 +1822,6 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
     // The row owner is the caller's cross-platform principal (uid string on
     // Unix, SID on Windows). A non-Unix caller is no longer dropped to None.
     let caller_principal = context.caller.principal();
-    let force_hold = request.require_approval.unwrap_or(false);
     let revert_available = request.revert.is_some();
     let outcome = decide_gate(
         inputs.reversibility,

@@ -986,6 +986,8 @@ pub struct VerbSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_plan: Option<String>,
     pub consequence: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
     /// Whether this verb currently skips the LLM. For an auto-promoted verb
     /// this already reflects the staleness check (`verb_effective_trust`):
     /// `false` here means the daemon has stopped honoring the promotion
@@ -1014,6 +1016,8 @@ pub struct VerbMenuItem {
     pub description: String,
     pub params: Vec<String>,
     pub consequence: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
     pub has_revert: bool,
 }
 

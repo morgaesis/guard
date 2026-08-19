@@ -26,7 +26,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::{capture_async, make_test_config, run_verb_synthesis_llm};
+use super::{
+    capture_async, make_test_config, run_verb_synthesis_llm, run_verb_synthesis_llm_with_preflight,
+};
 
 fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> SessionGrant {
     SessionGrant {
@@ -98,6 +100,59 @@ async fn synthesized_verbs_default_to_session_scope() {
         !verb.baseline,
         "prose synthesis must not create daemon-wide authority"
     );
+}
+
+fn synthesized_held_read_arguments(_request: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "enumerate-accounts",
+        "description": "Enumerate account records",
+        "binary": "fixturectl",
+        "args": ["accounts", "list"],
+        "params": {},
+        "consequence": "reversible",
+        "hold": true,
+        "trusted": false,
+        "evidence": "The operation reads a sensitive bulk account listing."
+    })
+}
+
+#[tokio::test]
+async fn verb_synthesis_preserves_sensitive_read_hold() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        synthesized_held_read_arguments,
+    ));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    cfg.config.daemon_principal = PrincipalKey::from_uid(cfg.config.daemon_uid);
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::UnixAdmin {
+            uid: cfg.config.daemon_uid,
+        },
+        AdminRequest::VerbCreate {
+            prose: "Enumerate all account records for an audit.".to_string(),
+            binary_hint: Some("fixturectl".to_string()),
+            preview: true,
+            gate_feedback: Vec::new(),
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated { verb, .. } = response else {
+        panic!("expected synthesized verb, got {response:?}");
+    };
+    assert!(verb.hold);
 }
 
 #[tokio::test]
@@ -271,6 +326,32 @@ fn undescribed_compiler_check_arguments(_request: &str) -> serde_json::Value {
     synthesis_arguments_with_description("")
 }
 
+fn unsupported_compiler_check_arguments(_request: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "unsupported-compiler-check",
+        "description": "Run an unsupported compiler diagnostic",
+        "binary": "rustc",
+        "args": ["--definitely-unsupported"],
+        "params": {},
+        "consequence": "reversible",
+        "trusted": false,
+        "evidence": "The proposed option is intended to inspect compiler state."
+    })
+}
+
+fn api_policy_denied_read_arguments(_request: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "list-secrets",
+        "description": "List secret metadata",
+        "binary": "kubectl",
+        "args": ["get", "secrets", "-n", "monitoring"],
+        "params": {},
+        "consequence": "reversible",
+        "trusted": false,
+        "evidence": "The command lists metadata for secrets in one namespace."
+    })
+}
+
 async fn synthesized_access_capability_description(
     respond: fn(&str) -> serde_json::Value,
 ) -> (String, crate::server::wire::AccessItem) {
@@ -338,6 +419,166 @@ async fn undescribed_synthesis_uses_the_matcher_derived_description() {
     assert_eq!(item.use_policy, "unselected");
     assert_eq!(item.default_use_policy.as_deref(), Some("unlimited"));
     assert_eq!(item.default_uses, None);
+}
+
+#[tokio::test]
+async fn access_request_rejects_matcher_that_fails_admission_preflight() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_verb_synthesis_llm_with_preflight(
+        listener,
+        unsupported_compiler_check_arguments,
+        "DENY",
+        "executable check failed: rustc does not support --definitely-unsupported",
+    ));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1001 },
+        AdminRequest::AccessRequest {
+            intent: "Run the unsupported compiler diagnostic.".to_string(),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("expected admission preflight rejection, got {response:?}");
+    };
+    assert!(
+        message.contains("rejected by admission preflight"),
+        "{message}"
+    );
+    assert!(message.contains("executable check failed"), "{message}");
+    assert!(cfg.state.grant_requests.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn access_request_rejects_api_policy_refused_capability() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        api_policy_denied_read_arguments,
+    ));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    let proxy = guard::proxy::ApiProxy::new(
+        "127.0.0.1:18443".parse().unwrap(),
+        guard::proxy::ProxyTls::generate().expect("proxy TLS"),
+        guard::proxy::Upstream::from_base_url(
+            "https://127.0.0.1:16443",
+            guard::proxy::UpstreamAuth::Bearer("upstream-test-only".to_string()),
+        )
+        .expect("upstream"),
+        guard::proxy::ApiPolicy::from_yaml(
+            "default: allow\nrules:\n  - verbs: [list]\n    resources: [secrets]\n    namespaces: [monitoring]\n    action: deny\n    description: secret listing disabled\n",
+        )
+        .expect("API policy"),
+        None,
+    );
+    cfg.state
+        .protocol_registry
+        .write()
+        .await
+        .insert("cluster-a".to_string(), Arc::new(proxy));
+
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1001 },
+        AdminRequest::AccessRequest {
+            intent: "List secret metadata in the monitoring namespace.".to_string(),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("expected api-policy rejection, got {response:?}");
+    };
+    assert!(
+        message.contains("api-policy refuses kubernetes list on resource 'secrets'"),
+        "{message}"
+    );
+    assert!(message.contains("secret listing disabled"), "{message}");
+    assert!(message.contains("approval would be unusable"), "{message}");
+    assert!(cfg.state.grant_requests.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn access_request_synthesis_is_rate_limited_per_principal() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_verb_synthesis_llm(listener));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    cfg.state.command_admission = crate::server::runtime::CommandAdmission::new(
+        crate::server::runtime::CommandAdmissionConfig {
+            evaluator_rate_per_minute: 1,
+            evaluator_burst: 2,
+            ..crate::server::runtime::CommandAdmissionConfig::default()
+        },
+    );
+    let caller = CallerIdentity::Unix { uid: 1001 };
+    for index in 0..2 {
+        let response = handle_admin_request_for_test(
+            &cfg,
+            &caller,
+            AdminRequest::AccessRequest {
+                intent: format!("Inspect compiler diagnostic variant {index}."),
+            },
+        )
+        .await;
+        assert!(
+            matches!(response, AdminResponse::AccessItem { .. }),
+            "request {index} was not admitted: {response:?}"
+        );
+    }
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &caller,
+        AdminRequest::AccessRequest {
+            intent: "Inspect compiler diagnostic variant 3.".to_string(),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("expected synthesis throttling, got {response:?}");
+    };
+    assert!(
+        message.contains("access request synthesis throttled"),
+        "{message}"
+    );
+    assert!(message.contains("rate limit reached"), "{message}");
+    assert_eq!(
+        cfg.state.grant_requests.read().await.len(),
+        1,
+        "equivalent synthesized matchers remain exactly deduplicated"
+    );
 }
 
 #[tokio::test]

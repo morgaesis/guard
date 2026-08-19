@@ -1208,6 +1208,21 @@ impl ApiProxy {
         self.protocol.name()
     }
 
+    /// Return the policy or protocol-floor reason that makes `op`
+    /// unconditionally unusable through this proxy. Hold and evaluate actions
+    /// remain usable because they can still reach an authorization decision.
+    pub async fn categorical_policy_refusal(&self, op: &ApiOp) -> Result<Option<String>, String> {
+        let (policy, _) = self
+            .capture_route_authority()
+            .await
+            .map_err(|error| format!("API route authority is unavailable: {error}"))?;
+        if let Some(reason) = self.protocol.deny_outright(op) {
+            return Ok(Some(reason));
+        }
+        let decision = policy.decide(op);
+        Ok(matches!(decision.action, ApiAction::Deny).then_some(decision.reason))
+    }
+
     pub fn upstream(&self) -> &Upstream {
         &self.upstream
     }

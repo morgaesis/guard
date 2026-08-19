@@ -52,6 +52,15 @@ async fn run_verb_synthesis_llm_with(
     listener: tokio::net::TcpListener,
     respond: fn(&str) -> serde_json::Value,
 ) {
+    run_verb_synthesis_llm_with_preflight(listener, respond, "APPROVE", "fixture allowed").await;
+}
+
+async fn run_verb_synthesis_llm_with_preflight(
+    listener: tokio::net::TcpListener,
+    respond: fn(&str) -> serde_json::Value,
+    preflight_decision: &'static str,
+    preflight_reason: &'static str,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     loop {
         let (mut stream, _) = match listener.accept().await {
@@ -81,7 +90,21 @@ async fn run_verb_synthesis_llm_with(
                     }
                 }
             }
-            let arguments = respond(&String::from_utf8_lossy(&request)).to_string();
+            let request = String::from_utf8_lossy(&request);
+            let synthesis = request.contains("create_verb");
+            let (function, arguments) = if synthesis {
+                ("create_verb", respond(&request).to_string())
+            } else {
+                (
+                    "decide",
+                    serde_json::json!({
+                        "decision": preflight_decision,
+                        "reason": preflight_reason,
+                        "risk": 1
+                    })
+                    .to_string(),
+                )
+            };
             let body = serde_json::json!({
                 "choices": [{
                     "message": {
@@ -89,7 +112,7 @@ async fn run_verb_synthesis_llm_with(
                             "id": "verb-1",
                             "type": "function",
                             "function": {
-                                "name": "create_verb",
+                                "name": function,
                                 "arguments": arguments
                             }
                         }]

@@ -450,6 +450,10 @@ pub struct Verb {
     pub consequence: Reversibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revert: Option<VerbCommand>,
+    /// Require operator approval even when the declared consequence would
+    /// otherwise execute or enter containment immediately.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hold: bool,
     /// When true the rendered command skips the LLM evaluator (deterministic
     /// allow). The reversibility class still drives the gate.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -525,6 +529,7 @@ pub struct RenderedVerb {
     pub args: Vec<String>,
     pub consequence: Reversibility,
     pub revert: Option<(String, Vec<String>)>,
+    pub hold: bool,
     pub trusted: bool,
     pub prompt_context: Option<String>,
     pub baseline: bool,
@@ -882,6 +887,7 @@ impl VerbCatalog {
             args,
             consequence: verb.consequence,
             revert,
+            hold: verb.hold,
             trusted: verb.trusted,
             prompt_context: verb.prompt_context.clone(),
             baseline: verb.baseline,
@@ -2465,6 +2471,7 @@ pub fn generated_access_matcher_shape(verb: &Verb) -> serde_json::Value {
         "coverage": coverage,
         "credential_plan": verb.credential_plan,
         "params": verb.params,
+        "hold": verb.hold,
     })
 }
 
@@ -3803,6 +3810,7 @@ verbs:
             params: p,
             consequence: Reversibility::Reversible,
             revert: None,
+            hold: false,
             trusted: true,
             prompt_context: None,
             source_prose: Some("read-only cmk listing of zones, networks, vms".to_string()),
@@ -3866,6 +3874,7 @@ verbs:
                 params,
                 consequence: Reversibility::Reversible,
                 revert: None,
+                hold: false,
                 trusted: false,
                 prompt_context: None,
                 source_prose: None,
@@ -3905,6 +3914,7 @@ verbs:
             params: BTreeMap::new(),
             consequence: Reversibility::Reversible,
             revert: None,
+            hold: false,
             trusted: false,
             prompt_context: None,
             source_prose: None,
@@ -3955,6 +3965,7 @@ verbs:
             params,
             consequence: Reversibility::Reversible,
             revert: None,
+            hold: false,
             trusted,
             prompt_context: None,
             source_prose: None,
