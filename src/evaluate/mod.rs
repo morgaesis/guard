@@ -20,7 +20,7 @@ pub mod fuzzing {
 }
 
 pub use cache::{EvalCache, DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL_SECS};
-pub use config::{EvalConfig, LlmConfig};
+pub use config::{EvalConfig, LlmConfig, DEFAULT_REASONING_EFFORT, REASONING_EFFORT_VALUES};
 pub use redact::redact_for_llm;
 pub use result::{EvalResult, EvalSource, LlmResponse};
 

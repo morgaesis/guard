@@ -755,6 +755,17 @@ enum ServerCommands {
         #[arg(long, value_name = "MODEL[,MODEL]", value_delimiter = ',')]
         llm_models: Option<Vec<String>>,
 
+        /// Hidden-reasoning effort requested from the provider on every
+        /// evaluator call. Higher effort spends more reasoning tokens for
+        /// better decisions on reasoning-capable models.
+        /// Env: GUARD_LLM_REASONING_EFFORT.
+        #[arg(
+            long,
+            value_name = "EFFORT",
+            value_parser = ["minimal", "low", "medium", "high", "max"]
+        )]
+        llm_reasoning_effort: Option<String>,
+
         /// Enable or disable LLM evaluation.
         #[arg(
             long = "evaluator",

@@ -25,6 +25,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             llm_timeout,
             llm_retries,
             llm_models,
+            llm_reasoning_effort,
             llm,
             no_llm,
             no_redact,
@@ -114,6 +115,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             llm_timeout,
             llm_retries,
             llm_models,
+            llm_reasoning_effort,
             llm,
             no_llm,
             no_redact,
@@ -940,7 +942,7 @@ fn test_llm_model_env_resolution_chain() {
     }
 
     // 1. Clean slate: no flag, no env -> None (caller falls back to
-    //    evaluate::DEFAULT_MODEL which is "openai/gpt-5.4-mini").
+    //    evaluate::DEFAULT_MODEL which is "openai/gpt-5.6-luna").
     assert_eq!(
         resolve_single_model_for_test(None),
         None,
@@ -1003,14 +1005,14 @@ fn test_server_start_llm_models_flag() {
         "server",
         "start",
         "--llm-models",
-        "openai/gpt-5.4-mini,meta-llama/llama-4-maverick",
+        "openai/gpt-5.6-luna,meta-llama/llama-4-maverick",
     ]) else {
         panic!("expected start");
     };
     assert_eq!(
         llm_models,
         Some(vec![
-            "openai/gpt-5.4-mini".to_string(),
+            "openai/gpt-5.6-luna".to_string(),
             "meta-llama/llama-4-maverick".to_string()
         ])
     );

@@ -352,10 +352,25 @@ impl Evaluator {
         use_function_calling: bool,
     ) -> Result<(LlmResponse, TokenUsage), AttemptError> {
         let gating = self.gate_mode.is_on();
+        let reasoning_effort = self.llm_config.reasoning_effort();
         let body = if use_function_calling {
-            build_function_call_body(api_url, model, system_prompt, command, gating)
+            build_function_call_body(
+                api_url,
+                model,
+                system_prompt,
+                command,
+                gating,
+                reasoning_effort,
+            )
         } else {
-            build_json_response_body(api_url, model, system_prompt, command, gating)
+            build_json_response_body(
+                api_url,
+                model,
+                system_prompt,
+                command,
+                gating,
+                reasoning_effort,
+            )
         };
 
         tracing::debug!("LLM POST {}: model={}", api_url, model);
@@ -427,7 +442,14 @@ impl Evaluator {
 
         // Routers commonly return HTTP 200 with an embedded error object.
         if parsed.get("error").is_some() {
-            return Err(AttemptError::ClientError(provider_error_summary(&parsed)));
+            let summary = provider_error_summary(&parsed);
+            // OpenRouter reports upstream capacity exhaustion as an embedded
+            // error on a 200, not as a 429; those are transient and worth the
+            // same backoff-and-retry treatment as an explicit 429.
+            if embedded_error_is_rate_limit(&parsed, &summary) {
+                return Err(AttemptError::RateLimited { retry_after: None });
+            }
+            return Err(AttemptError::ClientError(summary));
         }
 
         if let Some(decision) = provider_refusal_response(&parsed) {
@@ -443,6 +465,16 @@ impl Evaluator {
 
         Ok((decision, usage))
     }
+}
+
+/// True when a 200-with-embedded-error response is a rate limit in disguise:
+/// an explicit 429 error code, or rate-limit wording in the error text.
+fn embedded_error_is_rate_limit(parsed: &serde_json::Value, summary: &str) -> bool {
+    if parsed.pointer("/error/code").and_then(|code| code.as_u64()) == Some(429) {
+        return true;
+    }
+    let lowered = summary.to_ascii_lowercase();
+    lowered.contains("rate-limited") || lowered.contains("rate limit")
 }
 
 /// Token usage metrics from the provider response.
@@ -1024,6 +1056,25 @@ mod tests {
                 .to_string();
         let good_body = r#"{"choices":[{"message":{"content":"{\"decision\":\"APPROVE\",\"reason\":\"ok\",\"risk\":1}"}}]}"#.to_string();
         let responses = vec![(404, unsupported, None), (200, good_body, None)];
+        let mock = tokio::spawn(run_mock(listener, responses));
+
+        let evaluator = mock_server_evaluator(port, 2, vec![]).await;
+        let result = evaluator.evaluate_llm("pwd", None).await;
+        assert!(result.is_allow(), "got: {}", result);
+        let _ = mock.await;
+    }
+
+    #[tokio::test]
+    async fn test_embedded_rate_limit_error_is_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // OpenRouter reports upstream saturation as HTTP 200 with an embedded
+        // error; the retry loop must treat it like an explicit 429 and try
+        // again instead of failing the evaluation on the first response.
+        let limited = r#"{"error":{"message":"model is temporarily rate-limited upstream. Please retry shortly.","code":429}}"#
+            .to_string();
+        let good_body = r#"{"choices":[{"message":{"content":"{\"decision\":\"APPROVE\",\"reason\":\"ok\",\"risk\":1}"}}]}"#.to_string();
+        let responses = vec![(200, limited, None), (200, good_body, None)];
         let mock = tokio::spawn(run_mock(listener, responses));
 
         let evaluator = mock_server_evaluator(port, 2, vec![]).await;
