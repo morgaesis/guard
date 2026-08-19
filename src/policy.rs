@@ -484,7 +484,7 @@ impl PolicyEngine {
 /// - `?` matches any single character
 /// - `[abc]` matches any character in the set
 /// - `[!abc]` matches any character not in the set
-fn match_glob(pattern: &str, text: &str) -> bool {
+pub(crate) fn match_glob(pattern: &str, text: &str) -> bool {
     // Exact match is always valid
     if pattern == text {
         return true;

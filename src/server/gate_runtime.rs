@@ -1152,7 +1152,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
         use guard::proxy::HoldDecision;
         let principal = Some(self.server.config.daemon_principal.clone());
         if let Some(why) = gate_capacity_reason(&self.server, principal.as_ref()).await {
-            return HoldDecision::Denied { reason: why };
+            return HoldDecision::Denied {
+                reason: why,
+                handle: None,
+            };
         }
         let handle = new_handle();
         let now = now_unix();
@@ -1225,7 +1228,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
             notes: Vec::new(),
         };
         if let Err(reason) = persist_approval(&self.server, &approval).await {
-            return HoldDecision::Denied { reason };
+            return HoldDecision::Denied {
+                reason,
+                handle: None,
+            };
         }
         let notify = self
             .server
@@ -1308,6 +1314,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                         reason: a
                             .decided_reason
                             .unwrap_or_else(|| a.status.as_str().to_string()),
+                        handle: Some(handle),
                     };
                 }
                 Some(_) => {}
@@ -1315,6 +1322,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                     orphan_guard.armed = false;
                     return HoldDecision::Denied {
                         reason: "held request disappeared from the queue".to_string(),
+                        handle: Some(handle),
                     };
                 }
             }
@@ -1327,6 +1335,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                 orphan_guard.armed = false;
                 return HoldDecision::Denied {
                     reason: "expired without operator approval".to_string(),
+                    handle: Some(handle),
                 };
             }
             let poll = remaining

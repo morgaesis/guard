@@ -119,6 +119,16 @@ struct SessionAuth {
     token: String,
     context: ApiSessionContext,
 }
+struct BufferedRequest {
+    parts: Parts,
+    body: Bytes,
+}
+
+struct RouteMetadata<'a> {
+    path: &'a str,
+    query: &'a str,
+    op: &'a ApiOp,
+}
 
 /// A configured API proxy: TLS identity, upstream connection, the attached
 /// protocol plug-in, and the hot-reloaded operator policy. Hosted by the daemon
@@ -1471,9 +1481,17 @@ impl ApiProxy {
             );
         }
 
+        // Policy can constrain object metadata carried in a write body. Buffer
+        // only after protocol hard-denies and attribution checks have run, then
+        // preserve these exact bytes through classification and forwarding.
+        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
+            Ok(buffered) => buffered,
+            Err(error) => return self.request_body_error_response(error),
+        };
+
         let label = format!("{} {}", op.verb.as_str(), path);
 
-        let decision = route_policy.decide(&op);
+        let decision = route_policy.decide(&op, &body);
 
         // Protocol floors and explicit operator policy denies are absolute.
         // Session mode can only choose a stricter deterministic path or route a
@@ -1496,7 +1514,17 @@ impl ApiProxy {
             .unwrap_or_default();
         if !op.is_read() && session_mode == ApiEvaluationMode::ReadOnly {
             return self
-                .route_coverage_only(req, &path, &op, false, conn_id, session_context.as_ref())
+                .route_coverage_only(
+                    BufferedRequest { parts, body },
+                    RouteMetadata {
+                        path: &path,
+                        query: &query,
+                        op: &op,
+                    },
+                    false,
+                    conn_id,
+                    session_context.as_ref(),
+                )
                 .await;
         }
         if !matches!(decision.action, ApiAction::Hold) {
@@ -1506,15 +1534,28 @@ impl ApiProxy {
                     .is_some_and(|context| context.can_evaluate_api_override)
                 {
                     return self
-                        .route_evaluate(req, &path, &op, false, conn_id, session_context.as_ref())
+                        .route_evaluate(
+                            BufferedRequest { parts, body },
+                            RouteMetadata {
+                                path: &path,
+                                query: &query,
+                                op: &op,
+                            },
+                            false,
+                            conn_id,
+                            session_context.as_ref(),
+                        )
                         .await;
                 }
                 if session_context.is_some() {
                     return self
                         .route_coverage_only(
-                            req,
-                            &path,
-                            &op,
+                            BufferedRequest { parts, body },
+                            RouteMetadata {
+                                path: &path,
+                                query: &query,
+                                op: &op,
+                            },
                             false,
                             conn_id,
                             session_context.as_ref(),
@@ -1531,7 +1572,17 @@ impl ApiProxy {
                 && matches!(decision.action, ApiAction::Evaluate)
             {
                 return self
-                    .route_coverage_only(req, &path, &op, false, conn_id, session_context.as_ref())
+                    .route_coverage_only(
+                        BufferedRequest { parts, body },
+                        RouteMetadata {
+                            path: &path,
+                            query: &query,
+                            op: &op,
+                        },
+                        false,
+                        conn_id,
+                        session_context.as_ref(),
+                    )
                     .await;
             }
         }
@@ -1576,7 +1627,16 @@ impl ApiProxy {
                             .field("label", &label),
                     );
                     return self
-                        .forward_contained_cleanup(req, &path, &query, op, conn_id, created)
+                        .forward_contained_cleanup(
+                            BufferedRequest { parts, body },
+                            RouteMetadata {
+                                path: &path,
+                                query: &query,
+                                op: &op,
+                            },
+                            conn_id,
+                            created,
+                        )
                         .await;
                 }
                 self.created
@@ -1589,12 +1649,30 @@ impl ApiProxy {
         match decision.action {
             ApiAction::Deny => unreachable!("explicit deny returned above"),
             ApiAction::Hold => {
-                self.route_hold(req, &path, &query, &op, &decision.reason, conn_id)
-                    .await
+                self.route_hold_buffered(
+                    BufferedRequest { parts, body },
+                    &path,
+                    &query,
+                    &op,
+                    &decision.reason,
+                    conn_id,
+                    None,
+                )
+                .await
             }
             ApiAction::Evaluate => {
-                self.route_evaluate(req, &path, &op, false, conn_id, session_context.as_ref())
-                    .await
+                self.route_evaluate(
+                    BufferedRequest { parts, body },
+                    RouteMetadata {
+                        path: &path,
+                        query: &query,
+                        op: &op,
+                    },
+                    false,
+                    conn_id,
+                    session_context.as_ref(),
+                )
+                .await
             }
             ApiAction::Allow => {
                 // Rarity escalation: a broad allow rule fails toward scrutiny on
@@ -1613,9 +1691,12 @@ impl ApiProxy {
                             );
                             return self
                                 .route_evaluate(
-                                    req,
-                                    &path,
-                                    &op,
+                                    BufferedRequest { parts, body },
+                                    RouteMetadata {
+                                        path: &path,
+                                        query: &query,
+                                        op: &op,
+                                    },
                                     true,
                                     conn_id,
                                     session_context.as_ref(),
@@ -1632,30 +1713,50 @@ impl ApiProxy {
                                 label
                             );
                             return self
-                                .route_hold(req, &path, &query, &op, &reason, conn_id)
+                                .route_hold_buffered(
+                                    BufferedRequest { parts, body },
+                                    &path,
+                                    &query,
+                                    &op,
+                                    &reason,
+                                    conn_id,
+                                    None,
+                                )
                                 .await;
                         }
                     }
                 }
                 let redact = self.protocol.redactable_read(&op);
                 tracing::info!(target: "guard::apiproxy", "ALLOW {}{}", label, if redact { " (redacting)" } else { "" });
-                self.forward(req, &path, &query, redact, Some(op), conn_id)
-                    .await
+                self.forward_buffered(
+                    BufferedRequest { parts, body },
+                    &path,
+                    &query,
+                    redact,
+                    Some(op.clone()),
+                    conn_id,
+                    None,
+                    None,
+                )
+                .await
             }
         }
     }
 
-    async fn route_evaluate(
+    async fn route_evaluate<'a>(
         &self,
-        req: Request<Incoming>,
-        path: &str,
-        op: &ApiOp,
+        buffered: BufferedRequest,
+        route: RouteMetadata<'a>,
         rarity: bool,
         conn_id: u64,
         session_context: Option<&ApiSessionContext>,
     ) -> Response<ProxyBody> {
+        let mut parts = buffered.parts;
+        let body = buffered.body;
+        let path = route.path;
+        let query = route.query;
+        let op = route.op;
         let label = format!("{} {}", op.verb.as_str(), path);
-        let query = req.uri().query().unwrap_or("").to_string();
         if session_context
             .is_some_and(|context| context.evaluation_mode == ApiEvaluationMode::PolicyOnly)
         {
@@ -1673,21 +1774,18 @@ impl ApiProxy {
             .filter(|judge| judge.evaluator_enabled())
         else {
             return self
-                .route_hold(
-                    req,
+                .route_hold_buffered(
+                    BufferedRequest { parts, body },
                     path,
-                    &query,
+                    query,
                     op,
                     "api-policy evaluate requested but no evaluator is attached",
                     conn_id,
+                    None,
                 )
                 .await;
         };
 
-        let (mut parts, body) = match collect_request_body(req, self.request_body_timeout).await {
-            Ok(buffered) => buffered,
-            Err(error) => return self.request_body_error_response(error),
-        };
         let coverage_body_shape = redacted_body_shape(&body);
         let mut body = match prepare_create_provenance(
             &mut parts,
@@ -1736,7 +1834,7 @@ impl ApiProxy {
             protocol: self.protocol.name().to_string(),
             verb: op.verb.as_str().to_string(),
             path: path.to_string(),
-            redacted_query: crate::evaluate::redact_for_llm(&query),
+            redacted_query: crate::evaluate::redact_for_llm(query),
             group: op.group.clone(),
             version: op.version.clone(),
             resource: op.resource.clone(),
@@ -1854,10 +1952,9 @@ impl ApiProxy {
                             if redact { " (redacting)" } else { "" }
                         );
                         self.forward_buffered(
-                            parts,
-                            body,
+                            BufferedRequest { parts, body },
                             path,
-                            &query,
+                            query,
                             redact,
                             Some(op.clone()),
                             conn_id,
@@ -1900,11 +1997,9 @@ impl ApiProxy {
                         };
                         if !can_arm {
                             return self
-                                .route_hold_buffered(
-                                    parts,
-                                    body,
+                                .route_hold_buffered(BufferedRequest { parts, body },
                                     path,
-                                    &query,
+                                    query,
                                     op,
                                     "evaluator allowed a contained write but no auto-revert can be armed right now",
                                     conn_id,
@@ -1925,11 +2020,9 @@ impl ApiProxy {
                                 }),
                                 Ok(None) => {
                                     return self
-                                        .route_hold_buffered(
-                                            parts,
-                                            body,
+                                        .route_hold_buffered(BufferedRequest { parts, body },
                                             path,
-                                            &query,
+                                            query,
                                             op,
                                             "evaluator allowed a contained write but its revert could not be re-established at forward time",
                                             conn_id,
@@ -1952,10 +2045,9 @@ impl ApiProxy {
                             if redact { " (redacting)" } else { "" }
                         );
                         self.forward_buffered(
-                            parts,
-                            body,
+                            BufferedRequest { parts, body },
                             path,
-                            &query,
+                            query,
                             redact,
                             Some(op.clone()),
                             conn_id,
@@ -1966,10 +2058,9 @@ impl ApiProxy {
                     }
                     GateOutcome::Contain | GateOutcome::Hold => {
                         self.route_hold_buffered(
-                            parts,
-                            body,
+                            BufferedRequest { parts, body },
                             path,
-                            &query,
+                            query,
                             op,
                             &format!("api evaluator allowed but consequence gate held: {reason}"),
                             conn_id,
@@ -1985,20 +2076,19 @@ impl ApiProxy {
     /// Resolve exact typed API coverage without invoking the evaluator. This is
     /// the only write path available to read-only sessions and the fallback for
     /// `evaluate` policy cells under policy-only sessions.
-    async fn route_coverage_only(
+    async fn route_coverage_only<'a>(
         &self,
-        req: Request<Incoming>,
-        path: &str,
-        op: &ApiOp,
+        buffered: BufferedRequest,
+        route: RouteMetadata<'a>,
         rarity: bool,
         conn_id: u64,
         session_context: Option<&ApiSessionContext>,
     ) -> Response<ProxyBody> {
-        let query = req.uri().query().unwrap_or("").to_string();
-        let (mut parts, body) = match collect_request_body(req, self.request_body_timeout).await {
-            Ok(buffered) => buffered,
-            Err(error) => return self.request_body_error_response(error),
-        };
+        let mut parts = buffered.parts;
+        let body = buffered.body;
+        let path = route.path;
+        let query = route.query;
+        let op = route.op;
         let coverage_body_shape = redacted_body_shape(&body);
         let mut body = match prepare_create_provenance(
             &mut parts,
@@ -2049,7 +2139,7 @@ impl ApiProxy {
             protocol: self.protocol.name().to_string(),
             verb: op.verb.as_str().to_string(),
             path: path.to_string(),
-            redacted_query: crate::evaluate::redact_for_llm(&query),
+            redacted_query: crate::evaluate::redact_for_llm(query),
             group: op.group.clone(),
             version: op.version.clone(),
             resource: op.resource.clone(),
@@ -2091,10 +2181,9 @@ impl ApiProxy {
                 if outcome != GateOutcome::ExecuteNow {
                     return self
                         .route_hold_buffered(
-                            parts,
-                            body,
+                            BufferedRequest { parts, body },
                             path,
-                            &query,
+                            query,
                             op,
                             "exact typed API coverage requires consequence approval",
                             conn_id,
@@ -2104,10 +2193,9 @@ impl ApiProxy {
                 }
                 let redact = self.protocol.redactable_read(op);
                 self.forward_buffered(
-                    parts,
-                    body,
+                    BufferedRequest { parts, body },
                     path,
-                    &query,
+                    query,
                     redact,
                     Some(op.clone()),
                     conn_id,
@@ -2143,50 +2231,10 @@ impl ApiProxy {
         }
     }
 
-    /// Park a request for operator approval and forward it on approval. Shared
-    /// by an `ApiAction::Hold` policy decision and by rarity escalation of an
-    /// otherwise-allowed request. Fails closed to a 403 when no hold queue is
-    /// attached (the daemon is running without `--gate consequence`), on a
-    /// deny/expiry, or on a capacity refusal.
-    async fn route_hold(
-        &self,
-        req: Request<Incoming>,
-        path: &str,
-        query: &str,
-        op: &ApiOp,
-        reason: &str,
-        conn_id: u64,
-    ) -> Response<ProxyBody> {
-        let label = format!("{} {}", op.verb.as_str(), path);
-        if self.gate.get().is_none() {
-            tracing::info!(
-                target: "guard::apiproxy",
-                "HOLD {} denied: no approval queue (--gate consequence is not active)",
-                label
-            );
-            return self.status_resp(
-                StatusCode::FORBIDDEN,
-                &format!(
-                    "guard api-proxy ({}): {label} requires operator approval, but the daemon \
-                     is running without --gate consequence (no approval queue); denied",
-                    self.protocol.name()
-                ),
-                "Forbidden",
-            );
-        }
-        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
-            Ok(buffered) => buffered,
-            Err(error) => return self.request_body_error_response(error),
-        };
-        self.route_hold_buffered(parts, body, path, query, op, reason, conn_id, None)
-            .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn route_hold_buffered(
         &self,
-        mut parts: Parts,
-        body: Bytes,
+        buffered: BufferedRequest,
         path: &str,
         query: &str,
         op: &ApiOp,
@@ -2194,6 +2242,8 @@ impl ApiProxy {
         conn_id: u64,
         mut authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
+        let mut parts = buffered.parts;
+        let body = buffered.body;
         let mut body = match prepare_create_provenance(
             &mut parts,
             body,
@@ -2275,8 +2325,7 @@ impl ApiProxy {
                         });
                         let response = self
                             .forward_buffered(
-                                parts,
-                                body,
+                                BufferedRequest { parts, body },
                                 path,
                                 query,
                                 redact,
@@ -2289,15 +2338,28 @@ impl ApiProxy {
                         (response, GuardHoldOutcome::Approved)
                     }
                 }
-                HoldDecision::Denied { reason } => {
+                HoldDecision::Denied { reason, handle } => {
                     tracing::info!(target: "guard::apiproxy", "DENY {} (held: {})", label, reason);
-                    let response = self.status_resp(
-                        StatusCode::FORBIDDEN,
-                        &format!(
+                    let message = handle.as_ref().map_or_else(
+                        || {
+                            format!(
                             "guard api-proxy ({}): {label} held for operator approval: {reason}",
                             self.protocol.name()
-                        ),
+                        )
+                        },
+                        |handle| {
+                            format!(
+                                "guard api-proxy ({}): {label} held for operator approval \
+                                 {handle}: {reason}; inspect with guard approval show {handle}",
+                                self.protocol.name()
+                            )
+                        },
+                    );
+                    let response = self.approval_status_resp(
+                        StatusCode::FORBIDDEN,
+                        &message,
                         "Forbidden",
+                        handle.as_deref(),
                     );
                     (response, GuardHoldOutcome::Denied)
                 }
@@ -2319,30 +2381,37 @@ impl ApiProxy {
             Ok(buffered) => buffered,
             Err(error) => return self.request_body_error_response(error),
         };
-        self.forward_buffered(parts, body, path, query, redact, op, conn_id, None, None)
-            .await
+        self.forward_buffered(
+            BufferedRequest { parts, body },
+            path,
+            query,
+            redact,
+            op,
+            conn_id,
+            None,
+            None,
+        )
+        .await
     }
 
-    async fn forward_contained_cleanup(
+    async fn forward_contained_cleanup<'a>(
         &self,
-        req: Request<Incoming>,
-        path: &str,
-        query: &str,
-        op: ApiOp,
+        buffered: BufferedRequest,
+        route: RouteMetadata<'a>,
         conn_id: u64,
         created: CreatedMatch,
     ) -> Response<ProxyBody> {
-        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
-            Ok(buffered) => buffered,
-            Err(error) => return self.request_body_error_response(error),
-        };
+        let parts = buffered.parts;
+        let body = buffered.body;
+        let path = route.path;
+        let query = route.query;
+        let op = route.op;
         self.forward_buffered_with_cleanup(
-            parts,
-            body,
+            BufferedRequest { parts, body },
             path,
             query,
             false,
-            Some(op),
+            Some(op.clone()),
             conn_id,
             None,
             Some(created),
@@ -2354,8 +2423,7 @@ impl ApiProxy {
     #[allow(clippy::too_many_arguments)]
     async fn forward_buffered(
         &self,
-        parts: Parts,
-        body: Bytes,
+        buffered: BufferedRequest,
         path: &str,
         query: &str,
         redact: bool,
@@ -2365,8 +2433,10 @@ impl ApiProxy {
         authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
         self.forward_buffered_with_cleanup(
-            parts,
-            body,
+            BufferedRequest {
+                parts: buffered.parts,
+                body: buffered.body,
+            },
             path,
             query,
             redact,
@@ -2382,8 +2452,7 @@ impl ApiProxy {
     #[allow(clippy::too_many_arguments)]
     async fn forward_buffered_with_cleanup(
         &self,
-        mut parts: Parts,
-        mut body: Bytes,
+        buffered: BufferedRequest,
         path: &str,
         query: &str,
         redact: bool,
@@ -2393,6 +2462,8 @@ impl ApiProxy {
         created_cleanup: Option<CreatedMatch>,
         authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
+        let mut parts = buffered.parts;
+        let mut body = buffered.body;
         if let Some(operation) = op.as_ref() {
             body = match prepare_create_provenance(
                 &mut parts,
@@ -2500,8 +2571,7 @@ impl ApiProxy {
                 .await;
             if handle.is_none() && parts.extensions.get::<ApprovedApiHold>().is_none() {
                 return Box::pin(self.route_hold_buffered(
-                    parts,
-                    body,
+                    BufferedRequest { parts, body },
                     path,
                     query,
                     operation,
@@ -3852,6 +3922,22 @@ impl ApiProxy {
         if let Some(handle) = handle {
             if let Ok(value) = HeaderValue::from_str(handle) {
                 response.headers_mut().insert("x-guard-provisional", value);
+            }
+        }
+        response
+    }
+
+    fn approval_status_resp(
+        &self,
+        code: StatusCode,
+        message: &str,
+        reason: &str,
+        handle: Option<&str>,
+    ) -> Response<ProxyBody> {
+        let mut response = self.status_resp(code, message, reason);
+        if let Some(handle) = handle {
+            if let Ok(value) = HeaderValue::from_str(handle) {
+                response.headers_mut().insert("x-guard-approval", value);
             }
         }
         response

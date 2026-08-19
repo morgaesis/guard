@@ -59,9 +59,13 @@ pub enum HoldDecision {
     /// The operator approved the exact held request; the proxy forwards it.
     /// Carries the approval handle for the audit trail.
     Approved { handle: String },
-    /// Denied, expired, or never enqueued (capacity, no queue). The proxy
-    /// returns the reason to the client and forwards nothing.
-    Denied { reason: String },
+    /// Denied or expired after enqueue, or never enqueued (capacity, no queue).
+    /// The handle is present only when a durable approval exists for client
+    /// inspection.
+    Denied {
+        reason: String,
+        handle: Option<String>,
+    },
 }
 
 /// Implemented by the daemon to arm the proxy's synthesized reverts in its
@@ -139,6 +143,7 @@ pub trait GateSink: Send + Sync {
     ) -> HoldDecision {
         HoldDecision::Denied {
             reason: "no operator-approval queue is attached to this proxy".to_string(),
+            handle: None,
         }
     }
 }
