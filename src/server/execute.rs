@@ -757,7 +757,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                     });
                 }
             }
-        } else {
+        } else if !phase.server.config.admission_preview {
             let observed_argv = Some((request.binary.as_str(), request.args.as_slice()));
             let intent = durable_command.clone();
             match super::admin::submit_access_request(

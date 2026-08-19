@@ -139,6 +139,7 @@ mod regeneration_proposal_tests {
             params: BTreeMap::new(),
             consequence: guard::gating::Reversibility::Reversible,
             revert: None,
+            hold: false,
             trusted: false,
             prompt_context: None,
             exec_timeout_secs: None,
@@ -829,6 +830,7 @@ mod semantic_intent_tests {
             params: std::collections::BTreeMap::new(),
             consequence: guard::gating::Reversibility::Reversible,
             revert: None,
+            hold: false,
             trusted: true,
             prompt_context: None,
             exec_timeout_secs: None,
@@ -866,10 +868,13 @@ mod semantic_intent_tests {
 
 async fn reduce_access_intent(
     server: &ServerContext,
+    caller: &CallerIdentity,
+    evaluator_scope: &str,
     intent: &str,
     observed_argv: Option<(&str, &[String])>,
 ) -> Result<(Vec<Verb>, Vec<Verb>), String> {
     if let Some((binary, args)) = observed_argv {
+        preflight_synthesized_api_policy(server, binary, args).await?;
         let candidate = guard::gating::verb::Verb {
             name: "access-generated-pending".to_string(),
             description: String::new(),
@@ -881,6 +886,7 @@ async fn reduce_access_intent(
             params: std::collections::BTreeMap::new(),
             consequence: guard::gating::Reversibility::Irreversible,
             revert: None,
+            hold: false,
             trusted: false,
             prompt_context: None,
             exec_timeout_secs: None,
@@ -889,7 +895,7 @@ async fn reduce_access_intent(
             auto_promoted: false,
             promotion_stamp: None,
         };
-        return reduce_generated_access_candidate(server, candidate).await;
+        return reduce_generated_access_candidate(server, caller, candidate, false).await;
     }
     let catalog = server
         .refresh_and_lease_verb_catalog_for_use("access proposal selection")
@@ -984,20 +990,34 @@ async fn reduce_access_intent(
     }
 
     drop(catalog);
-    let candidate = server
+    let admission_scope = format!("access-synthesis:{evaluator_scope}");
+    let evaluator_permit = server
+        .state
+        .command_admission
+        .admit_evaluator(&admission_scope)
+        .map_err(|reason| format!("access request synthesis throttled: {reason}"))?;
+    let candidate_result = server
         .state
         .evaluator
         .synthesize_verb(intent, None, &[])
-        .await
-        .map_err(|error| {
-            format!("access intent could not be reduced to typed coverage: {error}")
-        })?;
-    reduce_generated_access_candidate(server, candidate).await
+        .await;
+    server.state.command_admission.complete_evaluator(
+        &admission_scope,
+        candidate_result.is_err(),
+        true,
+    );
+    drop(evaluator_permit);
+    let candidate = candidate_result.map_err(|error| {
+        format!("access intent could not be reduced to typed coverage: {error}")
+    })?;
+    reduce_generated_access_candidate(server, caller, candidate, true).await
 }
 
 async fn reduce_generated_access_candidate(
     server: &ServerContext,
+    caller: &CallerIdentity,
     mut candidate: Verb,
+    run_admission_preflight: bool,
 ) -> Result<(Vec<Verb>, Vec<Verb>), String> {
     candidate.baseline = false;
     candidate.trusted = false;
@@ -1036,15 +1056,21 @@ async fn reduce_generated_access_candidate(
             Ok(proposal)
         })
         .collect::<Result<Vec<_>, String>>()?;
+    candidate.name = generated_access_verb_name(&candidate);
     if let Some(reused) = existing.iter().find(|verb| {
         generated_access_matcher_shape(verb) == generated_access_matcher_shape(&candidate)
     }) {
+        if run_admission_preflight {
+            preflight_synthesized_verb(server, caller, reused).await?;
+        }
         return access_reduction(vec![reused.clone()]);
     }
-    candidate.name = generated_access_verb_name(&candidate);
     catalog
         .validate_candidate(&candidate)
         .map_err(|error| format!("invalid non-baseline access coverage: {error}"))?;
+    if run_admission_preflight {
+        preflight_synthesized_verb(server, caller, &candidate).await?;
+    }
     Ok((vec![candidate.clone()], vec![candidate]))
 }
 
@@ -1121,6 +1147,7 @@ mod access_capability_tests {
                 binary: "fixturectl".to_string(),
                 args: vec!["undo".to_string()],
             }),
+            hold: false,
             trusted: true,
             prompt_context: Some(format!("password={value}")),
             exec_timeout_secs: None,
@@ -1163,6 +1190,7 @@ mod access_capability_tests {
             )]),
             consequence: guard::gating::Reversibility::Irreversible,
             revert: None,
+            hold: false,
             trusted: false,
             prompt_context: None,
             exec_timeout_secs: None,
@@ -1214,6 +1242,7 @@ mod access_capability_tests {
             params: std::collections::BTreeMap::new(),
             consequence: guard::gating::Reversibility::Irreversible,
             revert: None,
+            hold: false,
             trusted: false,
             prompt_context: None,
             exec_timeout_secs: None,
@@ -1977,7 +2006,9 @@ pub(super) async fn submit_access_request(
         }
     }
 
-    let (reduced, proposed_verbs) = reduce_access_intent(server, &intent, observed_argv).await?;
+    let evaluator_scope = requester.to_string();
+    let (reduced, proposed_verbs) =
+        reduce_access_intent(server, caller, &evaluator_scope, &intent, observed_argv).await?;
     let _transition = server.state.grant_request_transition_gate.lock().await;
     if let Some(token) = session_token.as_deref() {
         let sessions = server.state.sessions.read().await;
@@ -4743,6 +4774,7 @@ async fn dispatch_admin_request(
                         coverage: v.coverage.clone(),
                         credential_plan: v.credential_plan.clone(),
                         consequence: v.consequence.as_str().to_string(),
+                        hold: v.hold,
                         trusted: verb_effective_trust(v, current_stamp),
                         has_revert: v.revert.is_some(),
                         params: v
@@ -4764,6 +4796,7 @@ async fn dispatch_admin_request(
                         description: verb.description.clone(),
                         params: verb.params.keys().cloned().collect(),
                         consequence: verb.consequence.as_str().to_string(),
+                        hold: verb.hold,
                         has_revert: verb.revert.is_some(),
                     })
                     .collect();
@@ -5931,7 +5964,7 @@ async fn preflight_synthesized_verb(
     preview.config.gate = guard::gating::GateMode::Consequence;
     preview.state.session_store = None;
     preview.state.sessions = std::sync::Arc::new(tokio::sync::RwLock::new(SessionRegistry::new()));
-    preview.state.verbs = std::sync::Arc::new(tokio::sync::RwLock::new(catalog));
+    preview.state.verbs = std::sync::Arc::new(tokio::sync::RwLock::new(catalog.clone()));
     preview.state.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
         server.state.saved_grants.read().await.clone(),
     ));
@@ -5950,33 +5983,54 @@ async fn preflight_synthesized_verb(
     preview.state.notify_hook = None;
 
     for (index, params) in parameter_sets.into_iter().enumerate() {
-        let response = super::execute::execute_command(
-            ExecuteRequest {
-                binary: String::new(),
-                args: Vec::new(),
-                auth_token: None,
-                env: Default::default(),
-                secrets: Default::default(),
-                secret_files: Default::default(),
-                stream: false,
-                session_token: None,
-                revert: None,
-                confirm_within_secs: None,
-                require_approval: None,
-                wait_approval_secs: None,
-                verb: Some(VerbInvocation {
-                    name: verb.name.clone(),
-                    params,
-                }),
-                reevaluate: true,
-                ssh_hostkey: None,
-                cwd: None,
-            },
-            &preview,
-            caller,
-        )
+        let rendered = catalog.render(&verb.name, &params).map_err(|error| {
+            format!(
+                "synthesized verb rejected before admission preflight for rendered candidate {}: {error}",
+                index + 1
+            )
+        })?;
+        preflight_synthesized_api_policy(server, &rendered.binary, &rendered.args).await?;
+        // Access-request synthesis reaches this preflight through the denial
+        // escalation path, while execution can itself offer an access request.
+        // Poll the boxed dry-run edge in a separate task so the mutually
+        // recursive path has both a finite future size and a fresh stack.
+        let request = ExecuteRequest {
+            binary: String::new(),
+            args: Vec::new(),
+            auth_token: None,
+            env: Default::default(),
+            secrets: Default::default(),
+            secret_files: Default::default(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: Some(VerbInvocation {
+                name: verb.name.clone(),
+                params,
+            }),
+            reevaluate: true,
+            ssh_hostkey: None,
+            cwd: None,
+        };
+        let task_server = preview.clone();
+        let task_caller = caller.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let response = tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                Box::pin(super::execute::execute_command(
+                    request,
+                    &task_server,
+                    &task_caller,
+                ))
+                .await
+                .into_response()
+            })
+        })
         .await
-        .into_response();
+        .map_err(|error| format!("synthesized verb admission preflight failed: {error}"))?;
         if !response.allowed {
             return Err(format!(
                 "synthesized verb rejected by admission preflight for rendered candidate {}: {}",
@@ -5986,6 +6040,256 @@ async fn preflight_synthesized_verb(
         }
     }
     Ok(())
+}
+
+async fn preflight_synthesized_api_policy(
+    server: &ServerContext,
+    binary: &str,
+    args: &[String],
+) -> Result<(), String> {
+    let Some(operation) = synthesized_kubectl_api_operation(binary, args) else {
+        return Ok(());
+    };
+    let proxies = server
+        .state
+        .protocol_registry
+        .read()
+        .await
+        .values()
+        .filter(|proxy| proxy.protocol_name() == "kubernetes")
+        .cloned()
+        .collect::<Vec<_>>();
+    if proxies.is_empty() {
+        return Ok(());
+    }
+
+    let mut refusals = Vec::with_capacity(proxies.len());
+    for proxy in proxies {
+        match proxy.categorical_policy_refusal(&operation).await {
+            Ok(Some(reason)) => refusals.push(reason),
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "synthesized verb api-policy preflight failed: {error}"
+                ))
+            }
+        }
+    }
+    let target = match operation.subresource.as_deref() {
+        Some(subresource) => format!(
+            "kubernetes subresource '{subresource}' on resource '{}'",
+            operation.resource
+        ),
+        None => format!(
+            "kubernetes {} on resource '{}'",
+            operation.verb.as_str(),
+            operation.resource
+        ),
+    };
+    Err(format!(
+        "api-policy refuses {target}: {}; approval would be unusable",
+        refusals
+            .first()
+            .map(String::as_str)
+            .unwrap_or("categorically denied")
+    ))
+}
+
+fn synthesized_kubectl_api_operation(binary: &str, args: &[String]) -> Option<guard::proxy::ApiOp> {
+    let binary = std::path::Path::new(binary)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(binary)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    if binary != "kubectl" {
+        return None;
+    }
+
+    let namespace = option_value(args, &["-n", "--namespace"]);
+    let command_index = kubectl_command_index(args)?;
+    let command = args[command_index].as_str();
+    if command == "get" {
+        if let Some(raw) = option_value(&args[command_index + 1..], &["--raw"]) {
+            let (path, query) = raw.split_once('?').unwrap_or((raw.as_str(), ""));
+            return guard::proxy::k8s::parse_api_op("GET", path, query);
+        }
+    }
+
+    let target = kubectl_positional_after(args, command_index + 1);
+    let (resource, name) = target
+        .as_deref()
+        .map(kubectl_resource_and_name)
+        .unwrap_or_else(|| ("pods".to_string(), None));
+    let explicit_subresource = option_value(args, &["--subresource"]);
+    let (verb, resource, subresource) = match command {
+        "proxy" => (
+            guard::proxy::op::Verb::Get,
+            resource,
+            Some("proxy".to_string()),
+        ),
+        "exec" => (
+            guard::proxy::op::Verb::Create,
+            "pods".to_string(),
+            Some("exec".to_string()),
+        ),
+        "attach" => (
+            guard::proxy::op::Verb::Create,
+            "pods".to_string(),
+            Some("attach".to_string()),
+        ),
+        "port-forward" => (
+            guard::proxy::op::Verb::Create,
+            "pods".to_string(),
+            Some("portforward".to_string()),
+        ),
+        "logs" => (
+            guard::proxy::op::Verb::Get,
+            "pods".to_string(),
+            Some("log".to_string()),
+        ),
+        "get" | "describe" => (
+            if args.iter().any(|argument| {
+                matches!(argument.as_str(), "--watch" | "-w") || argument == "--watch=true"
+            }) {
+                guard::proxy::op::Verb::Watch
+            } else if name.is_some() {
+                guard::proxy::op::Verb::Get
+            } else {
+                guard::proxy::op::Verb::List
+            },
+            resource,
+            explicit_subresource,
+        ),
+        "delete" => (
+            if name.is_some() {
+                guard::proxy::op::Verb::Delete
+            } else {
+                guard::proxy::op::Verb::DeleteCollection
+            },
+            resource,
+            explicit_subresource,
+        ),
+        "patch" => (
+            guard::proxy::op::Verb::Patch,
+            resource,
+            explicit_subresource,
+        ),
+        "replace" => (
+            guard::proxy::op::Verb::Update,
+            resource,
+            explicit_subresource,
+        ),
+        _ => return None,
+    };
+    Some(guard::proxy::ApiOp {
+        verb,
+        group: String::new(),
+        version: "v1".to_string(),
+        resource,
+        subresource,
+        namespace,
+        name,
+        dry_run: args
+            .iter()
+            .any(|argument| argument == "--dry-run" || argument.starts_with("--dry-run=")),
+        authority_selectors: Default::default(),
+    })
+}
+
+fn option_value(args: &[String], options: &[&str]) -> Option<String> {
+    for (index, argument) in args.iter().enumerate() {
+        if options.contains(&argument.as_str()) {
+            return args.get(index + 1).cloned();
+        }
+        for option in options {
+            if let Some(value) = argument.strip_prefix(&format!("{option}=")) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn kubectl_command_index(args: &[String]) -> Option<usize> {
+    const GLOBAL_VALUE_OPTIONS: &[&str] = &[
+        "-n",
+        "--namespace",
+        "--context",
+        "--cluster",
+        "--user",
+        "--kubeconfig",
+        "--request-timeout",
+        "--server",
+        "--token",
+    ];
+    let mut skip_value = false;
+    for (index, argument) in args.iter().enumerate() {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if GLOBAL_VALUE_OPTIONS.contains(&argument.as_str()) {
+            skip_value = true;
+            continue;
+        }
+        if argument.starts_with('-') {
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn kubectl_positional_after(args: &[String], start: usize) -> Option<String> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "-n",
+        "--namespace",
+        "-o",
+        "--output",
+        "-p",
+        "--port",
+        "--request-path",
+        "--selector",
+        "-l",
+        "--field-selector",
+        "--subresource",
+        "--raw",
+    ];
+    let mut skip_value = false;
+    for argument in &args[start..] {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if VALUE_OPTIONS.contains(&argument.as_str()) {
+            skip_value = true;
+            continue;
+        }
+        if argument.starts_with('-') {
+            continue;
+        }
+        return Some(argument.clone());
+    }
+    None
+}
+
+fn kubectl_resource_and_name(target: &str) -> (String, Option<String>) {
+    let (resource, name) = target
+        .split_once('/')
+        .map_or((target, None), |(resource, name)| (resource, Some(name)));
+    let resource = match resource.to_ascii_lowercase().as_str() {
+        "po" | "pod" => "pods",
+        "svc" | "service" => "services",
+        "deploy" | "deployment" => "deployments",
+        "sts" | "statefulset" => "statefulsets",
+        "ds" | "daemonset" => "daemonsets",
+        "cm" | "configmap" => "configmaps",
+        "secret" => "secrets",
+        other => other,
+    }
+    .to_string();
+    (resource, name.map(str::to_string))
 }
 
 /// Collapse runs of whitespace (incl. newlines) to single spaces, so prose and

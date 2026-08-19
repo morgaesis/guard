@@ -3033,6 +3033,7 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
             verb: Some(VerbContext {
                 name: "fixture-verb".to_string(),
                 class: Reversibility::Irreversible,
+                hold: false,
                 trusted: false,
                 exec_timeout_secs: None,
                 params: BTreeMap::from([("rollback_only".to_string(), value.clone())]),
@@ -6217,6 +6218,7 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
                 verb: Some(VerbContext {
                     name: "runtime-command".to_string(),
                     class: Reversibility::Reversible,
+                    hold: false,
                     trusted: true,
                     exec_timeout_secs: None,
                     params: BTreeMap::new(),
@@ -6332,6 +6334,7 @@ verbs:
                 verb: Some(VerbContext {
                     name: "runtime-command".to_string(),
                     class: Reversibility::Reversible,
+                    hold: false,
                     trusted: true,
                     exec_timeout_secs: None,
                     params: BTreeMap::new(),

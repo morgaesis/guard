@@ -793,6 +793,7 @@ pub(crate) fn build_candidate_verb(
         params,
         consequence,
         revert,
+        hold: false,
         trusted: true,
         prompt_context: None,
         exec_timeout_secs: None,

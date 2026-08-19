@@ -961,6 +961,47 @@ async fn trusted_verb_irreversible_still_holds_for_approval() {
     );
 }
 
+#[tokio::test]
+async fn reversible_verb_with_hold_flag_routes_to_held() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: enumerate-accounts\n    binary: true\n    consequence: reversible\n    hold: true\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let request = ExecuteRequest {
+        binary: String::new(),
+        args: Vec::new(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: Some(VerbInvocation {
+            name: "enumerate-accounts".to_string(),
+            params: std::collections::BTreeMap::new(),
+        }),
+    };
+
+    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(response.allowed);
+    assert_eq!(response.status, Some(GateStatus::Held));
+    assert!(response.exit_code.is_none());
+    assert!(response.handle.is_some());
+}
+
 /// The other half of the same interaction: a trusted verb declared
 /// reversible with a low (verb-forced) risk of 0 clears the gate at
 /// execute-now, exactly like an LLM-approved reversible command would.

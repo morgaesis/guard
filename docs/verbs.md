@@ -57,6 +57,11 @@ verbs:
 skip the consequence gate or hard invariants. Untrusted verbs keep the evaluator
 as a backstop.
 
+`hold: true` routes every matching operation to operator approval after policy
+admission, including operations declared `reversible`. Use it for reads whose
+scope or sensitivity requires review, such as bulk account enumeration. The
+field defaults to `false` when omitted.
+
 ## Coverage cells
 
 Coverage cells describe regions of ordinary tool argv. They can constrain exact

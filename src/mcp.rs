@@ -1848,9 +1848,10 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             format!("\n    params: {}", verb.params.join(", "))
                         };
                         format!(
-                            "{} [{}]{} - {}{}",
+                            "{} [{}]{}{} - {}{}",
                             verb.name,
                             verb.consequence,
+                            if verb.hold { " hold" } else { "" },
                             if verb.has_revert { " revertable" } else { "" },
                             verb.description,
                             params
@@ -2099,9 +2100,10 @@ fn render_verbs_text(items: &[server::VerbSummary]) -> String {
     let mut lines = Vec::with_capacity(items.len());
     for v in items {
         let mut line = format!(
-            "{} [{}]{}{} - {}",
+            "{} [{}]{}{}{} - {}",
             v.name,
             v.consequence,
+            if v.hold { " hold" } else { "" },
             if v.trusted { " trusted" } else { "" },
             if v.has_revert { " revertable" } else { "" },
             v.description
@@ -4355,6 +4357,7 @@ mod tests {
                     coverage: Vec::new(),
                     credential_plan: None,
                     consequence: "recoverable".to_string(),
+                    hold: false,
                     trusted: true,
                     has_revert: true,
                     params: std::collections::BTreeMap::new(),

@@ -29,6 +29,9 @@ use std::collections::BTreeSet;
 pub struct VerbContext {
     pub name: String,
     pub class: Reversibility,
+    /// At least one selected verb requires operator approval even when its
+    /// consequence class would otherwise permit immediate execution.
+    pub hold: bool,
     pub trusted: bool,
     pub exec_timeout_secs: Option<u64>,
     pub params: std::collections::BTreeMap<String, String>,
@@ -279,6 +282,12 @@ pub fn resolve_scoped_matches(
             .map(|matched| matched.matched.rendered.consequence)
             .max_by_key(|class| reversibility_rank(*class))
             .expect("selected matches are non-empty");
+        // Hold is a conservative requirement, not a precedence choice. Any
+        // active matching verb can require review even when a more specific
+        // session cell supplies the executable plan.
+        let hold = scoped
+            .iter()
+            .any(|matched| !matched.overridden && matched.matched.rendered.hold);
         let revert = selected[0].matched.rendered.revert.clone();
         let exec_timeout_secs = selected
             .iter()
@@ -288,6 +297,7 @@ pub fn resolve_scoped_matches(
             Some(VerbContext {
                 name: first.matched.rendered.name.clone(),
                 class,
+                hold,
                 trusted: true,
                 exec_timeout_secs,
                 params: first.matched.rendered.params.clone(),
@@ -492,6 +502,7 @@ mod verb_resolution_tests {
                             args.iter().map(|arg| (*arg).to_string()).collect(),
                         )
                     }),
+                    hold: false,
                     trusted: true,
                     prompt_context: None,
                     exec_timeout_secs: None,
@@ -595,6 +606,39 @@ mod verb_resolution_tests {
 
         assert_eq!(resolution.decision, VerbDecision::Preauthorized);
         assert_eq!(resolution.context.unwrap().exec_timeout_secs, Some(5));
+    }
+
+    #[test]
+    fn matching_hold_survives_more_specific_session_coverage() {
+        let mut sensitive_read = scoped(
+            "sensitive-read",
+            "all-accounts",
+            VerbMatchScope::Baseline,
+            CoverageAction::Preauthorized,
+            &[],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        sensitive_read.matched.rendered.hold = true;
+        let session = scoped(
+            "session-read",
+            "bounded-account",
+            VerbMatchScope::Session,
+            CoverageAction::Preauthorized,
+            &["target:account-a"],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        let resolution = resolve_scoped_matches(vec![sensitive_read, session], 17);
+
+        assert!(resolution.context.expect("resolved verb context").hold);
     }
 
     #[test]
@@ -972,6 +1016,7 @@ mod verb_resolution_properties {
                     args: vec!["get".to_string(), "pods".to_string()],
                     consequence: Reversibility::Recoverable,
                     revert: None,
+                    hold: false,
                     trusted: true,
                     prompt_context: None,
                     exec_timeout_secs: None,

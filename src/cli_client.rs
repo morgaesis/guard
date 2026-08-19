@@ -1177,10 +1177,11 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                     }
                     for v in &items {
                         println!(
-                            "{} [{}]{}{}{}{} - {}",
+                            "{} [{}]{}{}{}{}{} - {}",
                             v.name,
                             v.consequence,
                             if v.baseline { "" } else { " session-scoped" },
+                            if v.hold { " hold" } else { "" },
                             if v.trusted { " trusted" } else { "" },
                             if v.has_revert { " revertable" } else { "" },
                             if v.auto_promoted {
@@ -1231,9 +1232,10 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                     }
                     for verb in &items {
                         println!(
-                            "{} [{}]{} - {}",
+                            "{} [{}]{}{} - {}",
                             verb.name,
                             verb.consequence,
+                            if verb.hold { " hold" } else { "" },
                             if verb.has_revert { " revertable" } else { "" },
                             verb.description
                         );
