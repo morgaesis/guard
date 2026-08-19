@@ -56,7 +56,7 @@ The client submits a fresh request under the new authority.
 Load a hot-reloaded YAML policy with `--api-policy`; absence is default deny.
 [`examples/api-policy.yaml`](../examples/api-policy.yaml) documents the schema.
 Rules match typed protocol fields such as operation verb, resource, namespace,
-and subresource. Actions are:
+subresource, object name, and request-body metadata. Actions are:
 
 | Action | Behavior |
 |---|---|
@@ -70,6 +70,39 @@ listener is the default. Every Kubernetes mutation requires a live attributable
 session even on an explicitly configured policy-mode listener. Policy `allow`,
 operator approval, and evaluator judgment cannot grant anonymous mutation
 authority. Evaluated traffic cannot override those absolute boundaries.
+
+`names` is an OR-list of case-sensitive globs. For named requests, Guard uses
+the path name; for collection creates, it uses `metadata.name` from the request
+body. `annotations` and `labels` are key-to-glob maps, and every configured map
+entry must match the object-shaped `metadata` carried by the request. The glob
+syntax supports `*`, `?`, and character classes such as `[abc]`.
+
+```yaml
+rules:
+  - verbs: [delete]
+    resources: [jobs]
+    namespaces: [dev]
+    names: ["*-admission*"]
+    action: allow
+
+  - verbs: [create]
+    resources: [jobs]
+    namespaces: [dev]
+    names: ["*-admission*"]
+    annotations:
+      "helm.sh/hook": "pre-*"
+    labels:
+      "app.kubernetes.io/managed-by": Helm
+    action: allow
+```
+
+The requesting agent controls object metadata. Annotation and label predicates
+are convenience selectors for ephemeral, tool-managed objects, not a trust
+boundary. Pair them with narrow `names`, resource, and namespace predicates.
+Delete bodies normally carry `DeleteOptions`, not the deleted object's
+metadata, so annotation and label predicates do not match deletes. Use a name
+predicate for Helm's `before-hook-creation` cleanup. JSON Patch arrays likewise
+do not expose object-shaped metadata to these predicates.
 
 Kubernetes interactive subresources (`exec`, `attach`, `portforward`, and
 `proxy`), `pods/ephemeralcontainers`, and Secret watches are hard-denied. Writes
@@ -168,6 +201,10 @@ warning on standard error, and automation can read the header before treating
 the write as durable.
 `guard provisionals`, `guard confirm`, and `guard revert` manage API and command
 envelopes through the same interface.
+
+A held request that returns HTTP 403 includes its approval reference in the
+Kubernetes status message and in `X-Guard-Approval`. Client error output can
+name the request, and automation can poll it with `guard approval show <ref>`.
 
 ## Generated coverage and evaluator limits
 

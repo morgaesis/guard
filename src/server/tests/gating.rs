@@ -4902,7 +4902,10 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         resp
     );
     match waiter.await.unwrap() {
-        guard::proxy::HoldDecision::Denied { .. } => {}
+        guard::proxy::HoldDecision::Denied {
+            handle: Some(returned_handle),
+            ..
+        } => assert_eq!(returned_handle, handle),
         other => panic!("expected Denied, got {:?}", other),
     }
     assert_eq!(

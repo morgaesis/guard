@@ -1,13 +1,17 @@
 //! Operator-authored policy over Kubernetes API operations - the proxy's "slow
 //! clock", analogous to the verb catalog. Only the operator edits it; agents
 //! cannot. Rules match an [`ApiOp`] by verb/resource/namespace/subresource and
-//! yield an action (allow, deny, hold, evaluate) plus, for allowed reads, whether to
-//! redact secret values from the response. A write to a subresource is
-//! authorized only by a rule that names it. Default is fail-safe deny.
+//! may further constrain object names or request-body metadata. Body metadata
+//! is caller-controlled, so labels and annotations are a convenience selector,
+//! not an authorization identity. Pair them with a narrow `names` predicate.
+//! Rules yield an action (allow, deny, hold, evaluate) plus, for allowed reads,
+//! whether to redact secret values from the response. A write to a subresource
+//! is authorized only by a rule that names it. Default is fail-safe deny.
 
 use super::op::ApiOp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 /// What to do with a matched request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +36,8 @@ fn default_deny() -> ApiAction {
     ApiAction::Deny
 }
 
-/// One operator-authored rule. Empty lists default to `["*"]` (match any).
+/// One operator-authored rule. Core match lists default to `["*"]` (match
+/// any); optional object-predicate collections default to no constraint.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApiRule {
     /// Verbs matched: `get`, `list`, `watch`, `create`, `update`, `patch`,
@@ -55,6 +60,19 @@ pub struct ApiRule {
     /// any write subresource on the matched resource.
     #[serde(default)]
     pub subresources: Vec<String>,
+    /// Object-name globs. A named request uses the path name; a collection
+    /// create uses `metadata.name` from an object-shaped request body. An empty
+    /// list (the default) does not constrain the object name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+    /// Required request-body annotations, matched as key-to-glob predicates.
+    /// The caller controls these values, so they are not a trust boundary.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
+    /// Required request-body labels, matched as key-to-glob predicates. The
+    /// caller controls these values, so they are not a trust boundary.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     pub action: ApiAction,
     /// For an allowed read of a Secret, strip `data`/`stringData` from the
     /// response so values never reach the client.
@@ -66,11 +84,14 @@ pub struct ApiRule {
 }
 
 impl ApiRule {
-    fn matches(&self, op: &ApiOp) -> bool {
+    fn matches(&self, op: &ApiOp, metadata: &ObjectMetadata) -> bool {
         glob_any(&self.verbs, op.verb.as_str())
             && glob_any(&self.resources, &op.resource)
             && namespace_matches(&self.namespaces, op.namespace.as_deref())
             && self.subresource_matches(op)
+            && self.name_matches(metadata.name.as_deref())
+            && metadata_map_matches(&self.annotations, &metadata.annotations)
+            && metadata_map_matches(&self.labels, &metadata.labels)
     }
 
     /// A write to a subresource is authorized only when the rule names that
@@ -84,6 +105,77 @@ impl ApiRule {
             Some(sub) => glob_any(&self.subresources, sub),
         }
     }
+
+    fn name_matches(&self, name: Option<&str>) -> bool {
+        self.names.is_empty() || name.is_some_and(|name| predicate_glob_any(&self.names, name))
+    }
+}
+
+#[derive(Debug, Default)]
+struct ObjectMetadata {
+    name: Option<String>,
+    annotations: BTreeMap<String, String>,
+    labels: BTreeMap<String, String>,
+}
+
+impl ObjectMetadata {
+    fn from_request(op: &ApiOp, request_body: &[u8]) -> Self {
+        let mut metadata = request_body_metadata(request_body).unwrap_or_default();
+        // For named operations, the path is the object the apiserver targets.
+        // Do not let caller-controlled body metadata redirect a name predicate.
+        if op.name.is_some() {
+            metadata.name.clone_from(&op.name);
+        }
+        metadata
+    }
+}
+
+fn request_body_metadata(body: &[u8]) -> Option<ObjectMetadata> {
+    if body.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .or_else(|_| serde_yaml_ng::from_slice(body))
+        .ok()?;
+    let metadata = value.get("metadata")?.as_object()?;
+    Some(ObjectMetadata {
+        name: metadata
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        annotations: string_map(metadata.get("annotations")),
+        labels: string_map(metadata.get("labels")),
+    })
+}
+
+fn string_map(value: Option<&serde_json::Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(serde_json::Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn metadata_map_matches(
+    predicates: &BTreeMap<String, String>,
+    values: &BTreeMap<String, String>,
+) -> bool {
+    predicates.iter().all(|(key, pattern)| {
+        values
+            .get(key)
+            .is_some_and(|value| crate::policy::match_glob(pattern, value))
+    })
+}
+
+fn predicate_glob_any(patterns: &[String], value: &str) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| crate::policy::match_glob(pattern, value))
 }
 
 /// The full operator policy.
@@ -142,18 +234,23 @@ impl ApiPolicy {
     /// First matching rule wins; otherwise the default action. Redaction is
     /// forced on for any Secret read regardless of the rule flag, so an operator
     /// cannot accidentally allow reading secret values by omitting the flag.
-    pub fn decide(&self, op: &ApiOp) -> ApiDecision {
-        let (action, mut redact, reason) =
-            match self.rules.iter().enumerate().find(|(_, r)| r.matches(op)) {
-                Some((i, r)) => {
-                    let label = r
-                        .description
-                        .clone()
-                        .unwrap_or_else(|| format!("api-policy rule #{i}"));
-                    (r.action, r.redact_secrets, label)
-                }
-                None => (self.default, false, "api-policy default".to_string()),
-            };
+    pub fn decide(&self, op: &ApiOp, request_body: &[u8]) -> ApiDecision {
+        let metadata = ObjectMetadata::from_request(op, request_body);
+        let (action, mut redact, reason) = match self
+            .rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.matches(op, &metadata))
+        {
+            Some((i, r)) => {
+                let label = r
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("api-policy rule #{i}"));
+                (r.action, r.redact_secrets, label)
+            }
+            None => (self.default, false, "api-policy default".to_string()),
+        };
         // Reading secret values is never allowed to leak: force redaction on any
         // allowed Secret read, even if the matched rule did not set the flag.
         if matches!(action, ApiAction::Allow) && op.is_read() && op.is_secrets() {
@@ -207,7 +304,10 @@ mod tests {
     #[test]
     fn default_is_deny() {
         let p = ApiPolicy::deny_all();
-        assert_eq!(p.decide(&op("GET", "/api/v1/pods")).action, ApiAction::Deny);
+        assert_eq!(
+            p.decide(&op("GET", "/api/v1/pods"), b"").action,
+            ApiAction::Deny
+        );
     }
 
     #[test]
@@ -221,6 +321,9 @@ mod tests {
         let changed_intent = policy(
             "intent: inspect prod\ndefault: deny\nrules:\n  - verbs: [get]\n    resources: [pods]\n    action: allow\n",
         );
+        let changed_name = policy(
+            "intent: inspect dev\ndefault: deny\nrules:\n  - verbs: [get]\n    resources: [pods]\n    names: [api-*]\n    action: allow\n",
+        );
         assert_ne!(
             base.authority_fingerprint(),
             changed_action.authority_fingerprint()
@@ -228,6 +331,10 @@ mod tests {
         assert_ne!(
             base.authority_fingerprint(),
             changed_intent.authority_fingerprint()
+        );
+        assert_ne!(
+            base.authority_fingerprint(),
+            changed_name.authority_fingerprint()
         );
     }
 
@@ -246,16 +353,18 @@ rules:
 "#,
         );
         assert_eq!(
-            p.decide(&op("GET", "/api/v1/namespaces/d/pods")).action,
+            p.decide(&op("GET", "/api/v1/namespaces/d/pods"), b"")
+                .action,
             ApiAction::Allow
         );
         assert_eq!(
-            p.decide(&op("DELETE", "/api/v1/namespaces/d/pods/x"))
+            p.decide(&op("DELETE", "/api/v1/namespaces/d/pods/x"), b"")
                 .action,
             ApiAction::Hold
         );
         assert_eq!(
-            p.decide(&op("POST", "/api/v1/namespaces/d/pods")).action,
+            p.decide(&op("POST", "/api/v1/namespaces/d/pods"), b"")
+                .action,
             ApiAction::Deny,
             "unmatched create falls to default deny"
         );
@@ -276,23 +385,30 @@ rules:
 "#,
         );
         assert_eq!(
-            p.decide(&op(
-                "PATCH",
-                "/api/v1/namespaces/dev/pods/web-0/ephemeralcontainers"
-            ))
+            p.decide(
+                &op(
+                    "PATCH",
+                    "/api/v1/namespaces/dev/pods/web-0/ephemeralcontainers",
+                ),
+                b"",
+            )
             .action,
             ApiAction::Deny,
             "ephemeralcontainers write is not covered by a pods write rule"
         );
         assert_eq!(
-            p.decide(&op("POST", "/api/v1/namespaces/dev/pods/web-0/eviction"))
-                .action,
+            p.decide(
+                &op("POST", "/api/v1/namespaces/dev/pods/web-0/eviction"),
+                b"",
+            )
+            .action,
             ApiAction::Deny,
             "eviction write is not covered by a pods write rule"
         );
         // The bare pods write still works.
         assert_eq!(
-            p.decide(&op("POST", "/api/v1/namespaces/dev/pods")).action,
+            p.decide(&op("POST", "/api/v1/namespaces/dev/pods"), b"")
+                .action,
             ApiAction::Allow
         );
     }
@@ -312,12 +428,12 @@ rules:
 "#,
         );
         assert_eq!(
-            p.decide(&op("GET", "/api/v1/namespaces/dev/pods/web-0/log"))
+            p.decide(&op("GET", "/api/v1/namespaces/dev/pods/web-0/log"), b"",)
                 .action,
             ApiAction::Allow
         );
         assert_eq!(
-            p.decide(&op("GET", "/api/v1/namespaces/dev/pods/web-0/status"))
+            p.decide(&op("GET", "/api/v1/namespaces/dev/pods/web-0/status"), b"",)
                 .action,
             ApiAction::Allow
         );
@@ -337,19 +453,25 @@ rules:
 "#,
         );
         assert_eq!(
-            p.decide(&op(
-                "PATCH",
-                "/apis/apps/v1/namespaces/dev/deployments/api/scale"
-            ))
+            p.decide(
+                &op(
+                    "PATCH",
+                    "/apis/apps/v1/namespaces/dev/deployments/api/scale",
+                ),
+                b"",
+            )
             .action,
             ApiAction::Allow
         );
         // A different subresource is still not covered.
         assert_eq!(
-            p.decide(&op(
-                "PATCH",
-                "/apis/apps/v1/namespaces/dev/deployments/api/status"
-            ))
+            p.decide(
+                &op(
+                    "PATCH",
+                    "/apis/apps/v1/namespaces/dev/deployments/api/status",
+                ),
+                b"",
+            )
             .action,
             ApiAction::Deny
         );
@@ -368,17 +490,19 @@ rules:
 "#,
         );
         assert_eq!(
-            p.decide(&op("GET", "/api/v1/namespaces/dev/pods")).action,
+            p.decide(&op("GET", "/api/v1/namespaces/dev/pods"), b"")
+                .action,
             ApiAction::Allow
         );
         assert_eq!(
-            p.decide(&op("GET", "/api/v1/namespaces/prod/pods")).action,
+            p.decide(&op("GET", "/api/v1/namespaces/prod/pods"), b"")
+                .action,
             ApiAction::Deny,
             "prod is outside the allowed namespaces"
         );
         // A cluster-scoped node list does not match namespace-scoped rules.
         assert_eq!(
-            p.decide(&op("GET", "/api/v1/nodes")).action,
+            p.decide(&op("GET", "/api/v1/nodes"), b"").action,
             ApiAction::Deny
         );
     }
@@ -394,15 +518,117 @@ rules:
     action: allow
 "#,
         );
-        let d = p.decide(&op("GET", "/api/v1/namespaces/p/secrets/db"));
+        let d = p.decide(&op("GET", "/api/v1/namespaces/p/secrets/db"), b"");
         assert_eq!(d.action, ApiAction::Allow);
         assert!(
             d.redact_secrets,
             "an allowed Secret read must force redaction"
         );
         // A non-secret read is not redacted.
-        let cm = p.decide(&op("GET", "/api/v1/namespaces/p/configmaps/c"));
+        let cm = p.decide(&op("GET", "/api/v1/namespaces/p/configmaps/c"), b"");
         assert!(!cm.redact_secrets);
+    }
+
+    #[test]
+    fn name_glob_allows_hook_delete_but_plain_delete_holds() {
+        let p = policy(
+            r#"
+default: deny
+rules:
+  - verbs: [delete]
+    resources: [jobs]
+    namespaces: [dev]
+    names: ["*-admission*"]
+    action: allow
+  - verbs: [delete]
+    resources: ["*"]
+    namespaces: ["*"]
+    action: hold
+"#,
+        );
+        assert_eq!(
+            p.decide(
+                &op(
+                    "DELETE",
+                    "/apis/batch/v1/namespaces/dev/jobs/chart-admission-create",
+                ),
+                b"",
+            )
+            .action,
+            ApiAction::Allow
+        );
+        assert_eq!(
+            p.decide(
+                &op("DELETE", "/apis/batch/v1/namespaces/dev/jobs/plain-job"),
+                b"",
+            )
+            .action,
+            ApiAction::Hold
+        );
+    }
+
+    #[test]
+    fn annotations_and_labels_match_create_object_metadata() {
+        let p = policy(
+            r#"
+default: hold
+rules:
+  - verbs: [create]
+    resources: [jobs]
+    namespaces: [dev]
+    names: ["*-admission*"]
+    annotations:
+      "helm.sh/hook": "pre-*"
+    labels:
+      "app.kubernetes.io/managed-by": Helm
+    action: allow
+"#,
+        );
+        let create = op("POST", "/apis/batch/v1/namespaces/dev/jobs");
+        let hook = br#"{
+            "metadata": {
+                "name": "chart-admission-create",
+                "annotations": {"helm.sh/hook": "pre-install,pre-upgrade"},
+                "labels": {"app.kubernetes.io/managed-by": "Helm"}
+            }
+        }"#;
+        assert_eq!(p.decide(&create, hook).action, ApiAction::Allow);
+
+        let wrong_label = br#"{
+            "metadata": {
+                "name": "chart-admission-create",
+                "annotations": {"helm.sh/hook": "pre-install"},
+                "labels": {"app.kubernetes.io/managed-by": "another-tool"}
+            }
+        }"#;
+        assert_eq!(p.decide(&create, wrong_label).action, ApiAction::Hold);
+    }
+
+    #[test]
+    fn absent_object_predicates_preserve_legacy_policy_bytes_and_behavior() {
+        let p = policy(
+            r#"
+default: deny
+rules:
+  - verbs: [create]
+    resources: [pods]
+    action: allow
+"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&p).unwrap(),
+            r#"{"intent":null,"rules":[{"verbs":["create"],"resources":["pods"],"namespaces":["*"],"subresources":[],"action":"allow","redact_secrets":false,"description":null}],"default":"deny"}"#
+        );
+
+        let create = op("POST", "/api/v1/namespaces/dev/pods");
+        assert_eq!(p.decide(&create, b"").action, ApiAction::Allow);
+        assert_eq!(
+            p.decide(
+                &create,
+                br#"{"metadata":{"name":"any-name","labels":{"untrusted":"value"}}}"#,
+            ),
+            p.decide(&create, b""),
+        );
     }
 
     #[test]
@@ -410,27 +636,41 @@ rules:
         let p = ApiPolicy::from_yaml(include_str!("../../examples/api-policy.yaml"))
             .expect("examples/api-policy.yaml must parse");
         // Reads are allowed and secret values redacted.
-        let read = p.decide(&op("GET", "/api/v1/namespaces/p/secrets/s"));
+        let read = p.decide(&op("GET", "/api/v1/namespaces/p/secrets/s"), b"");
         assert_eq!(read.action, ApiAction::Allow);
         assert!(read.redact_secrets);
         // Writes allowed in a non-production namespace, denied in production.
         assert_eq!(
-            p.decide(&op("POST", "/api/v1/namespaces/dev/pods")).action,
+            p.decide(&op("POST", "/api/v1/namespaces/dev/pods"), b"")
+                .action,
             ApiAction::Allow
         );
         assert_eq!(
-            p.decide(&op("POST", "/api/v1/namespaces/prod/pods")).action,
+            p.decide(&op("POST", "/api/v1/namespaces/prod/pods"), b"")
+                .action,
             ApiAction::Deny
         );
         // Namespace deletion and other deletes are held for approval.
         assert_eq!(
-            p.decide(&op("DELETE", "/api/v1/namespaces/prod")).action,
+            p.decide(&op("DELETE", "/api/v1/namespaces/prod"), b"")
+                .action,
             ApiAction::Hold
         );
         assert_eq!(
-            p.decide(&op("DELETE", "/api/v1/namespaces/dev/pods/x"))
+            p.decide(&op("DELETE", "/api/v1/namespaces/dev/pods/x"), b"")
                 .action,
             ApiAction::Hold
+        );
+        assert_eq!(
+            p.decide(
+                &op(
+                    "DELETE",
+                    "/apis/batch/v1/namespaces/dev/jobs/chart-admission-create",
+                ),
+                b"",
+            )
+            .action,
+            ApiAction::Allow
         );
     }
 
@@ -446,7 +686,7 @@ rules:
     description: "namespace deletion needs sign-off"
 "#,
         );
-        let d = p.decide(&op("DELETE", "/api/v1/namespaces/prod"));
+        let d = p.decide(&op("DELETE", "/api/v1/namespaces/prod"), b"");
         assert_eq!(d.action, ApiAction::Hold);
         assert_eq!(d.reason, "namespace deletion needs sign-off");
     }
@@ -468,8 +708,11 @@ rules:
         assert_eq!(p.default, ApiAction::Evaluate);
         assert!(p.contains_evaluate());
         assert_eq!(
-            p.decide(&op("PATCH", "/apis/apps/v1/namespaces/dev/deployments/api"))
-                .action,
+            p.decide(
+                &op("PATCH", "/apis/apps/v1/namespaces/dev/deployments/api"),
+                b"",
+            )
+            .action,
             ApiAction::Evaluate
         );
     }
