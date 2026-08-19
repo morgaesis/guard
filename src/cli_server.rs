@@ -271,6 +271,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             llm_timeout,
             llm_retries,
             llm_models,
+            llm_reasoning_effort,
             llm,
             no_llm,
             no_redact,
@@ -626,6 +627,23 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .or_else(|| guard_env("LLM_MODEL").filter(|v| !v.is_empty()));
             if let Some(model) = resolved_single_model {
                 eval_config = eval_config.llm_model(model);
+            }
+
+            // Reasoning effort: flag > env var > default (minimal). The flag
+            // is enum-validated by clap; the env var is validated here so a
+            // typo fails startup instead of silently reaching the provider.
+            let resolved_reasoning_effort = llm_reasoning_effort
+                .filter(|value| !value.is_empty())
+                .or_else(|| guard_env("LLM_REASONING_EFFORT").filter(|value| !value.is_empty()));
+            if let Some(effort) = resolved_reasoning_effort {
+                anyhow::ensure!(
+                    guard::evaluate::REASONING_EFFORT_VALUES.contains(&effort.as_str()),
+                    "invalid GUARD_LLM_REASONING_EFFORT '{}': expected one of {}",
+                    effort,
+                    guard::evaluate::REASONING_EFFORT_VALUES.join(", ")
+                );
+                tracing::info!("LLM reasoning effort: {}", effort);
+                eval_config = eval_config.llm_reasoning_effort(effort);
             }
 
             // Retries: flag > env var > default.
@@ -2181,6 +2199,7 @@ mod api_endpoint_tests {
             api_key: None,
             api_url: None,
             proxy_url: None,
+            reasoning_effort: None,
             model: None,
             models: Vec::new(),
             timeout_secs: 1,

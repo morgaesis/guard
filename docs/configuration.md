@@ -18,10 +18,11 @@ not in command-line arguments.
 | `GUARD_LLM_API_KEY` | none | Evaluator API key. `OPENROUTER_API_KEY` is also accepted. |
 | `GUARD_LLM_API_URL` | OpenRouter chat completions | OpenAI-compatible evaluator endpoint. |
 | `GUARD_LLM_PROXY_URL` | unset | HTTP CONNECT proxy used only for evaluator requests. |
-| `GUARD_LLM_MODEL` | `openai/gpt-5.4-mini` | Primary model. |
+| `GUARD_LLM_MODEL` | `openai/gpt-5.6-luna` | Primary model. |
 | `GUARD_LLM_MODELS` | unset | Comma-separated fallback chain that supersedes the single model. |
 | `GUARD_LLM_RETRIES` | `2` | Transient retries per model, from 0 to 2; larger values are capped at 2. |
 | `GUARD_LLM_TIMEOUT` | `30` | Per-call timeout in seconds. |
+| `GUARD_LLM_REASONING_EFFORT` | `high` | Hidden-reasoning effort requested from the provider (`minimal`, `low`, `medium`, `high`, `max`). Raise it for reasoning-capable models whose decision quality improves with more thinking; reasoning tokens bill and spend from the completion budget. |
 | `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid`. |
 | `GUARD_DRY_RUN` | `false` | Evaluate approved work without spawning it. |
 | `GUARD_EXEC_TIMEOUT_SECS` | `0` | Wall-clock limit for brokered commands. Zero is unlimited. `--exec-timeout-secs` takes precedence. |
