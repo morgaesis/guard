@@ -3116,18 +3116,37 @@ impl ApiProxy {
                 }
             }
             if let Some(handle) = provisional_handle {
-                let warning = if containment_active {
-                    format!(
-                        "299 guard \"change is provisional; confirm with guard confirm {handle}\""
-                    )
+                let deadline = if containment_active {
+                    match self.gate.get() {
+                        Some(gate) => gate.provisional_deadline(&handle).await,
+                        None => None,
+                    }
                 } else {
-                    format!(
-                        "299 guard \"mutation outcome is uncertain; inspect provisional {handle}\""
-                    )
+                    None
                 };
-                builder = builder
-                    .header("x-guard-provisional", &handle)
-                    .header(hyper::header::WARNING, warning);
+                if let Some(deadline_unix) = deadline {
+                    let (provisional, warning) = provisional_response_metadata(
+                        &handle,
+                        deadline_unix,
+                        crate::env::now_unix(),
+                    );
+                    builder = builder
+                        .header("x-guard-provisional", provisional)
+                        .header(hyper::header::WARNING, warning);
+                } else {
+                    let warning = if containment_active {
+                        format!(
+                            "299 guard \"change is provisional; confirm with guard confirm {handle}\""
+                        )
+                    } else {
+                        format!(
+                            "299 guard \"mutation outcome is uncertain; inspect provisional {handle}\""
+                        )
+                    };
+                    builder = builder
+                        .header("x-guard-provisional", &handle)
+                        .header(hyper::header::WARNING, warning);
+                }
             }
             let bytes = self
                 .redact_upstream_bytes(response_secrets, &bytes)
@@ -3876,6 +3895,22 @@ impl ApiProxy {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = judge;
         tracing::info!(target: "guard::apiproxy", "rebuilt api evaluator for policy intent change");
     }
+}
+
+fn provisional_response_metadata(
+    handle: &str,
+    deadline_unix: u64,
+    now_unix: u64,
+) -> (String, String) {
+    let seconds_remaining = deadline_unix.saturating_sub(now_unix);
+    (
+        format!(
+            "{handle}; deadline_unix={deadline_unix}; seconds_remaining={seconds_remaining}"
+        ),
+        format!(
+            "299 guard \"change is provisional; confirm with guard confirm {handle}; auto-revert deadline_unix={deadline_unix}; seconds_remaining={seconds_remaining}\""
+        ),
+    )
 }
 
 fn bind_create_provenance(body: &[u8], provisional: &str) -> Result<Bytes, String> {
@@ -4817,6 +4852,29 @@ mod tests {
             ApiPolicy::deny_all(),
             None,
         )
+    }
+
+    #[test]
+    fn provisional_response_metadata_includes_handle_deadline_and_remaining_seconds() {
+        let (provisional, warning) =
+            provisional_response_metadata("handle-123", 1_700_000_123, 1_700_000_100);
+
+        assert_eq!(
+            provisional,
+            "handle-123; deadline_unix=1700000123; seconds_remaining=23"
+        );
+        assert_eq!(
+            warning,
+            "299 guard \"change is provisional; confirm with guard confirm handle-123; auto-revert deadline_unix=1700000123; seconds_remaining=23\""
+        );
+    }
+
+    #[test]
+    fn provisional_response_metadata_never_reports_negative_remaining_seconds() {
+        let (provisional, warning) = provisional_response_metadata("handle-123", 100, 101);
+
+        assert!(provisional.ends_with("seconds_remaining=0"));
+        assert!(warning.contains("deadline_unix=100; seconds_remaining=0"));
     }
 
     #[tokio::test]

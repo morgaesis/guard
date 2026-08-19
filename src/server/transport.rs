@@ -582,6 +582,7 @@ mod api_session_event_tests {
         Provisional {
             handle: "recovery".to_string(),
             principal: Some(guard::principal::PrincipalKey::from_uid(1_001)),
+            requester_principal: None,
             binary: "true".to_string(),
             args: Vec::new(),
             cwd: None,

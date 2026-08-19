@@ -2226,6 +2226,7 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
     let provisional = Provisional {
         handle: handle.clone(),
         principal: Some(cfg.config.daemon_principal.clone()),
+        requester_principal: None,
         binary: "(api-proxy)".to_string(),
         args: vec!["delete labels/bug in o/r".to_string()],
         cwd: None,
@@ -2484,6 +2485,7 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
     let provisional = Provisional {
         handle: handle.clone(),
         principal: Some(cfg.config.daemon_principal.clone()),
+        requester_principal: None,
         binary: "(api-proxy)".to_string(),
         args: vec!["delete labels/bug in o/r".to_string()],
         cwd: None,
@@ -2952,6 +2954,7 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
         cfg.state.provisional.write().await.insert(Provisional {
             handle: format!("provisional-{token}"),
             principal: agent.principal(),
+            requester_principal: None,
             binary: "true".to_string(),
             args: Vec::new(),
             cwd: None,
@@ -3000,6 +3003,103 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
     };
     assert_eq!(provisionals.len(), 1);
     assert_eq!(provisionals[0].handle, "provisional-status-session-a");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn requester_can_list_own_api_provisional_without_decision_authority() {
+    let (cfg, operator, requester) = gating_config(7_024, 1_000);
+    let handle = "api-provisional-requester-visible";
+    cfg.state.provisional.write().await.insert(Provisional {
+        handle: handle.to_string(),
+        principal: Some(cfg.config.daemon_principal.clone()),
+        requester_principal: requester.principal(),
+        binary: "(api-proxy)".to_string(),
+        args: vec!["patch deployments/api in dev".to_string()],
+        cwd: None,
+        secret_keys: BTreeMap::new(),
+        secret_file_keys: BTreeMap::new(),
+        revert_binary: String::new(),
+        revert_args: Vec::new(),
+        confirm_check_binary: None,
+        confirm_check_args: Vec::new(),
+        control_path: Some("daemon API proxy for protocol kubernetes".to_string()),
+        session_fingerprint: Some("sha256:requester-session".to_string()),
+        session_revision: Some("requester-session-revision".to_string()),
+        secret_entitlements: None,
+        api_revert: Some(ApiRevertPlan {
+            endpoint: "fixture".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://upstream.invalid".to_string(),
+            upstream_identity: "fixture-identity".to_string(),
+            method: "PUT".to_string(),
+            path: "/apis/apps/v1/namespaces/dev/deployments/api".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
+            body_file: None,
+        }),
+        reason: "patch deployments/api in dev".to_string(),
+        decision_trace: None,
+        created_unix: now_unix(),
+        deadline_unix: now_unix().saturating_add(300),
+        window_secs: 300,
+        auto_reverted_unix: None,
+        forward_done: true,
+        forward_exit: Some(0),
+        forward_persistence_failed: false,
+        status: ProvisionalStatus::Armed,
+        revert_exit: None,
+        revert_detail: None,
+    });
+
+    let AdminResponse::Provisionals { items } =
+        handle_admin_request_for_test(&cfg, &requester, AdminRequest::Provisionals).await
+    else {
+        panic!("requester should receive a provisional list");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].handle, handle);
+
+    let AdminResponse::Provisionals { items } = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1_001 },
+        AdminRequest::Provisionals,
+    )
+    .await
+    else {
+        panic!("other requester should receive a provisional list");
+    };
+    assert!(items.is_empty());
+
+    assert!(matches!(
+        handle_admin_request_for_test(
+            &cfg,
+            &requester,
+            AdminRequest::Confirm {
+                handle: handle.to_string(),
+            },
+        )
+        .await,
+        AdminResponse::Error { message } if message.contains("operator authority")
+    ));
+    assert_eq!(
+        cfg.state
+            .provisional
+            .read()
+            .await
+            .get(handle)
+            .unwrap()
+            .status,
+        ProvisionalStatus::Armed
+    );
+
+    let AdminResponse::Provisionals { items } =
+        handle_admin_request_for_test(&cfg, &operator, AdminRequest::Provisionals).await
+    else {
+        panic!("operator should receive a provisional list");
+    };
+    assert_eq!(items.len(), 1);
 }
 
 /// Approval arms the immutable snapshot without executing it. Only the
@@ -3132,7 +3232,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
     let guidance = held_response.verb_guidance.as_deref().unwrap();
     assert_eq!(
         guidance,
-        format!("approve: guard access approve {handle} --once")
+        format!("ask your admin to approve request {handle} (see guard access show {handle})")
     );
 
     // Non-operator approve is refused; the hold stays pending.
@@ -4223,8 +4323,15 @@ async fn exhausted_multi_verb_hold_requests_every_required_scope() {
         .map(|(handle, _)| handle.clone())
         .collect::<Vec<_>>();
     let response = result.into_response();
-    let guidance = response.verb_guidance.expect("exact operator guidance");
-    assert!(guidance.contains(&format!("guard access approve {}", handles.join(" "))));
+    let guidance = response
+        .verb_guidance
+        .expect("requester-safe approval guidance");
+    for handle in &handles {
+        assert!(guidance.contains(&format!(
+            "ask your admin to approve request {handle} (see guard access show {handle})"
+        )));
+    }
+    assert!(!guidance.contains("guard access approve"));
     assert!(response.handle.is_none());
     assert!(response.approval_options.is_empty());
 }
@@ -5742,6 +5849,12 @@ async fn access_audience_controls_hold_visibility_and_next_action() {
         owner_item.next_action,
         format!("guard approval show {handle} --wait")
     );
+    assert_eq!(
+        owner_item.approval_options,
+        vec![format!(
+            "ask your admin to approve request {handle} (see guard access show {handle})"
+        )]
+    );
 
     let AdminResponse::AccessItem {
         item: operator_item,
@@ -5759,6 +5872,10 @@ async fn access_audience_controls_hold_visibility_and_next_action() {
     assert_eq!(
         operator_item.next_action,
         format!("guard access approve {handle} --once")
+    );
+    assert_eq!(
+        operator_item.approval_options,
+        vec![format!("guard access approve {handle} --once")]
     );
 
     assert!(matches!(
@@ -5778,6 +5895,23 @@ async fn access_audience_controls_hold_visibility_and_next_action() {
         panic!("unrelated caller receives a scoped list")
     };
     assert!(items.iter().all(|item| item.reference != handle));
+}
+
+#[test]
+fn execution_approval_guidance_respects_authenticated_audience() {
+    let (cfg, operator, requester) = gating_config(7007, 1000);
+    let handle = "audience-request";
+
+    assert_eq!(
+        super::super::admin::approval_guidance(&cfg, &operator, handle, false),
+        format!(
+            "approve: guard access approve {handle}\nonce: guard access approve {handle} --once\nbounded: guard access approve {handle} --uses 3"
+        )
+    );
+    assert_eq!(
+        super::super::admin::approval_guidance(&cfg, &requester, handle, false),
+        format!("ask your admin to approve request {handle} (see guard access show {handle})")
+    );
 }
 
 #[tokio::test]
@@ -6603,6 +6737,7 @@ async fn sensitive_provisional_snapshots_are_redacted_and_cannot_replay() {
     let provisional = Provisional {
         handle: "sensitive-provisional-replay".to_string(),
         principal: agent.principal(),
+        requester_principal: None,
         binary: "curl.EXE".to_string(),
         args: vec![format!("-u{sensitive}")],
         cwd: None,
@@ -6722,6 +6857,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
     let provisional = Provisional {
         handle: "entitled-control-path".to_string(),
         principal: Some(principal),
+        requester_principal: None,
         binary: "true".to_string(),
         args: Vec::new(),
         cwd: None,
@@ -7042,6 +7178,7 @@ async fn provisional_revert_executes_in_snapshotted_cwd() {
     let provisional = Provisional {
         handle: "cwd-revert".to_string(),
         principal: agent.principal(),
+        requester_principal: None,
         binary: "true".to_string(),
         args: Vec::new(),
         cwd: Some(temp.path().to_path_buf()),

@@ -658,9 +658,13 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         first.next_action,
         format!("guard access show {}", first.reference)
     );
-    assert!(first
-        .approval_options
-        .contains(&format!("guard access approve {} --once", first.reference)));
+    assert_eq!(
+        first.approval_options,
+        vec![format!(
+            "ask your admin to approve request {} (see guard access show {})",
+            first.reference, first.reference
+        )]
+    );
 
     let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
@@ -2392,14 +2396,12 @@ async fn sessionless_denied_typed_command_returns_access_request_guidance() {
     let guidance = response
         .verb_guidance
         .as_deref()
-        .expect("denied typed command returns operator guidance");
-    for command in [
-        format!("guard access approve {handle}"),
-        format!("guard access approve {handle} --once"),
-        format!("guard access approve {handle} --uses 3"),
-    ] {
-        assert!(guidance.contains(&command), "missing {command}: {guidance}");
-    }
+        .expect("denied typed command returns requester guidance");
+    assert_eq!(
+        guidance,
+        format!("ask your admin to approve request {handle} (see guard access show {handle})")
+    );
+    assert!(!guidance.contains("guard access approve"));
 
     let retry = execute_command(request, &cfg, &worker)
         .await
@@ -2463,10 +2465,11 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
         .verb_guidance
         .as_deref()
         .expect("novel denial explains how to request typed access");
-    assert!(
-        guidance.contains(&format!("guard access approve {handle}")),
-        "{guidance}"
+    assert_eq!(
+        guidance,
+        format!("ask your admin to approve request {handle} (see guard access show {handle})")
     );
+    assert!(!guidance.contains("guard access approve"));
     let original = request.args.clone();
     let split = original
         .iter()

@@ -1375,12 +1375,42 @@ pub(super) async fn validate_durable_access_provenance(
     Ok(())
 }
 
-fn approval_options(handle: &str) -> Vec<String> {
+fn approval_options(handle: &str, audience: &AccessAudience, one_shot: bool) -> Vec<String> {
+    if !audience.is_operator {
+        return vec![format!(
+            "ask your admin to approve request {handle} (see guard access show {handle})"
+        )];
+    }
+
+    if one_shot {
+        return vec![format!("guard access approve {handle} --once")];
+    }
+
     vec![
         format!("guard access approve {handle}"),
         format!("guard access approve {handle} --once"),
         format!("guard access approve {handle} --uses 3"),
     ]
+}
+
+pub(super) fn approval_guidance(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    handle: &str,
+    one_shot: bool,
+) -> String {
+    let audience = AccessAudience::from_caller(server, caller);
+    let options = approval_options(handle, &audience, one_shot);
+    if audience.is_operator && !one_shot {
+        format!(
+            "approve: {}\nonce: {}\nbounded: {}",
+            options[0], options[1], options[2]
+        )
+    } else if audience.is_operator {
+        format!("approve: {}", options[0])
+    } else {
+        options[0].clone()
+    }
 }
 
 /// Canonical access-managed session for a principal. Principal identity is
@@ -1455,17 +1485,21 @@ fn access_use_policy(uses: Option<(Option<u64>, Option<u64>)>) -> &'static str {
 }
 
 #[derive(Clone)]
-struct AccessAudience {
+pub(super) struct AccessAudience {
     is_operator: bool,
     principal: Option<PrincipalKey>,
 }
 
 impl AccessAudience {
-    fn from_caller(server: &ServerContext, caller: &CallerIdentity) -> Self {
+    pub(super) fn from_caller(server: &ServerContext, caller: &CallerIdentity) -> Self {
         Self {
             is_operator: caller_is_session_admin(server, caller),
             principal: caller.principal(),
         }
+    }
+
+    pub(super) fn is_operator(&self) -> bool {
+        self.is_operator
     }
 
     fn can_view_principal(&self, owner: &Option<PrincipalKey>) -> bool {
@@ -1635,7 +1669,7 @@ async fn access_item_for_approval(
         state: projected_state.to_string(),
         next_action: hold_next_action(&approval.handle, projected_state, audience.is_operator),
         approval_options: if awaiting_decision {
-            vec![format!("guard access approve {} --once", approval.handle)]
+            approval_options(&approval.handle, audience, true)
         } else {
             Vec::new()
         },
@@ -1739,7 +1773,7 @@ async fn access_item_for_request(
             format!("guard access show {}", request.handle)
         },
         approval_options: if awaiting_decision {
-            approval_options(&request.handle)
+            approval_options(&request.handle, audience, false)
         } else {
             Vec::new()
         },
@@ -4673,7 +4707,11 @@ async fn dispatch_admin_request(
                 .await
                 .visible_list()
                 .iter()
-                .filter(|p| is_daemon || scope_eq(&p.principal, &caller_key))
+                .filter(|p| {
+                    is_daemon
+                        || scope_eq(&p.principal, &caller_key)
+                        || scope_eq(&p.requester_principal, &caller_key)
+                })
                 .map(ProvisionalSummary::from_row)
                 .collect();
             AdminResponse::Provisionals { items }

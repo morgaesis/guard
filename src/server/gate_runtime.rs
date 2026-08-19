@@ -37,6 +37,32 @@ use super::{
     SWEEPER_GRACE_SECS, SWEEPER_TICK_SECS,
 };
 
+async fn api_session_requester_principal(
+    server: &ServerContext,
+    fingerprint: Option<&str>,
+    revision: Option<&str>,
+) -> Option<PrincipalKey> {
+    let (Some(fingerprint), Some(revision)) = (fingerprint, revision) else {
+        return None;
+    };
+    let sessions = server.state.sessions.read().await;
+    sessions.list().into_iter().find_map(|summary| {
+        let matches_authority = sessions
+            .api_authority_for(&summary.token)
+            .is_some_and(|(candidate, _)| candidate == fingerprint)
+            && sessions
+                .authority_snapshot(&summary.token)
+                .is_some_and(|(candidate, _)| candidate == revision);
+        if !matches_authority {
+            return None;
+        }
+        match summary.owner {
+            crate::session::SessionOwner::Principal(principal) => Some(principal),
+            crate::session::SessionOwner::Unowned => None,
+        }
+    })
+}
+
 const STAGED_CLEANUP_RETRY_SECS: u64 = 30;
 const DISPATCH_CLASSIFICATION_RETRY_SECS: u64 = 90;
 
@@ -794,6 +820,12 @@ impl guard::proxy::GateSink for DaemonGateSink {
         }
         let handle = new_handle();
         let now = now_unix();
+        let requester_principal = api_session_requester_principal(
+            &self.server,
+            mutation.session_fingerprint.as_deref(),
+            mutation.session_revision.as_deref(),
+        )
+        .await;
 
         let revert_body = mutation.revert.body.clone();
         let body_file = if revert_body.is_some() {
@@ -823,6 +855,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let provisional = Provisional {
             handle: handle.clone(),
             principal,
+            requester_principal,
             binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![mutation.label.clone()],
             cwd: None,
@@ -1035,6 +1068,21 @@ impl guard::proxy::GateSink for DaemonGateSink {
             true
         });
         task.await.unwrap_or(false)
+    }
+
+    async fn provisional_deadline(&self, handle: &str) -> Option<u64> {
+        let provisional = self
+            .server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(handle)
+            .cloned()?;
+        (provisional.status == ProvisionalStatus::Armed
+            && provisional.forward_done
+            && provisional.deadline_unix > 0)
+            .then_some(provisional.deadline_unix)
     }
 
     async fn mark_revert_indeterminate(
@@ -1698,6 +1746,28 @@ pub(super) struct GateInputs {
     pub(super) consume_access_verbs: Vec<String>,
 }
 
+fn held_containment_guidance(
+    reversibility: Option<Reversibility>,
+    risk: Option<i32>,
+    revert_preauthorized: bool,
+    has_revert: bool,
+    confirm_within_secs: Option<u64>,
+) -> Option<String> {
+    if decide_gate(reversibility, risk, true, false) != GateOutcome::Contain {
+        return None;
+    }
+    let window = confirm_within_secs.unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS);
+    if revert_preauthorized && has_revert {
+        Some(format!(
+            "contain: re-run with --confirm-within {window} to execute under auto-revert"
+        ))
+    } else {
+        Some(format!(
+            "contain: re-run with --revert '<cmd>' --confirm-within {window} to execute under auto-revert"
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SessionAuthoritySnapshot {
     pub(super) revision: String,
@@ -1894,8 +1964,16 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             .await
         }
         GateOutcome::Hold => {
+            let containment_guidance = held_containment_guidance(
+                inputs.reversibility,
+                inputs.risk,
+                inputs.revert_preauthorized,
+                request.revert.is_some(),
+                request.confirm_within_secs,
+            );
             hold_for_approval_with_trace(context, request, caller_principal, inputs, decision_trace)
                 .await
+                .with_verb_resolution(Vec::new(), containment_guidance)
         }
     }
 }
@@ -2077,6 +2155,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     let provisional = Provisional {
         handle: handle.clone(),
         principal: caller_principal,
+        requester_principal: None,
         binary: request.binary.clone(),
         args: request.args.clone(),
         cwd: request.cwd.clone(),
@@ -2726,7 +2805,9 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         }
         None => ExecuteResult::held(reason, handle.clone(), Coverage::hold()).with_verb_resolution(
             Vec::new(),
-            Some(format!("approve: guard access approve {handle} --once")),
+            Some(super::admin::approval_guidance(
+                server, caller, &handle, true,
+            )),
         ),
     }
 }
@@ -2788,7 +2869,9 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
             )
             .with_verb_resolution(
                 Vec::new(),
-                Some(format!("approve: guard access approve {handle} --once")),
+                Some(super::admin::approval_guidance(
+                    server, caller, handle, true,
+                )),
             );
         }
 
@@ -4267,6 +4350,146 @@ mod transactional_tests {
             upstream_target: "https://fixture.invalid".to_string(),
             upstream_identity: "fixture-identity".to_string(),
         }
+    }
+
+    #[test]
+    fn held_recoverable_commands_name_the_available_containment_route() {
+        assert_eq!(
+            held_containment_guidance(
+                Some(Reversibility::Recoverable),
+                Some(4),
+                false,
+                false,
+                Some(120),
+            ),
+            Some(
+                "contain: re-run with --revert '<cmd>' --confirm-within 120 to execute under auto-revert"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            held_containment_guidance(Some(Reversibility::Recoverable), Some(4), true, true, None,),
+            Some(
+                "contain: re-run with --confirm-within 300 to execute under auto-revert"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn held_irreversible_or_high_risk_commands_do_not_promise_containment() {
+        assert_eq!(
+            held_containment_guidance(
+                Some(Reversibility::Irreversible),
+                Some(4),
+                false,
+                false,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            held_containment_guidance(Some(Reversibility::Recoverable), Some(9), true, true, None,),
+            None
+        );
+    }
+
+    fn api_session(owner: PrincipalKey) -> crate::session::SessionGrant {
+        crate::session::SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: false,
+            auto_amend: false,
+            granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(owner),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_revert_persists_session_owner_without_changing_daemon_identity() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let owner = PrincipalKey::from_uid(4242);
+        let token = "session-attribution";
+        assert!(server
+            .state
+            .sessions
+            .write()
+            .await
+            .grant(token.to_string(), api_session(owner.clone())));
+        let (session_fingerprint, session_revision) = {
+            let sessions = server.state.sessions.read().await;
+            let (fingerprint, _) = sessions.api_authority_for(token).unwrap();
+            let (revision, _) = sessions.authority_snapshot(token).unwrap();
+            (fingerprint, revision)
+        };
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: "fixture-endpoint".to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let mut mutation = fixture_api_mutation(false);
+        mutation.session_fingerprint = Some(session_fingerprint.clone());
+        mutation.session_revision = Some(session_revision);
+
+        let handle = guard::proxy::GateSink::arm_revert(&sink, mutation)
+            .await
+            .unwrap();
+        let staged = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            staged.principal,
+            Some(server.config.daemon_principal.clone())
+        );
+        assert_eq!(staged.requester_principal, Some(owner.clone()));
+        assert_eq!(staged.session_fingerprint, Some(session_fingerprint));
+
+        assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+        assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+        let armed = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            guard::proxy::GateSink::provisional_deadline(&sink, &handle).await,
+            Some(armed.deadline_unix)
+        );
+
+        let persisted = store
+            .load_provisionals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.handle == handle)
+            .unwrap();
+        assert_eq!(persisted.principal, Some(server.config.daemon_principal));
+        assert_eq!(persisted.requester_principal, Some(owner));
+        assert_eq!(persisted.session_fingerprint, armed.session_fingerprint);
     }
 
     #[tokio::test]

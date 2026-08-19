@@ -565,7 +565,7 @@ async fn mcp_process_rejects_a_built_in_custom_tool_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn typed_verb_denial_prints_every_exact_access_command() {
+async fn typed_verb_denial_prints_requester_safe_access_guidance() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_daemon, socket_path) = start_daemon_with_gate(&tmp, true).await;
     let output = timeout(
@@ -588,9 +588,10 @@ async fn typed_verb_denial_prints_every_exact_access_command() {
         .find_map(|line| line.trim().strip_prefix("request: "))
         .unwrap_or_else(|| panic!("durable request reference missing from stderr: {stderr}"));
     assert!(reference.starts_with("gr-"));
-    assert!(stderr.contains(&format!("guard access approve {reference}\n")));
-    assert!(stderr.contains(&format!("guard access approve {reference} --once")));
-    assert!(stderr.contains(&format!("guard access approve {reference} --uses 3")));
+    assert!(stderr.contains(&format!(
+        "ask your admin to approve request {reference} (see guard access show {reference})"
+    )));
+    assert!(!stderr.contains("guard access approve"));
     assert!(stderr.contains(&format!("guard access show {reference}")));
 }
 
@@ -822,8 +823,13 @@ async fn mcp_end_to_end_initialize_list_call() {
     assert_eq!(access_item["state"], "pending");
     assert_eq!(access_item["intent"], "inspect-identity");
     assert_eq!(access_item["effective_scope"], json!(["inspect-identity"]));
-    assert_eq!(access_item["approval_options"].as_array().unwrap().len(), 3);
     let reference = access_item["reference"].as_str().expect("access reference");
+    assert_eq!(
+        access_item["approval_options"],
+        json!([format!(
+            "ask your admin to approve request {reference} (see guard access show {reference})"
+        )])
+    );
 
     // 4. tools/call for the same authenticated caller's scoped access list
     let access_list = mcp

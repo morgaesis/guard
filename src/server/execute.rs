@@ -120,7 +120,9 @@ pub(super) async fn execute_command(
     caller: &CallerIdentity,
 ) -> ExecuteResult {
     let mut sink = tokio::io::sink();
-    execute_command_inner(request, server, caller, false, &mut sink).await
+    let result = execute_command_inner(request, server, caller, false, &mut sink).await;
+    let audience = super::admin::AccessAudience::from_caller(server, caller);
+    result.with_operator_guidance(audience.is_operator())
 }
 
 pub(super) async fn execute_command_streaming<W: AsyncWrite + Unpin>(
@@ -129,7 +131,9 @@ pub(super) async fn execute_command_streaming<W: AsyncWrite + Unpin>(
     caller: &CallerIdentity,
     writer: &mut W,
 ) -> ExecuteResult {
-    execute_command_inner(request, server, caller, true, writer).await
+    let result = execute_command_inner(request, server, caller, true, writer).await;
+    let audience = super::admin::AccessAudience::from_caller(server, caller);
+    result.with_operator_guidance(audience.is_operator())
 }
 
 async fn execute_command_inner<W: AsyncWrite + Unpin>(
@@ -722,11 +726,12 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             if let Some(request) = request {
                 if request.requester.is_some() {
                     access_request_handle = Some(request.handle.clone());
-                    let guidance = format!(
-                        "approve: guard access approve {}\nonce: guard access approve {} --once\nbounded: guard access approve {} --uses 3",
-                        request.handle, request.handle, request.handle
-                    );
-                    phase.verb_guidance = Some(guidance);
+                    phase.verb_guidance = Some(super::admin::approval_guidance(
+                        phase.server,
+                        phase.caller,
+                        &request.handle,
+                        false,
+                    ));
                     reason.push_str(&format!("; access_request={}", request.handle));
                 } else {
                     reason.push_str(&format!(
@@ -772,9 +777,11 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             {
                 Ok(item) if item.kind == "request" => {
                     access_request_handle = Some(item.reference.clone());
-                    phase.verb_guidance = Some(format!(
-                        "approve: guard access approve {}\nonce: guard access approve {} --once\nbounded: guard access approve {} --uses 3",
-                        item.reference, item.reference, item.reference
+                    phase.verb_guidance = Some(super::admin::approval_guidance(
+                        phase.server,
+                        phase.caller,
+                        &item.reference,
+                        false,
                     ));
                     reason.push_str(&format!("; access_request={}", item.reference));
                 }
