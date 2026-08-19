@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -3552,6 +3552,7 @@ struct RecordingSink {
     resolved: Arc<std::sync::Mutex<Vec<String>>>,
     dispatching: Arc<std::sync::Mutex<Vec<String>>>,
     rejected: Arc<std::sync::Mutex<Vec<String>>>,
+    deadline_unix: Arc<AtomicU64>,
     activated_signal: Arc<tokio::sync::Semaphore>,
     indeterminate_signal: Arc<tokio::sync::Semaphore>,
     resolved_signal: Arc<tokio::sync::Semaphore>,
@@ -3569,6 +3570,7 @@ impl Default for RecordingSink {
             resolved: Arc::default(),
             dispatching: Arc::default(),
             rejected: Arc::default(),
+            deadline_unix: Arc::new(AtomicU64::new(0)),
             activated_signal: Arc::new(tokio::sync::Semaphore::new(0)),
             indeterminate_signal: Arc::new(tokio::sync::Semaphore::new(0)),
             resolved_signal: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -3598,6 +3600,13 @@ impl guard::proxy::GateSink for RecordingSink {
             .push(resource_uid.map(str::to_string));
         self.activated_signal.add_permits(1);
         true
+    }
+
+    async fn provisional_deadline(&self, _handle: &str) -> Option<u64> {
+        match self.deadline_unix.load(Ordering::SeqCst) {
+            0 => None,
+            deadline => Some(deadline),
+        }
     }
 
     async fn mark_revert_indeterminate(
@@ -4257,6 +4266,8 @@ async fn proxy_arms_auto_revert_for_writes() {
     );
 
     let sink = RecordingSink::default();
+    let deadline_unix = guard::env::now_unix().saturating_add(300);
+    sink.deadline_unix.store(deadline_unix, Ordering::SeqCst);
     proxy.attach_gate(Arc::new(sink.clone()));
     proxy.attach_session_sink(Arc::new(LiveSessionSink));
 
@@ -4277,17 +4288,22 @@ async fn proxy_arms_auto_revert_for_writes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201, "create forwarded");
-    assert_eq!(
-        resp.headers()
-            .get("x-guard-provisional")
-            .and_then(|value| value.to_str().ok()),
-        Some("test-handle-0")
-    );
-    assert!(resp
+    let provisional_header = resp
+        .headers()
+        .get("x-guard-provisional")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    assert!(provisional_header.starts_with("test-handle-0;"));
+    assert!(provisional_header.contains(&format!("deadline_unix={deadline_unix}")));
+    assert!(provisional_header.contains("seconds_remaining="));
+    let warning = resp
         .headers()
         .get("warning")
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("guard confirm test-handle-0")));
+        .unwrap();
+    assert!(warning.contains("guard confirm test-handle-0"));
+    assert!(warning.contains(&format!("deadline_unix={deadline_unix}")));
+    assert!(warning.contains("seconds_remaining="));
 
     // A patch on a named object snapshots the prior state and arms a restore.
     let observed = client
@@ -4310,12 +4326,14 @@ async fn proxy_arms_auto_revert_for_writes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "patch forwarded");
-    assert_eq!(
-        resp.headers()
-            .get("x-guard-provisional")
-            .and_then(|value| value.to_str().ok()),
-        Some("test-handle-1")
-    );
+    let provisional_header = resp
+        .headers()
+        .get("x-guard-provisional")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    assert!(provisional_header.starts_with("test-handle-1;"));
+    assert!(provisional_header.contains(&format!("deadline_unix={deadline_unix}")));
+    assert!(provisional_header.contains("seconds_remaining="));
 
     // Both response headers prove the reverts were durable before success was
     // returned; the sink records the same handles for lifecycle assertions.

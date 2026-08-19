@@ -151,8 +151,29 @@ fn print_verb_guidance(response: &server::ExecuteResponse) {
         );
     }
     if let Some(guidance) = &response.verb_guidance {
-        eprintln!("  guidance: {}", guidance);
+        let guidance = guidance
+            .lines()
+            .filter(|line| !line.starts_with("contain: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !guidance.is_empty() {
+            eprintln!("  guidance: {guidance}");
+        }
     }
+}
+
+fn held_discovery_lines(response: &server::ExecuteResponse) -> Vec<String> {
+    let mut lines = response
+        .verb_guidance
+        .as_deref()
+        .into_iter()
+        .flat_map(str::lines)
+        .find(|line| line.starts_with("contain: "))
+        .map(str::to_string)
+        .into_iter()
+        .collect::<Vec<_>>();
+    lines.push("inspect: guard provisionals".to_string());
+    lines
 }
 
 /// The `result:` and `window:` lines of a contained execution banner. The
@@ -276,7 +297,7 @@ fn access_request_guidance_lines(response: &server::ExecuteResponse) -> Vec<Stri
                     request
                         .approval_options
                         .iter()
-                        .map(|command| format!("approve: {command}")),
+                        .map(|option| access_approval_option_line(option, "approve: ")),
                 );
                 lines.push(format!("inspect: guard access show {}", request.reference));
                 lines
@@ -292,10 +313,18 @@ fn access_request_guidance_lines(response: &server::ExecuteResponse) -> Vec<Stri
         response
             .approval_options
             .iter()
-            .map(|command| format!("approve: {command}")),
+            .map(|option| access_approval_option_line(option, "approve: ")),
     );
     lines.push(format!("inspect: guard access show {reference}"));
     lines
+}
+
+fn access_approval_option_line(option: &str, operator_prefix: &str) -> String {
+    if option.starts_with("guard access approve ") {
+        format!("{operator_prefix}{option}")
+    } else {
+        option.to_string()
+    }
 }
 
 fn print_access_request_guidance(response: &server::ExecuteResponse) {
@@ -319,6 +348,9 @@ fn print_held_banner(response: &server::ExecuteResponse) {
     eprintln!("  handle:  {}", handle);
     print_access_request_guidance(response);
     print_verb_guidance(response);
+    for line in held_discovery_lines(response) {
+        eprintln!("  {line}");
+    }
     eprintln!("  result:  not executed; approval arms it, you then resume it");
     eprintln!("  resume:  guard approval resume {}", handle);
 }
@@ -686,23 +718,7 @@ pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> R
             }
             let color = color_enabled_for_stdout();
             for p in &items {
-                let status = paint(&p.status, AnsiColor::Yellow, color);
-                println!(
-                    "[{}] handle={} cmd={:?} revert={:?} check={:?} control_path={:?} session={} deadline={} reason={:?}{}",
-                    status,
-                    p.handle,
-                    p.command,
-                    p.revert_command,
-                    p.confirm_check,
-                    p.control_path,
-                    p.session_fingerprint.as_deref().unwrap_or("none"),
-                    format_timestamp(p.deadline_unix),
-                    p.reason,
-                    p.revert_detail
-                        .as_ref()
-                        .map(|d| format!(" revert_detail={:?}", d))
-                        .unwrap_or_default(),
-                );
+                println!("{}", provisional_human_line(p, color));
             }
             Ok(())
         }
@@ -1947,6 +1963,9 @@ fn render_access_status(
                 active.activated_verbs.join(",")
             }
         );
+        if let Some(line) = secret_entitlements_line(&active.scope.secret_names, "  ") {
+            println!("{line}");
+        }
     }
     println!(
         "  activity: total={} allowed={} denied={} completed={} failed={} held={}",
@@ -1974,20 +1993,102 @@ fn render_access_status(
             interaction.command,
             interaction.reason,
         );
+        for line in decision_trace_human_lines(interaction.decision_trace.as_ref(), "    ") {
+            println!("{line}");
+        }
     }
     for approval in approvals {
         render_approval(approval, true);
+        for line in decision_trace_human_lines(approval.decision_trace.as_ref(), "  ") {
+            println!("{line}");
+        }
     }
     for provisional in provisionals {
+        let secret_names = secret_entitlements_line(&provisional.secret_names, "")
+            .map(|line| format!(" {line}"))
+            .unwrap_or_default();
         println!(
-            "[{}] handle={} cmd={:?} deadline={} reason={:?}",
+            "[{}] handle={} cmd={:?} deadline={} reason={:?}{}",
             provisional.status,
             provisional.handle,
             provisional.command,
             format_timestamp(provisional.deadline_unix),
             provisional.reason,
+            secret_names,
         );
+        for line in decision_trace_human_lines(provisional.decision_trace.as_ref(), "  ") {
+            println!("{line}");
+        }
     }
+}
+
+fn secret_entitlements_line(secret_names: &[String], indent: &str) -> Option<String> {
+    (!secret_names.is_empty()).then(|| format!("{indent}secret_names: {}", secret_names.join(",")))
+}
+
+fn decision_trace_human_lines(
+    trace: Option<&guard::gating::DecisionTrace>,
+    indent: &str,
+) -> Vec<String> {
+    let Some(trace) = trace else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    if !trace.verb_matches.is_empty() {
+        let matches = trace
+            .verb_matches
+            .iter()
+            .map(|matched| {
+                format!(
+                    "{}/{} ({}/{}{}{})",
+                    matched.verb,
+                    matched.cell,
+                    matched.scope,
+                    matched.action,
+                    if matched.selected {
+                        ", selected"
+                    } else {
+                        ", not selected"
+                    },
+                    if matched.overridden {
+                        ", overridden"
+                    } else {
+                        ""
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("{indent}verb_matches: {matches}"));
+    }
+    if let Some(delta) = &trace.suggested_grant_delta {
+        lines.push(format!("{indent}suggested_grant_delta: {delta}"));
+    }
+    lines
+}
+
+fn provisional_human_line(provisional: &server::ProvisionalSummary, color: bool) -> String {
+    let status = paint(&provisional.status, AnsiColor::Yellow, color);
+    let secret_names = secret_entitlements_line(&provisional.secret_names, "")
+        .map(|line| format!(" {line}"))
+        .unwrap_or_default();
+    format!(
+        "[{status}] handle={} cmd={:?} revert={:?} check={:?} control_path={:?} session={} deadline={} reason={:?}{}{}",
+        provisional.handle,
+        provisional.command,
+        provisional.revert_command,
+        provisional.confirm_check,
+        provisional.control_path,
+        provisional.session_fingerprint.as_deref().unwrap_or("none"),
+        format_timestamp(provisional.deadline_unix),
+        provisional.reason,
+        provisional
+            .revert_detail
+            .as_ref()
+            .map(|detail| format!(" revert_detail={detail:?}"))
+            .unwrap_or_default(),
+        secret_names,
+    )
 }
 
 fn any_decision_failed(items: &[server::AccessDecisionResult]) -> bool {
@@ -2061,8 +2162,11 @@ fn access_item_human(item: &server::AccessItem, raw: bool) -> String {
         }
     }
     lines.push(format!("next: {}", card_text(&item.next_action)));
-    for command in &item.approval_options {
-        lines.push(format!("approval: {}", card_text(command)));
+    for option in &item.approval_options {
+        lines.push(card_text(&access_approval_option_line(
+            option,
+            "approval: ",
+        )));
     }
     lines.join("\n")
 }
@@ -2598,8 +2702,11 @@ fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
         }
     }
     lines.push(format!("  next:      {}", card_text(&item.next_action)));
-    for command in &item.approval_options {
-        lines.push(format!("  approval:  {}", card_text(command)));
+    for option in &item.approval_options {
+        lines.push(card_text(&access_approval_option_line(
+            option,
+            "  approval:  ",
+        )));
     }
     lines
 }
@@ -3745,6 +3852,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn requester_guidance_does_not_label_admin_handoff_as_an_approve_command() {
+        let mut response = provisional_response(None, None);
+        response.allowed = false;
+        response.status = None;
+        response.handle = Some("gr-requester".to_string());
+        response.approval_options = vec![
+            "ask your admin to approve request gr-requester (see guard access show gr-requester)"
+                .to_string(),
+        ];
+
+        let lines = access_request_guidance_lines(&response);
+        assert!(lines.contains(
+            &"ask your admin to approve request gr-requester (see guard access show gr-requester)"
+                .to_string()
+        ));
+        assert!(lines
+            .iter()
+            .all(|line| !line.contains("guard access approve")));
+    }
+
     fn provisional_response(
         confirm_deadline_unix: Option<u64>,
         confirm_window_secs: Option<u64>,
@@ -3798,6 +3926,98 @@ mod tests {
                 vec!["result:  executed, auto-reverts unless confirmed".to_string()]
             );
         }
+    }
+
+    #[test]
+    fn held_banner_names_containment_only_when_the_server_reports_a_route() {
+        let mut response = provisional_response(None, None);
+        response.status = Some(server::GateStatus::Held);
+        response.verb_guidance = Some(
+            "ask your admin to approve request hold-1\ncontain: re-run with --revert '<cmd>' --confirm-within 300 to execute under auto-revert"
+                .to_string(),
+        );
+        assert_eq!(
+            held_discovery_lines(&response),
+            vec![
+                "contain: re-run with --revert '<cmd>' --confirm-within 300 to execute under auto-revert"
+                    .to_string(),
+                "inspect: guard provisionals".to_string(),
+            ]
+        );
+
+        response.verb_guidance = Some("ask your admin to approve request hold-1".to_string());
+        assert_eq!(
+            held_discovery_lines(&response),
+            vec!["inspect: guard provisionals".to_string()]
+        );
+    }
+
+    #[test]
+    fn access_status_human_fields_render_entitlements_and_decision_trace() {
+        assert_eq!(
+            secret_entitlements_line(
+                &["service/read".to_string(), "service/write".to_string()],
+                "  "
+            ),
+            Some("  secret_names: service/read,service/write".to_string())
+        );
+
+        let trace = guard::gating::DecisionTrace {
+            version: guard::gating::DecisionTrace::VERSION,
+            decision_source: "session_allow".to_string(),
+            verb_matches: vec![guard::gating::DecisionVerbMatch {
+                verb: "restart-service".to_string(),
+                cell: "restart".to_string(),
+                scope: "session".to_string(),
+                action: "evaluate".to_string(),
+                features: Vec::new(),
+                selected: true,
+                overridden: true,
+            }],
+            failed_dimensions: Vec::new(),
+            conflict: None,
+            guidance: None,
+            suggested_grant_delta: Some("grant restart-service".to_string()),
+        };
+
+        assert_eq!(
+            decision_trace_human_lines(Some(&trace), "    "),
+            vec![
+                "    verb_matches: restart-service/restart (session/evaluate, selected, overridden)"
+                    .to_string(),
+                "    suggested_grant_delta: grant restart-service".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn provisional_human_output_includes_secret_names_when_present() {
+        let provisional = server::ProvisionalSummary {
+            handle: "pv-1".to_string(),
+            status: "armed".to_string(),
+            forward_outcome: "completed".to_string(),
+            command: "servicectl restart app".to_string(),
+            revert_command: "servicectl rollback app".to_string(),
+            confirm_check: None,
+            control_path: None,
+            session_fingerprint: None,
+            reason: "recoverable change".to_string(),
+            created_unix: 1_700_000_000,
+            deadline_unix: 1_700_000_300,
+            forward_done: true,
+            cwd: None,
+            secret_names: vec!["service/read".to_string(), "service/write".to_string()],
+            principal: None,
+            revert_exit: None,
+            revert_detail: None,
+            decision_trace: None,
+        };
+
+        let line = provisional_human_line(&provisional, false);
+        assert!(
+            line.contains("secret_names: service/read,service/write"),
+            "{line}"
+        );
     }
 
     #[test]

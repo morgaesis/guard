@@ -1558,7 +1558,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             "approval_options": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Exact operator commands for a denied or held request. A held command exposes the one-shot approval command; a denied request may expose ordinary, one-time, and bounded-use approval commands."
+                                "description": "Audience-correct approval guidance for a denied or held request. Operators receive exact commands; requesters are directed to their admin."
                             },
                             "access_requests": {
                                 "type": "array",
@@ -1573,7 +1573,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                                     },
                                     "required": ["reference", "approval_options"]
                                 },
-                                "description": "Every durable access request created by the decision, with exact operator commands for each independently scoped request."
+                                "description": "Every durable access request created by the decision, with audience-correct approval guidance for each independently scoped request."
                             },
                             "coverage": { "type": ["object", "null"], "description": "What the gate checked and deliberately did NOT check (checked / not_checked arrays). Surfaced for held/provisional/dry-run outcomes." },
                             "verb_matches": {
@@ -2241,11 +2241,12 @@ fn render_access_text(items: &[server::AccessItem]) -> String {
                 item.state,
                 item.next_action
             );
-            for (label, command) in ["approve", "once", "bounded"]
-                .into_iter()
-                .zip(item.approval_options.iter())
-            {
-                line.push_str(&format!("\n{label}: {command}"));
+            for option in &item.approval_options {
+                if option.starts_with("guard access approve ") {
+                    line.push_str(&format!("\napproval: {option}"));
+                } else {
+                    line.push_str(&format!("\n{option}"));
+                }
             }
             line
         })
@@ -2633,12 +2634,17 @@ fn render_access_next_steps(result: &Value, handle: &str, approval_options: &[&s
         let mut output = String::from("\nAccess requests:");
         for (reference, commands) in access_requests {
             output.push_str(&format!("\n- `{reference}`"));
-            for command in commands {
-                output.push_str(&format!("\n  `{command}`"));
+            for command in &commands {
+                output.push_str(&render_approval_option(command, "  "));
             }
-            output.push_str(&format!(
-                "\n  Inspect with `guard access show {reference}`."
-            ));
+            if !commands
+                .iter()
+                .any(|command| command.contains("guard access show "))
+            {
+                output.push_str(&format!(
+                    "\n  Inspect with `guard access show {reference}`."
+                ));
+            }
         }
         return output;
     }
@@ -2649,19 +2655,36 @@ fn render_access_next_steps(result: &Value, handle: &str, approval_options: &[&s
 fn render_single_access_next_steps(handle: &str, approval_options: &[&str]) -> String {
     let mut output = String::new();
     if !approval_options.is_empty() {
-        output.push_str(if approval_options.len() == 1 {
+        let has_operator_commands = approval_options
+            .iter()
+            .any(|option| option.starts_with("guard access approve "));
+        output.push_str(if has_operator_commands && approval_options.len() == 1 {
             "\nOperator command:"
-        } else {
+        } else if has_operator_commands {
             "\nOperator commands:"
+        } else {
+            "\nNext step:"
         });
-        for command in approval_options {
-            output.push_str(&format!("\n`{command}`"));
+        for option in approval_options {
+            output.push_str(&render_approval_option(option, ""));
         }
     }
-    if !handle.is_empty() {
+    if !handle.is_empty()
+        && !approval_options
+            .iter()
+            .any(|option| option.contains("guard access show "))
+    {
         output.push_str(&format!("\nInspect with `guard access show {handle}`."));
     }
     output
+}
+
+fn render_approval_option(option: &str, indent: &str) -> String {
+    if option.starts_with("guard access approve ") {
+        format!("\n{indent}`{option}`")
+    } else {
+        format!("\n{indent}{option}")
+    }
 }
 
 fn decision_text(result: &Value) -> String {
@@ -3196,6 +3219,27 @@ mod tests {
         ] {
             assert!(text.contains(command), "missing {command}: {text}");
         }
+    }
+
+    #[test]
+    fn requester_tool_text_returns_semantic_access_handoff() {
+        let text = render_tool_text(&serde_json::json!({
+            "allowed": false,
+            "reason": "outside current access",
+            "status": null,
+            "handle": "request-example",
+            "approval_options": [
+                "ask your admin to approve request request-example (see guard access show request-example)"
+            ],
+            "exit_code": null,
+            "stdout": null,
+            "stderr": null
+        }));
+
+        assert!(text.contains(
+            "ask your admin to approve request request-example (see guard access show request-example)"
+        ));
+        assert!(!text.contains("guard access approve"));
     }
 
     #[test]

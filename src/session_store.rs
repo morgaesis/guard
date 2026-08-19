@@ -4106,6 +4106,7 @@ mod tests {
         Provisional {
             handle: handle.to_string(),
             principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
+            requester_principal: None,
             binary: "fixture-forward".to_string(),
             args: Vec::new(),
             cwd: None,
@@ -4886,6 +4887,7 @@ mod tests {
             .save_provisional(Provisional {
                 handle: "restart-trace".to_string(),
                 principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
+                requester_principal: None,
                 binary: "true".to_string(),
                 args: Vec::new(),
                 cwd: None,
@@ -5374,6 +5376,7 @@ mod tests {
         let armed = Provisional {
             handle: "provisional-cas".to_string(),
             principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
+            requester_principal: None,
             binary: "fixture-forward".to_string(),
             args: Vec::new(),
             cwd: None,
@@ -6176,6 +6179,7 @@ mod tests {
         let reverting = Provisional {
             handle: "live-revert".to_string(),
             principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
+            requester_principal: None,
             binary: "fixture-forward".to_string(),
             args: Vec::new(),
             cwd: None,

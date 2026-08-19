@@ -81,6 +81,13 @@ pub trait GateSink: Send + Sync {
     /// The confirmation window begins only after this durable transition.
     async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool;
 
+    /// Return the persisted auto-revert deadline for an armed API mutation.
+    /// Sinks that do not expose durable provisional state retain the legacy
+    /// response shape by returning `None`.
+    async fn provisional_deadline(&self, _handle: &str) -> Option<u64> {
+        None
+    }
+
     /// Preserve an actionable rollback and record why the upstream mutation
     /// outcome is uncertain.
     async fn mark_revert_indeterminate(

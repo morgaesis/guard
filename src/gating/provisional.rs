@@ -107,6 +107,12 @@ pub struct Provisional {
         deserialize_with = "crate::principal::principal_from_legacy"
     )]
     pub principal: Option<PrincipalKey>,
+    /// Principal that owned the session which admitted an API-proxy mutation.
+    /// This is attribution only: API reverts continue to use `principal` as
+    /// their daemon execution identity. Command provisionals and unbound API
+    /// requests leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_principal: Option<PrincipalKey>,
     pub binary: String,
     pub args: Vec<String>,
     /// Canonical working directory used by the forward command and its
@@ -808,6 +814,7 @@ mod tests {
         Provisional {
             handle: handle.to_string(),
             principal,
+            requester_principal: None,
             binary: "systemctl".into(),
             args: vec!["restart".into(), "app".into()],
             cwd: None,
