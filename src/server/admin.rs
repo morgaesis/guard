@@ -1017,7 +1017,7 @@ async fn reduce_access_intent(
 
 async fn reduce_generated_access_candidate(
     server: &ServerContext,
-    caller: &CallerIdentity,
+    _caller: &CallerIdentity,
     mut candidate: Verb,
     run_admission_preflight: bool,
 ) -> Result<(Vec<Verb>, Vec<Verb>), String> {
@@ -1063,7 +1063,7 @@ async fn reduce_generated_access_candidate(
         generated_access_matcher_shape(verb) == generated_access_matcher_shape(&candidate)
     }) {
         if run_admission_preflight {
-            preflight_synthesized_verb(server, caller, reused).await?;
+            preflight_synthesized_verb_structural(server, reused).await?;
         }
         return access_reduction(vec![reused.clone()]);
     }
@@ -1071,7 +1071,7 @@ async fn reduce_generated_access_candidate(
         .validate_candidate(&candidate)
         .map_err(|error| format!("invalid non-baseline access coverage: {error}"))?;
     if run_admission_preflight {
-        preflight_synthesized_verb(server, caller, &candidate).await?;
+        preflight_synthesized_verb_structural(server, &candidate).await?;
     }
     Ok((vec![candidate.clone()], vec![candidate]))
 }
@@ -6015,6 +6015,37 @@ async fn dispatch_admin_request(
     }
 }
 
+/// Structural mint-time preflight for synthesized access coverage: every
+/// rendered candidate must be finite, renderable, and not categorically
+/// refused by the live api-policy. Deliberately no dry-run execution: an
+/// approved access request executes under preauthorized coverage, so a
+/// mint-time evaluator verdict (or a provider failure) proves nothing about
+/// the capability's usability and must not block the request.
+async fn preflight_synthesized_verb_structural(
+    server: &ServerContext,
+    verb: &Verb,
+) -> Result<VerbCatalog, String> {
+    let parameter_sets = verb.finite_parameter_sets().ok_or_else(|| {
+        format!(
+            "synthesized verb admission preflight is incomplete: '{}' has a non-finite parameter pattern or more than 64 rendered candidates; enumerate bounded values before storage",
+            verb.name
+        )
+    })?;
+    let catalog = VerbCatalog::for_admission_preview(verb).map_err(|error| {
+        format!("synthesized verb rejected before admission preflight: {error}")
+    })?;
+    for (index, params) in parameter_sets.into_iter().enumerate() {
+        let rendered = catalog.render(&verb.name, &params).map_err(|error| {
+            format!(
+                "synthesized verb rejected before admission preflight for rendered candidate {}: {error}",
+                index + 1
+            )
+        })?;
+        preflight_synthesized_api_policy(server, &rendered.binary, &rendered.args).await?;
+    }
+    Ok(catalog)
+}
+
 async fn preflight_synthesized_verb(
     server: &ServerContext,
     caller: &CallerIdentity,
@@ -6026,9 +6057,7 @@ async fn preflight_synthesized_verb(
             verb.name
         )
     })?;
-    let catalog = VerbCatalog::for_admission_preview(verb).map_err(|error| {
-        format!("synthesized verb rejected before admission preflight: {error}")
-    })?;
+    let catalog = preflight_synthesized_verb_structural(server, verb).await?;
 
     // Use the production admission pipeline with execution disabled and every
     // authority-bearing registry isolated. The candidate is baseline only in
@@ -6059,13 +6088,6 @@ async fn preflight_synthesized_verb(
     preview.state.notify_hook = None;
 
     for (index, params) in parameter_sets.into_iter().enumerate() {
-        let rendered = catalog.render(&verb.name, &params).map_err(|error| {
-            format!(
-                "synthesized verb rejected before admission preflight for rendered candidate {}: {error}",
-                index + 1
-            )
-        })?;
-        preflight_synthesized_api_policy(server, &rendered.binary, &rendered.args).await?;
         // Access-request synthesis reaches this preflight through the denial
         // escalation path, while execution can itself offer an access request.
         // Poll the boxed dry-run edge in a separate task so the mutually

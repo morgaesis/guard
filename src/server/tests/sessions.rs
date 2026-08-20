@@ -422,7 +422,10 @@ async fn undescribed_synthesis_uses_the_matcher_derived_description() {
 }
 
 #[tokio::test]
-async fn access_request_rejects_matcher_that_fails_admission_preflight() {
+async fn access_request_minting_ignores_evaluator_verdicts() {
+    // An approved access request executes under preauthorized coverage, so a
+    // mint-time evaluator deny (or provider outage) proves nothing about the
+    // capability's usability and must not block the request itself.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(run_verb_synthesis_llm_with_preflight(
@@ -450,15 +453,11 @@ async fn access_request_rejects_matcher_that_fails_admission_preflight() {
         },
     )
     .await;
-    let AdminResponse::Error { message } = response else {
-        panic!("expected admission preflight rejection, got {response:?}");
-    };
     assert!(
-        message.contains("rejected by admission preflight"),
-        "{message}"
+        !matches!(response, AdminResponse::Error { .. }),
+        "structural preflight must not consult the evaluator: {response:?}"
     );
-    assert!(message.contains("executable check failed"), "{message}");
-    assert!(cfg.state.grant_requests.read().await.is_empty());
+    assert!(!cfg.state.grant_requests.read().await.is_empty());
 }
 
 #[tokio::test]
