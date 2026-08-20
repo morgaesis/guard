@@ -733,6 +733,99 @@ pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> R
     }
 }
 
+pub(crate) async fn handle_provisional_show(
+    socket: Option<String>,
+    handle: String,
+    json: bool,
+) -> Result<()> {
+    let (client, source) = gate_client(socket, json)?;
+    match client
+        .send_admin(server::AdminRequest::Provisionals)
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?
+    {
+        server::AdminResponse::Provisionals { items } => {
+            let Some(item) = items.into_iter().find(|item| item.handle == handle) else {
+                anyhow::bail!("no provisional execution with handle '{handle}'");
+            };
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "provisional",
+                    "item": item,
+                }));
+            }
+            println!("{}", provisional_detail_human(&item));
+            Ok(())
+        }
+        server::AdminResponse::Error { message } => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("unexpected response");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Full detail card for one provisional execution. Everything the list line
+/// carries plus the lifecycle, requester, and decision fields it elides.
+pub(crate) fn provisional_detail_human(item: &server::ProvisionalSummary) -> String {
+    let mut lines = vec![
+        format!("provisional {}", card_text(&item.handle)),
+        format!("status: {}", card_text(&item.status)),
+        format!("forward_outcome: {}", card_text(&item.forward_outcome)),
+        format!("forward_done: {}", item.forward_done),
+        format!("command: {}", card_text(&item.command)),
+        format!("revert: {}", card_text(&item.revert_command)),
+    ];
+    if let Some(check) = &item.confirm_check {
+        lines.push(format!("check: {}", card_text(check)));
+    }
+    if let Some(control_path) = &item.control_path {
+        lines.push(format!("control_path: {}", card_text(control_path)));
+    }
+    if let Some(cwd) = &item.cwd {
+        lines.push(format!("cwd: {}", card_text(cwd)));
+    }
+    lines.push(format!(
+        "session: {}",
+        card_text(item.session_fingerprint.as_deref().unwrap_or("none"))
+    ));
+    if let Some(principal) = &item.principal {
+        lines.push(format!("principal: {}", card_text(principal)));
+    }
+    if !item.secret_names.is_empty() {
+        lines.push(format!(
+            "secrets: {}",
+            card_text(&item.secret_names.join(","))
+        ));
+    }
+    lines.push(format!("created: {}", format_timestamp(item.created_unix)));
+    lines.push(format!(
+        "deadline: {}",
+        format_timestamp(item.deadline_unix)
+    ));
+    lines.push(format!("reason: {}", card_text(&item.reason)));
+    if let Some(exit) = item.revert_exit {
+        lines.push(format!("revert_exit: {exit}"));
+    }
+    if let Some(detail) = &item.revert_detail {
+        lines.push(format!("revert_detail: {}", card_text(detail)));
+    }
+    if let Some(trace) = &item.decision_trace {
+        lines.push(format!(
+            "decision_source: {}",
+            card_text(&trace.decision_source)
+        ));
+        if let Some(guidance) = &trace.guidance {
+            lines.push(format!("guidance: {}", card_text(guidance)));
+        }
+    }
+    lines.join("\n")
+}
+
 fn render_approval(item: &server::ApprovalSummary, include_transcript: bool) {
     println!(
         "[{}] handle={} cmd={:?} deadline={} reason={:?}",
@@ -1738,6 +1831,8 @@ fn parse_verb_create_choice(input: &str) -> Option<bool> {
 
 pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
     let mut raw_matcher = false;
+    let mut list_state_filter: Option<String> = None;
+    let mut list_agent_filter: Option<String> = None;
     let (socket, request, json) = match command {
         AccessCommands::Request {
             intent,
@@ -1808,7 +1903,16 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             },
             json,
         ),
-        AccessCommands::List { socket, json } => (socket, server::AdminRequest::AccessList, json),
+        AccessCommands::List {
+            state,
+            agent,
+            socket,
+            json,
+        } => {
+            list_state_filter = state;
+            list_agent_filter = agent;
+            (socket, server::AdminRequest::AccessList, json)
+        }
         AccessCommands::Show {
             reference,
             raw,
@@ -1831,7 +1935,7 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
     let config = load_client_config(json)?;
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = admin_client(socket_path, tcp_port, &config);
-    let response = match client.send_admin(request).await {
+    let mut response = match client.send_admin(request).await {
         Ok(response) => response,
         Err(error) => {
             let error = describe_connect_failure(error, &client, source);
@@ -1841,6 +1945,14 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             return Err(error);
         }
     };
+    let filtered = list_state_filter.is_some() || list_agent_filter.is_some();
+    if let server::AdminResponse::AccessItems { items } = &mut response {
+        filter_access_items(
+            items,
+            list_state_filter.as_deref(),
+            list_agent_filter.as_deref(),
+        );
+    }
     let decision_failed = access_decision_failed(&response);
     if json {
         let document = match access_json_response(&response) {
@@ -1856,7 +1968,11 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
     match response {
         server::AdminResponse::AccessItems { items } => {
             if items.is_empty() {
-                println!("(no access requests or sessions)");
+                if filtered {
+                    println!("(no matching access requests or sessions)");
+                } else {
+                    println!("(no access requests or sessions)");
+                }
             }
             for item in items {
                 println!(
@@ -2089,6 +2205,22 @@ fn provisional_human_line(provisional: &server::ProvisionalSummary, color: bool)
             .unwrap_or_default(),
         secret_names,
     )
+}
+
+/// Client-side `access list` narrowing. The list RPC is unfiltered; these
+/// filters cut the returned items to one state (for example `pending`,
+/// `active`, `expired`) or one requesting agent principal.
+pub(crate) fn filter_access_items(
+    items: &mut Vec<server::AccessItem>,
+    state: Option<&str>,
+    agent: Option<&str>,
+) {
+    if let Some(state) = state {
+        items.retain(|item| item.state == state);
+    }
+    if let Some(agent) = agent {
+        items.retain(|item| item.requester == agent);
+    }
 }
 
 fn any_decision_failed(items: &[server::AccessDecisionResult]) -> bool {

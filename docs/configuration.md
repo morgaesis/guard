@@ -84,6 +84,8 @@ enforcement surface for repeated commands whose executable shapes are finite.
 An optional `exec_timeout_secs` field applies a wall-clock limit to one verb and
 overrides `GUARD_EXEC_TIMEOUT_SECS`; setting the field to `0` makes that verb
 unlimited.
+A copyable supplement in this style for an in-house `servicectl` CLI is at
+[`examples/system-prompt-append-tools.md`](../examples/system-prompt-append-tools.md).
 
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
 enabled, policy allow patterns do not skip evaluation. `--no-evaluator` makes

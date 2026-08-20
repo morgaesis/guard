@@ -70,9 +70,9 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 
 use cli_client::{
     handle_access, handle_api, handle_approval, handle_audit_tail, handle_audit_verify,
-    handle_config, handle_gate_action, handle_provisionals, handle_resume, handle_status,
-    handle_verb, run_exec, run_mcp, warn_resume_alias_deprecated, GatingOptions, RunInjections,
-    SshHostKeyCliMode,
+    handle_config, handle_gate_action, handle_provisional_show, handle_provisionals, handle_resume,
+    handle_status, handle_verb, run_exec, run_mcp, warn_resume_alias_deprecated, GatingOptions,
+    RunInjections, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -249,11 +249,12 @@ enum MainArgs {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
-    /// Print a categorized command tree with access markers.
+    /// Print the full command tree with one-line summaries, generated from
+    /// the CLI definition itself.
     #[clap(name = "help-tree")]
     HelpTree {
-        /// Include operator-authorized commands.
-        #[arg(long, action = ArgAction::SetTrue)]
+        /// Superseded: the tree always includes operator-authorized commands.
+        #[arg(long, hide = true, action = ArgAction::SetTrue)]
         admin: bool,
     },
     /// Generate shell completion definitions.
@@ -268,6 +269,8 @@ enum MainArgs {
         /// Emit machine-readable provisional records.
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
+        #[command(subcommand)]
+        command: Option<ProvisionalCommands>,
     },
     /// Confirm a provisional: keep the change and cancel its auto-revert.
     /// Daemon-UID only.
@@ -303,6 +306,20 @@ enum MainArgs {
     /// Inspect the daemon's hash-chained audit log. Daemon-principal only.
     #[clap(subcommand)]
     Audit(AuditCommands),
+}
+
+#[derive(Subcommand)]
+enum ProvisionalCommands {
+    /// Show full detail for one provisional execution.
+    Show {
+        /// Provisional handle from `guard provisionals`.
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit the machine-readable provisional record.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -457,6 +474,12 @@ enum AccessCommands {
     },
     /// List compact request and session state.
     List {
+        /// Only items in this state (for example pending, active, expired).
+        #[arg(long, value_name = "STATE")]
+        state: Option<String>,
+        /// Only items requested by this agent principal.
+        #[arg(long, value_name = "PRINCIPAL")]
+        agent: Option<String>,
         #[arg(long)]
         socket: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
@@ -494,7 +517,6 @@ enum VerbCommands {
         json: bool,
     },
     /// Show one verb, including typed coverage and generation evidence.
-    #[clap(hide = true)]
     Show {
         name: String,
         #[arg(long)]
@@ -503,7 +525,6 @@ enum VerbCommands {
         json: bool,
     },
     /// Delete one operator-authored verb.
-    #[clap(hide = true)]
     Delete {
         name: String,
         #[arg(long)]
@@ -1492,7 +1513,18 @@ async fn run_main() -> Result<()> {
             .await
         }
         Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
-        Ok(MainArgs::Provisionals { socket, json }) => handle_provisionals(socket, json).await,
+        Ok(MainArgs::Provisionals {
+            socket,
+            json,
+            command,
+        }) => match command {
+            Some(ProvisionalCommands::Show {
+                handle,
+                socket: show_socket,
+                json: show_json,
+            }) => handle_provisional_show(show_socket.or(socket), handle, json || show_json).await,
+            None => handle_provisionals(socket, json).await,
+        },
         Ok(MainArgs::Confirm { handle, socket }) => {
             handle_gate_action(socket, "confirm", handle).await
         }
@@ -1555,8 +1587,8 @@ async fn run_main() -> Result<()> {
             legacy_authority_error("appeal", "guard access request <intent>")
         }
         Ok(MainArgs::Status { socket, json }) => handle_status(socket, json).await,
-        Ok(MainArgs::HelpTree { admin }) => {
-            print_help_tree(admin);
+        Ok(MainArgs::HelpTree { admin: _ }) => {
+            print_help_tree();
             Ok(())
         }
         Ok(MainArgs::Completions { shell }) => {
@@ -1719,60 +1751,59 @@ fn find_subcommand<'cmd>(parent: &'cmd clap::Command, token: &str) -> Option<&'c
         .find(|sub| sub.get_name() == token || sub.get_all_aliases().any(|alias| alias == token))
 }
 
-fn print_help_tree(admin: bool) {
+/// One entry of the generated help tree: the canonical command path, the
+/// display name (canonical name plus any accepted aliases), and the command's
+/// about text flattened to a single line. Derived from the clap command model
+/// itself so the tree cannot drift from the real CLI surface; hidden commands
+/// and clap's implicit `help` subcommand are excluded.
+fn help_tree_entries(
+    command: &clap::Command,
+    path: &[String],
+    entries: &mut Vec<(Vec<String>, String, String)>,
+) {
+    for sub in command.get_subcommands() {
+        if sub.is_hide_set() || sub.get_name() == "help" {
+            continue;
+        }
+        let mut sub_path = path.to_vec();
+        sub_path.push(sub.get_name().to_string());
+        let mut display = sub.get_name().to_string();
+        for alias in sub.get_all_aliases() {
+            display.push('|');
+            display.push_str(alias);
+        }
+        let about = sub
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        entries.push((sub_path.clone(), display, about));
+        help_tree_entries(sub, &sub_path, entries);
+    }
+}
+
+fn print_help_tree() {
     let color = color_enabled_for_stdout();
-    println!("{}", paint("guard access summary", AnsiColor::Bold, color));
-    println!("  user");
-    println!("    run|exec <binary> [args...]");
-    println!("    server connect <binary> [args...]");
-    println!("    status");
-    println!("    server status");
-    println!("    secrets|secret add|remove|list");
-    println!("    verb list");
-    println!("    verb run <name> --param key=value");
-    println!("    access request \"<intent>\"");
-    println!("    access list");
-    println!("    access show <request-or-session>");
-    println!("    access status <session>");
-    println!("    provisionals");
-    println!("    approval list|show|note|withdraw");
-    println!("    approval show <handle> --wait");
-    println!("    approval resume <handle> [--wait]");
-    println!("    mcp serve");
-    println!();
-    println!("  local setup");
-    println!("    shim [tools] [--list|--remove]");
-    println!("    config show|set-server|set-port|set-token|set-admin-token|set-user|clear");
-    if admin {
-        println!();
-        println!("{}", paint("  admin", AnsiColor::Yellow, color));
-        println!("    server start");
-        println!("    verb show <name>");
-        println!("    access approve <request>... [--once|--uses N|--yes]");
-        println!("    access approve <request> [--dry-run|--wait]");
-        println!("    access revoke <session-or-agent>");
-        println!("    access deny <request>... [--reason text]");
-        println!("    access extend <session-or-agent> \"<intent>\" [--once|--uses N]");
-        println!("    secrets list --detailed");
-        println!("    confirm|revert <handle>");
-        println!("    audit verify|tail [-n N]");
-    } else {
-        println!();
-        println!(
-            "{}",
-            paint(
-                "Run `guard help-tree --admin` to include operator-authorized commands.",
-                AnsiColor::Cyan,
-                color,
-            )
-        );
+    println!("{}", paint("guard command tree", AnsiColor::Bold, color));
+    let mut entries = Vec::new();
+    help_tree_entries(&MainArgs::command(), &[], &mut entries);
+    for (path, display, about) in &entries {
+        let indent = "  ".repeat(path.len());
+        let name = if path.len() == 1 {
+            paint(display, AnsiColor::Bold, color)
+        } else {
+            display.clone()
+        };
+        if about.is_empty() {
+            println!("{indent}{name}");
+        } else {
+            println!("{indent}{name}  {about}");
+        }
     }
     println!();
-    println!("Access markers:");
-    println!("  user commands are available to allowed local callers.");
-    println!("  local setup commands edit client-side files for the invoking account.");
-    println!("  access list and show expose stable references and scoped authority, never raw session tokens.");
-    println!("  admin commands require operator authority for the active transport.");
+    println!("Each summary states its own authority where one is required; commands without one are available to allowed local callers.");
 }
 #[cfg(test)]
 mod tests;

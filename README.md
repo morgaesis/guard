@@ -1,5 +1,8 @@
 # guard
 
+[![CI](https://github.com/morgaesis/guard/actions/workflows/ci.yml/badge.svg)](https://github.com/morgaesis/guard/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/morgaesis/guard/badge)](https://scorecard.dev/viewer/?uri=github.com/morgaesis/guard)
+
 Guard is a policy-gated command and API broker for AI agents. Agents submit
 ordinary commands or API requests and describe missing access in prose. The
 Guard daemon applies policy, reduces approved intent to bounded enforcement

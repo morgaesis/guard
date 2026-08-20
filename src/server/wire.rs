@@ -821,9 +821,6 @@ pub enum AdminResponse {
     ApprovalWait {
         wait: AccessWaitResult,
     },
-    SessionBulkRevoked {
-        count: usize,
-    },
     EvaluationBatch {
         items: Vec<BatchEvaluation>,
     },
