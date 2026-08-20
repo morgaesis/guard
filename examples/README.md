@@ -1,7 +1,7 @@
 # Example configurations
 
 Reference configurations for Guard. None are loaded automatically. The default
-is evaluator-only command gating with `openai/gpt-5.6-luna` through OpenRouter,
+is evaluator-only command gating with `openai/gpt-5.4-mini` through OpenRouter,
 function calling, and two retries. The files in this directory opt into a
 specific deterministic policy, verb catalog, saved grant, API policy, or model
 fallback configuration.

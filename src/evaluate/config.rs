@@ -16,18 +16,17 @@ use tokio::sync::RwLock;
 /// The user's stated preference is a single call to this model, no fallback, no
 /// static policy. Changing this default will change the out-of-the-box behaviour
 /// of every daemon, so update deliberately.
-const DEFAULT_MODEL: &str = "openai/gpt-5.6-luna";
+const DEFAULT_MODEL: &str = "openai/gpt-5.4-mini";
 /// Generous enough for a slow provider cold-start plus a reasoning model's
 /// hidden thinking tokens; 10s produced spurious transport timeouts in
 /// production.
 const DEFAULT_TIMEOUT: u64 = 30;
 pub(super) const DEFAULT_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_RETRIES: u32 = 2;
-/// Default hidden-reasoning budget requested from the provider. `high` holds
-/// the full prompt-regression corpus with the default model and costs little
-/// on it; lower it for expensive or non-reasoning models. See
-/// `prompt::add_reasoning_controls` for how it reaches the provider.
-pub const DEFAULT_REASONING_EFFORT: &str = "high";
+/// Default hidden-reasoning budget requested from the provider. See
+/// `prompt::add_reasoning_controls` for why `minimal` is the default; raise
+/// it per deployment for reasoning-capable models such as gpt-5.6-luna.
+pub const DEFAULT_REASONING_EFFORT: &str = "minimal";
 /// Effort values accepted by both the OpenRouter `reasoning.effort` field and
 /// the OpenAI-compatible `reasoning_effort` field.
 pub const REASONING_EFFORT_VALUES: [&str; 5] = ["minimal", "low", "medium", "high", "max"];
@@ -289,7 +288,7 @@ mod tests {
         assert!(config.models.is_empty());
         assert_eq!(config.timeout_secs, DEFAULT_TIMEOUT);
         assert_eq!(config.model(), DEFAULT_MODEL);
-        assert_eq!(config.model(), "openai/gpt-5.6-luna");
+        assert_eq!(config.model(), "openai/gpt-5.4-mini");
         assert_eq!(config.api_url(), DEFAULT_API_URL);
         assert_eq!(config.retries, DEFAULT_RETRIES);
     }
@@ -298,7 +297,7 @@ mod tests {
     fn test_llm_config_model_chain_default_single() {
         let config = LlmConfig::default();
         let chain = config.model_chain();
-        assert_eq!(chain, vec!["openai/gpt-5.6-luna".to_string()]);
+        assert_eq!(chain, vec!["openai/gpt-5.4-mini".to_string()]);
     }
 
     #[test]
