@@ -1382,9 +1382,15 @@ impl SessionStore {
                     format!("decode durable grant request {handle} with status {status}")
                 })?;
                 if validate_access_authority {
-                    validate_persisted_access_request(&request).with_context(|| {
-                        format!("validate durable access coverage for request {handle}")
-                    })?;
+                    if let Err(error) = validate_persisted_access_request(&request) {
+                        tracing::warn!(
+                            %handle,
+                            %error,
+                            "skipping durable grant request that fails current validation; \
+                             the row is never honored and can be cleared with guard access"
+                        );
+                        continue;
+                    }
                 }
                 if request.handle != handle
                     || request.status.as_str() != status
@@ -2043,9 +2049,15 @@ impl SessionStore {
                 let request = serde_json::from_str::<GrantRequest>(&json).with_context(|| {
                     format!("decode durable grant request {handle} with status {status}")
                 })?;
-                validate_persisted_access_request(&request).with_context(|| {
-                    format!("validate durable access coverage for request {handle}")
-                })?;
+                if let Err(error) = validate_persisted_access_request(&request) {
+                    tracing::warn!(
+                        %handle,
+                        %error,
+                        "skipping durable grant request that fails current validation; \
+                         the row is never honored and can be cleared with guard access"
+                    );
+                    continue;
+                }
                 let created_unix = decode_u64(created_unix)?;
                 if request.handle != handle
                     || request.status.as_str() != status
@@ -4410,7 +4422,9 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        assert!(store.load_grant_requests().await.is_err());
+        // A row an older binary wrote under a superseded scheme must not
+        // refuse the daemon boot: it is skipped fail-closed instead.
+        assert!(store.load_grant_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4560,15 +4574,16 @@ mod tests {
         drop(store);
 
         for _ in 0..2 {
-            assert!(SessionStore::open(path.clone(), 3_600).await.is_err());
+            // An inconsistent legacy row must not refuse the boot. It is
+            // skipped fail-closed on load and never rewritten: sanitizing a
+            // row that fails validation would launder it.
+            let reopened = SessionStore::open(path.clone(), 3_600).await.unwrap();
+            assert!(reopened.load_grant_requests().await.unwrap().is_empty());
+            drop(reopened);
             let connection = Connection::open(&path).unwrap();
-            let version: i64 = connection
-                .query_row("PRAGMA user_version", [], |row| row.get(0))
-                .unwrap();
             let durable: String = connection
                 .query_row("SELECT json FROM grant_requests", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, SCHEMA_VERSION - 1);
             assert_eq!(durable, json);
         }
     }
@@ -4617,11 +4632,14 @@ mod tests {
             drop(conn);
             drop(store);
 
-            let error = SessionStore::open(path.clone(), 3600).await.unwrap_err();
-            assert!(!error.to_string().contains(&value));
+            // A sensitive row an older binary persisted must not refuse the
+            // daemon boot; it is skipped fail-closed on load instead.
+            let reopened = SessionStore::open(path.clone(), 3600).await.unwrap();
+            assert!(reopened.load_grant_requests().await.unwrap().is_empty());
+            drop(reopened);
 
-            let error = SessionStore::open(path, 3600).await.unwrap_err();
-            assert!(!error.to_string().contains(&value));
+            let reopened = SessionStore::open(path, 3600).await.unwrap();
+            assert!(reopened.load_grant_requests().await.unwrap().is_empty());
         }
     }
 
@@ -4796,8 +4814,10 @@ mod tests {
             drop(store);
 
             for _ in 0..2 {
-                let error = SessionStore::open(path.clone(), 3600).await.unwrap_err();
-                assert!(!error.to_string().contains(&value));
+                // Rows persisted by an older binary must not refuse the boot;
+                // they are skipped fail-closed on load instead.
+                let reopened = SessionStore::open(path.clone(), 3600).await.unwrap();
+                assert!(reopened.load_grant_requests().await.unwrap().is_empty());
             }
         }
     }
@@ -4830,7 +4850,7 @@ mod tests {
             )
             .unwrap();
             drop(conn);
-            assert!(store.load_grant_requests().await.is_err());
+            assert!(store.load_grant_requests().await.unwrap().is_empty());
         }
     }
 
@@ -4870,7 +4890,7 @@ mod tests {
             )
             .unwrap();
             drop(conn);
-            assert!(store.load_grant_requests().await.is_err());
+            assert!(store.load_grant_requests().await.unwrap().is_empty());
         }
     }
 
