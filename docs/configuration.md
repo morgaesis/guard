@@ -79,6 +79,8 @@ verbs:
 
 The prompt supplement explains novel invocations. The typed verb is the
 enforcement surface for repeated commands whose executable shapes are finite.
+A copyable supplement in this style for an in-house `servicectl` CLI is at
+[`examples/system-prompt-append-tools.md`](../examples/system-prompt-append-tools.md).
 
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
 enabled, policy allow patterns do not skip evaluation. `--no-evaluator` makes
