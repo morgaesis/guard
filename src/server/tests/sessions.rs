@@ -2980,8 +2980,10 @@ async fn approved_matcher_name_tamper_fails_closed_across_restart_boundaries() {
         )
         .unwrap();
     drop(connection);
-    assert!(store.load_grant_requests().await.is_err());
-    assert!(store.load_registry().await.is_err());
+    // The tampered row is skipped fail-closed on load rather than refusing
+    // the boot; the provenance and install checks below still reject it.
+    assert!(store.load_grant_requests().await.unwrap().is_empty());
+    assert!(store.load_registry().await.is_ok());
 
     let (mut restarted, _) = make_test_config();
     restarted.config.daemon_uid = 777;
