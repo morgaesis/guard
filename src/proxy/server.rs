@@ -1229,7 +1229,10 @@ impl ApiProxy {
         if let Some(reason) = self.protocol.deny_outright(op) {
             return Ok(Some(reason));
         }
-        let decision = policy.decide(op);
+        // This judges a hypothetical operation with no request body, so rules
+        // gated on body metadata predicates cannot match and the check stays
+        // conservative: it can over-refuse, never under-refuse.
+        let decision = policy.decide(op, b"");
         Ok(matches!(decision.action, ApiAction::Deny).then_some(decision.reason))
     }
 
