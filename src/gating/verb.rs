@@ -6472,7 +6472,9 @@ mod asynchronous_adoption_tests {
         assert!(receive.recv_timeout(Duration::from_millis(100)).is_err());
         assert!(lease.render("inspect-object", &BTreeMap::new()).is_ok());
         drop(lease);
-        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Generous: this wait proves completion, not latency; slow Windows
+        // runners exceed small bounds on the reload-and-delete round trip.
+        receive.recv_timeout(Duration::from_secs(30)).unwrap();
         writer.join().unwrap();
 
         assert!(
