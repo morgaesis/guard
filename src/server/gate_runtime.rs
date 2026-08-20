@@ -37,6 +37,32 @@ use super::{
     SWEEPER_GRACE_SECS, SWEEPER_TICK_SECS,
 };
 
+async fn api_session_requester_principal(
+    server: &ServerContext,
+    fingerprint: Option<&str>,
+    revision: Option<&str>,
+) -> Option<PrincipalKey> {
+    let (Some(fingerprint), Some(revision)) = (fingerprint, revision) else {
+        return None;
+    };
+    let sessions = server.state.sessions.read().await;
+    sessions.list().into_iter().find_map(|summary| {
+        let matches_authority = sessions
+            .api_authority_for(&summary.token)
+            .is_some_and(|(candidate, _)| candidate == fingerprint)
+            && sessions
+                .authority_snapshot(&summary.token)
+                .is_some_and(|(candidate, _)| candidate == revision);
+        if !matches_authority {
+            return None;
+        }
+        match summary.owner {
+            crate::session::SessionOwner::Principal(principal) => Some(principal),
+            crate::session::SessionOwner::Unowned => None,
+        }
+    })
+}
+
 const STAGED_CLEANUP_RETRY_SECS: u64 = 30;
 const DISPATCH_CLASSIFICATION_RETRY_SECS: u64 = 90;
 
@@ -794,6 +820,12 @@ impl guard::proxy::GateSink for DaemonGateSink {
         }
         let handle = new_handle();
         let now = now_unix();
+        let requester_principal = api_session_requester_principal(
+            &self.server,
+            mutation.session_fingerprint.as_deref(),
+            mutation.session_revision.as_deref(),
+        )
+        .await;
 
         let revert_body = mutation.revert.body.clone();
         let body_file = if revert_body.is_some() {
@@ -823,6 +855,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let provisional = Provisional {
             handle: handle.clone(),
             principal,
+            requester_principal,
             binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![mutation.label.clone()],
             cwd: None,
@@ -1037,6 +1070,21 @@ impl guard::proxy::GateSink for DaemonGateSink {
         task.await.unwrap_or(false)
     }
 
+    async fn provisional_deadline(&self, handle: &str) -> Option<u64> {
+        let provisional = self
+            .server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(handle)
+            .cloned()?;
+        (provisional.status == ProvisionalStatus::Armed
+            && provisional.forward_done
+            && provisional.deadline_unix > 0)
+            .then_some(provisional.deadline_unix)
+    }
+
     async fn mark_revert_indeterminate(
         &self,
         handle: &str,
@@ -1152,7 +1200,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
         use guard::proxy::HoldDecision;
         let principal = Some(self.server.config.daemon_principal.clone());
         if let Some(why) = gate_capacity_reason(&self.server, principal.as_ref()).await {
-            return HoldDecision::Denied { reason: why };
+            return HoldDecision::Denied {
+                reason: why,
+                handle: None,
+            };
         }
         let handle = new_handle();
         let now = now_unix();
@@ -1202,6 +1253,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             catalog_version: None,
             verb_digest: None,
             verb_composition_digest: None,
+            exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal,
@@ -1225,7 +1277,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
             notes: Vec::new(),
         };
         if let Err(reason) = persist_approval(&self.server, &approval).await {
-            return HoldDecision::Denied { reason };
+            return HoldDecision::Denied {
+                reason,
+                handle: None,
+            };
         }
         let notify = self
             .server
@@ -1308,6 +1363,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                         reason: a
                             .decided_reason
                             .unwrap_or_else(|| a.status.as_str().to_string()),
+                        handle: Some(handle),
                     };
                 }
                 Some(_) => {}
@@ -1315,6 +1371,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                     orphan_guard.armed = false;
                     return HoldDecision::Denied {
                         reason: "held request disappeared from the queue".to_string(),
+                        handle: Some(handle),
                     };
                 }
             }
@@ -1327,6 +1384,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                 orphan_guard.armed = false;
                 return HoldDecision::Denied {
                     reason: "expired without operator approval".to_string(),
+                    handle: Some(handle),
                 };
             }
             let poll = remaining
@@ -1696,6 +1754,34 @@ pub(super) struct GateInputs {
     /// Selected requester-session verbs supplying this execution's authority.
     /// Baseline or unrelated work leaves this empty.
     pub(super) consume_access_verbs: Vec<String>,
+    /// Deterministic floor: route this allow to an operator hold regardless of
+    /// its reversibility class and risk score. Set by the safe-mode
+    /// opaque-carrier floor (`guard::gating::opaque_carrier_floor_reason`);
+    /// the caller's own `--require-approval` is honored separately from the
+    /// request.
+    pub(super) force_hold: bool,
+}
+
+fn held_containment_guidance(
+    reversibility: Option<Reversibility>,
+    risk: Option<i32>,
+    revert_preauthorized: bool,
+    has_revert: bool,
+    confirm_within_secs: Option<u64>,
+) -> Option<String> {
+    if decide_gate(reversibility, risk, true, false) != GateOutcome::Contain {
+        return None;
+    }
+    let window = confirm_within_secs.unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS);
+    if revert_preauthorized && has_revert {
+        Some(format!(
+            "contain: re-run with --confirm-within {window} to execute under auto-revert"
+        ))
+    } else {
+        Some(format!(
+            "contain: re-run with --revert '<cmd>' --confirm-within {window} to execute under auto-revert"
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1783,17 +1869,28 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             );
         }
     }
+    let exec_timeout_secs = inputs
+        .verb
+        .as_ref()
+        .and_then(|verb| verb.exec_timeout_secs)
+        .unwrap_or(server.config.exec_timeout_secs);
     let command_authority = Some(CommandAuthorization::routed(
         inputs.verb.as_ref(),
         inputs.authority.as_ref(),
+        exec_timeout_secs,
     ));
     let secret_authority = inputs
         .authority
         .as_ref()
         .map(|snapshot| snapshot.secret_entitlements.clone());
 
-    // Gating off, or an operator-authored static-policy allow: execute directly.
-    if !server.config.gate.is_on() || inputs.bypass {
+    let force_hold = request.require_approval.unwrap_or(false)
+        || inputs.verb.as_ref().is_some_and(|verb| verb.hold)
+        || inputs.force_hold;
+
+    // Gating off, or an operator-authored static-policy allow with no matched
+    // per-verb hold requirement: execute directly.
+    if !server.config.gate.is_on() || (inputs.bypass && !force_hold) {
         if let Err(reason) =
             admit_access_use(server, &request, &inputs.consume_access_verbs, None).await
         {
@@ -1818,7 +1915,6 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
     // The row owner is the caller's cross-platform principal (uid string on
     // Unix, SID on Windows). A non-Unix caller is no longer dropped to None.
     let caller_principal = context.caller.principal();
-    let force_hold = request.require_approval.unwrap_or(false);
     let revert_available = request.revert.is_some();
     let outcome = decide_gate(
         inputs.reversibility,
@@ -1894,8 +1990,16 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             .await
         }
         GateOutcome::Hold => {
+            let containment_guidance = held_containment_guidance(
+                inputs.reversibility,
+                inputs.risk,
+                inputs.revert_preauthorized,
+                request.revert.is_some(),
+                request.confirm_within_secs,
+            );
             hold_for_approval_with_trace(context, request, caller_principal, inputs, decision_trace)
                 .await
+                .with_verb_resolution(Vec::new(), containment_guidance)
         }
     }
 }
@@ -2077,6 +2181,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     let provisional = Provisional {
         handle: handle.clone(),
         principal: caller_principal,
+        requester_principal: None,
         binary: request.binary.clone(),
         args: request.args.clone(),
         cwd: request.cwd.clone(),
@@ -2649,6 +2754,11 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
         verb_digest: verb.as_ref().and_then(|v| v.verb_digest.clone()),
         verb_composition_digest: verb.as_ref().and_then(|v| v.composition_digest.clone()),
+        exec_timeout_secs: Some(
+            verb.as_ref()
+                .and_then(|verb| verb.exec_timeout_secs)
+                .unwrap_or(server.config.exec_timeout_secs),
+        ),
         access_verbs: consume_access_verbs,
         access_requests,
         principal: caller_principal,
@@ -2726,7 +2836,9 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         }
         None => ExecuteResult::held(reason, handle.clone(), Coverage::hold()).with_verb_resolution(
             Vec::new(),
-            Some(format!("approve: guard access approve {handle} --once")),
+            Some(super::admin::approval_guidance(
+                server, caller, &handle, true,
+            )),
         ),
     }
 }
@@ -2788,7 +2900,9 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
             )
             .with_verb_resolution(
                 Vec::new(),
-                Some(format!("approve: guard access approve {handle} --once")),
+                Some(super::admin::approval_guidance(
+                    server, caller, handle, true,
+                )),
             );
         }
 
@@ -3400,6 +3514,7 @@ async fn execute_snapshot_request(
         Some(CommandAuthorization::replay(
             verb_authority,
             session_authority,
+            snapshot.exec_timeout_secs,
         )),
     )
     .await
@@ -4267,6 +4382,146 @@ mod transactional_tests {
             upstream_target: "https://fixture.invalid".to_string(),
             upstream_identity: "fixture-identity".to_string(),
         }
+    }
+
+    #[test]
+    fn held_recoverable_commands_name_the_available_containment_route() {
+        assert_eq!(
+            held_containment_guidance(
+                Some(Reversibility::Recoverable),
+                Some(4),
+                false,
+                false,
+                Some(120),
+            ),
+            Some(
+                "contain: re-run with --revert '<cmd>' --confirm-within 120 to execute under auto-revert"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            held_containment_guidance(Some(Reversibility::Recoverable), Some(4), true, true, None,),
+            Some(
+                "contain: re-run with --confirm-within 300 to execute under auto-revert"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn held_irreversible_or_high_risk_commands_do_not_promise_containment() {
+        assert_eq!(
+            held_containment_guidance(
+                Some(Reversibility::Irreversible),
+                Some(4),
+                false,
+                false,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            held_containment_guidance(Some(Reversibility::Recoverable), Some(9), true, true, None,),
+            None
+        );
+    }
+
+    fn api_session(owner: PrincipalKey) -> crate::session::SessionGrant {
+        crate::session::SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: false,
+            auto_amend: false,
+            granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(owner),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_revert_persists_session_owner_without_changing_daemon_identity() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let owner = PrincipalKey::from_uid(4242);
+        let token = "session-attribution";
+        assert!(server
+            .state
+            .sessions
+            .write()
+            .await
+            .grant(token.to_string(), api_session(owner.clone())));
+        let (session_fingerprint, session_revision) = {
+            let sessions = server.state.sessions.read().await;
+            let (fingerprint, _) = sessions.api_authority_for(token).unwrap();
+            let (revision, _) = sessions.authority_snapshot(token).unwrap();
+            (fingerprint, revision)
+        };
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: "fixture-endpoint".to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let mut mutation = fixture_api_mutation(false);
+        mutation.session_fingerprint = Some(session_fingerprint.clone());
+        mutation.session_revision = Some(session_revision);
+
+        let handle = guard::proxy::GateSink::arm_revert(&sink, mutation)
+            .await
+            .unwrap();
+        let staged = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            staged.principal,
+            Some(server.config.daemon_principal.clone())
+        );
+        assert_eq!(staged.requester_principal, Some(owner.clone()));
+        assert_eq!(staged.session_fingerprint, Some(session_fingerprint));
+
+        assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+        assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+        let armed = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            guard::proxy::GateSink::provisional_deadline(&sink, &handle).await,
+            Some(armed.deadline_unix)
+        );
+
+        let persisted = store
+            .load_provisionals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.handle == handle)
+            .unwrap();
+        assert_eq!(persisted.principal, Some(server.config.daemon_principal));
+        assert_eq!(persisted.requester_principal, Some(owner));
+        assert_eq!(persisted.session_fingerprint, armed.session_fingerprint);
     }
 
     #[tokio::test]

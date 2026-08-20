@@ -10,7 +10,7 @@ use guard::env::now_unix;
 use guard::gating::verb::{
     canonicalize_generated_authority_envelope, generated_access_matcher_shape,
     normalize_generated_access_verb, parse_normalized_generated_access_verb, CoverageAction,
-    CoverageProbe, CoverageProvenance, ValueConstraint, Verb, VerbCoverageCell,
+    CoverageObservationReplay, CoverageProvenance, ValueConstraint, Verb, VerbCoverageCell,
 };
 use guard::gating::Reversibility;
 use guard::principal::PrincipalKey;
@@ -758,18 +758,19 @@ fn migrate_legacy_pattern(
             prompt_stamp: "not-applicable".to_string(),
             model_stamp: "not-applicable".to_string(),
             generated_unix: now_unix(),
-            probes: vec![
-                CoverageProbe {
+            probes: Vec::new(),
+            // Replayed from the migrated legacy pattern; no probe was
+            // executed against the generated cell.
+            observation_replays: vec![
+                CoverageObservationReplay {
                     dimension: "evidence".to_string(),
                     args: evidence_args,
-                    expected_match: true,
-                    observed_match: true,
+                    template_match: true,
                 },
-                CoverageProbe {
+                CoverageObservationReplay {
                     dimension: "boundary".to_string(),
                     args: boundary_args,
-                    expected_match: trailing_wildcard,
-                    observed_match: trailing_wildcard,
+                    template_match: trailing_wildcard,
                 },
             ],
         }),
@@ -788,8 +789,10 @@ fn migrate_legacy_pattern(
         params: BTreeMap::new(),
         consequence: Reversibility::Irreversible,
         revert: None,
+        hold: false,
         trusted: action == CoverageAction::Preauthorized,
         prompt_context: None,
+        exec_timeout_secs: None,
         source_prose: None,
         evidence: Some(evidence_metadata),
         auto_promoted: false,
@@ -840,14 +843,23 @@ fn validate_saved_grant(grant: &SavedGrant) -> Result<()> {
                     cell.name
                 )
             })?;
-            if provenance.probes.is_empty()
-                || provenance
-                    .probes
-                    .iter()
-                    .any(|probe| probe.expected_match != probe.observed_match)
+            if provenance
+                .probes
+                .iter()
+                .any(|probe| probe.expected_match != probe.observed_match)
             {
                 bail!(
-                    "generated verb '{}' coverage '{}' has incomplete or failing probes",
+                    "generated verb '{}' coverage '{}' has failing probes",
+                    verb.name,
+                    cell.name
+                );
+            }
+            // Provenance must carry at least one record of where the cell
+            // came from: either probes a generator actually executed or
+            // observation replays of the evidence it was derived from.
+            if provenance.probes.is_empty() && provenance.observation_replays.is_empty() {
+                bail!(
+                    "generated verb '{}' coverage '{}' has no probe or observation-replay provenance",
                     verb.name,
                     cell.name
                 );
@@ -906,7 +918,7 @@ fn selector_matches(selector: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use guard::gating::verb::{generated_access_verb_name, ParamSpec};
+    use guard::gating::verb::{generated_access_verb_name, CoverageProbe, ParamSpec};
 
     #[test]
     fn parses_saved_grant_catalog() {
@@ -1273,6 +1285,7 @@ mod tests {
                             expected_match: true,
                             observed_match: true,
                         }],
+                        observation_replays: Vec::new(),
                     }),
                 }],
                 credential_plan: None,
@@ -1287,8 +1300,10 @@ mod tests {
                 )]),
                 consequence: Reversibility::Irreversible,
                 revert: None,
+                hold: false,
                 trusted: false,
                 prompt_context: None,
+                exec_timeout_secs: None,
                 source_prose: None,
                 evidence: None,
                 auto_promoted: false,

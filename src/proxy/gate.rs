@@ -59,9 +59,13 @@ pub enum HoldDecision {
     /// The operator approved the exact held request; the proxy forwards it.
     /// Carries the approval handle for the audit trail.
     Approved { handle: String },
-    /// Denied, expired, or never enqueued (capacity, no queue). The proxy
-    /// returns the reason to the client and forwards nothing.
-    Denied { reason: String },
+    /// Denied or expired after enqueue, or never enqueued (capacity, no queue).
+    /// The handle is present only when a durable approval exists for client
+    /// inspection.
+    Denied {
+        reason: String,
+        handle: Option<String>,
+    },
 }
 
 /// Implemented by the daemon to arm the proxy's synthesized reverts in its
@@ -80,6 +84,13 @@ pub trait GateSink: Send + Sync {
     /// Mark a staged revert as live after successful upstream response headers.
     /// The confirmation window begins only after this durable transition.
     async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool;
+
+    /// Return the persisted auto-revert deadline for an armed API mutation.
+    /// Sinks that do not expose durable provisional state retain the legacy
+    /// response shape by returning `None`.
+    async fn provisional_deadline(&self, _handle: &str) -> Option<u64> {
+        None
+    }
 
     /// Preserve an actionable rollback and record why the upstream mutation
     /// outcome is uncertain.
@@ -139,6 +150,7 @@ pub trait GateSink: Send + Sync {
     ) -> HoldDecision {
         HoldDecision::Denied {
             reason: "no operator-approval queue is attached to this proxy".to_string(),
+            handle: None,
         }
     }
 }

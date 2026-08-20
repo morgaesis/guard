@@ -52,6 +52,7 @@ const MAX_HTTP_SESSIONS: usize = 1024;
 const MAX_MCP_REQUEST_IDS: usize = 16 * 1024;
 const HTTP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Clone, Debug)]
 pub struct McpConfig {
@@ -66,6 +67,8 @@ pub struct McpConfig {
     /// Bearer token required on every HTTP request. Mandatory whenever
     /// `http_addr` is set; there is no unauthenticated network transport.
     pub http_token: Option<String>,
+    /// Deadline for one buffered daemon execute or admin round trip.
+    pub client_timeout_secs: u64,
 }
 
 impl McpConfig {
@@ -80,6 +83,9 @@ impl McpConfig {
 
         if self.tool_name.trim().is_empty() {
             bail!("MCP tool name cannot be empty");
+        }
+        if self.client_timeout_secs == 0 {
+            bail!("GUARD_CLIENT_TIMEOUT_SECS must be greater than zero");
         }
 
         if self.tool_name != DEFAULT_TOOL_NAME
@@ -126,6 +132,7 @@ impl Default for McpConfig {
             tool_name: DEFAULT_TOOL_NAME.to_string(),
             http_addr: None,
             http_token: None,
+            client_timeout_secs: DEFAULT_CLIENT_TIMEOUT_SECS,
         }
     }
 }
@@ -224,6 +231,7 @@ struct ClientExecutor {
     tcp_port: Option<u16>,
     auth_token: Option<String>,
     session_token: Option<String>,
+    client_timeout: Duration,
 }
 
 impl ClientExecutor {
@@ -243,9 +251,10 @@ impl ClientExecutor {
 #[async_trait]
 impl GuardAdmin for ClientExecutor {
     async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse> {
-        self.admin_client()
-            .send_admin(request)
+        let client = self.admin_client();
+        tokio::time::timeout(self.client_timeout, client.send_admin(request))
             .await
+            .map_err(|_| client_timeout_error("admin request", self.client_timeout, false))?
             .context("failed to query guard daemon")
     }
 
@@ -322,13 +331,37 @@ impl GuardExecutor for ClientExecutor {
             });
         }
 
-        let response = client
-            .execute_with_injections(&args.binary, &args.args, env, secrets, args.secret_files)
-            .await
-            .context("failed to execute command through guard server")?;
+        let response = tokio::time::timeout(
+            self.client_timeout,
+            client.execute_with_injections(
+                &args.binary,
+                &args.args,
+                env,
+                secrets,
+                args.secret_files,
+            ),
+        )
+        .await
+        .map_err(|_| client_timeout_error("execute request", self.client_timeout, true))?
+        .context("failed to execute command through guard server")?;
 
         Ok(response.into())
     }
+}
+
+fn client_timeout_error(
+    operation: &str,
+    timeout: Duration,
+    execution_may_continue: bool,
+) -> anyhow::Error {
+    let continuation = if execution_may_continue {
+        "; buffered daemon execution may continue after the MCP client stops waiting"
+    } else {
+        ""
+    };
+    anyhow::anyhow!(
+        "guard daemon {operation} exceeded the client deadline of {timeout:?} (GUARD_CLIENT_TIMEOUT_SECS){continuation}"
+    )
 }
 
 fn guard_tool_secret_map(
@@ -370,6 +403,7 @@ pub async fn serve(config: McpConfig) -> Result<()> {
         tcp_port: config.tcp_port,
         auth_token: config.auth_token.clone(),
         session_token: config.session_token.clone(),
+        client_timeout: Duration::from_secs(config.client_timeout_secs),
     });
     let surface = probe_mcp_surface(executor.as_ref(), &config).await;
     let server = McpServer::new(executor.clone(), executor, config.tool_name)
@@ -1524,7 +1558,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             "approval_options": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Exact operator commands for a denied or held request. A held command exposes the one-shot approval command; a denied request may expose ordinary, one-time, and bounded-use approval commands."
+                                "description": "Audience-correct approval guidance for a denied or held request. Operators receive exact commands; requesters are directed to their admin."
                             },
                             "access_requests": {
                                 "type": "array",
@@ -1539,7 +1573,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                                     },
                                     "required": ["reference", "approval_options"]
                                 },
-                                "description": "Every durable access request created by the decision, with exact operator commands for each independently scoped request."
+                                "description": "Every durable access request created by the decision, with audience-correct approval guidance for each independently scoped request."
                             },
                             "coverage": { "type": ["object", "null"], "description": "What the gate checked and deliberately did NOT check (checked / not_checked arrays). Surfaced for held/provisional/dry-run outcomes." },
                             "verb_matches": {
@@ -1814,9 +1848,10 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             format!("\n    params: {}", verb.params.join(", "))
                         };
                         format!(
-                            "{} [{}]{} - {}{}",
+                            "{} [{}]{}{} - {}{}",
                             verb.name,
                             verb.consequence,
+                            if verb.hold { " hold" } else { "" },
                             if verb.has_revert { " revertable" } else { "" },
                             verb.description,
                             params
@@ -2065,9 +2100,10 @@ fn render_verbs_text(items: &[server::VerbSummary]) -> String {
     let mut lines = Vec::with_capacity(items.len());
     for v in items {
         let mut line = format!(
-            "{} [{}]{}{} - {}",
+            "{} [{}]{}{}{} - {}",
             v.name,
             v.consequence,
+            if v.hold { " hold" } else { "" },
             if v.trusted { " trusted" } else { "" },
             if v.has_revert { " revertable" } else { "" },
             v.description
@@ -2205,11 +2241,12 @@ fn render_access_text(items: &[server::AccessItem]) -> String {
                 item.state,
                 item.next_action
             );
-            for (label, command) in ["approve", "once", "bounded"]
-                .into_iter()
-                .zip(item.approval_options.iter())
-            {
-                line.push_str(&format!("\n{label}: {command}"));
+            for option in &item.approval_options {
+                if option.starts_with("guard access approve ") {
+                    line.push_str(&format!("\napproval: {option}"));
+                } else {
+                    line.push_str(&format!("\n{option}"));
+                }
             }
             line
         })
@@ -2597,12 +2634,17 @@ fn render_access_next_steps(result: &Value, handle: &str, approval_options: &[&s
         let mut output = String::from("\nAccess requests:");
         for (reference, commands) in access_requests {
             output.push_str(&format!("\n- `{reference}`"));
-            for command in commands {
-                output.push_str(&format!("\n  `{command}`"));
+            for command in &commands {
+                output.push_str(&render_approval_option(command, "  "));
             }
-            output.push_str(&format!(
-                "\n  Inspect with `guard access show {reference}`."
-            ));
+            if !commands
+                .iter()
+                .any(|command| command.contains("guard access show "))
+            {
+                output.push_str(&format!(
+                    "\n  Inspect with `guard access show {reference}`."
+                ));
+            }
         }
         return output;
     }
@@ -2613,19 +2655,36 @@ fn render_access_next_steps(result: &Value, handle: &str, approval_options: &[&s
 fn render_single_access_next_steps(handle: &str, approval_options: &[&str]) -> String {
     let mut output = String::new();
     if !approval_options.is_empty() {
-        output.push_str(if approval_options.len() == 1 {
+        let has_operator_commands = approval_options
+            .iter()
+            .any(|option| option.starts_with("guard access approve "));
+        output.push_str(if has_operator_commands && approval_options.len() == 1 {
             "\nOperator command:"
-        } else {
+        } else if has_operator_commands {
             "\nOperator commands:"
+        } else {
+            "\nNext step:"
         });
-        for command in approval_options {
-            output.push_str(&format!("\n`{command}`"));
+        for option in approval_options {
+            output.push_str(&render_approval_option(option, ""));
         }
     }
-    if !handle.is_empty() {
+    if !handle.is_empty()
+        && !approval_options
+            .iter()
+            .any(|option| option.contains("guard access show "))
+    {
         output.push_str(&format!("\nInspect with `guard access show {handle}`."));
     }
     output
+}
+
+fn render_approval_option(option: &str, indent: &str) -> String {
+    if option.starts_with("guard access approve ") {
+        format!("\n{indent}`{option}`")
+    } else {
+        format!("\n{indent}{option}")
+    }
 }
 
 fn decision_text(result: &Value) -> String {
@@ -3163,6 +3222,27 @@ mod tests {
     }
 
     #[test]
+    fn requester_tool_text_returns_semantic_access_handoff() {
+        let text = render_tool_text(&serde_json::json!({
+            "allowed": false,
+            "reason": "outside current access",
+            "status": null,
+            "handle": "request-example",
+            "approval_options": [
+                "ask your admin to approve request request-example (see guard access show request-example)"
+            ],
+            "exit_code": null,
+            "stdout": null,
+            "stderr": null
+        }));
+
+        assert!(text.contains(
+            "ask your admin to approve request request-example (see guard access show request-example)"
+        ));
+        assert!(!text.contains("guard access approve"));
+    }
+
+    #[test]
     fn multi_request_denial_returns_each_exact_operator_handoff() {
         let text = render_tool_text(&serde_json::json!({
             "allowed": false,
@@ -3611,6 +3691,7 @@ mod tests {
             tcp_port: None,
             auth_token: None,
             session_token: None,
+            client_timeout: Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS),
         };
         let args: GuardToolArgs = serde_json::from_value(json!({})).unwrap();
         let error = executor.execute(args).await.unwrap_err();
@@ -3646,6 +3727,7 @@ mod tests {
             tcp_port: Some(port),
             auth_token: Some("exec-auth-fixture".to_string()),
             session_token: Some("session-fixture".to_string()),
+            client_timeout: Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS),
         };
         let args: GuardToolArgs = serde_json::from_value(json!({ "binary": "true" })).unwrap();
         executor.execute(args).await.unwrap();
@@ -3653,6 +3735,72 @@ mod tests {
         let request = captured.await.unwrap();
         assert_eq!(request["execute"]["auth_token"], "exec-auth-fixture");
         assert_eq!(request["execute"]["session_token"], "session-fixture");
+    }
+
+    #[tokio::test]
+    async fn executor_deadline_bounds_a_stalled_daemon_execute() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            let _ = lines.next_line().await.unwrap().expect("execute request");
+            std::future::pending::<()>().await;
+        });
+        let executor = ClientExecutor {
+            socket_path: None,
+            tcp_port: Some(port),
+            auth_token: None,
+            session_token: None,
+            client_timeout: Duration::from_millis(50),
+        };
+        let args: GuardToolArgs = serde_json::from_value(json!({ "binary": "true" })).unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), executor.execute(args))
+            .await
+            .expect("MCP execute must honor its client deadline")
+            .unwrap_err();
+        assert!(error.to_string().contains("client deadline"), "{error:#}");
+        assert!(
+            error.to_string().contains("GUARD_CLIENT_TIMEOUT_SECS"),
+            "{error:#}"
+        );
+        stalled.abort();
+        let _ = stalled.await;
+    }
+
+    #[tokio::test]
+    async fn admin_deadline_bounds_a_stalled_daemon_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            let _ = lines.next_line().await.unwrap().expect("admin request");
+            std::future::pending::<()>().await;
+        });
+        let executor = ClientExecutor {
+            socket_path: None,
+            tcp_port: Some(port),
+            auth_token: None,
+            session_token: None,
+            client_timeout: Duration::from_millis(50),
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            executor.send_admin(server::AdminRequest::VerbList),
+        )
+        .await
+        .expect("MCP admin request must honor its client deadline")
+        .unwrap_err();
+        assert!(error.to_string().contains("client deadline"), "{error:#}");
+        assert!(
+            error.to_string().contains("GUARD_CLIENT_TIMEOUT_SECS"),
+            "{error:#}"
+        );
+        stalled.abort();
+        let _ = stalled.await;
     }
 
     #[tokio::test]
@@ -3679,6 +3827,7 @@ mod tests {
             tcp_port: Some(port),
             auth_token: Some("exec-auth-fixture".to_string()),
             session_token: None,
+            client_timeout: Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS),
         };
         let response = executor
             .send_admin(server::AdminRequest::VerbList)
@@ -4252,6 +4401,7 @@ mod tests {
                     coverage: Vec::new(),
                     credential_plan: None,
                     consequence: "recoverable".to_string(),
+                    hold: false,
                     trusted: true,
                     has_revert: true,
                     params: std::collections::BTreeMap::new(),
@@ -4355,6 +4505,7 @@ mod tests {
             tool_name: DEFAULT_TOOL_NAME.to_string(),
             http_addr: Some("127.0.0.1:0".parse().unwrap()),
             http_token: None,
+            client_timeout_secs: DEFAULT_CLIENT_TIMEOUT_SECS,
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("bearer token"));
@@ -4366,6 +4517,11 @@ mod tests {
         config
             .validate()
             .expect("token present makes http config valid");
+
+        config.client_timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("GUARD_CLIENT_TIMEOUT_SECS"));
+        config.client_timeout_secs = DEFAULT_CLIENT_TIMEOUT_SECS;
 
         config.http_addr = Some("0.0.0.0:7333".parse().unwrap());
         let err = config.validate().unwrap_err();

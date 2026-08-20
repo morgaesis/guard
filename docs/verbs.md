@@ -34,6 +34,26 @@ The packaged Windows service treats the installed catalog as immutable process
 input and disables automatic promotion. Administrators update that catalog
 while the service is stopped, then restart the service to load the new bytes.
 
+## Linting a catalog
+
+`guard verb lint` validates a catalog file directly, without contacting or
+starting a daemon. It reports every invalid verb, naming the verb and the
+failing parameter, instead of stopping at the first failure, and exits 1 when
+findings exist. Linting a catalog with the new binary before swapping binaries
+turns a would-be startup abort into a pre-upgrade report:
+
+```bash
+guard verb lint --file /var/lib/guard/verbs.yaml
+guard verb lint --fix
+```
+
+Without `--file`, lint reads `GUARD_VERBS` or the daemon's default catalog
+path. A structurally valid catalog whose verbs are not in canonical form also
+exits 1 and names each verb needing repair; `--fix` applies the same
+canonicalization the daemon performs at load time (operator-boundary
+normalization and generated-authority envelopes) and rewrites the file through
+the same atomic replacement path, printing each repaired verb.
+
 ## Command templates
 
 A template renders each `{param}` as one argv element without a shell or word
@@ -56,6 +76,11 @@ verbs:
 `trusted: true` skips the evaluator for a matching operation, but it does not
 skip the consequence gate or hard invariants. Untrusted verbs keep the evaluator
 as a backstop.
+
+`hold: true` routes every matching operation to operator approval after policy
+admission, including operations declared `reversible`. Use it for reads whose
+scope or sensitivity requires review, such as bulk account enumeration. The
+field defaults to `false` when omitted.
 
 ## Coverage cells
 
@@ -181,8 +206,16 @@ promote exact observed, statically read-only shapes into trusted verbs. Paramete
 patterns contain only escaped values supported by evidence. Irreversible and
 recoverable shapes are not auto-promoted: mutating commands remain under
 consequence gating or operator review, and a model-proposed rollback never
-creates unattended authority. Promotion records the evaluator regime, and a
+creates unattended authority. An auto-promoted verb never carries a consequence
+above `reversible`. Promotion records the evaluator regime, and a
 model or prompt change sends stale coverage back to evaluation.
+
+Auto-promoted verbs are marked `auto_promoted` in `guard verb list`, and their
+coverage provenance states how it was produced: `observation_replays` record
+the observed evaluator decisions a matcher was derived from, plus the
+generator's own boundary example. Provenance `probes` are reserved for checks a
+generator actually executed against the finished matcher; automatic promotion
+records none.
 
 API traffic uses the same verb vocabulary. Generated API cells bind endpoint,
 session fingerprint, full session revision, operation, namespace, body shape,

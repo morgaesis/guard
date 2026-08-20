@@ -18,12 +18,14 @@ not in command-line arguments.
 | `GUARD_LLM_API_KEY` | none | Evaluator API key. `OPENROUTER_API_KEY` is also accepted. |
 | `GUARD_LLM_API_URL` | OpenRouter chat completions | OpenAI-compatible evaluator endpoint. |
 | `GUARD_LLM_PROXY_URL` | unset | HTTP CONNECT proxy used only for evaluator requests. |
-| `GUARD_LLM_MODEL` | `openai/gpt-5.4-mini` | Primary model. |
+| `GUARD_LLM_MODEL` | `openai/gpt-5.4-mini` | Primary model. `openai/gpt-5.6-luna` with `GUARD_LLM_REASONING_EFFORT=high` holds the same corpus at a quarter of the token price but denies a borderline maintenance command more often. |
 | `GUARD_LLM_MODELS` | unset | Comma-separated fallback chain that supersedes the single model. |
 | `GUARD_LLM_RETRIES` | `2` | Transient retries per model, from 0 to 2; larger values are capped at 2. |
 | `GUARD_LLM_TIMEOUT` | `30` | Per-call timeout in seconds. |
+| `GUARD_LLM_REASONING_EFFORT` | `minimal` | Hidden-reasoning effort requested from the provider (`minimal`, `low`, `medium`, `high`, `max`). Raise it for reasoning-capable models whose decision quality improves with more thinking; reasoning tokens bill and spend from the completion budget. |
 | `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid`. |
 | `GUARD_DRY_RUN` | `false` | Evaluate approved work without spawning it. |
+| `GUARD_EXEC_TIMEOUT_SECS` | `0` | Wall-clock limit for brokered commands. Zero is unlimited. `--exec-timeout-secs` takes precedence. |
 | `GUARD_PROMPT_APPEND` | unset | Additive evaluator prompt path. |
 | `GUARD_PREFLIGHT` | `false` | Deterministic executable and credential-disclosure checks. |
 | `GUARD_ALLOW_BIN` | unset | Comma-separated hard binary floor. |
@@ -79,6 +81,11 @@ verbs:
 
 The prompt supplement explains novel invocations. The typed verb is the
 enforcement surface for repeated commands whose executable shapes are finite.
+An optional `exec_timeout_secs` field applies a wall-clock limit to one verb and
+overrides `GUARD_EXEC_TIMEOUT_SECS`; setting the field to `0` makes that verb
+unlimited.
+A copyable supplement in this style for an in-house `servicectl` CLI is at
+[`examples/system-prompt-append-tools.md`](../examples/system-prompt-append-tools.md).
 
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
 enabled, policy allow patterns do not skip evaluation. `--no-evaluator` makes
@@ -97,6 +104,12 @@ credential plans, and rollback behavior.
 | `GUARD_AUTH_TOKEN` | none | Execution bearer required for TCP. |
 | `GUARD_ADMIN_TOKEN` | none | Separate bearer for TCP admin RPCs. |
 | `GUARD_MCP_TOKEN` | none | Bearer required by HTTP MCP. |
+| `GUARD_CLIENT_TIMEOUT_SECS` | `600` | MCP bridge deadline in seconds for each buffered execute or admin daemon round trip. |
+
+The MCP deadline stops the bridge from waiting for a response. Buffered
+execution remains daemon-owned after admission and can continue after the MCP
+deadline; `GUARD_EXEC_TIMEOUT_SECS` or a verb's `exec_timeout_secs` bounds the
+child itself.
 
 The client endpoint order is an explicit command option, environment, saved
 client configuration, then the default local endpoint. Use `guard config show`

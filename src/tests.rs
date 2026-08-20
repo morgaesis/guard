@@ -25,6 +25,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             llm_timeout,
             llm_retries,
             llm_models,
+            llm_reasoning_effort,
             llm,
             no_llm,
             no_redact,
@@ -51,6 +52,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             metrics_addr,
             history_retention,
             exec_as_caller,
+            exec_timeout_secs,
             system_prompt,
             system_prompt_append,
             gate,
@@ -114,6 +116,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             llm_timeout,
             llm_retries,
             llm_models,
+            llm_reasoning_effort,
             llm,
             no_llm,
             no_redact,
@@ -140,6 +143,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             metrics_addr,
             history_retention,
             exec_as_caller,
+            exec_timeout_secs,
             system_prompt,
             system_prompt_append,
             gate,
@@ -190,6 +194,17 @@ fn parse_start(args: &[&str]) -> ServerCommands {
         },
         _ => panic!("expected server start args"),
     }
+}
+
+#[test]
+fn parses_exec_timeout_secs() {
+    let ServerCommands::Start {
+        exec_timeout_secs, ..
+    } = parse_start(&["guard", "server", "start", "--exec-timeout-secs", "42"])
+    else {
+        panic!("expected server start");
+    };
+    assert_eq!(exec_timeout_secs, Some(42));
 }
 
 #[test]
@@ -773,6 +788,25 @@ fn resume_and_verb_amend_parse_their_requester_and_cas_inputs() {
 }
 
 #[test]
+fn verb_lint_parses_optional_file_and_explicit_fix() {
+    match MainArgs::try_parse_from(["guard", "verb", "lint", "--file", "candidate.yaml", "--fix"]) {
+        Ok(MainArgs::Verb(VerbCommands::Lint { file, fix })) => {
+            assert_eq!(file, Some(PathBuf::from("candidate.yaml")));
+            assert!(fix);
+        }
+        Ok(_) => panic!("unexpected verb command"),
+        Err(error) => panic!("verb lint did not parse: {error}"),
+    }
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "verb", "lint"]),
+        Ok(MainArgs::Verb(VerbCommands::Lint {
+            file: None,
+            fix: false
+        }))
+    ));
+}
+
+#[test]
 fn access_extend_help_explains_target_and_bounded_use_defaults() {
     let error = match MainArgs::try_parse_from(["guard", "access", "extend", "--help"]) {
         Err(error) => error,
@@ -838,7 +872,7 @@ fn historical_authority_aliases_and_argv_http_bearer_are_rejected() {
 }
 
 #[test]
-fn ordinary_verb_help_hides_operator_only_show() {
+fn verb_help_lists_show_and_delete() {
     let error = match MainArgs::try_parse_from(["guard", "verb", "--help"]) {
         Err(error) => error,
         Ok(_) => panic!("verb help unexpectedly parsed"),
@@ -846,7 +880,8 @@ fn ordinary_verb_help_hides_operator_only_show() {
     let rendered = error.to_string();
     assert!(rendered.contains("list"));
     assert!(rendered.contains("run"));
-    assert!(!rendered.contains("show"));
+    assert!(rendered.contains("show"));
+    assert!(rendered.contains("delete"));
 }
 
 #[test]
@@ -1483,4 +1518,204 @@ fn wait_approval_accepts_explicit_and_bare_unbounded() {
         ));
     }
     assert!(MainArgs::try_parse_from(["guard", "run", "--wait-approval=0", "true"]).is_err());
+}
+
+/// Anti-drift guard: the help tree is generated from the clap model, so every
+/// printed command path must resolve in that model as a visible command, and
+/// every visible command must appear in the tree exactly once, in walk order.
+#[test]
+fn help_tree_matches_clap_model() {
+    let root = MainArgs::command();
+    let mut entries = Vec::new();
+    help_tree_entries(&root, &[], &mut entries);
+    assert!(!entries.is_empty(), "help tree walk found no commands");
+
+    for (path, _display, _about) in &entries {
+        let mut current = &root;
+        for name in path {
+            current = find_subcommand(current, name).unwrap_or_else(|| {
+                panic!(
+                    "help tree prints `{}`, which is not in the clap model",
+                    path.join(" ")
+                )
+            });
+        }
+        assert!(
+            !current.is_hide_set(),
+            "help tree prints hidden command `{}`",
+            path.join(" ")
+        );
+    }
+
+    fn visible_paths(command: &clap::Command, path: &[String], paths: &mut Vec<Vec<String>>) {
+        for sub in command.get_subcommands() {
+            if sub.is_hide_set() || sub.get_name() == "help" {
+                continue;
+            }
+            let mut sub_path = path.to_vec();
+            sub_path.push(sub.get_name().to_string());
+            paths.push(sub_path.clone());
+            visible_paths(sub, &sub_path, paths);
+        }
+    }
+    let mut expected = Vec::new();
+    visible_paths(&root, &[], &mut expected);
+    let printed: Vec<Vec<String>> = entries.iter().map(|(path, _, _)| path.clone()).collect();
+    assert_eq!(printed, expected, "help tree lags the clap command tree");
+}
+
+#[test]
+fn provisionals_show_parses_handle_and_flags() {
+    match MainArgs::try_parse_from(["guard", "provisionals", "show", "prov-1", "--json"]).unwrap() {
+        MainArgs::Provisionals {
+            command:
+                Some(ProvisionalCommands::Show {
+                    handle,
+                    socket,
+                    json,
+                }),
+            ..
+        } => {
+            assert_eq!(handle, "prov-1");
+            assert!(socket.is_none());
+            assert!(json);
+        }
+        _ => panic!("expected provisionals show"),
+    }
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "provisionals"]),
+        Ok(MainArgs::Provisionals { command: None, .. })
+    ));
+}
+
+#[test]
+fn provisional_detail_includes_fields_the_list_line_elides() {
+    let item = server::ProvisionalSummary {
+        handle: "prov-1".to_string(),
+        status: "pending".to_string(),
+        forward_outcome: "running".to_string(),
+        command: "systemctl restart nginx".to_string(),
+        revert_command: "systemctl stop nginx".to_string(),
+        confirm_check: Some("curl -fsS localhost".to_string()),
+        control_path: Some("local systemd".to_string()),
+        session_fingerprint: Some("ses-9".to_string()),
+        reason: "recoverable service restart".to_string(),
+        created_unix: 1000,
+        deadline_unix: 1600,
+        forward_done: true,
+        cwd: Some("/srv/app".to_string()),
+        secret_names: vec!["deploy-token".to_string()],
+        principal: Some("agent:alice".to_string()),
+        revert_exit: None,
+        revert_detail: None,
+        decision_trace: None,
+    };
+    let detail = cli_client::provisional_detail_human(&item);
+    for expected in [
+        "provisional prov-1",
+        "status: pending",
+        "forward_outcome: running",
+        "forward_done: true",
+        "command: systemctl restart nginx",
+        "revert: systemctl stop nginx",
+        "check: curl -fsS localhost",
+        "control_path: local systemd",
+        "cwd: /srv/app",
+        "session: ses-9",
+        "principal: agent:alice",
+        "secrets: deploy-token",
+        "reason: recoverable service restart",
+    ] {
+        assert!(
+            detail.contains(expected),
+            "detail missing `{expected}`:\n{detail}"
+        );
+    }
+}
+
+#[test]
+fn access_list_parses_state_and_agent_filters() {
+    match MainArgs::try_parse_from([
+        "guard",
+        "access",
+        "list",
+        "--state",
+        "pending",
+        "--agent",
+        "agent:alice",
+    ])
+    .unwrap()
+    {
+        MainArgs::Access(AccessCommands::List { state, agent, .. }) => {
+            assert_eq!(state.as_deref(), Some("pending"));
+            assert_eq!(agent.as_deref(), Some("agent:alice"));
+        }
+        _ => panic!("expected access list"),
+    }
+}
+
+fn access_item_fixture(reference: &str, state: &str, requester: &str) -> server::AccessItem {
+    server::AccessItem {
+        reference: reference.to_string(),
+        kind: "request".to_string(),
+        requester: requester.to_string(),
+        target: "unassigned".to_string(),
+        effective_scope: Vec::new(),
+        expires_unix: None,
+        remaining_uses: None,
+        use_policy: "unselected".to_string(),
+        consequence: String::new(),
+        default_use_policy: None,
+        default_uses: None,
+        state: state.to_string(),
+        next_action: String::new(),
+        approval_options: Vec::new(),
+        intent: None,
+        capabilities: Vec::new(),
+        decided_reason: None,
+    }
+}
+
+#[test]
+fn access_list_filters_narrow_by_state_and_agent() {
+    let items = || {
+        vec![
+            access_item_fixture("req-1", "pending", "agent:alice"),
+            access_item_fixture("req-2", "expired", "agent:alice"),
+            access_item_fixture("ses-3", "active", "agent:bob"),
+        ]
+    };
+    let references = |items: &[server::AccessItem]| {
+        items
+            .iter()
+            .map(|i| i.reference.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let mut by_state = items();
+    cli_client::filter_access_items(&mut by_state, Some("pending"), None);
+    assert_eq!(references(&by_state), ["req-1"]);
+
+    let mut by_agent = items();
+    cli_client::filter_access_items(&mut by_agent, None, Some("agent:alice"));
+    assert_eq!(references(&by_agent), ["req-1", "req-2"]);
+
+    let mut by_both = items();
+    cli_client::filter_access_items(&mut by_both, Some("expired"), Some("agent:alice"));
+    assert_eq!(references(&by_both), ["req-2"]);
+
+    let mut unfiltered = items();
+    cli_client::filter_access_items(&mut unfiltered, None, None);
+    assert_eq!(unfiltered.len(), 3);
+}
+
+#[test]
+fn verb_show_and_delete_are_visible_commands() {
+    let root = MainArgs::command();
+    let verb = find_subcommand(&root, "verb").expect("verb command exists");
+    for name in ["show", "delete"] {
+        let sub = find_subcommand(verb, name)
+            .unwrap_or_else(|| panic!("verb {name} is in the clap model"));
+        assert!(!sub.is_hide_set(), "verb {name} must be visible");
+    }
 }

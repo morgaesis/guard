@@ -147,6 +147,7 @@ fn structured_guidance_preserves_access_commands_and_coverage_detail() {
         )
         .with_verb_resolution(Vec::new(), Some("coverage conflict".to_string()))
         .with_access_request(Some("gr-example".to_string()))
+        .with_operator_guidance(true)
         .into_response();
     assert_eq!(
         response.verb_guidance.as_deref(),

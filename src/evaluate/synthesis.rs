@@ -44,6 +44,8 @@ Rules:
 - consequence: "reversible" for read-only/list/get/idempotent; "recoverable"
   ONLY for a mutation with a clean structured inverse, and then ALSO provide a
   `revert`; "irreversible" for destruction or anything lacking a clean inverse.
+- hold: true for a sensitive or broad read that requires operator review despite
+  being reversible, such as bulk account enumeration; otherwise false.
 - trusted: true only for clearly safe read-only operations; otherwise false so
   the LLM still evaluates the rendered command.
 - Do not invent flags that print or redirect credentials or configuration.
@@ -402,6 +404,7 @@ fn build_create_verb_body(
                             }
                         },
                         "consequence": {"type": "string", "enum": ["reversible", "recoverable", "irreversible"]},
+                        "hold": {"type": "boolean", "description": "true when this operation requires operator approval despite being reversible"},
                         "revert": {
                             "type": "object",
                             "properties": {

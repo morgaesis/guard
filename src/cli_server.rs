@@ -202,7 +202,7 @@ fn default_api_promotion_state_path() -> Option<PathBuf> {
 /// call site): auto-promotion should work out of the box on a fresh host,
 /// the same way `--learn-deny` and `--learn-rules` do not require the
 /// operator to hand-create a state file first.
-fn default_verbs_path() -> Option<PathBuf> {
+pub(crate) fn default_verbs_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("verbs.yaml"))
 }
 
@@ -271,6 +271,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             llm_timeout,
             llm_retries,
             llm_models,
+            llm_reasoning_effort,
             llm,
             no_llm,
             no_redact,
@@ -297,6 +298,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             metrics_addr,
             history_retention,
             exec_as_caller,
+            exec_timeout_secs,
             system_prompt,
             system_prompt_append,
             gate,
@@ -569,6 +571,10 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     tracing::info!("Approved commands will execute as the connecting unix uid");
                 }
             }
+            let exec_timeout_secs = exec_timeout_secs
+                .map(Some)
+                .unwrap_or(guard_env_u64("EXEC_TIMEOUT_SECS")?)
+                .unwrap_or(0);
 
             let llm_enabled = resolve_bool_flag(llm, no_llm, true);
             if !llm_enabled {
@@ -621,6 +627,23 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .or_else(|| guard_env("LLM_MODEL").filter(|v| !v.is_empty()));
             if let Some(model) = resolved_single_model {
                 eval_config = eval_config.llm_model(model);
+            }
+
+            // Reasoning effort: flag > env var > default (minimal). The flag
+            // is enum-validated by clap; the env var is validated here so a
+            // typo fails startup instead of silently reaching the provider.
+            let resolved_reasoning_effort = llm_reasoning_effort
+                .filter(|value| !value.is_empty())
+                .or_else(|| guard_env("LLM_REASONING_EFFORT").filter(|value| !value.is_empty()));
+            if let Some(effort) = resolved_reasoning_effort {
+                anyhow::ensure!(
+                    guard::evaluate::REASONING_EFFORT_VALUES.contains(&effort.as_str()),
+                    "invalid GUARD_LLM_REASONING_EFFORT '{}': expected one of {}",
+                    effort,
+                    guard::evaluate::REASONING_EFFORT_VALUES.join(", ")
+                );
+                tracing::info!("LLM reasoning effort: {}", effort);
+                eval_config = eval_config.llm_reasoning_effort(effort);
             }
 
             // Retries: flag > env var > default.
@@ -1098,6 +1121,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             let socket_announcement = socket_path
                 .as_ref()
                 .map(|path| format!("guard server listening on socket {}", path.display()));
+            let state_dir = state_db_path.as_ref().and_then(|path| {
+                path.parent().map(|parent| {
+                    parent
+                        .canonicalize()
+                        .unwrap_or_else(|_| parent.to_path_buf())
+                })
+            });
 
             tracing::info!("Creating server instance...");
             let config = server::ServerConfig {
@@ -1114,7 +1144,9 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 redact_secrets,
                 preflight,
                 exec_as_caller,
+                exec_timeout_secs,
                 state_db_path,
+                state_dir,
                 audit_log_path,
                 ..server::ServerConfig::default()
             };
@@ -1281,6 +1313,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     catalog.names().len(),
                     catalog.version()
                 );
+                srv.set_verb_catalog_path(path.clone());
                 srv.set_verbs(catalog);
             }
 
@@ -2175,6 +2208,7 @@ mod api_endpoint_tests {
             api_key: None,
             api_url: None,
             proxy_url: None,
+            reasoning_effort: None,
             model: None,
             models: Vec::new(),
             timeout_secs: 1,

@@ -23,6 +23,13 @@ const DEFAULT_MODEL: &str = "openai/gpt-5.4-mini";
 const DEFAULT_TIMEOUT: u64 = 30;
 pub(super) const DEFAULT_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_RETRIES: u32 = 2;
+/// Default hidden-reasoning budget requested from the provider. See
+/// `prompt::add_reasoning_controls` for why `minimal` is the default; raise
+/// it per deployment for reasoning-capable models such as gpt-5.6-luna.
+pub const DEFAULT_REASONING_EFFORT: &str = "minimal";
+/// Effort values accepted by both the OpenRouter `reasoning.effort` field and
+/// the OpenAI-compatible `reasoning_effort` field.
+pub const REASONING_EFFORT_VALUES: [&str; 5] = ["minimal", "low", "medium", "high", "max"];
 
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
@@ -39,6 +46,9 @@ pub struct LlmConfig {
     pub timeout_secs: u64,
     /// Retries PER model (total attempts = retries + 1, capped at 3).
     pub retries: u32,
+    /// Requested hidden-reasoning effort, one of `REASONING_EFFORT_VALUES`.
+    /// `None` means `DEFAULT_REASONING_EFFORT`.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -52,6 +62,7 @@ impl Default for LlmConfig {
             models: Vec::new(),
             timeout_secs: DEFAULT_TIMEOUT,
             retries: DEFAULT_RETRIES,
+            reasoning_effort: None,
         }
     }
 }
@@ -86,6 +97,12 @@ impl LlmConfig {
     /// Retry budget capped at 2 (so total attempts per model <= 3).
     pub fn effective_retries(&self) -> u32 {
         self.retries.min(2)
+    }
+
+    pub fn reasoning_effort(&self) -> &str {
+        self.reasoning_effort
+            .as_deref()
+            .unwrap_or(DEFAULT_REASONING_EFFORT)
     }
 }
 
@@ -193,6 +210,11 @@ impl EvalConfig {
 
     pub fn llm_retries(mut self, retries: u32) -> Self {
         self.llm.retries = retries;
+        self
+    }
+
+    pub fn llm_reasoning_effort(mut self, effort: String) -> Self {
+        self.llm.reasoning_effort = Some(effort);
         self
     }
 

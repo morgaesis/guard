@@ -28,6 +28,13 @@ pub(crate) struct RunInjections {
     pub(crate) secret_files: HashMap<String, String>,
 }
 
+/// Endpoint and presentation options parsed from `guard run` flags.
+pub(crate) struct RunClientOptions {
+    pub(crate) socket: Option<String>,
+    pub(crate) json: bool,
+    pub(crate) explain: bool,
+}
+
 /// CLI spelling of the ssh host-key mode. Kebab-case value names
 /// (`only-existing`, `accept-new`, `accept-all`) are derived by clap.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -151,8 +158,29 @@ fn print_verb_guidance(response: &server::ExecuteResponse) {
         );
     }
     if let Some(guidance) = &response.verb_guidance {
-        eprintln!("  guidance: {}", guidance);
+        let guidance = guidance
+            .lines()
+            .filter(|line| !line.starts_with("contain: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !guidance.is_empty() {
+            eprintln!("  guidance: {guidance}");
+        }
     }
+}
+
+fn held_discovery_lines(response: &server::ExecuteResponse) -> Vec<String> {
+    let mut lines = response
+        .verb_guidance
+        .as_deref()
+        .into_iter()
+        .flat_map(str::lines)
+        .find(|line| line.starts_with("contain: "))
+        .map(str::to_string)
+        .into_iter()
+        .collect::<Vec<_>>();
+    lines.push("inspect: guard provisionals".to_string());
+    lines
 }
 
 /// The `result:` and `window:` lines of a contained execution banner. The
@@ -276,7 +304,7 @@ fn access_request_guidance_lines(response: &server::ExecuteResponse) -> Vec<Stri
                     request
                         .approval_options
                         .iter()
-                        .map(|command| format!("approve: {command}")),
+                        .map(|option| access_approval_option_line(option, "approve: ")),
                 );
                 lines.push(format!("inspect: guard access show {}", request.reference));
                 lines
@@ -292,10 +320,18 @@ fn access_request_guidance_lines(response: &server::ExecuteResponse) -> Vec<Stri
         response
             .approval_options
             .iter()
-            .map(|command| format!("approve: {command}")),
+            .map(|option| access_approval_option_line(option, "approve: ")),
     );
     lines.push(format!("inspect: guard access show {reference}"));
     lines
+}
+
+fn access_approval_option_line(option: &str, operator_prefix: &str) -> String {
+    if option.starts_with("guard access approve ") {
+        format!("{operator_prefix}{option}")
+    } else {
+        option.to_string()
+    }
 }
 
 fn print_access_request_guidance(response: &server::ExecuteResponse) {
@@ -319,6 +355,9 @@ fn print_held_banner(response: &server::ExecuteResponse) {
     eprintln!("  handle:  {}", handle);
     print_access_request_guidance(response);
     print_verb_guidance(response);
+    for line in held_discovery_lines(response) {
+        eprintln!("  {line}");
+    }
     eprintln!("  result:  not executed; approval arms it, you then resume it");
     eprintln!("  resume:  guard approval resume {}", handle);
 }
@@ -392,13 +431,17 @@ pub(crate) async fn run_exec(
     injections: RunInjections,
     gating: GatingOptions,
     hostkey: server::SshHostKeyMode,
-    json: bool,
-    explain: bool,
+    options: RunClientOptions,
 ) -> Result<()> {
+    let RunClientOptions {
+        socket,
+        json,
+        explain,
+    } = options;
     let config = load_client_config(json)?;
 
     let (socket_path, tcp_port, endpoint_source) =
-        resolve_client_endpoint_with_source(None, &config);
+        resolve_client_endpoint_with_source(socket, &config);
 
     let mut revert = match gating.revert.as_deref() {
         Some(spec) => Some(parse_revert(spec)?),
@@ -686,23 +729,7 @@ pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> R
             }
             let color = color_enabled_for_stdout();
             for p in &items {
-                let status = paint(&p.status, AnsiColor::Yellow, color);
-                println!(
-                    "[{}] handle={} cmd={:?} revert={:?} check={:?} control_path={:?} session={} deadline={} reason={:?}{}",
-                    status,
-                    p.handle,
-                    p.command,
-                    p.revert_command,
-                    p.confirm_check,
-                    p.control_path,
-                    p.session_fingerprint.as_deref().unwrap_or("none"),
-                    format_timestamp(p.deadline_unix),
-                    p.reason,
-                    p.revert_detail
-                        .as_ref()
-                        .map(|d| format!(" revert_detail={:?}", d))
-                        .unwrap_or_default(),
-                );
+                println!("{}", provisional_human_line(p, color));
             }
             Ok(())
         }
@@ -715,6 +742,99 @@ pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> R
             std::process::exit(1);
         }
     }
+}
+
+pub(crate) async fn handle_provisional_show(
+    socket: Option<String>,
+    handle: String,
+    json: bool,
+) -> Result<()> {
+    let (client, source) = gate_client(socket, json)?;
+    match client
+        .send_admin(server::AdminRequest::Provisionals)
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?
+    {
+        server::AdminResponse::Provisionals { items } => {
+            let Some(item) = items.into_iter().find(|item| item.handle == handle) else {
+                anyhow::bail!("no provisional execution with handle '{handle}'");
+            };
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "provisional",
+                    "item": item,
+                }));
+            }
+            println!("{}", provisional_detail_human(&item));
+            Ok(())
+        }
+        server::AdminResponse::Error { message } => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("unexpected response");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Full detail card for one provisional execution. Everything the list line
+/// carries plus the lifecycle, requester, and decision fields it elides.
+pub(crate) fn provisional_detail_human(item: &server::ProvisionalSummary) -> String {
+    let mut lines = vec![
+        format!("provisional {}", card_text(&item.handle)),
+        format!("status: {}", card_text(&item.status)),
+        format!("forward_outcome: {}", card_text(&item.forward_outcome)),
+        format!("forward_done: {}", item.forward_done),
+        format!("command: {}", card_text(&item.command)),
+        format!("revert: {}", card_text(&item.revert_command)),
+    ];
+    if let Some(check) = &item.confirm_check {
+        lines.push(format!("check: {}", card_text(check)));
+    }
+    if let Some(control_path) = &item.control_path {
+        lines.push(format!("control_path: {}", card_text(control_path)));
+    }
+    if let Some(cwd) = &item.cwd {
+        lines.push(format!("cwd: {}", card_text(cwd)));
+    }
+    lines.push(format!(
+        "session: {}",
+        card_text(item.session_fingerprint.as_deref().unwrap_or("none"))
+    ));
+    if let Some(principal) = &item.principal {
+        lines.push(format!("principal: {}", card_text(principal)));
+    }
+    if !item.secret_names.is_empty() {
+        lines.push(format!(
+            "secrets: {}",
+            card_text(&item.secret_names.join(","))
+        ));
+    }
+    lines.push(format!("created: {}", format_timestamp(item.created_unix)));
+    lines.push(format!(
+        "deadline: {}",
+        format_timestamp(item.deadline_unix)
+    ));
+    lines.push(format!("reason: {}", card_text(&item.reason)));
+    if let Some(exit) = item.revert_exit {
+        lines.push(format!("revert_exit: {exit}"));
+    }
+    if let Some(detail) = &item.revert_detail {
+        lines.push(format!("revert_detail: {}", card_text(detail)));
+    }
+    if let Some(trace) = &item.decision_trace {
+        lines.push(format!(
+            "decision_source: {}",
+            card_text(&trace.decision_source)
+        ));
+        if let Some(guidance) = &trace.guidance {
+            lines.push(format!("guidance: {}", card_text(guidance)));
+        }
+    }
+    lines.join("\n")
 }
 
 fn render_approval(item: &server::ApprovalSummary, include_transcript: bool) {
@@ -1157,6 +1277,50 @@ fn audit_tail_json_response(path: &str, items: &[serde_json::Value]) -> serde_js
 
 pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
     match subcommand {
+        VerbCommands::Lint { file, fix } => {
+            let path = file
+                .or_else(|| {
+                    guard_env("VERBS")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                })
+                .or_else(crate::cli_server::default_verbs_path)
+                .ok_or_else(|| anyhow::anyhow!("could not determine default verbs path"))?;
+            let report = guard::gating::verb::VerbCatalog::lint_file(&path, fix)
+                .with_context(|| format!("failed to lint verb catalog {}", path.display()))?;
+            for finding in &report.findings {
+                eprintln!("error: verb '{}': {}", finding.verb, finding.message);
+            }
+            if !report.findings.is_empty() {
+                eprintln!("{} finding(s) in {}", report.findings.len(), path.display());
+                std::process::exit(1);
+            }
+            if !report.repairs.is_empty() {
+                for repair in &report.repairs {
+                    println!("verb '{}': {}", repair.verb, repair.changes.join(", "));
+                }
+                if !fix {
+                    eprintln!(
+                        "{} requires canonical repair; rerun with --fix",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+            if let Some(warning) = &report.durability_warning {
+                eprintln!("warning: catalog repair committed with a durability warning: {warning}");
+            }
+            if report.fixed {
+                println!(
+                    "repaired {} verb(s) in {}",
+                    report.repairs.len(),
+                    path.display()
+                );
+            } else {
+                println!("valid: {} verb(s) in {}", report.verb_count, path.display());
+            }
+            Ok(())
+        }
         VerbCommands::List { socket, json } => {
             let (client, source) = gate_client(socket, json)?;
             match client
@@ -1177,10 +1341,11 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                     }
                     for v in &items {
                         println!(
-                            "{} [{}]{}{}{}{} - {}",
+                            "{} [{}]{}{}{}{}{} - {}",
                             v.name,
                             v.consequence,
                             if v.baseline { "" } else { " session-scoped" },
+                            if v.hold { " hold" } else { "" },
                             if v.trusted { " trusted" } else { "" },
                             if v.has_revert { " revertable" } else { "" },
                             if v.auto_promoted {
@@ -1231,9 +1396,10 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                     }
                     for verb in &items {
                         println!(
-                            "{} [{}]{} - {}",
+                            "{} [{}]{}{} - {}",
                             verb.name,
                             verb.consequence,
+                            if verb.hold { " hold" } else { "" },
                             if verb.has_revert { " revertable" } else { "" },
                             verb.description
                         );
@@ -1720,6 +1886,8 @@ fn parse_verb_create_choice(input: &str) -> Option<bool> {
 
 pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
     let mut raw_matcher = false;
+    let mut list_state_filter: Option<String> = None;
+    let mut list_agent_filter: Option<String> = None;
     let (socket, request, json) = match command {
         AccessCommands::Request {
             intent,
@@ -1790,7 +1958,16 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             },
             json,
         ),
-        AccessCommands::List { socket, json } => (socket, server::AdminRequest::AccessList, json),
+        AccessCommands::List {
+            state,
+            agent,
+            socket,
+            json,
+        } => {
+            list_state_filter = state;
+            list_agent_filter = agent;
+            (socket, server::AdminRequest::AccessList, json)
+        }
         AccessCommands::Show {
             reference,
             raw,
@@ -1813,7 +1990,7 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
     let config = load_client_config(json)?;
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = admin_client(socket_path, tcp_port, &config);
-    let response = match client.send_admin(request).await {
+    let mut response = match client.send_admin(request).await {
         Ok(response) => response,
         Err(error) => {
             let error = describe_connect_failure(error, &client, source);
@@ -1823,6 +2000,14 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             return Err(error);
         }
     };
+    let filtered = list_state_filter.is_some() || list_agent_filter.is_some();
+    if let server::AdminResponse::AccessItems { items } = &mut response {
+        filter_access_items(
+            items,
+            list_state_filter.as_deref(),
+            list_agent_filter.as_deref(),
+        );
+    }
     let decision_failed = access_decision_failed(&response);
     if json {
         let document = match access_json_response(&response) {
@@ -1838,7 +2023,11 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
     match response {
         server::AdminResponse::AccessItems { items } => {
             if items.is_empty() {
-                println!("(no access requests or sessions)");
+                if filtered {
+                    println!("(no matching access requests or sessions)");
+                } else {
+                    println!("(no access requests or sessions)");
+                }
             }
             for item in items {
                 println!(
@@ -1945,6 +2134,9 @@ fn render_access_status(
                 active.activated_verbs.join(",")
             }
         );
+        if let Some(line) = secret_entitlements_line(&active.scope.secret_names, "  ") {
+            println!("{line}");
+        }
     }
     println!(
         "  activity: total={} allowed={} denied={} completed={} failed={} held={}",
@@ -1972,19 +2164,117 @@ fn render_access_status(
             interaction.command,
             interaction.reason,
         );
+        for line in decision_trace_human_lines(interaction.decision_trace.as_ref(), "    ") {
+            println!("{line}");
+        }
     }
     for approval in approvals {
         render_approval(approval, true);
+        for line in decision_trace_human_lines(approval.decision_trace.as_ref(), "  ") {
+            println!("{line}");
+        }
     }
     for provisional in provisionals {
+        let secret_names = secret_entitlements_line(&provisional.secret_names, "")
+            .map(|line| format!(" {line}"))
+            .unwrap_or_default();
         println!(
-            "[{}] handle={} cmd={:?} deadline={} reason={:?}",
+            "[{}] handle={} cmd={:?} deadline={} reason={:?}{}",
             provisional.status,
             provisional.handle,
             provisional.command,
             format_timestamp(provisional.deadline_unix),
             provisional.reason,
+            secret_names,
         );
+        for line in decision_trace_human_lines(provisional.decision_trace.as_ref(), "  ") {
+            println!("{line}");
+        }
+    }
+}
+
+fn secret_entitlements_line(secret_names: &[String], indent: &str) -> Option<String> {
+    (!secret_names.is_empty()).then(|| format!("{indent}secret_names: {}", secret_names.join(",")))
+}
+
+fn decision_trace_human_lines(
+    trace: Option<&guard::gating::DecisionTrace>,
+    indent: &str,
+) -> Vec<String> {
+    let Some(trace) = trace else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    if !trace.verb_matches.is_empty() {
+        let matches = trace
+            .verb_matches
+            .iter()
+            .map(|matched| {
+                format!(
+                    "{}/{} ({}/{}{}{})",
+                    matched.verb,
+                    matched.cell,
+                    matched.scope,
+                    matched.action,
+                    if matched.selected {
+                        ", selected"
+                    } else {
+                        ", not selected"
+                    },
+                    if matched.overridden {
+                        ", overridden"
+                    } else {
+                        ""
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("{indent}verb_matches: {matches}"));
+    }
+    if let Some(delta) = &trace.suggested_grant_delta {
+        lines.push(format!("{indent}suggested_grant_delta: {delta}"));
+    }
+    lines
+}
+
+fn provisional_human_line(provisional: &server::ProvisionalSummary, color: bool) -> String {
+    let status = paint(&provisional.status, AnsiColor::Yellow, color);
+    let secret_names = secret_entitlements_line(&provisional.secret_names, "")
+        .map(|line| format!(" {line}"))
+        .unwrap_or_default();
+    format!(
+        "[{status}] handle={} cmd={:?} revert={:?} check={:?} control_path={:?} session={} deadline={} reason={:?}{}{}",
+        provisional.handle,
+        provisional.command,
+        provisional.revert_command,
+        provisional.confirm_check,
+        provisional.control_path,
+        provisional.session_fingerprint.as_deref().unwrap_or("none"),
+        format_timestamp(provisional.deadline_unix),
+        provisional.reason,
+        provisional
+            .revert_detail
+            .as_ref()
+            .map(|detail| format!(" revert_detail={detail:?}"))
+            .unwrap_or_default(),
+        secret_names,
+    )
+}
+
+/// Client-side `access list` narrowing. The list RPC is unfiltered; these
+/// filters cut the returned items to one state (for example `pending`,
+/// `active`, `expired`) or one requesting agent principal.
+pub(crate) fn filter_access_items(
+    items: &mut Vec<server::AccessItem>,
+    state: Option<&str>,
+    agent: Option<&str>,
+) {
+    if let Some(state) = state {
+        items.retain(|item| item.state == state);
+    }
+    if let Some(agent) = agent {
+        items.retain(|item| item.requester == agent);
     }
 }
 
@@ -2059,8 +2349,11 @@ fn access_item_human(item: &server::AccessItem, raw: bool) -> String {
         }
     }
     lines.push(format!("next: {}", card_text(&item.next_action)));
-    for command in &item.approval_options {
-        lines.push(format!("approval: {}", card_text(command)));
+    for option in &item.approval_options {
+        lines.push(card_text(&access_approval_option_line(
+            option,
+            "approval: ",
+        )));
     }
     lines.join("\n")
 }
@@ -2596,8 +2889,11 @@ fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
         }
     }
     lines.push(format!("  next:      {}", card_text(&item.next_action)));
-    for command in &item.approval_options {
-        lines.push(format!("  approval:  {}", card_text(command)));
+    for option in &item.approval_options {
+        lines.push(card_text(&access_approval_option_line(
+            option,
+            "  approval:  ",
+        )));
     }
     lines
 }
@@ -3093,6 +3389,15 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
             // HTTP MCP credentials never enter argv. validate() rejects HTTP
             // mode unless GUARD_MCP_TOKEN supplies a nonempty bearer.
             let http_token = guard_env("MCP_TOKEN").filter(|token| !token.is_empty());
+            let client_timeout_secs = guard_env("CLIENT_TIMEOUT_SECS")
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .context("GUARD_CLIENT_TIMEOUT_SECS must be a positive integer")
+                })
+                .transpose()?
+                .unwrap_or(mcp::DEFAULT_CLIENT_TIMEOUT_SECS);
 
             let mcp_config = mcp::McpConfig {
                 socket_path,
@@ -3102,6 +3407,7 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
                 tool_name,
                 http_addr,
                 http_token,
+                client_timeout_secs,
             };
 
             mcp::serve(mcp_config).await
@@ -3586,6 +3892,8 @@ pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MainArgs;
+    use clap::Parser;
 
     fn config_with(socket: Option<&str>, port: Option<u16>) -> client_config::ClientConfig {
         client_config::ClientConfig {
@@ -3593,6 +3901,28 @@ mod tests {
             server_tcp_port: port,
             ..Default::default()
         }
+    }
+
+    fn parsed_run_socket(args: &[&str]) -> Option<String> {
+        match MainArgs::try_parse_from(args).expect("parse guard run") {
+            MainArgs::Run { socket, .. } => socket,
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_parses_explicit_socket_override() {
+        assert_eq!(
+            parsed_run_socket(&[
+                "guard",
+                "run",
+                "--socket",
+                "/run/guard/alternate.sock",
+                "echo",
+                "ok",
+            ]),
+            Some("/run/guard/alternate.sock".to_string())
+        );
     }
 
     #[test]
@@ -3733,6 +4063,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn requester_guidance_does_not_label_admin_handoff_as_an_approve_command() {
+        let mut response = provisional_response(None, None);
+        response.allowed = false;
+        response.status = None;
+        response.handle = Some("gr-requester".to_string());
+        response.approval_options = vec![
+            "ask your admin to approve request gr-requester (see guard access show gr-requester)"
+                .to_string(),
+        ];
+
+        let lines = access_request_guidance_lines(&response);
+        assert!(lines.contains(
+            &"ask your admin to approve request gr-requester (see guard access show gr-requester)"
+                .to_string()
+        ));
+        assert!(lines
+            .iter()
+            .all(|line| !line.contains("guard access approve")));
+    }
+
     fn provisional_response(
         confirm_deadline_unix: Option<u64>,
         confirm_window_secs: Option<u64>,
@@ -3786,6 +4137,98 @@ mod tests {
                 vec!["result:  executed, auto-reverts unless confirmed".to_string()]
             );
         }
+    }
+
+    #[test]
+    fn held_banner_names_containment_only_when_the_server_reports_a_route() {
+        let mut response = provisional_response(None, None);
+        response.status = Some(server::GateStatus::Held);
+        response.verb_guidance = Some(
+            "ask your admin to approve request hold-1\ncontain: re-run with --revert '<cmd>' --confirm-within 300 to execute under auto-revert"
+                .to_string(),
+        );
+        assert_eq!(
+            held_discovery_lines(&response),
+            vec![
+                "contain: re-run with --revert '<cmd>' --confirm-within 300 to execute under auto-revert"
+                    .to_string(),
+                "inspect: guard provisionals".to_string(),
+            ]
+        );
+
+        response.verb_guidance = Some("ask your admin to approve request hold-1".to_string());
+        assert_eq!(
+            held_discovery_lines(&response),
+            vec!["inspect: guard provisionals".to_string()]
+        );
+    }
+
+    #[test]
+    fn access_status_human_fields_render_entitlements_and_decision_trace() {
+        assert_eq!(
+            secret_entitlements_line(
+                &["service/read".to_string(), "service/write".to_string()],
+                "  "
+            ),
+            Some("  secret_names: service/read,service/write".to_string())
+        );
+
+        let trace = guard::gating::DecisionTrace {
+            version: guard::gating::DecisionTrace::VERSION,
+            decision_source: "session_allow".to_string(),
+            verb_matches: vec![guard::gating::DecisionVerbMatch {
+                verb: "restart-service".to_string(),
+                cell: "restart".to_string(),
+                scope: "session".to_string(),
+                action: "evaluate".to_string(),
+                features: Vec::new(),
+                selected: true,
+                overridden: true,
+            }],
+            failed_dimensions: Vec::new(),
+            conflict: None,
+            guidance: None,
+            suggested_grant_delta: Some("grant restart-service".to_string()),
+        };
+
+        assert_eq!(
+            decision_trace_human_lines(Some(&trace), "    "),
+            vec![
+                "    verb_matches: restart-service/restart (session/evaluate, selected, overridden)"
+                    .to_string(),
+                "    suggested_grant_delta: grant restart-service".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn provisional_human_output_includes_secret_names_when_present() {
+        let provisional = server::ProvisionalSummary {
+            handle: "pv-1".to_string(),
+            status: "armed".to_string(),
+            forward_outcome: "completed".to_string(),
+            command: "servicectl restart app".to_string(),
+            revert_command: "servicectl rollback app".to_string(),
+            confirm_check: None,
+            control_path: None,
+            session_fingerprint: None,
+            reason: "recoverable change".to_string(),
+            created_unix: 1_700_000_000,
+            deadline_unix: 1_700_000_300,
+            forward_done: true,
+            cwd: None,
+            secret_names: vec!["service/read".to_string(), "service/write".to_string()],
+            principal: None,
+            revert_exit: None,
+            revert_detail: None,
+            decision_trace: None,
+        };
+
+        let line = provisional_human_line(&provisional, false);
+        assert!(
+            line.contains("secret_names: service/read,service/write"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -4524,6 +4967,50 @@ mod tests {
             AnsiColor::Yellow
         ));
         assert!(matches!(consequence_color("reversible"), AnsiColor::Green));
+    }
+
+    #[test]
+    fn run_socket_flag_is_honored() {
+        let socket = parsed_run_socket(&["guard", "run", "--socket", "/tmp/run.sock", "true"]);
+        let (socket, port, source) = resolve_endpoint(
+            socket,
+            Some("9999".to_string()),
+            Some("/tmp/env.sock".to_string()),
+            &config_with(Some("/tmp/config.sock"), Some(1234)),
+            true,
+        );
+
+        assert_eq!(socket, Some(PathBuf::from("/tmp/run.sock")));
+        assert_eq!(port, None);
+        assert_eq!(source, EndpointSource::Flag);
+    }
+
+    #[test]
+    fn run_without_socket_uses_environment_then_config() {
+        let socket = parsed_run_socket(&["guard", "run", "true"]);
+        assert_eq!(socket, None);
+
+        let (env_socket, env_port, env_source) = resolve_endpoint(
+            socket.clone(),
+            None,
+            Some("/tmp/env.sock".to_string()),
+            &config_with(Some("/tmp/config.sock"), None),
+            true,
+        );
+        assert_eq!(env_socket, Some(PathBuf::from("/tmp/env.sock")));
+        assert_eq!(env_port, None);
+        assert_eq!(env_source, EndpointSource::Env);
+
+        let (config_socket, config_port, config_source) = resolve_endpoint(
+            socket,
+            None,
+            None,
+            &config_with(Some("/tmp/config.sock"), None),
+            true,
+        );
+        assert_eq!(config_socket, Some(PathBuf::from("/tmp/config.sock")));
+        assert_eq!(config_port, None);
+        assert_eq!(config_source, EndpointSource::Config);
     }
 
     #[test]

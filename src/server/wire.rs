@@ -821,9 +821,6 @@ pub enum AdminResponse {
     ApprovalWait {
         wait: AccessWaitResult,
     },
-    SessionBulkRevoked {
-        count: usize,
-    },
     EvaluationBatch {
         items: Vec<BatchEvaluation>,
     },
@@ -986,6 +983,8 @@ pub struct VerbSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_plan: Option<String>,
     pub consequence: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
     /// Whether this verb currently skips the LLM. For an auto-promoted verb
     /// this already reflects the staleness check (`verb_effective_trust`):
     /// `false` here means the daemon has stopped honoring the promotion
@@ -1014,6 +1013,8 @@ pub struct VerbMenuItem {
     pub description: String,
     pub params: Vec<String>,
     pub consequence: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
     pub has_revert: bool,
 }
 
@@ -1367,12 +1368,20 @@ pub struct AccessRequestGuidance {
 }
 
 impl AccessRequestGuidance {
-    fn new(reference: String) -> Self {
-        let approval_options = vec![
-            format!("guard access approve {reference}"),
-            format!("guard access approve {reference} --once"),
-            format!("guard access approve {reference} --uses 3"),
-        ];
+    fn new(reference: String, operator_guidance: bool, one_shot: bool) -> Self {
+        let approval_options = if !operator_guidance {
+            vec![format!(
+                "ask your admin to approve request {reference} (see guard access show {reference})"
+            )]
+        } else if one_shot {
+            vec![format!("guard access approve {reference} --once")]
+        } else {
+            vec![
+                format!("guard access approve {reference}"),
+                format!("guard access approve {reference} --once"),
+                format!("guard access approve {reference} --uses 3"),
+            ]
+        };
         Self {
             reference,
             approval_options,
@@ -1582,6 +1591,10 @@ pub(super) struct ExecuteResult {
     pub(super) exec: ExecOutcome,
     request_handle: Option<String>,
     access_requests: Vec<AccessRequestGuidance>,
+    /// True only for an authenticated operator or daemon projection. The safe
+    /// default keeps direct tests and new transports from exposing operator
+    /// commands until they explicitly attach an audience.
+    operator_guidance: bool,
     /// Secret-store key names whose values entered the environment of a
     /// successfully spawned child. This does not prove the child consumed them.
     exposed_secret_refs: Vec<String>,
@@ -1603,6 +1616,7 @@ impl ExecuteResult {
             exec: ExecOutcome::NotAttempted,
             request_handle: None,
             access_requests: Vec::new(),
+            operator_guidance: false,
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1628,6 +1642,7 @@ impl ExecuteResult {
             },
             request_handle: None,
             access_requests: Vec::new(),
+            operator_guidance: false,
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1651,6 +1666,7 @@ impl ExecuteResult {
             },
             request_handle: None,
             access_requests: Vec::new(),
+            operator_guidance: false,
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1675,6 +1691,7 @@ impl ExecuteResult {
             },
             request_handle: None,
             access_requests: Vec::new(),
+            operator_guidance: false,
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1691,6 +1708,7 @@ impl ExecuteResult {
             exec: ExecOutcome::DryRun { coverage: None },
             request_handle: None,
             access_requests: Vec::new(),
+            operator_guidance: false,
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1709,6 +1727,7 @@ impl ExecuteResult {
             },
             request_handle: None,
             access_requests: Vec::new(),
+            operator_guidance: false,
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1726,6 +1745,7 @@ impl ExecuteResult {
             exec: ExecOutcome::Held { handle, coverage },
             request_handle: None,
             access_requests: Vec::new(),
+            operator_guidance: false,
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1760,6 +1780,7 @@ impl ExecuteResult {
             },
             request_handle: None,
             access_requests: Vec::new(),
+            operator_guidance: false,
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1804,7 +1825,7 @@ impl ExecuteResult {
         self.request_handle = request_handle.clone();
         self.access_requests = request_handle
             .into_iter()
-            .map(AccessRequestGuidance::new)
+            .map(|reference| AccessRequestGuidance::new(reference, false, false))
             .collect();
         self
     }
@@ -1815,18 +1836,55 @@ impl ExecuteResult {
         self.request_handle = (references.len() == 1).then(|| references[0].clone());
         self.access_requests = references
             .into_iter()
-            .map(AccessRequestGuidance::new)
+            .map(|reference| AccessRequestGuidance::new(reference, false, false))
             .collect();
-        if !self.access_requests.is_empty() {
-            let joined = self
-                .access_requests
+        self.verb_guidance = (!self.access_requests.is_empty()).then(|| {
+            self.access_requests
                 .iter()
-                .map(|request| request.reference.as_str())
+                .flat_map(|request| request.approval_options.iter())
+                .cloned()
                 .collect::<Vec<_>>()
-                .join(" ");
-            self.verb_guidance = Some(format!(
-                "approve: guard access approve {joined}\nonce: guard access approve {joined} --once\nbounded: guard access approve {joined} --uses 3"
-            ));
+                .join("\n")
+        });
+        self
+    }
+
+    pub(super) fn with_operator_guidance(mut self, operator_guidance: bool) -> Self {
+        let generated_requester_guidance = self
+            .access_requests
+            .iter()
+            .flat_map(|request| request.approval_options.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let replace_generated_guidance = !generated_requester_guidance.is_empty()
+            && self.verb_guidance.as_deref() == Some(generated_requester_guidance.as_str());
+        self.operator_guidance = operator_guidance;
+        for request in &mut self.access_requests {
+            *request =
+                AccessRequestGuidance::new(request.reference.clone(), operator_guidance, false);
+        }
+        if replace_generated_guidance {
+            self.verb_guidance = if operator_guidance {
+                let joined = self
+                    .access_requests
+                    .iter()
+                    .map(|request| request.reference.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Some(format!(
+                    "approve: guard access approve {joined}\nonce: guard access approve {joined} --once\nbounded: guard access approve {joined} --uses 3"
+                ))
+            } else {
+                Some(
+                    self.access_requests
+                        .iter()
+                        .flat_map(|request| request.approval_options.iter())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            };
         }
         self
     }
@@ -1888,6 +1946,7 @@ impl ExecuteResult {
         let allowed = self.policy_allowed();
         let request_handle = self.request_handle;
         let access_requests = self.access_requests;
+        let operator_guidance = self.operator_guidance;
         let request_approval_options = access_requests
             .first()
             .filter(|_| access_requests.len() == 1)
@@ -2025,11 +2084,10 @@ impl ExecuteResult {
                 decision_trace,
             },
             ExecOutcome::Held { handle, coverage } => {
-                let approval_options = vec![format!("guard access approve {handle} --once")];
-                let access_requests = vec![AccessRequestGuidance {
-                    reference: handle.clone(),
-                    approval_options: approval_options.clone(),
-                }];
+                let access_request =
+                    AccessRequestGuidance::new(handle.clone(), operator_guidance, true);
+                let approval_options = access_request.approval_options.clone();
+                let access_requests = vec![access_request];
                 ExecuteResponse {
                     // Approved but held: allowed=true (not a denial), no exit code.
                     allowed: true,
@@ -2194,15 +2252,15 @@ mod decision_trace_feature_tests {
     }
 
     #[test]
-    fn multi_request_denial_is_structured_without_singular_or_prose_parsing() {
-        let response = ExecuteResult::denied("two scopes require approval")
+    fn multi_request_denial_is_audience_correct_without_prose_parsing() {
+        let requester = ExecuteResult::denied("two scopes require approval")
             .with_access_requests(vec!["access-b".to_string(), "access-a".to_string()])
             .into_response();
 
-        assert_eq!(response.handle, None);
-        assert!(response.approval_options.is_empty());
+        assert_eq!(requester.handle, None);
+        assert!(requester.approval_options.is_empty());
         assert_eq!(
-            response
+            requester
                 .access_requests
                 .iter()
                 .map(|request| request.reference.as_str())
@@ -2210,12 +2268,70 @@ mod decision_trace_feature_tests {
             vec!["access-a", "access-b"]
         );
         assert_eq!(
-            response.access_requests[0].approval_options,
+            requester.access_requests[0].approval_options,
+            vec!["ask your admin to approve request access-a (see guard access show access-a)"]
+        );
+        assert_eq!(
+            requester.verb_guidance.as_deref(),
+            Some(
+                "ask your admin to approve request access-a (see guard access show access-a)\nask your admin to approve request access-b (see guard access show access-b)"
+            )
+        );
+
+        let operator = ExecuteResult::denied("two scopes require approval")
+            .with_access_requests(vec!["access-b".to_string(), "access-a".to_string()])
+            .with_operator_guidance(true)
+            .into_response();
+        assert_eq!(
+            operator.access_requests[0].approval_options,
             vec![
                 "guard access approve access-a",
                 "guard access approve access-a --once",
                 "guard access approve access-a --uses 3",
             ]
+        );
+        assert_eq!(
+            operator.verb_guidance.as_deref(),
+            Some(
+                "approve: guard access approve access-a access-b\nonce: guard access approve access-a access-b --once\nbounded: guard access approve access-a access-b --uses 3"
+            )
+        );
+
+        let operator_single = ExecuteResult::denied("one scope requires approval")
+            .with_access_requests(vec!["access-a".to_string()])
+            .with_operator_guidance(true)
+            .into_response();
+        assert_eq!(
+            operator_single.verb_guidance.as_deref(),
+            Some(
+                "approve: guard access approve access-a\nonce: guard access approve access-a --once\nbounded: guard access approve access-a --uses 3"
+            )
+        );
+    }
+
+    #[test]
+    fn held_response_exposes_approval_command_only_to_operator_audience() {
+        let requester = ExecuteResult::held(
+            "operator review required",
+            "hold-a".to_string(),
+            Coverage::hold(),
+        )
+        .into_response();
+        assert_eq!(
+            requester.approval_options,
+            vec!["ask your admin to approve request hold-a (see guard access show hold-a)"]
+        );
+
+        let operator = ExecuteResult::held(
+            "operator review required",
+            "hold-a".to_string(),
+            Coverage::hold(),
+        )
+        .with_operator_guidance(true)
+        .into_response();
+        assert_eq!(
+            operator.approval_options,
+            vec!["guard access approve hold-a --once"]
         );
     }
 }

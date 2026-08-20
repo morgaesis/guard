@@ -2226,6 +2226,7 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
     let provisional = Provisional {
         handle: handle.clone(),
         principal: Some(cfg.config.daemon_principal.clone()),
+        requester_principal: None,
         binary: "(api-proxy)".to_string(),
         args: vec!["delete labels/bug in o/r".to_string()],
         cwd: None,
@@ -2484,6 +2485,7 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
     let provisional = Provisional {
         handle: handle.clone(),
         principal: Some(cfg.config.daemon_principal.clone()),
+        requester_principal: None,
         binary: "(api-proxy)".to_string(),
         args: vec!["delete labels/bug in o/r".to_string()],
         cwd: None,
@@ -2790,6 +2792,7 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
         bypass: false,
         authority: None,
         consume_access_verbs: Vec::new(),
+        force_hold: false,
     };
     let mut sink = tokio::io::sink();
     let result = route_gated_allow(
@@ -2876,6 +2879,7 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
             bypass: false,
             authority: Some(revoked_authority),
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
         None,
     )
@@ -2930,6 +2934,7 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
             bypass: false,
             authority: Some(expired_authority),
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
         None,
     )
@@ -2952,6 +2957,7 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
         cfg.state.provisional.write().await.insert(Provisional {
             handle: format!("provisional-{token}"),
             principal: agent.principal(),
+            requester_principal: None,
             binary: "true".to_string(),
             args: Vec::new(),
             cwd: None,
@@ -3002,12 +3008,110 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
     assert_eq!(provisionals[0].handle, "provisional-status-session-a");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn requester_can_list_own_api_provisional_without_decision_authority() {
+    let (cfg, operator, requester) = gating_config(7_024, 1_000);
+    let handle = "api-provisional-requester-visible";
+    cfg.state.provisional.write().await.insert(Provisional {
+        handle: handle.to_string(),
+        principal: Some(cfg.config.daemon_principal.clone()),
+        requester_principal: requester.principal(),
+        binary: "(api-proxy)".to_string(),
+        args: vec!["patch deployments/api in dev".to_string()],
+        cwd: None,
+        secret_keys: BTreeMap::new(),
+        secret_file_keys: BTreeMap::new(),
+        revert_binary: String::new(),
+        revert_args: Vec::new(),
+        confirm_check_binary: None,
+        confirm_check_args: Vec::new(),
+        control_path: Some("daemon API proxy for protocol kubernetes".to_string()),
+        session_fingerprint: Some("sha256:requester-session".to_string()),
+        session_revision: Some("requester-session-revision".to_string()),
+        secret_entitlements: None,
+        api_revert: Some(ApiRevertPlan {
+            endpoint: "fixture".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://upstream.invalid".to_string(),
+            upstream_identity: "fixture-identity".to_string(),
+            method: "PUT".to_string(),
+            path: "/apis/apps/v1/namespaces/dev/deployments/api".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
+            body_file: None,
+        }),
+        reason: "patch deployments/api in dev".to_string(),
+        decision_trace: None,
+        created_unix: now_unix(),
+        deadline_unix: now_unix().saturating_add(300),
+        window_secs: 300,
+        auto_reverted_unix: None,
+        forward_done: true,
+        forward_exit: Some(0),
+        forward_persistence_failed: false,
+        status: ProvisionalStatus::Armed,
+        revert_exit: None,
+        revert_detail: None,
+    });
+
+    let AdminResponse::Provisionals { items } =
+        handle_admin_request_for_test(&cfg, &requester, AdminRequest::Provisionals).await
+    else {
+        panic!("requester should receive a provisional list");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].handle, handle);
+
+    let AdminResponse::Provisionals { items } = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1_001 },
+        AdminRequest::Provisionals,
+    )
+    .await
+    else {
+        panic!("other requester should receive a provisional list");
+    };
+    assert!(items.is_empty());
+
+    assert!(matches!(
+        handle_admin_request_for_test(
+            &cfg,
+            &requester,
+            AdminRequest::Confirm {
+                handle: handle.to_string(),
+            },
+        )
+        .await,
+        AdminResponse::Error { message } if message.contains("operator authority")
+    ));
+    assert_eq!(
+        cfg.state
+            .provisional
+            .read()
+            .await
+            .get(handle)
+            .unwrap()
+            .status,
+        ProvisionalStatus::Armed
+    );
+
+    let AdminResponse::Provisionals { items } =
+        handle_admin_request_for_test(&cfg, &operator, AdminRequest::Provisionals).await
+    else {
+        panic!("operator should receive a provisional list");
+    };
+    assert_eq!(items.len(), 1);
+}
+
 /// Approval arms the immutable snapshot without executing it. Only the
 /// authenticated requester can claim the one-shot resume.
 #[cfg(unix)]
 #[tokio::test]
 async fn approval_snapshot_omits_rendered_verb_parameter_values() {
     let (mut cfg, _, agent) = gating_config(7004, 1000);
+    cfg.config.exec_timeout_secs = 17;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.db");
     let store = SessionStore::open(path.clone(), 3600).await.unwrap();
@@ -3032,7 +3136,9 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
             verb: Some(VerbContext {
                 name: "fixture-verb".to_string(),
                 class: Reversibility::Irreversible,
+                hold: false,
                 trusted: false,
+                exec_timeout_secs: None,
                 params: BTreeMap::from([("rollback_only".to_string(), value.clone())]),
                 catalog_version: 1,
                 verb_digest: None,
@@ -3042,6 +3148,7 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -3057,10 +3164,17 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
         .unwrap()
         .clone();
     assert!(approval.snapshot.verb_params.is_empty());
+    assert_eq!(approval.snapshot.exec_timeout_secs, Some(17));
     assert!(store.load_approvals().await.unwrap()[0]
         .snapshot
         .verb_params
         .is_empty());
+    assert_eq!(
+        store.load_approvals().await.unwrap()[0]
+            .snapshot
+            .exec_timeout_secs,
+        Some(17)
+    );
     let durable = std::fs::read(path).unwrap();
     assert!(!durable
         .windows(value.len())
@@ -3121,6 +3235,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -3132,7 +3247,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
     let guidance = held_response.verb_guidance.as_deref().unwrap();
     assert_eq!(
         guidance,
-        format!("approve: guard access approve {handle} --once")
+        format!("ask your admin to approve request {handle} (see guard access show {handle})")
     );
 
     // Non-operator approve is refused; the hold stays pending.
@@ -3351,6 +3466,7 @@ async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -3461,6 +3577,7 @@ async fn armed_hold_expires_across_restart_without_execution() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -3605,6 +3722,7 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
             catalog_version: None,
             verb_digest: None,
             verb_composition_digest: None,
+            exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(principal),
@@ -3740,6 +3858,7 @@ async fn held_snapshot_consumes_its_originating_once_authority() {
             bypass: false,
             authority,
             consume_access_verbs: vec!["inspect-fixture".to_string()],
+            force_hold: false,
         },
     )
     .await;
@@ -3911,6 +4030,7 @@ async fn held_snapshot_does_not_fall_through_to_overlapping_authority() {
             bypass: false,
             authority: live_authority(&cfg, "access-token").await,
             consume_access_verbs: selected_verbs.clone(),
+            force_hold: false,
         },
     )
     .await;
@@ -4050,6 +4170,7 @@ async fn held_snapshot_binds_and_consumes_multiple_originating_requests() {
             bypass: false,
             authority: live_authority(&cfg, "access-token").await,
             consume_access_verbs: selected_verbs,
+            force_hold: false,
         },
     )
     .await;
@@ -4192,6 +4313,7 @@ async fn exhausted_multi_verb_hold_requests_every_required_scope() {
             bypass: false,
             authority: live_authority(&cfg, "access-token").await,
             consume_access_verbs: selected_verbs.clone(),
+            force_hold: false,
         },
     )
     .await;
@@ -4223,8 +4345,15 @@ async fn exhausted_multi_verb_hold_requests_every_required_scope() {
         .map(|(handle, _)| handle.clone())
         .collect::<Vec<_>>();
     let response = result.into_response();
-    let guidance = response.verb_guidance.expect("exact operator guidance");
-    assert!(guidance.contains(&format!("guard access approve {}", handles.join(" "))));
+    let guidance = response
+        .verb_guidance
+        .expect("requester-safe approval guidance");
+    for handle in &handles {
+        assert!(guidance.contains(&format!(
+            "ask your admin to approve request {handle} (see guard access show {handle})"
+        )));
+    }
+    assert!(!guidance.contains("guard access approve"));
     assert!(response.handle.is_none());
     assert!(response.approval_options.is_empty());
 }
@@ -4250,6 +4379,7 @@ async fn held_access_replay_fails_if_staged_session_was_revoked() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
     };
@@ -4326,6 +4456,7 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -4484,6 +4615,7 @@ async fn hold_is_not_returned_until_its_pending_state_is_durable() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -4555,6 +4687,7 @@ async fn approval_state_must_be_durable_before_a_held_snapshot_executes() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -4783,7 +4916,10 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         resp
     );
     match waiter.await.unwrap() {
-        guard::proxy::HoldDecision::Denied { .. } => {}
+        guard::proxy::HoldDecision::Denied {
+            handle: Some(returned_handle),
+            ..
+        } => assert_eq!(returned_handle, handle),
         other => panic!("expected Denied, got {:?}", other),
     }
     assert_eq!(
@@ -4890,6 +5026,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
                 bypass: false,
                 authority: None,
                 consume_access_verbs: Vec::new(),
+                force_hold: false,
             },
             Some(guard::gating::DecisionTrace::source("static_policy")),
         )
@@ -4967,6 +5104,7 @@ async fn waiting_requester_resumes_armed_hold_and_receives_terminal_output() {
                 bypass: false,
                 authority: None,
                 consume_access_verbs: Vec::new(),
+                force_hold: false,
             },
             None,
         )
@@ -5066,6 +5204,7 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
             bypass: false,
             authority: live_authority(&cfg, &session_token).await,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -5178,6 +5317,7 @@ async fn approve_rejected_when_bound_secret_value_changed() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -5282,6 +5422,7 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -5374,6 +5515,7 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -5464,6 +5606,7 @@ async fn approval_note_operator_and_owner_post_others_refused() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -5579,6 +5722,7 @@ fn held_verb_approval(
             catalog_version,
             verb_digest,
             verb_composition_digest: None,
+            exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal,
@@ -5742,6 +5886,12 @@ async fn access_audience_controls_hold_visibility_and_next_action() {
         owner_item.next_action,
         format!("guard approval show {handle} --wait")
     );
+    assert_eq!(
+        owner_item.approval_options,
+        vec![format!(
+            "ask your admin to approve request {handle} (see guard access show {handle})"
+        )]
+    );
 
     let AdminResponse::AccessItem {
         item: operator_item,
@@ -5759,6 +5909,10 @@ async fn access_audience_controls_hold_visibility_and_next_action() {
     assert_eq!(
         operator_item.next_action,
         format!("guard access approve {handle} --once")
+    );
+    assert_eq!(
+        operator_item.approval_options,
+        vec![format!("guard access approve {handle} --once")]
     );
 
     assert!(matches!(
@@ -5778,6 +5932,23 @@ async fn access_audience_controls_hold_visibility_and_next_action() {
         panic!("unrelated caller receives a scoped list")
     };
     assert!(items.iter().all(|item| item.reference != handle));
+}
+
+#[test]
+fn execution_approval_guidance_respects_authenticated_audience() {
+    let (cfg, operator, requester) = gating_config(7007, 1000);
+    let handle = "audience-request";
+
+    assert_eq!(
+        super::super::admin::approval_guidance(&cfg, &operator, handle, false),
+        format!(
+            "approve: guard access approve {handle}\nonce: guard access approve {handle} --once\nbounded: guard access approve {handle} --uses 3"
+        )
+    );
+    assert_eq!(
+        super::super::admin::approval_guidance(&cfg, &requester, handle, false),
+        format!("ask your admin to approve request {handle} (see guard access show {handle})")
+    );
 }
 
 #[tokio::test]
@@ -6205,7 +6376,9 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
                 verb: Some(VerbContext {
                     name: "runtime-command".to_string(),
                     class: Reversibility::Reversible,
+                    hold: false,
                     trusted: true,
+                    exec_timeout_secs: None,
                     params: BTreeMap::new(),
                     catalog_version: version,
                     verb_digest: Some(digest),
@@ -6215,6 +6388,7 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
                 bypass: true,
                 authority: None,
                 consume_access_verbs: Vec::new(),
+                force_hold: false,
             },
             None,
         )
@@ -6319,7 +6493,9 @@ verbs:
                 verb: Some(VerbContext {
                     name: "runtime-command".to_string(),
                     class: Reversibility::Reversible,
+                    hold: false,
                     trusted: true,
+                    exec_timeout_secs: None,
                     params: BTreeMap::new(),
                     catalog_version: version,
                     verb_digest: Some(digest),
@@ -6329,6 +6505,7 @@ verbs:
                 bypass: true,
                 authority: session_authority,
                 consume_access_verbs: Vec::new(),
+                force_hold: false,
             },
             None,
         )
@@ -6409,6 +6586,7 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6459,6 +6637,7 @@ async fn sensitive_hold_and_containment_snapshots_fail_before_persistence() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -6522,6 +6701,7 @@ async fn sensitive_armed_approval_is_redacted_and_cannot_resume() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -6603,6 +6783,7 @@ async fn sensitive_provisional_snapshots_are_redacted_and_cannot_replay() {
     let provisional = Provisional {
         handle: "sensitive-provisional-replay".to_string(),
         principal: agent.principal(),
+        requester_principal: None,
         binary: "curl.EXE".to_string(),
         args: vec![format!("-u{sensitive}")],
         cwd: None,
@@ -6697,6 +6878,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: Some(principal.clone()),
@@ -6722,6 +6904,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
     let provisional = Provisional {
         handle: "entitled-control-path".to_string(),
         principal: Some(principal),
+        requester_principal: None,
         binary: "true".to_string(),
         args: Vec::new(),
         cwd: None,
@@ -6839,6 +7022,7 @@ async fn approved_snapshot_rejects_changed_session_revision() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6874,6 +7058,7 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6915,6 +7100,7 @@ async fn approved_snapshot_executes_in_snapshotted_cwd() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6957,6 +7143,7 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -7007,6 +7194,7 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -7042,6 +7230,7 @@ async fn provisional_revert_executes_in_snapshotted_cwd() {
     let provisional = Provisional {
         handle: "cwd-revert".to_string(),
         principal: agent.principal(),
+        requester_principal: None,
         binary: "true".to_string(),
         args: Vec::new(),
         cwd: Some(temp.path().to_path_buf()),

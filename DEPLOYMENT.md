@@ -281,6 +281,7 @@ test ! -e "$backup_dir"
 sha256sum --check BINARY-SHA256
 expected_binary_hash="$(awk '$2 == "guard" {print $1}' BINARY-SHA256)"
 test "${#expected_binary_hash}" -eq 64
+test ! -f /var/lib/guard/verbs.yaml || ./guard verb lint --file /var/lib/guard/verbs.yaml
 install -d -o root -g root -m 0700 "$backup_dir"
 systemctl stop "$guard_unit"
 test "$(systemctl is-active "$guard_unit" || true)" = inactive

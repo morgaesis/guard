@@ -11,15 +11,17 @@ use crate::server::execute::{
 };
 use crate::server::gate_runtime::binary_allowed;
 use crate::server::transport::emit_audit_events;
+#[cfg(unix)]
+use crate::server::wire::GateStatus;
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
 };
 #[cfg(unix)]
 use crate::server::RequestContext;
 use crate::server::{
-    binary_exists_on_path, dangerous_env_name, deterministic_credential_deny_reason,
-    deterministic_safe_allow_reason, invalid_shell_secret_reference, is_valid_secret_key,
-    validate_request_injections,
+    binary_exists_on_path, configured_credential_path_deny_reason, dangerous_env_name,
+    deterministic_credential_deny_reason, deterministic_safe_allow_reason,
+    invalid_shell_secret_reference, is_valid_secret_key, validate_request_injections,
 };
 #[cfg(unix)]
 use crate::session::SessionExactRule;
@@ -30,6 +32,8 @@ use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
 use guard::gating::verb::VerbCatalog;
 #[cfg(unix)]
 use guard::gating::GateMode;
+#[cfg(unix)]
+use guard::policy::PolicyMode;
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -762,6 +766,108 @@ fn credential_preflight_allows_basic_kubectl_inspection() {
 }
 
 #[test]
+fn configured_path_deny_matches_state_dir_and_catalog_on_word_boundaries() {
+    let state_dir = std::path::Path::new("/var/lib/guard-fixture");
+    let catalog = std::path::Path::new("/etc/guard-fixture/verbs.yaml");
+    let deny = |binary: &str, args: &[&str]| {
+        configured_credential_path_deny_reason(
+            binary,
+            &args
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            Some(state_dir),
+            Some(catalog),
+        )
+    };
+
+    let reason = deny("cat", &["/var/lib/guard-fixture/state.db"])
+        .expect("state directory contents must be denied");
+    assert!(reason.contains("Guard state or verb catalog material"));
+    assert!(deny("cat", &["/etc/guard-fixture/verbs.yaml"]).is_some());
+    assert!(
+        deny(
+            "sh",
+            &["-c", "cat '/etc/guard-fixture/verbs.yaml' >/dev/null"]
+        )
+        .is_some(),
+        "quoted shell references must still match"
+    );
+    // Prefix-similar paths stay allowed: the match respects word boundaries.
+    assert!(deny("cat", &["/var/lib/guard-fixtures/notes.txt"]).is_none());
+    assert!(deny("cat", &["/etc/guard-fixture/verbs.yaml.bak"]).is_none());
+    assert!(deny("ls", &["/tmp"]).is_none());
+    assert!(configured_credential_path_deny_reason(
+        "cat",
+        &["/etc/anything".to_string()],
+        None,
+        None
+    )
+    .is_none());
+}
+
+/// The state-directory and catalog deny is authorization-material protection,
+/// not an opt-in preflight: it must hold with `--preflight` off, while the
+/// broader deterministic credential preflight stays opt-in.
+#[tokio::test]
+async fn guard_catalog_read_is_denied_even_without_preflight() {
+    let (mut cfg, _buf) = make_test_config();
+    assert!(
+        !cfg.config.preflight,
+        "fixture must model a preflight-off daemon"
+    );
+    let state = tempfile::tempdir().expect("state fixture dir");
+    let catalog_path = state.path().join("verbs.yaml");
+    cfg.config.state_dir = Some(state.path().to_path_buf());
+    cfg.config.verb_catalog_path = Some(catalog_path.clone());
+
+    let result = execute_command(
+        basic_request("cat", vec![catalog_path.display().to_string()]),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await;
+    assert!(!result.policy_allowed());
+    assert!(
+        result
+            .policy_reason()
+            .contains("Guard state or verb catalog material"),
+        "unexpected reason: {}",
+        result.policy_reason()
+    );
+
+    let result = execute_command(
+        basic_request(
+            "cat",
+            vec![state.path().join("state.db").display().to_string()],
+        ),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await;
+    assert!(!result.policy_allowed());
+    assert!(result
+        .policy_reason()
+        .contains("Guard state or verb catalog material"));
+
+    // An environment dump is a preflight-only rule; with preflight off it must
+    // not surface a preflight denial.
+    let result = execute_command(
+        basic_request("printenv", vec!["PATH".to_string()]),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await;
+    assert!(
+        !result
+            .policy_reason()
+            .contains("credential preflight denied"),
+        "preflight rule fired while preflight was off: {}",
+        result.policy_reason()
+    );
+}
+
+#[test]
 fn binary_allowlist_none_allows_everything() {
     assert!(binary_allowed(&None, "kubectl"));
     assert!(binary_allowed(&None, "/tmp/whatever"));
@@ -1196,6 +1302,150 @@ fn basic_request(binary: &str, args: Vec<String>) -> ExecuteRequest {
 }
 
 #[cfg(unix)]
+fn process_state(pid: i32) -> Option<char> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_string()))
+        .and_then(|tail| tail.chars().next())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn buffered_exec_timeout_kills_the_process_group_and_is_audited() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_timeout_secs = 1;
+    let (_audit_dir, audit) = attach_test_audit_log(&mut cfg);
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let dir = tempfile::tempdir().unwrap();
+    let child_pid_file = dir.path().join("child.pid");
+    let request = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            format!(
+                "sleep 30 & child=$!; printf '%s' \"$child\" > {}; wait",
+                child_pid_file.display()
+            ),
+        ],
+    );
+    let mut sink = tokio::io::sink();
+    let result = exec_after_approval_with_secret_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &caller,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        "fixture allow".to_string(),
+        None,
+    )
+    .await;
+
+    let reason = match &result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(*started);
+            reason.clone()
+        }
+        other => panic!("expected timeout failure, got {other:?}"),
+    };
+    assert!(reason.starts_with("exec_timeout:"), "{reason}");
+    let child_pid = std::fs::read_to_string(&child_pid_file)
+        .expect("shell recorded its background child")
+        .parse::<i32>()
+        .expect("valid child pid");
+    let state = process_state(child_pid);
+    assert!(
+        state.is_none() || state == Some('Z'),
+        "same-group child remained runnable after timeout: {state:?}"
+    );
+
+    emit_audit_events(&cfg, &caller, "sh", &[], &result);
+    let response = result.into_response();
+    assert!(!response.allowed);
+    assert!(response.reason.contains("exec_timeout"));
+    assert!(std::fs::read_to_string(audit.path())
+        .unwrap()
+        .contains("exec_timeout"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn streaming_exec_timeout_does_not_reset_on_keepalive() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_timeout_secs = 1;
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let mut stream = Vec::new();
+    let request = basic_request("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
+    let result = exec_after_approval_with_secret_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &caller,
+            depth: 0,
+            stream_output: true,
+            stream_writer: &mut stream,
+        },
+        request,
+        "fixture allow".to_string(),
+        None,
+    )
+    .await;
+
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(started);
+            assert!(reason.starts_with("exec_timeout:"), "{reason}");
+        }
+        other => panic!("expected streaming timeout failure, got {other:?}"),
+    }
+    assert!(
+        String::from_utf8_lossy(&stream).contains("keepalive"),
+        "streaming execution should retain transport keepalives"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verb_exec_timeout_overrides_the_daemon_default() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.config.exec_timeout_secs = 30;
+    *cfg.state.verbs.write().await = VerbCatalog::from_yaml(
+        r#"
+verbs:
+  - name: bounded-sleep
+    binary: sh
+    args: ["-c", "sleep 30"]
+    consequence: reversible
+    trusted: true
+    exec_timeout_secs: 1
+"#,
+    )
+    .unwrap();
+    let mut request = basic_request("", Vec::new());
+    request.verb = Some(crate::server::VerbInvocation {
+        name: "bounded-sleep".to_string(),
+        params: Default::default(),
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }),
+    )
+    .await
+    .expect("the per-verb limit must override the longer daemon default");
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(started);
+            assert!(reason.contains("exec_timeout"), "{reason}");
+            assert!(reason.contains("1 seconds"), "{reason}");
+        }
+        other => panic!("expected per-verb timeout failure, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn approved_ansible_evaluate_verbs_bypass_denial_without_filing_another_request() {
     let _env_guard = TEST_ENV_LOCK.lock().await;
@@ -1313,6 +1563,200 @@ verbs:
     assert!(cfg.state.grant_requests.read().await.is_empty());
     let admission = cfg.state.command_admission.snapshot();
     assert_eq!(admission.evaluator_attempted, 0);
+}
+
+/// Gated allowing evaluator stub: approves everything as reversible risk 1,
+/// the shape that would reach execute-now if no deterministic floor applied.
+#[cfg(unix)]
+async fn run_gated_allowing_llm(listener: tokio::net::TcpListener) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 2048];
+            while let Ok(n) = stream.read(&mut tmp).await {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..pos]);
+                    let content_length = headers
+                        .split("\r\n")
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .or_else(|| line.strip_prefix("content-length: "))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= pos + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let args = serde_json::json!({
+                "decision": "APPROVE",
+                "reason": "bounded maintenance",
+                "risk": 1,
+                "reversibility": "reversible"
+            })
+            .to_string();
+            let body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "decide",
+                                "arguments": args
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+}
+
+#[cfg(unix)]
+fn install_ansible_playbook_shim(temp: &tempfile::TempDir) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin_dir = temp.path().join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    let shim = bin_dir.join("ansible-playbook");
+    std::fs::write(&shim, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+    bin_dir
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn safe_mode_llm_allow_on_opaque_carrier_is_clamped_to_hold() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_gated_allowing_llm(listener));
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = install_ansible_playbook_shim(&temp);
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .mode(PolicyMode::Safe)
+                .gate_mode(GateMode::Consequence)
+                .cache_enabled(false)
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+
+    let request = basic_request("ansible-playbook", vec!["site.yml".to_string()]);
+    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(
+        response.allowed,
+        "the clamp holds an approved command; it is not a denial: {response:?}"
+    );
+    assert_eq!(
+        response.status,
+        Some(GateStatus::Held),
+        "a model-only allow of an opaque carrier must hold, not execute: {response:?}"
+    );
+    assert_eq!(response.exit_code, None, "a held command never executed");
+    assert!(
+        response.reason.contains("opaque-carrier floor"),
+        "the hold reason must name the carrier boundary: {}",
+        response.reason
+    );
+    assert!(response.handle.is_some());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn typed_verb_authorized_opaque_carrier_is_not_clamped() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_gated_allowing_llm(listener));
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = install_ansible_playbook_shim(&temp);
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .mode(PolicyMode::Safe)
+                .gate_mode(GateMode::Consequence)
+                .cache_enabled(false)
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: validate-approved-playbook
+    binary: ansible-playbook
+    args: ["--syntax-check", "/srv/automation/site.yml"]
+    consequence: reversible
+    coverage:
+      - name: syntax-check
+        action: evaluate
+        required_args: ["--syntax-check", "/srv/automation/site.yml"]
+"#,
+        )
+        .unwrap(),
+    ));
+
+    let request = basic_request(
+        "ansible-playbook",
+        vec![
+            "--syntax-check".to_string(),
+            "/srv/automation/site.yml".to_string(),
+        ],
+    );
+    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(
+        response.allowed,
+        "typed verb coverage expresses the trust the floor demands: {response:?}"
+    );
+    assert_eq!(
+        response.status, None,
+        "an operator-authored typed verb bypasses the carrier floor: {response:?}"
+    );
+    assert_eq!(response.exit_code, Some(0));
 }
 
 #[cfg(unix)]

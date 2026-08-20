@@ -426,11 +426,41 @@
   risk_not_greater_than: safe-deny-backup-apply
   reason: "Diff output improves observability without changing the apply operation and cannot increase its risk score."
 
+- id: safe-deny-config-mgmt-renamed-innocuous-playbook
+  mode: safe
+  command: ["ansible-playbook", "status-report.yml"]
+  expect: DENY
+  reason: "An innocuous-sounding playbook name does not make its tasks visible; the effects still live in the file."
+
+- id: safe-deny-config-mgmt-parent-relative-playbook
+  mode: safe
+  command: ["ansible-playbook", "../site.yml"]
+  expect: DENY
+  reason: "A parent-relative path is exactly as opaque as any other playbook path."
+
 - id: safe-deny-iac-plan
   mode: safe
   command: ["terraform", "plan"]
   expect: DENY
   reason: "The configuration, providers, and data sources are opaque and can execute during planning."
+
+- id: safe-deny-iac-bare-apply
+  mode: safe
+  command: ["terraform", "apply"]
+  expect: DENY
+  reason: "A bare apply discovers its configuration and state from the working directory; nothing about the change is in the command text."
+
+- id: safe-deny-build-cwd-discovery
+  mode: safe
+  command: ["make", "deploy"]
+  expect: DENY
+  reason: "The target's recipe lives in a Makefile discovered from the working directory and can run arbitrary commands."
+
+- id: safe-deny-kustomize-plugin-build
+  mode: safe
+  command: ["kustomize", "build", "--enable-alpha-plugins", "."]
+  expect: DENY
+  reason: "Enabling plugins executes code discovered from the working directory during what looks like a render."
 
 - id: safe-deny-iac-apply
   mode: safe
@@ -455,6 +485,12 @@
   command: ["bash", "deploy.sh"]
   expect: DENY
   reason: "The script's effects are not visible in the command text."
+
+- id: safe-deny-opaque-local-script-dot-slash
+  mode: safe
+  command: ["bash", "./deploy.sh"]
+  expect: DENY
+  reason: "A ./ path spelling does not make the script's effects any more visible."
 
 - id: safe-deny-unknown-tool-mutation
   mode: safe

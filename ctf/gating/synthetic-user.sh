@@ -322,16 +322,18 @@ response_target() {
 }
 
 require_request_guidance() {
+  # Requester-facing guidance is audience-gated: the literal approve command
+  # is operator-only, so its presence here would be an authority leak.
   local file="$1" handle="$2"
-  grep -Fq "guard access approve $handle" "$file"
-  grep -Fq "guard access approve $handle --once" "$file"
-  grep -Fq "guard access approve $handle --uses 3" "$file"
+  grep -Fq "ask your admin to approve request $handle" "$file"
+  grep -Fq "guard access show $handle" "$file"
+  ! grep -Fq "guard access approve $handle" "$file"
 }
 
 require_hold_guidance() {
   local file="$1" handle="$2"
-  grep -Fq "guard access approve $handle --once" "$file"
-  ! grep -Fq "guard access approve $handle --uses" "$file"
+  grep -Fq "ask your admin to approve request $handle" "$file"
+  ! grep -Fq "guard access approve $handle" "$file"
 }
 
 save_request() {
@@ -670,10 +672,9 @@ phase_su15() {
       require_request_guidance /scenario/journey/maintenance-denied.out "$denied_handle"
       capture_mcp_denial
       grep -Fq '"allowed":false' /scenario/journey/maintenance-mcp.out
-      grep -Fq "\`guard access approve $denied_handle\`" /scenario/journey/maintenance-mcp.out
-      grep -Fq "\`guard access approve $denied_handle --once\`" /scenario/journey/maintenance-mcp.out
-      grep -Fq "\`guard access approve $denied_handle --uses 3\`" /scenario/journey/maintenance-mcp.out
-      grep -Fq "\`guard access show $denied_handle\`" /scenario/journey/maintenance-mcp.out
+      grep -Fq "ask your admin to approve request $denied_handle" /scenario/journey/maintenance-mcp.out
+      ! grep -Fq "guard access approve $denied_handle" /scenario/journey/maintenance-mcp.out
+      grep -Fq "guard access show $denied_handle" /scenario/journey/maintenance-mcp.out
       expect_failure maintenance-retry guard run --json hostctl apply /scenario/fixtures/access-maintenance-applied
       retry_handle="$(response_handle /scenario/journey/maintenance-retry.out)"
       [ "$retry_handle" = "$denied_handle" ]

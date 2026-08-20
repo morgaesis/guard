@@ -81,6 +81,84 @@ async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
     start_daemon_with_gate(tmp, false).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn run_socket_flag_overrides_environment_endpoint() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_daemon, socket_path) = start_daemon(&tmp).await;
+    let output = timeout(
+        Duration::from_secs(10),
+        Command::new(GUARD_BIN)
+            .args(["run", "--json", "--socket"])
+            .arg(&socket_path)
+            .args(["echo", "socket-ok"])
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .env("GUARD_SOCKET", tmp.path().join("wrong.sock"))
+            .output(),
+    )
+    .await
+    .expect("guard run timed out")
+    .expect("run guard command");
+    assert!(
+        output.status.success(),
+        "guard run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse run envelope");
+    assert_eq!(envelope["type"], "run_result");
+    assert_eq!(envelope["response"]["allowed"], true);
+    assert!(envelope["response"]["stdout"]
+        .as_str()
+        .is_some_and(|value| value.contains("socket-ok")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verb_lint_reports_every_named_failure_and_exits_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restrict tempdir");
+    let catalog = tmp.path().join("verbs.yaml");
+    std::fs::write(
+        &catalog,
+        r#"verbs:
+  - name: inspect-first
+    binary: fixturectl
+    args: ["show", "{target}"]
+    params:
+      target: { pattern: "[a-z]+" }
+    consequence: reversible
+  - name: inspect-second
+    binary: fixturectl
+    args: ["show", "{resource}"]
+    params:
+      resource: { pattern: "[0-9]+" }
+    consequence: reversible
+"#,
+    )
+    .expect("write catalog");
+    std::fs::set_permissions(&catalog, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict catalog");
+
+    let output = timeout(
+        Duration::from_secs(10),
+        Command::new(GUARD_BIN)
+            .args(["verb", "lint", "--file"])
+            .arg(&catalog)
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .output(),
+    )
+    .await
+    .expect("verb lint timed out")
+    .expect("run verb lint");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in ["inspect-first", "target", "inspect-second", "resource"] {
+        assert!(stderr.contains(expected), "missing {expected}: {stderr}");
+    }
+    assert!(stderr.contains("2 finding(s)"), "{stderr}");
+}
+
 async fn start_daemon_with_gate(
     tmp: &TempDir,
     consequence_gate: bool,
@@ -565,7 +643,7 @@ async fn mcp_process_rejects_a_built_in_custom_tool_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn typed_verb_denial_prints_every_exact_access_command() {
+async fn typed_verb_denial_prints_requester_safe_access_guidance() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_daemon, socket_path) = start_daemon_with_gate(&tmp, true).await;
     let output = timeout(
@@ -588,9 +666,10 @@ async fn typed_verb_denial_prints_every_exact_access_command() {
         .find_map(|line| line.trim().strip_prefix("request: "))
         .unwrap_or_else(|| panic!("durable request reference missing from stderr: {stderr}"));
     assert!(reference.starts_with("gr-"));
-    assert!(stderr.contains(&format!("guard access approve {reference}\n")));
-    assert!(stderr.contains(&format!("guard access approve {reference} --once")));
-    assert!(stderr.contains(&format!("guard access approve {reference} --uses 3")));
+    assert!(stderr.contains(&format!(
+        "ask your admin to approve request {reference} (see guard access show {reference})"
+    )));
+    assert!(!stderr.contains("guard access approve"));
     assert!(stderr.contains(&format!("guard access show {reference}")));
 }
 
@@ -822,8 +901,13 @@ async fn mcp_end_to_end_initialize_list_call() {
     assert_eq!(access_item["state"], "pending");
     assert_eq!(access_item["intent"], "inspect-identity");
     assert_eq!(access_item["effective_scope"], json!(["inspect-identity"]));
-    assert_eq!(access_item["approval_options"].as_array().unwrap().len(), 3);
     let reference = access_item["reference"].as_str().expect("access reference");
+    assert_eq!(
+        access_item["approval_options"],
+        json!([format!(
+            "ask your admin to approve request {reference} (see guard access show {reference})"
+        )])
+    );
 
     // 4. tools/call for the same authenticated caller's scoped access list
     let access_list = mcp

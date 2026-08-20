@@ -138,14 +138,25 @@ async fn prompt_regression_corpus_matches_expected_decisions() {
     for case in &cases {
         let mode = PolicyMode::parse(&case.mode)
             .unwrap_or_else(|| panic!("case {}: unknown mode '{}'", case.id, case.mode));
-        let evaluator = Evaluator::new(
-            EvalConfig::default()
-                .mode(mode)
-                .llm_enabled(true)
-                .cache_enabled(false)
-                .llm_api_key(api_key.clone()),
-        )
-        .unwrap_or_else(|e| panic!("case {}: failed to build evaluator: {e}", case.id));
+        let mut eval_config = EvalConfig::default()
+            .mode(mode)
+            .llm_enabled(true)
+            .cache_enabled(false)
+            .llm_api_key(api_key.clone());
+        // Honor the daemon's model/effort env vars so the corpus can be run
+        // against a candidate model before changing the shipped default.
+        if let Ok(model) = std::env::var("GUARD_LLM_MODEL") {
+            if !model.is_empty() {
+                eval_config = eval_config.llm_model(model);
+            }
+        }
+        if let Ok(effort) = std::env::var("GUARD_LLM_REASONING_EFFORT") {
+            if !effort.is_empty() {
+                eval_config = eval_config.llm_reasoning_effort(effort);
+            }
+        }
+        let evaluator = Evaluator::new(eval_config)
+            .unwrap_or_else(|e| panic!("case {}: failed to build evaluator: {e}", case.id));
 
         let command_line = case.command.join(" ");
         for sample in 0..case.samples {

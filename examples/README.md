@@ -68,6 +68,13 @@ regex per parameter, single-argv rendering, no shell), which is what makes
   allowed, deletes and side-effect-only operations held. Load with
   `--api-policy`.
 
+- **[system-prompt-append-tools.md](system-prompt-append-tools.md)** --
+  Evaluator prompt supplement describing an in-house tool's read and mutation
+  surface, in the worked style from
+  [docs/configuration.md](../docs/configuration.md). Adds local tool knowledge
+  to the mode prompt without replacing it; load with `--system-prompt-append`
+  or `GUARD_PROMPT_APPEND`.
+
 - **[fallback-models.env](fallback-models.env)** -- Multi-model fallback chain.
   Adds retry-then-failover across multiple LLM providers via
   `GUARD_LLM_MODELS`. Only needed when your uptime requirements exceed a
