@@ -67,8 +67,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use super::verb::{
-    is_kebab_name, CoverageAction, CoverageProbe, CoverageProvenance, ParamSpec, Verb, VerbCommand,
-    VerbCoverageCell,
+    is_kebab_name, CoverageAction, CoverageObservationReplay, CoverageProvenance, ParamSpec, Verb,
+    VerbCommand, VerbCoverageCell,
 };
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
@@ -724,6 +724,16 @@ pub(crate) fn choose_verb_name(
 /// (`Evaluator::try_confirm_verb_promotion`) still runs
 /// `verb::validate_auto_promoted_verb_safety` on the result before it is
 /// ever appended to the catalog.
+///
+/// Two structural bounds are enforced here rather than trusted from the
+/// caller:
+///
+/// - Automatic promotion never mints authority above
+///   `Reversibility::Reversible`; any other class is refused outright.
+/// - Provenance is honest about how it was produced: the recorded argv
+///   records are `observation_replays` derived from the observed evaluator
+///   decisions the template was compiled from, never `probes`, which would
+///   claim an executed match that never ran.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_candidate_verb(
     binary: &str,
@@ -735,7 +745,14 @@ pub(crate) fn build_candidate_verb(
     revert: Option<VerbCommand>,
     evidence: String,
     promotion_stamp: String,
-) -> Verb {
+) -> Result<Verb> {
+    if consequence != Reversibility::Reversible {
+        anyhow::bail!(
+            "automatic promotion may not mint a '{}' verb: only statically read-only \
+             (reversible) shapes are eligible",
+            consequence.as_str()
+        );
+    }
     let description = sanitize_learning_text(&description);
     let evidence = sanitize_learning_text(&evidence);
     let fixed_args = args
@@ -766,23 +783,22 @@ pub(crate) fn build_candidate_verb(
             prompt_stamp: promotion_stamp.clone(),
             model_stamp: promotion_stamp.clone(),
             generated_unix: now_unix(),
-            probes: vec![
-                CoverageProbe {
+            probes: Vec::new(),
+            observation_replays: vec![
+                CoverageObservationReplay {
                     dimension: "observed_shape".to_string(),
                     args: args.clone(),
-                    expected_match: true,
-                    observed_match: true,
+                    template_match: true,
                 },
-                CoverageProbe {
+                CoverageObservationReplay {
                     dimension: "outside_shape".to_string(),
                     args: vec!["--guard-outside-coverage".to_string()],
-                    expected_match: false,
-                    observed_match: false,
+                    template_match: false,
                 },
             ],
         }),
     }];
-    Verb {
+    Ok(Verb {
         name,
         description,
         binary: binary.to_string(),
@@ -799,7 +815,7 @@ pub(crate) fn build_candidate_verb(
         evidence: Some(evidence),
         auto_promoted: true,
         promotion_stamp: Some(promotion_stamp),
-    }
+    })
 }
 
 impl AsyncDurableStore for AllowPromotionStore {
@@ -1055,11 +1071,64 @@ mod tests {
             None,
             contaminated,
             "fixture-stamp".to_string(),
-        );
+        )
+        .unwrap();
         let encoded = serde_json::to_vec(&verb).unwrap();
         assert!(!encoded
             .windows(value.len())
             .any(|window| window == value.as_bytes()));
+    }
+
+    #[test]
+    fn promoted_verb_provenance_replays_observations_and_claims_no_probes() {
+        let verb = build_candidate_verb(
+            "fixturectl",
+            "fixture-status".to_string(),
+            "Show fixture status".to_string(),
+            vec!["status".to_string()],
+            BTreeMap::new(),
+            Reversibility::Reversible,
+            None,
+            "evidence".to_string(),
+            "fixture-stamp".to_string(),
+        )
+        .unwrap();
+        assert!(verb.auto_promoted);
+        assert_eq!(verb.consequence, Reversibility::Reversible);
+        let provenance = verb.coverage[0].provenance.as_ref().unwrap();
+        assert_eq!(provenance.source, "automatic_evaluator_promotion");
+        assert!(
+            provenance.probes.is_empty(),
+            "nothing was executed against the matcher, so no probe may be claimed"
+        );
+        assert_eq!(provenance.observation_replays.len(), 2);
+        assert!(provenance
+            .observation_replays
+            .iter()
+            .any(|replay| replay.dimension == "observed_shape" && replay.template_match));
+        assert!(provenance
+            .observation_replays
+            .iter()
+            .any(|replay| replay.dimension == "outside_shape" && !replay.template_match));
+    }
+
+    #[test]
+    fn build_candidate_verb_refuses_any_class_above_reversible() {
+        for class in [Reversibility::Recoverable, Reversibility::Irreversible] {
+            let error = build_candidate_verb(
+                "fixturectl",
+                "fixture-restart".to_string(),
+                "Restart fixture".to_string(),
+                vec!["restart".to_string()],
+                BTreeMap::new(),
+                class,
+                None,
+                "evidence".to_string(),
+                "fixture-stamp".to_string(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("only statically read-only"));
+        }
     }
 
     #[test]

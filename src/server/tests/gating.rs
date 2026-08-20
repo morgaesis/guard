@@ -2790,6 +2790,7 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
         bypass: false,
         authority: None,
         consume_access_verbs: Vec::new(),
+        force_hold: false,
     };
     let mut sink = tokio::io::sink();
     let result = route_gated_allow(
@@ -2876,6 +2877,7 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
             bypass: false,
             authority: Some(revoked_authority),
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
         None,
     )
@@ -2930,6 +2932,7 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
             bypass: false,
             authority: Some(expired_authority),
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
         None,
     )
@@ -3042,6 +3045,7 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -3121,6 +3125,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -3351,6 +3356,7 @@ async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -3461,6 +3467,7 @@ async fn armed_hold_expires_across_restart_without_execution() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -3740,6 +3747,7 @@ async fn held_snapshot_consumes_its_originating_once_authority() {
             bypass: false,
             authority,
             consume_access_verbs: vec!["inspect-fixture".to_string()],
+            force_hold: false,
         },
     )
     .await;
@@ -3911,6 +3919,7 @@ async fn held_snapshot_does_not_fall_through_to_overlapping_authority() {
             bypass: false,
             authority: live_authority(&cfg, "access-token").await,
             consume_access_verbs: selected_verbs.clone(),
+            force_hold: false,
         },
     )
     .await;
@@ -4050,6 +4059,7 @@ async fn held_snapshot_binds_and_consumes_multiple_originating_requests() {
             bypass: false,
             authority: live_authority(&cfg, "access-token").await,
             consume_access_verbs: selected_verbs,
+            force_hold: false,
         },
     )
     .await;
@@ -4192,6 +4202,7 @@ async fn exhausted_multi_verb_hold_requests_every_required_scope() {
             bypass: false,
             authority: live_authority(&cfg, "access-token").await,
             consume_access_verbs: selected_verbs.clone(),
+            force_hold: false,
         },
     )
     .await;
@@ -4326,6 +4337,7 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -4484,6 +4496,7 @@ async fn hold_is_not_returned_until_its_pending_state_is_durable() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -4555,6 +4568,7 @@ async fn approval_state_must_be_durable_before_a_held_snapshot_executes() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -4890,6 +4904,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
                 bypass: false,
                 authority: None,
                 consume_access_verbs: Vec::new(),
+                force_hold: false,
             },
             Some(guard::gating::DecisionTrace::source("static_policy")),
         )
@@ -4967,6 +4982,7 @@ async fn waiting_requester_resumes_armed_hold_and_receives_terminal_output() {
                 bypass: false,
                 authority: None,
                 consume_access_verbs: Vec::new(),
+                force_hold: false,
             },
             None,
         )
@@ -5066,6 +5082,7 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
             bypass: false,
             authority: live_authority(&cfg, &session_token).await,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -5178,6 +5195,7 @@ async fn approve_rejected_when_bound_secret_value_changed() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -5282,6 +5300,7 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -5374,6 +5393,7 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -5464,6 +5484,7 @@ async fn approval_note_operator_and_owner_post_others_refused() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -6215,6 +6236,7 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
                 bypass: true,
                 authority: None,
                 consume_access_verbs: Vec::new(),
+                force_hold: false,
             },
             None,
         )
@@ -6329,6 +6351,7 @@ verbs:
                 bypass: true,
                 authority: session_authority,
                 consume_access_verbs: Vec::new(),
+                force_hold: false,
             },
             None,
         )
@@ -6459,6 +6482,7 @@ async fn sensitive_hold_and_containment_snapshots_fail_before_persistence() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;
@@ -6522,6 +6546,7 @@ async fn sensitive_armed_approval_is_redacted_and_cannot_resume() {
             bypass: false,
             authority: None,
             consume_access_verbs: Vec::new(),
+            force_hold: false,
         },
     )
     .await;

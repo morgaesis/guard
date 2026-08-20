@@ -4757,6 +4757,7 @@ mod tests {
                 model_stamp: "safe-model".to_string(),
                 generated_unix: 1,
                 probes: Vec::new(),
+                observation_replays: Vec::new(),
             }),
         }];
         verb.name = guard::gating::verb::generated_access_verb_name(&verb);

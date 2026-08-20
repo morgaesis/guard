@@ -1696,6 +1696,12 @@ pub(super) struct GateInputs {
     /// Selected requester-session verbs supplying this execution's authority.
     /// Baseline or unrelated work leaves this empty.
     pub(super) consume_access_verbs: Vec<String>,
+    /// Deterministic floor: route this allow to an operator hold regardless of
+    /// its reversibility class and risk score. Set by the safe-mode
+    /// opaque-carrier floor (`guard::gating::opaque_carrier_floor_reason`);
+    /// the caller's own `--require-approval` is honored separately from the
+    /// request.
+    pub(super) force_hold: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1818,7 +1824,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
     // The row owner is the caller's cross-platform principal (uid string on
     // Unix, SID on Windows). A non-Unix caller is no longer dropped to None.
     let caller_principal = context.caller.principal();
-    let force_hold = request.require_approval.unwrap_or(false);
+    let force_hold = request.require_approval.unwrap_or(false) || inputs.force_hold;
     let revert_available = request.revert.is_some();
     let outcome = decide_gate(
         inputs.reversibility,

@@ -409,7 +409,7 @@ pub(super) async fn learning_notice(
 ) -> Option<String> {
     let mut notice = if outcome.is_candidate {
         format!(
-            "Verb evidence for `{}` on `{}` reached {} approvals; automatic typed promotion evaluates coverage evidence and boundary probes without routine operator review.",
+            "Verb evidence for `{}` on `{}` reached {} approvals; automatic typed promotion validates the derived matcher against replayed observation evidence without routine operator review.",
             outcome.pattern, outcome.service, outcome.approvals
         )
     } else if let Some(reason) = &outcome.skipped_reason {

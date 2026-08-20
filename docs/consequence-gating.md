@@ -19,6 +19,14 @@ Classification can raise the gate but cannot lower it. Missing or conflicting
 classification holds. Trusted verbs skip evaluator approval, not consequence
 routing.
 
+In safe mode, an evaluator allow of a cwd-dependent opaque carrier
+(`ansible-playbook`, `terraform`, `helm`, `make`, and the rest of the fixed
+classifier list) is deterministically routed to a hold regardless of its
+reversibility class and risk score: these tools execute effects defined
+outside the command text, so a model verdict alone never reaches execute-now
+for them. Coverage by an operator-authored typed verb, which can pin an exact
+`cwd`, authorizes the command past the floor; an evaluator deny stays a deny.
+
 Unix and foreground Windows operators hold the explicitly configured admin
 bearer. The packaged Windows service rejects that bearer and accepts
 kernel-authenticated local SYSTEM on its named pipe so the installer can broker
