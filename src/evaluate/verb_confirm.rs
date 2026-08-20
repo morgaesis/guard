@@ -164,7 +164,7 @@ impl Evaluator {
                 None,
                 evidence,
                 promotion_stamp,
-            )
+            )?
         } else {
             if !self.llm_config.enabled {
                 return Ok(None);
@@ -244,7 +244,7 @@ impl Evaluator {
                 None,
                 evidence,
                 promotion_stamp,
-            )
+            )?
         };
 
         // Promotion authority must not be created from a model's consequence
@@ -591,6 +591,17 @@ mod tests {
             verb.promotion_stamp.as_deref(),
             Some(evaluator.verb_promotion_stamp())
         );
+        // Honest provenance and the automatic-promotion authority ceiling:
+        // the record is a replay of observed evaluator decisions (never an
+        // executed probe) and the consequence class never exceeds reversible.
+        assert_eq!(verb.consequence, Reversibility::Reversible);
+        let provenance = verb.coverage[0]
+            .provenance
+            .as_ref()
+            .expect("auto-promoted coverage carries provenance");
+        assert_eq!(provenance.source, "automatic_evaluator_promotion");
+        assert!(provenance.probes.is_empty());
+        assert!(!provenance.observation_replays.is_empty());
     }
 
     #[tokio::test]

@@ -11,6 +11,8 @@ use crate::server::execute::{
 };
 use crate::server::gate_runtime::binary_allowed;
 use crate::server::transport::emit_audit_events;
+#[cfg(unix)]
+use crate::server::wire::GateStatus;
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
 };
@@ -30,6 +32,8 @@ use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
 use guard::gating::verb::VerbCatalog;
 #[cfg(unix)]
 use guard::gating::GateMode;
+#[cfg(unix)]
+use guard::policy::PolicyMode;
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -1559,6 +1563,200 @@ verbs:
     assert!(cfg.state.grant_requests.read().await.is_empty());
     let admission = cfg.state.command_admission.snapshot();
     assert_eq!(admission.evaluator_attempted, 0);
+}
+
+/// Gated allowing evaluator stub: approves everything as reversible risk 1,
+/// the shape that would reach execute-now if no deterministic floor applied.
+#[cfg(unix)]
+async fn run_gated_allowing_llm(listener: tokio::net::TcpListener) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 2048];
+            while let Ok(n) = stream.read(&mut tmp).await {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..pos]);
+                    let content_length = headers
+                        .split("\r\n")
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .or_else(|| line.strip_prefix("content-length: "))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= pos + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let args = serde_json::json!({
+                "decision": "APPROVE",
+                "reason": "bounded maintenance",
+                "risk": 1,
+                "reversibility": "reversible"
+            })
+            .to_string();
+            let body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "decide",
+                                "arguments": args
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+}
+
+#[cfg(unix)]
+fn install_ansible_playbook_shim(temp: &tempfile::TempDir) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin_dir = temp.path().join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    let shim = bin_dir.join("ansible-playbook");
+    std::fs::write(&shim, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+    bin_dir
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn safe_mode_llm_allow_on_opaque_carrier_is_clamped_to_hold() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_gated_allowing_llm(listener));
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = install_ansible_playbook_shim(&temp);
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .mode(PolicyMode::Safe)
+                .gate_mode(GateMode::Consequence)
+                .cache_enabled(false)
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+
+    let request = basic_request("ansible-playbook", vec!["site.yml".to_string()]);
+    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(
+        response.allowed,
+        "the clamp holds an approved command; it is not a denial: {response:?}"
+    );
+    assert_eq!(
+        response.status,
+        Some(GateStatus::Held),
+        "a model-only allow of an opaque carrier must hold, not execute: {response:?}"
+    );
+    assert_eq!(response.exit_code, None, "a held command never executed");
+    assert!(
+        response.reason.contains("opaque-carrier floor"),
+        "the hold reason must name the carrier boundary: {}",
+        response.reason
+    );
+    assert!(response.handle.is_some());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn typed_verb_authorized_opaque_carrier_is_not_clamped() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_gated_allowing_llm(listener));
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = install_ansible_playbook_shim(&temp);
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .mode(PolicyMode::Safe)
+                .gate_mode(GateMode::Consequence)
+                .cache_enabled(false)
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: validate-approved-playbook
+    binary: ansible-playbook
+    args: ["--syntax-check", "/srv/automation/site.yml"]
+    consequence: reversible
+    coverage:
+      - name: syntax-check
+        action: evaluate
+        required_args: ["--syntax-check", "/srv/automation/site.yml"]
+"#,
+        )
+        .unwrap(),
+    ));
+
+    let request = basic_request(
+        "ansible-playbook",
+        vec![
+            "--syntax-check".to_string(),
+            "/srv/automation/site.yml".to_string(),
+        ],
+    );
+    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(
+        response.allowed,
+        "typed verb coverage expresses the trust the floor demands: {response:?}"
+    );
+    assert_eq!(
+        response.status, None,
+        "an operator-authored typed verb bypasses the carrier floor: {response:?}"
+    );
+    assert_eq!(response.exit_code, Some(0));
 }
 
 #[cfg(unix)]

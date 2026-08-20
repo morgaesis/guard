@@ -1754,6 +1754,12 @@ pub(super) struct GateInputs {
     /// Selected requester-session verbs supplying this execution's authority.
     /// Baseline or unrelated work leaves this empty.
     pub(super) consume_access_verbs: Vec<String>,
+    /// Deterministic floor: route this allow to an operator hold regardless of
+    /// its reversibility class and risk score. Set by the safe-mode
+    /// opaque-carrier floor (`guard::gating::opaque_carrier_floor_reason`);
+    /// the caller's own `--require-approval` is honored separately from the
+    /// request.
+    pub(super) force_hold: bool,
 }
 
 fn held_containment_guidance(
@@ -1879,7 +1885,8 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
         .map(|snapshot| snapshot.secret_entitlements.clone());
 
     let force_hold = request.require_approval.unwrap_or(false)
-        || inputs.verb.as_ref().is_some_and(|verb| verb.hold);
+        || inputs.verb.as_ref().is_some_and(|verb| verb.hold)
+        || inputs.force_hold;
 
     // Gating off, or an operator-authored static-policy allow with no matched
     // per-verb hold requirement: execute directly.

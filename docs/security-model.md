@@ -54,6 +54,13 @@ grant escalation path. Tools outside the evaluator's knowledge are
 unevaluable, not implicitly trusted; operators describe house tools through
 prompt supplements (`--system-prompt-append`) or typed verbs.
 
+For cwd-dependent opaque carriers (`ansible-playbook`, `terraform`, `helm`,
+`make`, and the rest of the fixed classifier list) the carrier boundary is
+also a deterministic floor under consequence gating, not prompt compliance
+alone: a safe-mode evaluator allow of such a binary is clamped to an operator
+hold unless an operator-authored typed verb covers the command. An evaluator
+deny is never softened, and readonly and paranoid modes are unchanged.
+
 Session overlays intentionally expand baseline evaluator or readonly coverage
 inside activated verb regions. This gives a short-lived agent bounded mutation
 authority without changing the global posture. The exact session revision and

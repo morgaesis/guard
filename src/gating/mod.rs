@@ -30,6 +30,7 @@ pub mod read_grant;
 pub mod ssh_readonly;
 pub mod verb;
 
+use crate::policy::PolicyMode;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -336,6 +337,38 @@ pub fn decide_gate(
     }
 }
 
+/// Deterministic safe-mode floor for cwd-dependent opaque carriers. The
+/// binaries named by [`allow_promotion::is_cwd_dependent_opaque_carrier`]
+/// carry their blast radius outside the command text (a playbook, chart,
+/// plan, Makefile, or plugin tree discovered from the caller working
+/// directory), so the safe-mode prompt's carrier boundary is backed by this
+/// code path rather than model compliance alone: an evaluator allow for such
+/// a binary never executes by itself and is clamped to an operator hold. An
+/// operator-authored typed verb (which can pin an exact `cwd`) expresses the
+/// trust the floor demands and bypasses it per verb; a session grant skips
+/// the evaluator entirely and is likewise untouched. Readonly and paranoid
+/// modes already deny these operations outright and are unchanged, and an
+/// evaluator deny is never softened.
+///
+/// Returns the hold reason when the floor applies.
+pub fn opaque_carrier_floor_reason(
+    mode: Option<PolicyMode>,
+    binary: &str,
+    verb_authorized: bool,
+) -> Option<String> {
+    if verb_authorized
+        || mode != Some(PolicyMode::Safe)
+        || !allow_promotion::is_cwd_dependent_opaque_carrier(binary)
+    {
+        return None;
+    }
+    Some(format!(
+        "opaque-carrier floor: '{binary}' executes effects defined outside the command text, \
+         so an evaluator allow alone cannot execute it in safe mode; held for operator \
+         approval (an operator-authored typed verb authorizes it deterministically)"
+    ))
+}
+
 /// Honest statement of what a gate verified and what it deliberately did not.
 /// Surfaced to the caller for held/provisional/dry-run outcomes so an approval
 /// is never mistaken for a guarantee the action is correct or safe to keep.
@@ -510,6 +543,42 @@ mod tests {
         );
         assert_eq!("off".parse::<GateMode>().unwrap(), GateMode::Off);
         assert!("bogus".parse::<GateMode>().is_err());
+    }
+
+    #[test]
+    fn opaque_carrier_floor_clamps_only_unauthorized_safe_mode_carriers() {
+        let reason = opaque_carrier_floor_reason(Some(PolicyMode::Safe), "ansible-playbook", false)
+            .expect("safe-mode carrier without verb authority must hit the floor");
+        assert!(reason.contains("opaque-carrier floor"));
+        assert!(reason.contains("ansible-playbook"));
+        // Every classifier member is floored the same way.
+        assert!(opaque_carrier_floor_reason(Some(PolicyMode::Safe), "terraform", false).is_some());
+        assert!(opaque_carrier_floor_reason(Some(PolicyMode::Safe), "make", false).is_some());
+    }
+
+    #[test]
+    fn opaque_carrier_floor_is_bypassed_by_typed_verb_authority() {
+        assert_eq!(
+            opaque_carrier_floor_reason(Some(PolicyMode::Safe), "ansible-playbook", true),
+            None,
+            "an operator-authored typed verb expresses the trust the floor demands"
+        );
+    }
+
+    #[test]
+    fn opaque_carrier_floor_leaves_other_modes_and_binaries_alone() {
+        for mode in [Some(PolicyMode::Readonly), Some(PolicyMode::Paranoid), None] {
+            assert_eq!(
+                opaque_carrier_floor_reason(mode, "ansible-playbook", false),
+                None,
+                "only safe mode carries the floor; {mode:?} is unchanged"
+            );
+        }
+        assert_eq!(
+            opaque_carrier_floor_reason(Some(PolicyMode::Safe), "kubectl", false),
+            None,
+            "a non-carrier binary is routed by the ordinary gate"
+        );
     }
 
     #[test]

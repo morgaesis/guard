@@ -1720,6 +1720,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                         bypass: false,
                         authority,
                         consume_access_verbs: selected_session_verbs(phase),
+                        force_hold: false,
                     };
                     let result = route_allow_and_record(
                         phase,
@@ -1881,6 +1882,7 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
                 bypass: true,
                 authority,
                 consume_access_verbs: Vec::new(),
+                force_hold: false,
             };
             return Err(route_allow_and_record(
                 phase,
@@ -1986,6 +1988,7 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
                 bypass: false,
                 authority,
                 consume_access_verbs: selected_session_verbs(phase),
+                force_hold: false,
             };
             return Err(route_allow_and_record(
                 phase,
@@ -2200,6 +2203,27 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                     reason = format!("{reason} {notice}");
                 }
             }
+            // Deterministic safe-mode floor: a cwd-dependent opaque carrier
+            // approved solely by the model (fresh or cached verdict) is
+            // clamped to an operator hold rather than executed. An
+            // operator-authored typed verb match expresses the trust the
+            // floor demands and bypasses it; a model deny is untouched.
+            let carrier_floor_reason = if matches!(
+                source,
+                guard::evaluate::EvalSource::Llm | guard::evaluate::EvalSource::Cache
+            ) {
+                guard::gating::opaque_carrier_floor_reason(
+                    server.state.evaluator.mode(),
+                    &request.binary,
+                    verb_ctx.is_some(),
+                )
+            } else {
+                None
+            };
+            let force_hold = carrier_floor_reason.is_some();
+            if let Some(floor) = carrier_floor_reason {
+                reason = format!("{reason} [{floor}]");
+            }
             tracing::debug!("command allowed: {}", reason);
             if !log_audit_policy_for_request(server, phase.caller, &request, true, &reason) {
                 return ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON);
@@ -2239,6 +2263,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 bypass,
                 authority: evaluated_authority,
                 consume_access_verbs: selected_session_verbs(phase),
+                force_hold,
             };
             route_allow_and_record(
                 phase,

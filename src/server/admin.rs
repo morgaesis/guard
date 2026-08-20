@@ -17,7 +17,9 @@ use guard::gating::verb::{
     generated_access_matcher_shape, generated_access_verb_name, Verb, VerbCatalog,
 };
 #[cfg(test)]
-use guard::gating::verb::{CoverageAction, CoverageProbe, CoverageProvenance, VerbCoverageCell};
+use guard::gating::verb::{
+    CoverageAction, CoverageObservationReplay, CoverageProvenance, VerbCoverageCell,
+};
 use guard::principal::{scope_eq, PrincipalKey};
 #[cfg(test)]
 use guard::redact::redact_output;
@@ -1236,6 +1238,7 @@ mod access_capability_tests {
                     model_stamp: "safe-model".to_string(),
                     generated_unix: 1,
                     probes: Vec::new(),
+                    observation_replays: Vec::new(),
                 }),
             }],
             credential_plan: None,
@@ -3220,18 +3223,19 @@ fn stamp_generated_verb(
         prompt_stamp: stamp.to_string(),
         model_stamp: stamp.to_string(),
         generated_unix: now_unix(),
-        probes: vec![
-            CoverageProbe {
+        probes: Vec::new(),
+        // Replayed from the generated template itself; no probe was executed
+        // against the finished matcher, so this must not claim one was.
+        observation_replays: vec![
+            CoverageObservationReplay {
                 dimension: "generated_example".to_string(),
                 args: verb.args.clone(),
-                expected_match: true,
-                observed_match: true,
+                template_match: true,
             },
-            CoverageProbe {
+            CoverageObservationReplay {
                 dimension: "outside_generated_boundary".to_string(),
                 args: vec!["--guard-outside-coverage".to_string()],
-                expected_match: false,
-                observed_match: false,
+                template_match: false,
             },
         ],
     };

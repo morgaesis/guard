@@ -206,8 +206,16 @@ promote exact observed, statically read-only shapes into trusted verbs. Paramete
 patterns contain only escaped values supported by evidence. Irreversible and
 recoverable shapes are not auto-promoted: mutating commands remain under
 consequence gating or operator review, and a model-proposed rollback never
-creates unattended authority. Promotion records the evaluator regime, and a
+creates unattended authority. An auto-promoted verb never carries a consequence
+above `reversible`. Promotion records the evaluator regime, and a
 model or prompt change sends stale coverage back to evaluation.
+
+Auto-promoted verbs are marked `auto_promoted` in `guard verb list`, and their
+coverage provenance states how it was produced: `observation_replays` record
+the observed evaluator decisions a matcher was derived from, plus the
+generator's own boundary example. Provenance `probes` are reserved for checks a
+generator actually executed against the finished matcher; automatic promotion
+records none.
 
 API traffic uses the same verb vocabulary. Generated API cells bind endpoint,
 session fingerprint, full session revision, operation, namespace, body shape,

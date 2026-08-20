@@ -367,8 +367,19 @@ pub struct CoverageProvenance {
     pub prompt_stamp: String,
     pub model_stamp: String,
     pub generated_unix: u64,
+    /// Probes a generator actually executed against the finished matcher.
+    /// Generators that only replay evidence they already held record
+    /// `observation_replays` instead; a record here asserts that a real
+    /// match was run and observed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probes: Vec<CoverageProbe>,
+    /// Argv records replayed from evidence the generator already held: the
+    /// evaluator-approved samples a matcher was derived from, plus the
+    /// generator's own boundary example. `template_match` states what the
+    /// matcher's construction implies for the argv; nothing was executed or
+    /// independently probed to produce these records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observation_replays: Vec<CoverageObservationReplay>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,6 +389,14 @@ pub struct CoverageProbe {
     pub args: Vec<String>,
     pub expected_match: bool,
     pub observed_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageObservationReplay {
+    pub dimension: String,
+    pub args: Vec<String>,
+    pub template_match: bool,
 }
 
 /// One concrete reverse match before session/global precedence is resolved.
@@ -2792,6 +2811,9 @@ fn generated_authority_contains_sensitive_literal(verb: &Verb) -> bool {
                         .probes
                         .iter()
                         .any(|probe| command_contains_sensitive_literals(&verb.binary, &probe.args))
+                    || provenance.observation_replays.iter().any(|replay| {
+                        command_contains_sensitive_literals(&verb.binary, &replay.args)
+                    })
             })
     })
 }
@@ -2822,6 +2844,9 @@ fn sanitize_synthesized_verb_prose(verb: &mut Verb) {
             }
             for probe in &mut provenance.probes {
                 probe.dimension = crate::redact::redact_output_text(&probe.dimension);
+            }
+            for replay in &mut provenance.observation_replays {
+                replay.dimension = crate::redact::redact_output_text(&replay.dimension);
             }
         }
     }
@@ -4260,6 +4285,7 @@ verbs:
                     expected_match: true,
                     observed_match: true,
                 }],
+                observation_replays: Vec::new(),
             }),
         });
 
@@ -5005,6 +5031,7 @@ verbs:
                         expected_match: true,
                         observed_match: true,
                     }],
+                    observation_replays: Vec::new(),
                 }),
             }];
             verb.consequence = Reversibility::Irreversible;
@@ -6272,6 +6299,7 @@ verbs:
                     },
                     generated_unix: 1,
                     probes: Vec::new(),
+                    observation_replays: Vec::new(),
                 }),
             }];
             let error = normalize_generated_access_verb(verb).unwrap_err();
