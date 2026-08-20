@@ -706,6 +706,24 @@ impl SessionRegistry {
         true
     }
 
+    /// Retire every active session that predates principal binding. These
+    /// grants are already unusable on every authority path; moving them to
+    /// revoked history prevents them from blocking startup provenance checks.
+    pub fn revoke_unowned(&mut self) -> Vec<String> {
+        let mut tokens = self
+            .grants
+            .iter()
+            .filter(|(_, grant)| matches!(grant.owner, SessionOwner::Unowned))
+            .map(|(token, _)| token.clone())
+            .collect::<Vec<_>>();
+        tokens.sort();
+        for token in &tokens {
+            let removed = self.revoke(token);
+            debug_assert!(removed, "selected unowned session must still exist");
+        }
+        tokens
+    }
+
     /// True if this token currently maps to a non-expired grant.
     pub fn has(&self, token: &str) -> bool {
         let Some(grant) = self.grants.get(token) else {

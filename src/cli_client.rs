@@ -28,6 +28,13 @@ pub(crate) struct RunInjections {
     pub(crate) secret_files: HashMap<String, String>,
 }
 
+/// Endpoint and presentation options parsed from `guard run` flags.
+pub(crate) struct RunClientOptions {
+    pub(crate) socket: Option<String>,
+    pub(crate) json: bool,
+    pub(crate) explain: bool,
+}
+
 /// CLI spelling of the ssh host-key mode. Kebab-case value names
 /// (`only-existing`, `accept-new`, `accept-all`) are derived by clap.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -424,13 +431,17 @@ pub(crate) async fn run_exec(
     injections: RunInjections,
     gating: GatingOptions,
     hostkey: server::SshHostKeyMode,
-    json: bool,
-    explain: bool,
+    options: RunClientOptions,
 ) -> Result<()> {
+    let RunClientOptions {
+        socket,
+        json,
+        explain,
+    } = options;
     let config = load_client_config(json)?;
 
     let (socket_path, tcp_port, endpoint_source) =
-        resolve_client_endpoint_with_source(None, &config);
+        resolve_client_endpoint_with_source(socket, &config);
 
     let mut revert = match gating.revert.as_deref() {
         Some(spec) => Some(parse_revert(spec)?),
@@ -1266,6 +1277,50 @@ fn audit_tail_json_response(path: &str, items: &[serde_json::Value]) -> serde_js
 
 pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
     match subcommand {
+        VerbCommands::Lint { file, fix } => {
+            let path = file
+                .or_else(|| {
+                    guard_env("VERBS")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                })
+                .or_else(crate::cli_server::default_verbs_path)
+                .ok_or_else(|| anyhow::anyhow!("could not determine default verbs path"))?;
+            let report = guard::gating::verb::VerbCatalog::lint_file(&path, fix)
+                .with_context(|| format!("failed to lint verb catalog {}", path.display()))?;
+            for finding in &report.findings {
+                eprintln!("error: verb '{}': {}", finding.verb, finding.message);
+            }
+            if !report.findings.is_empty() {
+                eprintln!("{} finding(s) in {}", report.findings.len(), path.display());
+                std::process::exit(1);
+            }
+            if !report.repairs.is_empty() {
+                for repair in &report.repairs {
+                    println!("verb '{}': {}", repair.verb, repair.changes.join(", "));
+                }
+                if !fix {
+                    eprintln!(
+                        "{} requires canonical repair; rerun with --fix",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+            if let Some(warning) = &report.durability_warning {
+                eprintln!("warning: catalog repair committed with a durability warning: {warning}");
+            }
+            if report.fixed {
+                println!(
+                    "repaired {} verb(s) in {}",
+                    report.repairs.len(),
+                    path.display()
+                );
+            } else {
+                println!("valid: {} verb(s) in {}", report.verb_count, path.display());
+            }
+            Ok(())
+        }
         VerbCommands::List { socket, json } => {
             let (client, source) = gate_client(socket, json)?;
             match client
@@ -3837,6 +3892,8 @@ pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MainArgs;
+    use clap::Parser;
 
     fn config_with(socket: Option<&str>, port: Option<u16>) -> client_config::ClientConfig {
         client_config::ClientConfig {
@@ -3844,6 +3901,28 @@ mod tests {
             server_tcp_port: port,
             ..Default::default()
         }
+    }
+
+    fn parsed_run_socket(args: &[&str]) -> Option<String> {
+        match MainArgs::try_parse_from(args).expect("parse guard run") {
+            MainArgs::Run { socket, .. } => socket,
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_parses_explicit_socket_override() {
+        assert_eq!(
+            parsed_run_socket(&[
+                "guard",
+                "run",
+                "--socket",
+                "/run/guard/alternate.sock",
+                "echo",
+                "ok",
+            ]),
+            Some("/run/guard/alternate.sock".to_string())
+        );
     }
 
     #[test]
@@ -4888,6 +4967,50 @@ mod tests {
             AnsiColor::Yellow
         ));
         assert!(matches!(consequence_color("reversible"), AnsiColor::Green));
+    }
+
+    #[test]
+    fn run_socket_flag_is_honored() {
+        let socket = parsed_run_socket(&["guard", "run", "--socket", "/tmp/run.sock", "true"]);
+        let (socket, port, source) = resolve_endpoint(
+            socket,
+            Some("9999".to_string()),
+            Some("/tmp/env.sock".to_string()),
+            &config_with(Some("/tmp/config.sock"), Some(1234)),
+            true,
+        );
+
+        assert_eq!(socket, Some(PathBuf::from("/tmp/run.sock")));
+        assert_eq!(port, None);
+        assert_eq!(source, EndpointSource::Flag);
+    }
+
+    #[test]
+    fn run_without_socket_uses_environment_then_config() {
+        let socket = parsed_run_socket(&["guard", "run", "true"]);
+        assert_eq!(socket, None);
+
+        let (env_socket, env_port, env_source) = resolve_endpoint(
+            socket.clone(),
+            None,
+            Some("/tmp/env.sock".to_string()),
+            &config_with(Some("/tmp/config.sock"), None),
+            true,
+        );
+        assert_eq!(env_socket, Some(PathBuf::from("/tmp/env.sock")));
+        assert_eq!(env_port, None);
+        assert_eq!(env_source, EndpointSource::Env);
+
+        let (config_socket, config_port, config_source) = resolve_endpoint(
+            socket,
+            None,
+            None,
+            &config_with(Some("/tmp/config.sock"), None),
+            true,
+        );
+        assert_eq!(config_socket, Some(PathBuf::from("/tmp/config.sock")));
+        assert_eq!(config_port, None);
+        assert_eq!(config_source, EndpointSource::Config);
     }
 
     #[test]

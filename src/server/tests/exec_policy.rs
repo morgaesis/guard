@@ -17,9 +17,9 @@ use crate::server::wire::{
 #[cfg(unix)]
 use crate::server::RequestContext;
 use crate::server::{
-    binary_exists_on_path, dangerous_env_name, deterministic_credential_deny_reason,
-    deterministic_safe_allow_reason, invalid_shell_secret_reference, is_valid_secret_key,
-    validate_request_injections,
+    binary_exists_on_path, configured_credential_path_deny_reason, dangerous_env_name,
+    deterministic_credential_deny_reason, deterministic_safe_allow_reason,
+    invalid_shell_secret_reference, is_valid_secret_key, validate_request_injections,
 };
 #[cfg(unix)]
 use crate::session::SessionExactRule;
@@ -759,6 +759,108 @@ fn credential_preflight_denies_private_key_path() {
 fn credential_preflight_allows_basic_kubectl_inspection() {
     let args = vec!["get".to_string(), "namespaces".to_string()];
     assert!(deterministic_credential_deny_reason("kubectl", &args).is_none());
+}
+
+#[test]
+fn configured_path_deny_matches_state_dir_and_catalog_on_word_boundaries() {
+    let state_dir = std::path::Path::new("/var/lib/guard-fixture");
+    let catalog = std::path::Path::new("/etc/guard-fixture/verbs.yaml");
+    let deny = |binary: &str, args: &[&str]| {
+        configured_credential_path_deny_reason(
+            binary,
+            &args
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            Some(state_dir),
+            Some(catalog),
+        )
+    };
+
+    let reason = deny("cat", &["/var/lib/guard-fixture/state.db"])
+        .expect("state directory contents must be denied");
+    assert!(reason.contains("Guard state or verb catalog material"));
+    assert!(deny("cat", &["/etc/guard-fixture/verbs.yaml"]).is_some());
+    assert!(
+        deny(
+            "sh",
+            &["-c", "cat '/etc/guard-fixture/verbs.yaml' >/dev/null"]
+        )
+        .is_some(),
+        "quoted shell references must still match"
+    );
+    // Prefix-similar paths stay allowed: the match respects word boundaries.
+    assert!(deny("cat", &["/var/lib/guard-fixtures/notes.txt"]).is_none());
+    assert!(deny("cat", &["/etc/guard-fixture/verbs.yaml.bak"]).is_none());
+    assert!(deny("ls", &["/tmp"]).is_none());
+    assert!(configured_credential_path_deny_reason(
+        "cat",
+        &["/etc/anything".to_string()],
+        None,
+        None
+    )
+    .is_none());
+}
+
+/// The state-directory and catalog deny is authorization-material protection,
+/// not an opt-in preflight: it must hold with `--preflight` off, while the
+/// broader deterministic credential preflight stays opt-in.
+#[tokio::test]
+async fn guard_catalog_read_is_denied_even_without_preflight() {
+    let (mut cfg, _buf) = make_test_config();
+    assert!(
+        !cfg.config.preflight,
+        "fixture must model a preflight-off daemon"
+    );
+    let state = tempfile::tempdir().expect("state fixture dir");
+    let catalog_path = state.path().join("verbs.yaml");
+    cfg.config.state_dir = Some(state.path().to_path_buf());
+    cfg.config.verb_catalog_path = Some(catalog_path.clone());
+
+    let result = execute_command(
+        basic_request("cat", vec![catalog_path.display().to_string()]),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await;
+    assert!(!result.policy_allowed());
+    assert!(
+        result
+            .policy_reason()
+            .contains("Guard state or verb catalog material"),
+        "unexpected reason: {}",
+        result.policy_reason()
+    );
+
+    let result = execute_command(
+        basic_request(
+            "cat",
+            vec![state.path().join("state.db").display().to_string()],
+        ),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await;
+    assert!(!result.policy_allowed());
+    assert!(result
+        .policy_reason()
+        .contains("Guard state or verb catalog material"));
+
+    // An environment dump is a preflight-only rule; with preflight off it must
+    // not surface a preflight denial.
+    let result = execute_command(
+        basic_request("printenv", vec!["PATH".to_string()]),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await;
+    assert!(
+        !result
+            .policy_reason()
+            .contains("credential preflight denied"),
+        "preflight rule fired while preflight was off: {}",
+        result.policy_reason()
+    );
 }
 
 #[test]

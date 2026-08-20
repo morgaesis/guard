@@ -1237,6 +1237,48 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .is_none());
 }
 
+/// A legacy grant deserialized before principal binding is refused on every
+/// authority path yet still resolvable by fingerprint, so an operator can
+/// retire it explicitly instead of hitting the access-managed gate during an
+/// upgrade.
+#[tokio::test]
+async fn legacy_unowned_session_is_revocable_by_fingerprint() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let mut legacy = granted_session(vec!["rustc*".to_string()], Vec::new());
+    legacy.owner = crate::session::SessionOwner::Unowned;
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant("legacy-unowned-token".to_string(), legacy);
+    let fingerprint = session_reference("legacy-unowned-token");
+
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessRevoke {
+            target: fingerprint.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected fingerprint revoke result")
+    };
+    assert!(items[0].success, "{items:?}");
+    assert_eq!(items[0].state, "revoked");
+    assert_eq!(items[0].target.as_deref(), Some(fingerprint.as_str()));
+
+    let sessions = cfg.state.sessions.read().await;
+    assert!(!sessions.has("legacy-unowned-token"));
+    let history = sessions.history_snapshot();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].status, crate::session::HistoricalStatus::Revoked);
+}
+
 #[tokio::test]
 async fn access_request_can_name_multiple_catalog_verbs() {
     let (mut cfg, _) = make_test_config();

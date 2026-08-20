@@ -34,6 +34,26 @@ The packaged Windows service treats the installed catalog as immutable process
 input and disables automatic promotion. Administrators update that catalog
 while the service is stopped, then restart the service to load the new bytes.
 
+## Linting a catalog
+
+`guard verb lint` validates a catalog file directly, without contacting or
+starting a daemon. It reports every invalid verb, naming the verb and the
+failing parameter, instead of stopping at the first failure, and exits 1 when
+findings exist. Linting a catalog with the new binary before swapping binaries
+turns a would-be startup abort into a pre-upgrade report:
+
+```bash
+guard verb lint --file /var/lib/guard/verbs.yaml
+guard verb lint --fix
+```
+
+Without `--file`, lint reads `GUARD_VERBS` or the daemon's default catalog
+path. A structurally valid catalog whose verbs are not in canonical form also
+exits 1 and names each verb needing repair; `--fix` applies the same
+canonicalization the daemon performs at load time (operator-boundary
+normalization and generated-authority envelopes) and rewrites the file through
+the same atomic replacement path, printing each repaired verb.
+
 ## Command templates
 
 A template renders each `{param}` as one argv element without a shell or word

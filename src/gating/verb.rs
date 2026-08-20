@@ -561,6 +561,28 @@ pub struct VerbCatalog {
     snapshot: Option<LearningFileSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerbCatalogFinding {
+    pub verb: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerbCatalogRepair {
+    pub verb: String,
+    pub changes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerbCatalogLintReport {
+    pub findings: Vec<VerbCatalogFinding>,
+    pub repairs: Vec<VerbCatalogRepair>,
+    pub verb_count: usize,
+    pub fixed: bool,
+    pub durability_warning: Option<String>,
+    canonical: Option<String>,
+}
+
 impl VerbCatalog {
     pub fn empty() -> Self {
         Self::default()
@@ -643,32 +665,9 @@ impl VerbCatalog {
             serde_yaml_ng::from_str(text).context("failed to parse verb catalog")?;
         let mut verbs = BTreeMap::new();
         let mut repaired = false;
-        for mut verb in file.verbs {
-            if is_synthesized_verb(&verb) && text_contains_sensitive_literals(&verb.name) {
-                bail!("generated verb name contains sensitive material");
-            }
-            if verb.name.starts_with("grant-") {
-                bail!(
-                    "verb name '{}' uses the reserved saved-grant namespace",
-                    verb.name
-                );
-            }
-            if verb.name.starts_with("access-generated-") {
-                bail!(
-                    "verb name '{}' uses the reserved generated-access namespace",
-                    verb.name
-                );
-            }
-            if is_synthesized_verb(&verb) {
-                let original = serde_json::to_value(&verb)?;
-                verb = canonicalize_generated_authority_envelope(verb)?;
-                repaired |= original != serde_json::to_value(&verb)?;
-            }
-            normalize_operator_boundaries(&mut verb);
-            validate_verb(&verb)?;
-            if verb.auto_promoted {
-                validate_auto_promoted_verb_durable_safety(&verb)?;
-            }
+        for verb in file.verbs {
+            let (verb, repairs) = prepare_catalog_verb(verb)?;
+            repaired |= !repairs.is_empty();
             if verbs.insert(verb.name.clone(), verb.clone()).is_some() {
                 bail!("duplicate verb name: '{}'", verb.name);
             }
@@ -690,6 +689,43 @@ impl VerbCatalog {
             },
             canonical,
         ))
+    }
+
+    /// Validate every independently decodable verb in a catalog. Unlike
+    /// `from_yaml`, this reports one structural failure per verb instead of
+    /// stopping at the first invalid definition.
+    pub fn lint_yaml(text: &str) -> VerbCatalogLintReport {
+        lint_catalog_yaml(text)
+    }
+
+    /// Validate one file without contacting a daemon. Canonical repairs are
+    /// committed through the same bounded atomic rewrite path used by daemon
+    /// catalog loading, and only when the complete catalog is otherwise valid.
+    pub fn lint_file(path: &Path, fix: bool) -> Result<VerbCatalogLintReport> {
+        if fix {
+            let (mut report, _snapshot, warning) =
+                rewrite_learning_file_bounded(path, |snapshot| {
+                    let bytes = snapshot.content().context("verb catalog does not exist")?;
+                    let text = std::str::from_utf8(bytes)
+                        .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
+                    let mut report = lint_catalog_yaml(text);
+                    let replacement = if report.findings.is_empty() {
+                        report.canonical.take()
+                    } else {
+                        None
+                    };
+                    report.fixed = replacement.is_some();
+                    Ok((replacement, report))
+                })?;
+            report.durability_warning = warning.map(|error| error.to_string());
+            return Ok(report);
+        }
+
+        let snapshot = load_immutable_learning_file_snapshot(path)?;
+        let bytes = snapshot.content().context("verb catalog does not exist")?;
+        let text = std::str::from_utf8(bytes)
+            .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
+        Ok(lint_catalog_yaml(text))
     }
 
     /// Load a catalog from a file, recording its path and mtime for reloads.
@@ -1371,6 +1407,140 @@ fn catalog_repair_warning(
         return Ok(None);
     };
     Ok(Some(error))
+}
+
+fn prepare_catalog_verb(mut verb: Verb) -> Result<(Verb, Vec<String>)> {
+    if is_synthesized_verb(&verb) && text_contains_sensitive_literals(&verb.name) {
+        bail!("generated verb name contains sensitive material");
+    }
+    if verb.name.starts_with("grant-") {
+        bail!(
+            "verb name '{}' uses the reserved saved-grant namespace",
+            verb.name
+        );
+    }
+    if verb.name.starts_with("access-generated-") {
+        bail!(
+            "verb name '{}' uses the reserved generated-access namespace",
+            verb.name
+        );
+    }
+
+    let mut repairs = Vec::new();
+    if is_synthesized_verb(&verb) {
+        let before = serde_json::to_value(&verb)?;
+        verb = canonicalize_generated_authority_envelope(verb)?;
+        if before != serde_json::to_value(&verb)? {
+            repairs.push("canonicalize generated authority envelope".to_string());
+        }
+    }
+    let before_boundaries = serde_json::to_value(&verb)?;
+    normalize_operator_boundaries(&mut verb);
+    if before_boundaries != serde_json::to_value(&verb)? {
+        repairs.push("normalize operator boundaries".to_string());
+    }
+    validate_verb(&verb)?;
+    if verb.auto_promoted {
+        validate_auto_promoted_verb_durable_safety(&verb)?;
+    }
+    Ok((verb, repairs))
+}
+
+fn lint_catalog_yaml(text: &str) -> VerbCatalogLintReport {
+    let mut report = VerbCatalogLintReport {
+        findings: Vec::new(),
+        repairs: Vec::new(),
+        verb_count: 0,
+        fixed: false,
+        durability_warning: None,
+        canonical: None,
+    };
+    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let document: serde_yaml_ng::Value = match serde_yaml_ng::from_str(body) {
+        Ok(document) => document,
+        Err(error) => {
+            report.findings.push(VerbCatalogFinding {
+                verb: "<catalog>".to_string(),
+                message: format!("failed to parse verb catalog: {error}"),
+            });
+            return report;
+        }
+    };
+    let Some(mapping) = document.as_mapping() else {
+        report.findings.push(VerbCatalogFinding {
+            verb: "<catalog>".to_string(),
+            message: "verb catalog must be a YAML mapping".to_string(),
+        });
+        return report;
+    };
+    let key = serde_yaml_ng::Value::String("verbs".to_string());
+    let values = match mapping.get(&key) {
+        None => Vec::new(),
+        Some(serde_yaml_ng::Value::Sequence(values)) => values.clone(),
+        Some(_) => {
+            report.findings.push(VerbCatalogFinding {
+                verb: "<catalog>".to_string(),
+                message: "the catalog's `verbs` key is not a sequence".to_string(),
+            });
+            return report;
+        }
+    };
+    report.verb_count = values.len();
+
+    let mut names = BTreeSet::new();
+    let mut verbs = BTreeMap::new();
+    for (index, value) in values.into_iter().enumerate() {
+        let fallback = format!("<item {}>", index + 1);
+        let declared_name = value
+            .as_mapping()
+            .and_then(|mapping| mapping.get(serde_yaml_ng::Value::String("name".to_string())))
+            .and_then(serde_yaml_ng::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| fallback.clone());
+        let verb: Verb = match serde_yaml_ng::from_value(value) {
+            Ok(verb) => verb,
+            Err(error) => {
+                report.findings.push(VerbCatalogFinding {
+                    verb: declared_name,
+                    message: format!("failed to decode verb definition: {error}"),
+                });
+                continue;
+            }
+        };
+        let name = verb.name.clone();
+        if !names.insert(name.clone()) {
+            report.findings.push(VerbCatalogFinding {
+                verb: name.clone(),
+                message: format!("duplicate verb name: '{name}'"),
+            });
+        }
+        match prepare_catalog_verb(verb) {
+            Ok((verb, changes)) => {
+                if !changes.is_empty() {
+                    report.repairs.push(VerbCatalogRepair {
+                        verb: name.clone(),
+                        changes,
+                    });
+                }
+                verbs.entry(name).or_insert(verb);
+            }
+            Err(error) => report.findings.push(VerbCatalogFinding {
+                verb: name,
+                message: format!("{error:#}"),
+            }),
+        }
+    }
+
+    if report.findings.is_empty() && !report.repairs.is_empty() {
+        match canonical_catalog_yaml(text, verbs.values()) {
+            Ok(canonical) => report.canonical = Some(canonical),
+            Err(error) => report.findings.push(VerbCatalogFinding {
+                verb: "<catalog>".to_string(),
+                message: format!("failed to serialize canonical catalog: {error:#}"),
+            }),
+        }
+    }
+    report
 }
 
 /// Compose the new catalog text by adding one verb to the top-level `verbs:`
@@ -3608,6 +3778,73 @@ verbs:
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn catalog_lint_collects_named_findings_across_verbs() {
+        let report = VerbCatalog::lint_yaml(
+            r#"
+verbs:
+  - name: inspect-first
+    binary: fixturectl
+    args: ["show", "{target}"]
+    params:
+      target: { pattern: "[a-z]+" }
+    consequence: reversible
+  - name: inspect-second
+    binary: fixturectl
+    args: ["show", "{resource}"]
+    params:
+      resource: { pattern: "[0-9]+" }
+    consequence: reversible
+"#,
+        );
+
+        assert_eq!(report.findings.len(), 2, "{:#?}", report.findings);
+        for (verb, parameter) in [("inspect-first", "target"), ("inspect-second", "resource")] {
+            let finding = report
+                .findings
+                .iter()
+                .find(|finding| finding.verb == verb)
+                .unwrap_or_else(|| panic!("missing finding for {verb}"));
+            assert!(finding.message.contains(verb), "{}", finding.message);
+            assert!(finding.message.contains(parameter), "{}", finding.message);
+        }
+    }
+
+    #[test]
+    fn catalog_lint_fix_is_explicit_and_round_trips() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        let original = r#"metadata: preserved
+verbs:
+  - name: guarded-inspect
+    binary: fixturectl
+    consequence: reversible
+    coverage:
+      - name: blocked
+        action: deny
+"#;
+        crate::learned_rules::write_authority_file(&path, original).unwrap();
+
+        let pending = VerbCatalog::lint_file(&path, false).unwrap();
+        assert!(pending.findings.is_empty());
+        assert_eq!(pending.repairs.len(), 1);
+        assert!(!pending.fixed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let fixed = VerbCatalog::lint_file(&path, true).unwrap();
+        assert!(fixed.findings.is_empty());
+        assert!(fixed.fixed);
+        assert_eq!(fixed.repairs[0].verb, "guarded-inspect");
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(repaired.contains("metadata: preserved"));
+        assert!(repaired.contains("sticky: true"));
+
+        let clean = VerbCatalog::lint_file(&path, false).unwrap();
+        assert!(clean.findings.is_empty());
+        assert!(clean.repairs.is_empty());
+        assert!(!clean.fixed);
     }
 
     #[test]

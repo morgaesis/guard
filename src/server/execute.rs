@@ -56,8 +56,8 @@ use super::wire::{
     SESSION_UNOWNED_REFUSED,
 };
 use super::{
-    binary_exists_on_path, child_env_allowlist, dangerous_env_name,
-    deterministic_credential_deny_reason, deterministic_safe_allow_reason,
+    binary_exists_on_path, child_env_allowlist, configured_credential_path_deny_reason,
+    dangerous_env_name, deterministic_credential_deny_reason, deterministic_safe_allow_reason,
     validate_request_injections, RequestContext, ServerContext, MAX_GUARD_DEPTH, MAX_OUTPUT_BYTES,
 };
 use super::{DEFAULT_CONFIRM_WITHIN_SECS, MAX_CONFIRM_WITHIN_SECS};
@@ -1793,17 +1793,30 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
         .await);
     }
 
-    if server.config.preflight {
-        if let Some(reason) = deterministic_credential_deny_reason(&request.binary, &request.args) {
-            return Err(deny_and_record(
-                phase,
-                request,
-                SessionDecisionSource::Validation,
-                None,
-                reason,
-            )
-            .await);
-        }
+    // Guard's own state directory and verb catalog are authorization
+    // material; brokered reads of them are refused even when the operator
+    // left the broader credential preflight opt-in.
+    if let Some(reason) = configured_credential_path_deny_reason(
+        &request.binary,
+        &request.args,
+        server.config.state_dir.as_deref(),
+        server.config.verb_catalog_path.as_deref(),
+    )
+    .or_else(|| {
+        server
+            .config
+            .preflight
+            .then(|| deterministic_credential_deny_reason(&request.binary, &request.args))
+            .flatten()
+    }) {
+        return Err(deny_and_record(
+            phase,
+            request,
+            SessionDecisionSource::Validation,
+            None,
+            reason,
+        )
+        .await);
     }
     Ok(())
 }

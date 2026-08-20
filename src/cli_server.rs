@@ -202,7 +202,7 @@ fn default_api_promotion_state_path() -> Option<PathBuf> {
 /// call site): auto-promotion should work out of the box on a fresh host,
 /// the same way `--learn-deny` and `--learn-rules` do not require the
 /// operator to hand-create a state file first.
-fn default_verbs_path() -> Option<PathBuf> {
+pub(crate) fn default_verbs_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("verbs.yaml"))
 }
 
@@ -1121,6 +1121,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             let socket_announcement = socket_path
                 .as_ref()
                 .map(|path| format!("guard server listening on socket {}", path.display()));
+            let state_dir = state_db_path.as_ref().and_then(|path| {
+                path.parent().map(|parent| {
+                    parent
+                        .canonicalize()
+                        .unwrap_or_else(|_| parent.to_path_buf())
+                })
+            });
 
             tracing::info!("Creating server instance...");
             let config = server::ServerConfig {
@@ -1139,6 +1146,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 exec_as_caller,
                 exec_timeout_secs,
                 state_db_path,
+                state_dir,
                 audit_log_path,
                 ..server::ServerConfig::default()
             };
@@ -1305,6 +1313,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     catalog.names().len(),
                     catalog.version()
                 );
+                srv.set_verb_catalog_path(path.clone());
                 srv.set_verbs(catalog);
             }
 
