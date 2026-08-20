@@ -171,7 +171,7 @@ jobs:
             ARCHITECTURE.md ROADMAP.md LICENSE .env.example "$root/"
           cp docs/*.md "$root/docs/"
           cp ctf/DESIGN.md "$root/ctf/"
-          cp examples/*.yaml examples/README.md examples/fallback-models.env "$root/examples/"
+          cp examples/*.yaml examples/*.md examples/fallback-models.env "$root/examples/"
           cp deployment/systemd/guard.service \
             deployment/systemd/guard-exec-as-caller.service \
             deployment/systemd/guard.env.example \
@@ -229,6 +229,7 @@ jobs:
           test -f "$root/examples/verbs-kubectl.yaml"
           test -f "$root/examples/api-policy.yaml"
           test -f "$root/examples/fallback-models.env"
+          test -f "$root/examples/system-prompt-append-tools.md"
           test -f "$root/deployment/windows/install-guard.ps1"
           actual_manifest="dist/${bundle}.manifest.actual"
           find "$root" -type f -printf '%P\n' | LC_ALL=C sort > "$actual_manifest"
