@@ -172,6 +172,12 @@ pub(crate) struct ServerConfig {
     /// records but grants no admin authority.
     pub(crate) daemon_principal: PrincipalKey,
     pub(crate) state_db_path: Option<PathBuf>,
+    /// Canonical directory containing Guard's durable daemon state. Commands
+    /// may never read from it, independent of optional preflight checks.
+    pub(crate) state_dir: Option<PathBuf>,
+    /// Canonical operator verb catalog path, including catalogs outside the
+    /// state directory. It is protected as authorization material.
+    pub(crate) verb_catalog_path: Option<PathBuf>,
     /// Consequence-gating mode. `Off` preserves legacy behavior; `Consequence`
     /// routes LLM-approved commands by reversibility.
     pub(crate) gate: GateMode,
@@ -236,6 +242,8 @@ impl Default for ServerConfig {
             daemon_uid: current_uid(),
             daemon_principal: resolve_daemon_principal(),
             state_db_path: None,
+            state_dir: None,
+            verb_catalog_path: None,
             // Gating defaults to off; the daemon entrypoint enables it and
             // populates the registries from persisted state before serving.
             gate: GateMode::Off,
@@ -832,6 +840,71 @@ fn binary_path_candidates(dir: &std::path::Path, binary: &str) -> Vec<PathBuf> {
     {
         vec![dir.join(binary)]
     }
+}
+
+fn command_references_configured_path(
+    command: &str,
+    path: &std::path::Path,
+    directory: bool,
+) -> bool {
+    let command = command.replace('\\', "/").to_ascii_lowercase();
+    let path = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if path.is_empty() {
+        return false;
+    }
+    command.match_indices(&path).any(|(start, matched)| {
+        let before = command[..start].chars().next_back();
+        let after = command[start + matched.len()..].chars().next();
+        let boundary = |character: Option<char>| {
+            character.is_none_or(|character| {
+                character.is_ascii_whitespace()
+                    || matches!(
+                        character,
+                        '\'' | '"'
+                            | '='
+                            | ':'
+                            | ';'
+                            | ','
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '<'
+                            | '>'
+                            | '|'
+                            | '&'
+                    )
+            })
+        };
+        boundary(before) && (boundary(after) || (directory && after == Some('/')))
+    })
+}
+
+fn configured_credential_path_deny_reason(
+    binary: &str,
+    args: &[String],
+    state_dir: Option<&std::path::Path>,
+    verb_catalog_path: Option<&std::path::Path>,
+) -> Option<String> {
+    let command = if args.is_empty() {
+        binary.to_string()
+    } else {
+        format!("{} {}", binary, args.join(" "))
+    };
+    let references_state =
+        state_dir.is_some_and(|path| command_references_configured_path(&command, path, true));
+    let references_catalog = verb_catalog_path
+        .is_some_and(|path| command_references_configured_path(&command, path, false));
+    (references_state || references_catalog).then(|| {
+        "credential preflight denied: command references Guard state or verb catalog material"
+            .to_string()
+    })
 }
 
 fn deterministic_credential_deny_reason(binary: &str, args: &[String]) -> Option<String> {

@@ -773,6 +773,25 @@ fn resume_and_verb_amend_parse_their_requester_and_cas_inputs() {
 }
 
 #[test]
+fn verb_lint_parses_optional_file_and_explicit_fix() {
+    match MainArgs::try_parse_from(["guard", "verb", "lint", "--file", "candidate.yaml", "--fix"]) {
+        Ok(MainArgs::Verb(VerbCommands::Lint { file, fix })) => {
+            assert_eq!(file, Some(PathBuf::from("candidate.yaml")));
+            assert!(fix);
+        }
+        Ok(_) => panic!("unexpected verb command"),
+        Err(error) => panic!("verb lint did not parse: {error}"),
+    }
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "verb", "lint"]),
+        Ok(MainArgs::Verb(VerbCommands::Lint {
+            file: None,
+            fix: false
+        }))
+    ));
+}
+
+#[test]
 fn access_extend_help_explains_target_and_bounded_use_defaults() {
     let error = match MainArgs::try_parse_from(["guard", "access", "extend", "--help"]) {
         Err(error) => error,

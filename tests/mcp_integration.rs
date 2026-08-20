@@ -81,6 +81,84 @@ async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
     start_daemon_with_gate(tmp, false).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn run_socket_flag_overrides_environment_endpoint() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_daemon, socket_path) = start_daemon(&tmp).await;
+    let output = timeout(
+        Duration::from_secs(10),
+        Command::new(GUARD_BIN)
+            .args(["run", "--json", "--socket"])
+            .arg(&socket_path)
+            .args(["echo", "socket-ok"])
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .env("GUARD_SOCKET", tmp.path().join("wrong.sock"))
+            .output(),
+    )
+    .await
+    .expect("guard run timed out")
+    .expect("run guard command");
+    assert!(
+        output.status.success(),
+        "guard run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse run envelope");
+    assert_eq!(envelope["type"], "run_result");
+    assert_eq!(envelope["response"]["allowed"], true);
+    assert!(envelope["response"]["stdout"]
+        .as_str()
+        .is_some_and(|value| value.contains("socket-ok")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verb_lint_reports_every_named_failure_and_exits_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restrict tempdir");
+    let catalog = tmp.path().join("verbs.yaml");
+    std::fs::write(
+        &catalog,
+        r#"verbs:
+  - name: inspect-first
+    binary: fixturectl
+    args: ["show", "{target}"]
+    params:
+      target: { pattern: "[a-z]+" }
+    consequence: reversible
+  - name: inspect-second
+    binary: fixturectl
+    args: ["show", "{resource}"]
+    params:
+      resource: { pattern: "[0-9]+" }
+    consequence: reversible
+"#,
+    )
+    .expect("write catalog");
+    std::fs::set_permissions(&catalog, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict catalog");
+
+    let output = timeout(
+        Duration::from_secs(10),
+        Command::new(GUARD_BIN)
+            .args(["verb", "lint", "--file"])
+            .arg(&catalog)
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .output(),
+    )
+    .await
+    .expect("verb lint timed out")
+    .expect("run verb lint");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in ["inspect-first", "target", "inspect-second", "resource"] {
+        assert!(stderr.contains(expected), "missing {expected}: {stderr}");
+    }
+    assert!(stderr.contains("2 finding(s)"), "{stderr}");
+}
+
 async fn start_daemon_with_gate(
     tmp: &TempDir,
     consequence_gate: bool,

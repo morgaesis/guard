@@ -1,6 +1,6 @@
 use crate::grant_profile::SavedGrantCatalog;
 use crate::secrets::SecretManager;
-use crate::session::SessionRegistry;
+use crate::session::{session_reference, SessionRegistry};
 use crate::session_store::SessionStore;
 use crate::tool_config::ToolRegistry;
 #[cfg(unix)]
@@ -789,6 +789,12 @@ impl Server {
         self.context.state.verbs = Arc::new(RwLock::new(catalog));
     }
 
+    /// Protect the operator-owned catalog from brokered reads even when it is
+    /// stored outside Guard's state directory.
+    pub fn set_verb_catalog_path(&mut self, path: std::path::PathBuf) {
+        self.context.config.verb_catalog_path = Some(path.canonicalize().unwrap_or(path));
+    }
+
     /// Install reusable grants. Must be called before `run`.
     pub fn set_saved_grants(&mut self, catalog: SavedGrantCatalog) {
         self.context.state.saved_grants = Arc::new(RwLock::new(catalog));
@@ -1138,6 +1144,37 @@ impl Server {
         Ok(())
     }
 
+    async fn startup_revoke_unowned_sessions(&self) -> Result<()> {
+        let baseline = self.context.state.sessions.read().await.clone();
+        let mut staged = baseline.clone();
+        let retired = staged.revoke_unowned();
+        if retired.is_empty() {
+            return Ok(());
+        }
+        if let Some(store) = &self.context.state.session_store {
+            store
+                .persist_registry_strict(&staged)
+                .await
+                .context("persist startup retirement of unowned sessions")?;
+        }
+        {
+            let mut live = self.context.state.sessions.write().await;
+            if live.revision() != baseline.revision() {
+                anyhow::bail!("session authority changed while startup retirement was committing");
+            }
+            *live = staged;
+        }
+        for token in retired {
+            self.context.emit_audit_ungated(
+                AuditEvent::new(AuditKind::SessionRevoke)
+                    .field("token_fingerprint", session_reference(&token))
+                    .field("access_managed", false)
+                    .field("source", "startup-unowned"),
+            );
+        }
+        Ok(())
+    }
+
     async fn install_saved_grant_verbs(&self) {
         let generated = self
             .context
@@ -1222,6 +1259,7 @@ impl Server {
                 .context("reload leased session registry before startup recovery")?;
             *self.context.state.sessions.write().await = registry;
         }
+        self.startup_revoke_unowned_sessions().await?;
 
         // Load durable authorization state. Consequence rows also receive
         // boot-safe recovery when gating is enabled.
@@ -2690,26 +2728,77 @@ mod line_limit_tests {
     }
 
     #[tokio::test]
-    async fn active_legacy_bearer_session_prevents_listener_startup() {
+    async fn startup_sweep_retires_unowned_sessions_and_audits_each_row() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("state.db");
         let socket = temp.path().join("guard.sock");
+        let audit_path = temp.path().join("audit.jsonl");
         let seed = SessionStore::open(database.clone(), 3600).await.unwrap();
         let mut registry = crate::session::SessionRegistry::new();
-        assert!(registry.grant(
-            "legacy-fixture-token".to_string(),
-            durable_fixture_grant(false)
-        ));
+        for token in ["legacy-fixture-one", "legacy-fixture-two"] {
+            let mut grant = durable_fixture_grant(false);
+            grant.owner = crate::session::SessionOwner::Unowned;
+            assert!(registry.grant(token.to_string(), grant));
+        }
         seed.persist_registry(&registry).await.unwrap();
         drop(seed);
 
-        let error = server_for_durable_fixture(database, socket.clone())
+        let mut server = server_for_durable_fixture(database, socket.clone()).await;
+        let audit = Arc::new(guard::audit::AuditLog::open(&audit_path).unwrap());
+        server.context.state.audit = Some(audit);
+        let loaded = server
+            .context
+            .state
+            .session_store
+            .as_ref()
+            .unwrap()
+            .load_registry()
             .await
-            .run()
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("legacy bearer session"));
+            .unwrap();
+        *server.context.state.sessions.write().await = loaded;
+
+        server.startup_revoke_unowned_sessions().await.unwrap();
         assert!(!socket.exists());
+        assert!(server.context.state.sessions.read().await.list().is_empty());
+        crate::server::admin::validate_durable_access_provenance(&server.context)
+            .await
+            .unwrap();
+
+        let durable = server
+            .context
+            .state
+            .session_store
+            .as_ref()
+            .unwrap()
+            .load_registry()
+            .await
+            .unwrap();
+        let history = durable.history_snapshot();
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|entry| {
+            entry.status == crate::session::HistoricalStatus::Revoked
+                && entry.owner == crate::session::SessionOwner::Unowned
+        }));
+
+        let records = guard::audit::tail_records(&audit_path, 10).unwrap();
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert_eq!(record["kind"], "SESSION_REVOKE");
+            let field = |key: &str| {
+                record["fields"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|pair| pair[0] == key)
+                    .map(|pair| pair[1].clone())
+                    .unwrap_or_else(|| panic!("missing audit field {key}: {record}"))
+            };
+            assert_eq!(field("source"), "startup-unowned");
+            assert_eq!(field("access_managed"), "false");
+            assert!(field("token_fingerprint")
+                .as_str()
+                .is_some_and(|value| value.starts_with("session:")));
+        }
     }
 
     #[tokio::test]

@@ -2726,11 +2726,20 @@ async fn revoke_access_target_owned(
     let mut generation_retry = false;
     loop {
         let baseline_sessions = server.state.sessions.read().await.clone();
-        let token = match baseline_sessions.token_for_access_target(target) {
-            Ok(Some(token)) if baseline_sessions.is_access_managed(&token) => token,
+        let (token, access_managed) = match baseline_sessions.token_for_access_target(target) {
+            Ok(Some(token)) if baseline_sessions.is_access_managed(&token) => (token, true),
+            Ok(Some(token))
+                if matches!(
+                    baseline_sessions.owner_for(&token),
+                    Some(SessionOwner::Unowned)
+                ) =>
+            {
+                (token, false)
+            }
             Ok(Some(_)) => {
                 return AdminResponse::Error {
-                    message: "access revoke only accepts access-managed sessions".to_string(),
+                    message: "access revoke only accepts access-managed or legacy unowned sessions"
+                        .to_string(),
                 }
             }
             Ok(None) => {
@@ -2823,7 +2832,7 @@ async fn revoke_access_target_owned(
             AuditEvent::new(AuditKind::SessionRevoke)
                 .caller(caller)
                 .field("token_fingerprint", &reference)
-                .field("access_managed", true),
+                .field("access_managed", access_managed),
         );
         return AdminResponse::AccessDecisions {
             items: vec![AccessDecisionResult {
@@ -4748,9 +4757,34 @@ async fn dispatch_admin_request(
                     .collect();
                 AdminResponse::Verbs { items }
             } else {
+                let visible_session_verbs =
+                    match caller.principal().filter(|_| caller.is_local_peer()) {
+                        Some(principal) => {
+                            let sessions = server.state.sessions.read().await;
+                            access_token_for_principal_ci(&sessions, &principal)
+                                .and_then(|token| {
+                                    sessions.verb_scope_for(&token).map(|(activated, _)| {
+                                        activated
+                                            .into_iter()
+                                            .filter(|name| {
+                                                sessions
+                                                    .select_access_requests(
+                                                        &token,
+                                                        std::slice::from_ref(name),
+                                                    )
+                                                    .is_ok()
+                                            })
+                                            .collect::<std::collections::BTreeSet<_>>()
+                                    })
+                                })
+                                .unwrap_or_default()
+                        }
+                        None => std::collections::BTreeSet::new(),
+                    };
                 let items = cat
                     .list()
                     .iter()
+                    .filter(|verb| verb.baseline || visible_session_verbs.contains(&verb.name))
                     .map(|verb| VerbMenuItem {
                         name: verb.name.clone(),
                         description: verb.description.clone(),

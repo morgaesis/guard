@@ -1314,6 +1314,100 @@ verbs:
     ));
 }
 
+/// A non-operator menu lists only verbs the caller can actually activate:
+/// baseline verbs plus the caller's own session-activated scope. Foreign or
+/// unactivated non-baseline verbs stay invisible, while operators keep the
+/// complete catalog view.
+#[tokio::test]
+async fn non_operator_verb_menu_is_filtered_to_activatable_scope() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: open-fixture
+    binary: fixturectl
+    consequence: reversible
+  - name: session-only
+    binary: fixturectl
+    baseline: false
+    consequence: reversible
+  - name: foreign-only
+    binary: fixturectl
+    baseline: false
+    consequence: reversible
+"#,
+        )
+        .unwrap(),
+    ));
+    let mut grant = SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: vec!["session-only".to_string()],
+        override_markers: Vec::new(),
+        scope: Default::default(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1001)),
+    };
+    grant.scope.access_managed = true;
+    {
+        let mut sessions = cfg.state.sessions.write().await;
+        sessions.grant("menu-access".to_string(), grant);
+        assert_eq!(
+            sessions.install_access_grant(
+                "menu-access",
+                Some(2),
+                "gr-menu".to_string(),
+                vec!["session-only".to_string()],
+            ),
+            Some(true)
+        );
+    }
+
+    let menu_names = |response: &AdminResponse| -> Vec<String> {
+        let AdminResponse::VerbMenu { items } = response else {
+            panic!("expected sanitized verb menu, got {response:?}");
+        };
+        items.iter().map(|item| item.name.clone()).collect()
+    };
+
+    let holder = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1001 },
+        AdminRequest::VerbList,
+    )
+    .await;
+    assert_eq!(menu_names(&holder), vec!["open-fixture", "session-only"]);
+
+    let stranger = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::Unix { uid: 2002 },
+        AdminRequest::VerbList,
+    )
+    .await;
+    assert_eq!(menu_names(&stranger), vec!["open-fixture"]);
+
+    let operator = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::UnixAdmin { uid: 777 },
+        AdminRequest::VerbList,
+    )
+    .await;
+    let AdminResponse::Verbs { items } = operator else {
+        panic!("operator must keep the complete catalog view");
+    };
+    assert_eq!(items.len(), 3);
+}
+
 fn overbroad_until_gate_feedback_arrives(request: &str) -> serde_json::Value {
     // The gate complaint about the first candidate names its overbroad
     // pattern; once the daemon threads that complaint into the synthesis

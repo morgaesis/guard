@@ -71,8 +71,8 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 use cli_client::{
     handle_access, handle_api, handle_approval, handle_audit_tail, handle_audit_verify,
     handle_config, handle_gate_action, handle_provisionals, handle_resume, handle_status,
-    handle_verb, run_exec, run_mcp, warn_resume_alias_deprecated, GatingOptions, RunInjections,
-    SshHostKeyCliMode,
+    handle_verb, run_exec, run_mcp, warn_resume_alias_deprecated, GatingOptions, RunClientOptions,
+    RunInjections, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -106,6 +106,9 @@ enum MainArgs {
             guard-origin outcome. Use --json and read `allowed`/`status` for certainty."
     )]
     Run {
+        /// Override the daemon socket or Windows named pipe.
+        #[arg(long)]
+        socket: Option<String>,
         /// Emit one machine-readable result object instead of streaming child output.
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
@@ -485,6 +488,15 @@ enum AccessCommands {
 
 #[derive(Subcommand)]
 enum VerbCommands {
+    /// Validate a verb catalog locally without starting the daemon.
+    Lint {
+        /// Catalog to validate. Defaults to GUARD_VERBS or the daemon catalog path.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Apply canonical repairs to an otherwise valid catalog.
+        #[arg(long, action = ArgAction::SetTrue)]
+        fix: bool,
+    },
     /// List available verbs with their parameters and consequence class.
     List {
         #[arg(long)]
@@ -1430,6 +1442,7 @@ async fn run_main() -> Result<()> {
 
     match result {
         Ok(MainArgs::Run {
+            socket,
             json,
             explain,
             env_vars,
@@ -1470,8 +1483,11 @@ async fn run_main() -> Result<()> {
                 },
                 gating,
                 hostkey.into(),
-                json,
-                explain,
+                RunClientOptions {
+                    socket,
+                    json,
+                    explain,
+                },
             )
             .await
         }
