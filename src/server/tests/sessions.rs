@@ -935,6 +935,10 @@ verbs:
         response.verb_matches[0].action,
         guard::gating::verb::CoverageAction::Evaluate
     );
+    assert!(!response
+        .verb_guidance
+        .as_deref()
+        .is_some_and(|guidance| guidance.contains("incompatible authorization")));
     assert_eq!(
         cfg.state
             .sessions

@@ -243,7 +243,9 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     // An access overlay is additive only when one of its reviewed session
     // verbs is selected. Detach an unmatched implicit overlay before policy
     // validation so unrelated commands follow the caller's baseline policy.
-    // An explicitly requested session remains attached and policy-only.
+    // Restoring the pre-resolution request also discards session-derived
+    // rendering and revert state. An explicitly requested session remains
+    // attached and policy-only.
     if matches!(
         session_attachment,
         Some(SessionAttachmentOrigin::ImplicitAccessOverlay)
