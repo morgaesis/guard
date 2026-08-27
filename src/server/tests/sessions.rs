@@ -2779,6 +2779,7 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
     };
     let pending_hold = held("pending-revoked-session-hold");
     let mut armed_hold = held("armed-revoked-session-hold");
+    let durable_only_hold = held("durable-only-revoked-session-hold");
     armed_hold.decided_unix = Some(guard::env::now_unix());
     armed_hold.decided_reason = Some(APPROVAL_ARMED_REASON.to_string());
     {
@@ -2789,6 +2790,12 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
     let store = cfg.state.session_store.as_ref().unwrap();
     store.save_approval(pending_hold.clone()).await.unwrap();
     store.save_approval(armed_hold.clone()).await.unwrap();
+    // This row deliberately bypasses the daemon's in-memory projection. The
+    // revoke transaction must discover it from durable state itself.
+    store
+        .save_approval(durable_only_hold.clone())
+        .await
+        .unwrap();
     let pending_notify = cfg
         .state
         .approvals
@@ -2819,14 +2826,22 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
     tokio::time::timeout(std::time::Duration::from_secs(1), &mut notified)
         .await
         .expect("revocation wakes pending hold waiter");
-    for handle in [&pending_hold.handle, &armed_hold.handle] {
+    for handle in [
+        &pending_hold.handle,
+        &armed_hold.handle,
+        &durable_only_hold.handle,
+    ] {
         assert_eq!(
             cfg.state.approvals.read().await.get(handle).unwrap().status,
             ApprovalStatus::Denied
         );
     }
     let durable_approvals = store.load_approvals().await.unwrap();
-    for handle in [&pending_hold.handle, &armed_hold.handle] {
+    for handle in [
+        &pending_hold.handle,
+        &armed_hold.handle,
+        &durable_only_hold.handle,
+    ] {
         let durable = durable_approvals
             .iter()
             .find(|approval| &approval.handle == handle)
@@ -2837,6 +2852,13 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
             Some("originating access session was revoked")
         );
     }
+    let error = store
+        .save_approval(held("late-revoked-session-hold"))
+        .await
+        .expect_err("revoked authority cannot publish a new hold");
+    assert!(error
+        .to_string()
+        .contains("approval session authority is no longer live"));
     assert_eq!(
         cfg.state.grant_requests.read().await[&extension.reference].status,
         crate::grant_profile::GrantRequestStatus::Withdrawn
@@ -4451,9 +4473,14 @@ fn session_auto_amend_refuses_credential_shaped_argv() {
         Some(1)
     )
     .is_err());
+    let database_password = (0..24)
+        .map(|index| char::from(b'a' + ((index * 7 + 3) % 26) as u8))
+        .collect::<String>();
     assert!(deny_session_auto_amend_candidate(
         "psql",
-        &["postgres://app:SyntheticDbPass1@db.internal/prod".into()],
+        &[format!(
+            "postgres://app:{database_password}@db.internal/prod"
+        )],
         Some(9)
     )
     .is_err());

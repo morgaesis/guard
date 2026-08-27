@@ -312,9 +312,9 @@ struct ServerState {
     saved_grants: Arc<RwLock<SavedGrantCatalog>>,
     /// Durable requests to amend a live or saved grant.
     grant_requests: Arc<RwLock<std::collections::BTreeMap<String, GrantRequest>>>,
-    /// Serializes terminal transitions so memory and durable state observe one
-    /// winner for approve, deny, and withdraw races.
-    grant_request_transition_gate: Arc<Mutex<()>>,
+    /// Serializes session-bound hold publication and grant-request terminal
+    /// transitions so revocation has one authority winner in this daemon.
+    authority_transition_gate: Arc<Mutex<()>>,
     /// Optional API proxies hosted alongside the gate socket. When set,
     /// the daemon terminates brokered clients' TLS, gates each API operation
     /// against the operator policy, and re-originates to the upstream with the
@@ -374,7 +374,7 @@ impl ServerState {
             verb_previews: Arc::new(RwLock::new(admin::VerbPreviewCache::default())),
             saved_grants: Arc::new(RwLock::new(SavedGrantCatalog::empty())),
             grant_requests: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
-            grant_request_transition_gate: Arc::new(Mutex::new(())),
+            authority_transition_gate: Arc::new(Mutex::new(())),
             protocol_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
             api_coverage: None,
             read_grants: Arc::new(RwLock::new(GrantReadRegistry::new())),

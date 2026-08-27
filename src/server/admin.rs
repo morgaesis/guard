@@ -2006,7 +2006,7 @@ pub(super) async fn submit_access_request(
 
     prune_grant_requests(server).await;
     {
-        let _transition = server.state.grant_request_transition_gate.lock().await;
+        let _transition = server.state.authority_transition_gate.lock().await;
         if let Some(token) = session_token.as_deref() {
             let sessions = server.state.sessions.read().await;
             let snapshot = access_target_snapshot(&sessions, token)?;
@@ -2062,7 +2062,7 @@ pub(super) async fn submit_access_request(
     let evaluator_scope = requester.to_string();
     let (reduced, proposed_verbs) =
         reduce_access_intent(server, caller, &evaluator_scope, &intent, observed_argv).await?;
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     if let Some(token) = session_token.as_deref() {
         let sessions = server.state.sessions.read().await;
         let snapshot = access_target_snapshot(&sessions, token)?;
@@ -2348,7 +2348,7 @@ async fn approve_access_request_owned(
     uses: Option<u64>,
     audience: &AccessAudience,
 ) -> AccessDecisionResult {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let Some(pending) = server
         .state
         .grant_requests
@@ -2792,7 +2792,7 @@ async fn revoke_access_target_owned(
     caller: &CallerIdentity,
     target: &str,
 ) -> AdminResponse {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let mut generation_retry = false;
     loop {
         let baseline_sessions = server.state.sessions.read().await.clone();
@@ -2845,55 +2845,63 @@ async fn revoke_access_target_owned(
             .collect::<Vec<_>>();
         let revoked_at = now_unix();
         let session_fingerprint = audit_session_fingerprint(Some(&token));
-        let baseline_approvals = server.state.approvals.read().await.list();
-        let approval_denials = baseline_approvals
-            .into_iter()
-            .filter(|approval| {
-                approval.status == ApprovalStatus::Pending
-                    && approval.snapshot.session_fingerprint.as_deref()
-                        == Some(session_fingerprint.as_str())
-                    && approval.snapshot.session_revision.as_deref() == expected_revision.as_deref()
-            })
-            .map(|pending| {
-                let mut denied = pending.clone();
-                denied.status = ApprovalStatus::Denied;
-                denied.decided_unix = Some(revoked_at);
-                denied.decided_reason = Some("originating access session was revoked".to_string());
-                (pending, denied)
-            })
-            .collect::<Vec<_>>();
-        if let Some(store) = &server.state.session_store {
-            if let Err(error) = store
+        let approval_denials = if let Some(store) = &server.state.session_store {
+            match store
                 .commit_access_revoke(
                     token.clone(),
-                    expected_revision,
+                    expected_revision.clone(),
                     staged.clone(),
                     withdrawals.clone(),
-                    approval_denials.clone(),
                 )
                 .await
             {
-                match reload_sessions_after_registry_conflict(
-                    server,
-                    &error,
-                    generation_retry,
-                    "access revoke",
-                    baseline_sessions.revision(),
-                )
-                .await
-                {
-                    Ok(true) => {
-                        generation_retry = true;
-                        continue;
+                Ok(denied) => denied,
+                Err(error) => {
+                    match reload_sessions_after_registry_conflict(
+                        server,
+                        &error,
+                        generation_retry,
+                        "access revoke",
+                        baseline_sessions.revision(),
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            generation_retry = true;
+                            continue;
+                        }
+                        Err(message) => return AdminResponse::Error { message },
+                        Ok(false) => {}
                     }
-                    Err(message) => return AdminResponse::Error { message },
-                    Ok(false) => {}
+                    return AdminResponse::Error {
+                        message: format!("failed to persist access revoke: {error}"),
+                    };
                 }
-                return AdminResponse::Error {
-                    message: format!("failed to persist access revoke: {error}"),
-                };
             }
-        }
+        } else {
+            server
+                .state
+                .approvals
+                .read()
+                .await
+                .list()
+                .into_iter()
+                .filter(|approval| {
+                    approval.status == ApprovalStatus::Pending
+                        && approval.snapshot.session_fingerprint.as_deref()
+                            == Some(session_fingerprint.as_str())
+                        && approval.snapshot.session_revision.as_deref()
+                            == expected_revision.as_deref()
+                })
+                .map(|mut denied| {
+                    denied.status = ApprovalStatus::Denied;
+                    denied.decided_unix = Some(revoked_at);
+                    denied.decided_reason =
+                        Some("originating access session was revoked".to_string());
+                    denied
+                })
+                .collect::<Vec<_>>()
+        };
         {
             let mut live_sessions = server.state.sessions.write().await;
             if live_sessions.revision() != baseline_sessions.revision() {
@@ -2915,7 +2923,7 @@ async fn revoke_access_target_owned(
         }
         {
             let mut live_approvals = server.state.approvals.write().await;
-            for (_, denied) in &approval_denials {
+            for denied in &approval_denials {
                 live_approvals.install_persisted(denied.clone(), true);
             }
         }
@@ -2924,7 +2932,7 @@ async fn revoke_access_target_owned(
         for (_, withdrawn) in &withdrawals {
             emit_grant_request_event(server, withdrawn, "grant_request_withdrawn");
         }
-        for (_, denied) in &approval_denials {
+        for denied in &approval_denials {
             server.emit_event(NotifyEvent {
                 event: "decision_made",
                 at_unix: revoked_at,
@@ -2965,7 +2973,7 @@ async fn approve_held_access(
     uses: Option<u64>,
     audience: &AccessAudience,
 ) -> AccessDecisionResult {
-    let transition = server.state.grant_request_transition_gate.lock().await;
+    let transition = server.state.authority_transition_gate.lock().await;
     let Some(approval) = server.state.approvals.read().await.get(handle).cloned() else {
         return AccessDecisionResult {
             request: handle.to_string(),
@@ -4274,7 +4282,7 @@ async fn dispatch_admin_request(
                 granted_at: 0, // SessionRegistry::grant fills the current time
                 owner: session_owner,
             };
-            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let _transition = server.state.authority_transition_gate.lock().await;
             let baseline = server.state.sessions.read().await.clone();
             let mut staged = baseline.clone();
             staged.purge_expired();
@@ -4319,7 +4327,7 @@ async fn dispatch_admin_request(
         } => handle_session_appeal(server, caller, token, binary, args).await,
         #[cfg(test)]
         AdminRequest::SessionRevoke { token } => {
-            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let _transition = server.state.authority_transition_gate.lock().await;
             let baseline = server.state.sessions.read().await.clone();
             let mut staged = baseline.clone();
             let removed = staged.revoke(&token);
@@ -5694,7 +5702,7 @@ async fn dispatch_admin_request(
                     && grant.auto_approve_requests
                     && grant.contains_delta(&request.delta)
             });
-            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let _transition = server.state.authority_transition_gate.lock().await;
             {
                 let mut requests = server.state.grant_requests.write().await;
                 if requests.len() >= MAX_GRANT_REQUESTS {
@@ -5852,7 +5860,7 @@ async fn dispatch_admin_request(
             session_token,
         } => {
             prune_grant_requests(server).await;
-            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let _transition = server.state.authority_transition_gate.lock().await;
             let current = server
                 .state
                 .grant_requests
@@ -6093,7 +6101,7 @@ async fn dispatch_admin_request(
             ));
             preview.state.grant_requests =
                 std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new()));
-            preview.state.grant_request_transition_gate =
+            preview.state.authority_transition_gate =
                 std::sync::Arc::new(tokio::sync::Mutex::new(()));
             preview.state.provisional = std::sync::Arc::new(tokio::sync::RwLock::new(
                 guard::gating::provisional::ProvisionalRegistry::new(),
@@ -6207,7 +6215,7 @@ async fn preflight_synthesized_verb(
     ));
     preview.state.grant_requests =
         std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new()));
-    preview.state.grant_request_transition_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    preview.state.authority_transition_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     preview.state.provisional = std::sync::Arc::new(tokio::sync::RwLock::new(
         guard::gating::provisional::ProvisionalRegistry::new(),
     ));
@@ -6707,7 +6715,7 @@ async fn decide_grant_request_owned(
     approve: bool,
     reason: &str,
 ) -> AdminResponse {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let request = server
         .state
         .grant_requests
@@ -6954,7 +6962,7 @@ async fn validate_grant_request_for_approval(
 }
 
 pub(super) async fn prune_grant_requests(server: &ServerContext) {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let now = now_unix();
     let active_requests = server
         .state
@@ -7867,7 +7875,7 @@ async fn handle_approve(
     caller: &CallerIdentity,
     handle: &str,
 ) -> AdminResponse {
-    let transition = server.state.grant_request_transition_gate.lock().await;
+    let transition = server.state.authority_transition_gate.lock().await;
     let Some(approval) = server.state.approvals.read().await.get(handle).cloned() else {
         return AdminResponse::Error {
             message: format!("no approval with handle '{handle}'"),
@@ -7989,7 +7997,7 @@ pub(super) async fn handle_approval_note(
             message: "note text must not be empty".to_string(),
         };
     }
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let (is_operator, caller_key) = caller_scope(server, caller);
     let author = {
         let reg = server.state.approvals.read().await;
@@ -8076,7 +8084,7 @@ async fn handle_deny(
     handle: &str,
     reason: &str,
 ) -> AdminResponse {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let now = now_unix();
     let mut registry = server.state.approvals.write().await;
     let Some(expected) = registry.get(handle).cloned() else {

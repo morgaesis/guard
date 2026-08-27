@@ -2789,8 +2789,8 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
 
     // Serialize the final session check with access admission and revocation.
     // A revocation that wins this lock prevents the hold from being published;
-    // a hold that wins is included in the revocation's dependent snapshot.
-    let transition = server.state.grant_request_transition_gate.lock().await;
+    // a hold that wins commits first and the revoke transaction denies it.
+    let transition = server.state.authority_transition_gate.lock().await;
     if approval.snapshot.session_fingerprint.is_some() {
         let sessions = server.state.sessions.read().await;
         if super::admin::session_token_for_approval_snapshot(&sessions, &approval.snapshot)
@@ -3001,7 +3001,7 @@ pub(super) async fn resume_approval(
     caller: &CallerIdentity,
     handle: &str,
 ) -> ExecuteResult {
-    let transition = server.state.grant_request_transition_gate.lock().await;
+    let transition = server.state.authority_transition_gate.lock().await;
     let Some(expected) = server.state.approvals.read().await.get(handle).cloned() else {
         return ExecuteResult::denied("no armed held command for this requester");
     };

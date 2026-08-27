@@ -1,9 +1,9 @@
 use crate::grant_profile::EvaluationMode;
 use crate::grant_profile::{GrantRequest, SavedGrant};
 use crate::session::{
-    session_grant_revision_key, CredentialReference, HistoricalGrant, HistoricalStatus,
-    IssuedGrantScope, SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant,
-    SessionInteraction, SessionOwner, SessionRegistry, StoredSessionInteraction,
+    session_grant_revision_key, session_token_fingerprint, CredentialReference, HistoricalGrant,
+    HistoricalStatus, IssuedGrantScope, SessionDecisionSource, SessionExactRule, SessionExecStatus,
+    SessionGrant, SessionInteraction, SessionOwner, SessionRegistry, StoredSessionInteraction,
 };
 use anyhow::{Context, Result};
 use guard::gating::approval::{Approval, ApprovalStatus};
@@ -11,7 +11,6 @@ use guard::gating::provisional::{Provisional, ProvisionalStatus, REVERT_BODY_CLE
 use guard::gating::read_grant::ReadGrant;
 use guard::redact::{redact_output_text, SENSITIVE_ARGV_REPLAY_GUIDANCE};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -62,17 +61,6 @@ struct SessionRevisionUpdate {
     new_revision: String,
     token_fingerprint: String,
     scope_json: String,
-}
-
-fn access_session_token_fingerprint(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    format!(
-        "sha256:{}",
-        digest[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    )
 }
 
 #[derive(Debug)]
@@ -249,6 +237,24 @@ impl SessionStore {
     where
         F: FnOnce(u64) -> Result<u64> + Send + 'static,
     {
+        self.run_registry_write_with_result(task, revision, stale, move |expected_generation| {
+            operation(expected_generation).map(|generation| (generation, ()))
+        })
+        .await
+        .map(|_| ())
+    }
+
+    async fn run_registry_write_with_result<F, T>(
+        &self,
+        task: &'static str,
+        revision: u64,
+        stale: StaleRegistryWrite,
+        operation: F,
+    ) -> Result<Option<T>>
+    where
+        F: FnOnce(u64) -> Result<(u64, T)> + Send + 'static,
+        T: Send + 'static,
+    {
         let gate = self.registry_write_gate.clone();
         #[cfg(test)]
         let gate_identity = std::sync::Arc::as_ptr(&gate) as usize;
@@ -258,19 +264,20 @@ impl SessionStore {
             let mut state = gate.lock().await;
             if revision < state.last_written_revision {
                 return match stale {
-                    StaleRegistryWrite::Ignore => Ok(()),
+                    StaleRegistryWrite::Ignore => Ok(None),
                     StaleRegistryWrite::Reject(message) => anyhow::bail!(message),
                 };
             }
             let expected_generation = state.database_generation;
-            let generation = tokio::task::spawn_blocking(move || operation(expected_generation))
-                .await
-                .with_context(|| format!("{task} task failed"))??;
+            let (generation, result) =
+                tokio::task::spawn_blocking(move || operation(expected_generation))
+                    .await
+                    .with_context(|| format!("{task} task failed"))??;
             #[cfg(test)]
             pause_registry_write_after_commit(gate_identity, task).await;
             state.database_generation = generation;
             state.last_written_revision = revision;
-            Ok(())
+            Ok(Some(result))
         })
         .await
         .with_context(|| format!("{task} coordination task failed"))?
@@ -817,7 +824,7 @@ impl SessionStore {
                         token: token.clone(),
                         old_revision,
                         new_revision,
-                        token_fingerprint: access_session_token_fingerprint(&token),
+                        token_fingerprint: session_token_fingerprint(&token),
                         scope_json: encode_scope(&grant.scope)?,
                     });
                 }
@@ -1248,14 +1255,17 @@ impl SessionStore {
         ensure_supported_schema_version(version, SCHEMA_VERSION)?;
         if version == SCHEMA_VERSION {
             Self::validate_current_schema_tables(conn)?;
-            let tx = conn.unchecked_transaction()?;
+            // Current-schema validation can repair legacy-sensitive rows, so
+            // reserve the write slot before reading. The connection busy
+            // timeout then provides bounded waiting instead of an upgrade race.
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
             sanitize_persisted_credentials(&tx)?;
             Self::validate_authority_row_indexes(&tx, true)?;
             tx.commit()?;
             return Ok(());
         }
 
-        let tx = conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_grants (
                 token TEXT PRIMARY KEY,
@@ -2079,15 +2089,15 @@ impl SessionStore {
     }
 
     /// Revoke one access session and terminalize every pending dependent in
-    /// the same transaction.
+    /// the same transaction. Returns the exact durable approval denials for
+    /// post-commit publication to this daemon's in-memory projection.
     pub async fn commit_access_revoke(
         &self,
         token: String,
         expected_revision: Option<String>,
         registry: SessionRegistry,
         withdrawals: Vec<(GrantRequest, GrantRequest)>,
-        approval_denials: Vec<(Approval, Approval)>,
-    ) -> Result<()> {
+    ) -> Result<Vec<Approval>> {
         #[cfg(test)]
         if self
             .fail_next_write
@@ -2108,32 +2118,11 @@ impl SessionStore {
             validate_persisted_access_request(previous)?;
             validate_persisted_access_request(next)?;
         }
-        let approval_denials = approval_denials
-            .into_iter()
-            .map(|(mut previous, mut next)| {
-                previous.sanitize_explanatory_text();
-                next.sanitize_explanatory_text();
-                (previous, next)
-            })
-            .collect::<Vec<_>>();
-        let session_fingerprint = access_session_token_fingerprint(&token);
-        for (previous, next) in &approval_denials {
-            validate_persisted_approval(previous)?;
-            validate_persisted_approval(next)?;
-            if previous.status != ApprovalStatus::Pending
-                || next.status != ApprovalStatus::Denied
-                || previous.snapshot.session_fingerprint.as_deref()
-                    != Some(session_fingerprint.as_str())
-                || previous.snapshot.session_revision != expected_revision
-                || !valid_approval_transition(previous, next)?
-            {
-                anyhow::bail!("invalid revoked-session approval denial");
-            }
-        }
+        let session_fingerprint = session_token_fingerprint(&token);
         let path = self.path.clone();
         let retention = self.history_retention_secs;
         let revision = registry.revision();
-        self.run_registry_write(
+        self.run_registry_write_with_result(
             "access revoke transaction",
             revision,
             StaleRegistryWrite::Reject("access revoke session snapshot is stale"),
@@ -2146,6 +2135,52 @@ impl SessionStore {
             if session_grant_revision_key(&durable_grant) != expected_revision {
                 anyhow::bail!("durable access session changed before revoke");
             }
+            let approval_denials = {
+                let mut statement = tx.prepare(
+                    "SELECT handle, status, created_unix, json
+                     FROM gating_approval WHERE status = ?1",
+                )?;
+                let rows = statement.query_map(params![ApprovalStatus::Pending.as_str()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+                let mut denials = Vec::new();
+                for row in rows {
+                    let (handle, status, created_unix, expected_json) = row?;
+                    let mut pending = serde_json::from_str::<Approval>(&expected_json)
+                        .with_context(|| {
+                            format!("decode durable approval {handle} with status {status}")
+                        })?;
+                    if pending.handle != handle
+                        || pending.status.as_str() != status
+                        || pending.created_unix != decode_u64(created_unix)?
+                    {
+                        anyhow::bail!(
+                            "durable approval index disagrees with serialized row for {handle}"
+                        );
+                    }
+                    validate_persisted_approval(&pending)
+                        .with_context(|| format!("validate durable approval {handle}"))?;
+                    pending.sanitize_explanatory_text();
+                    if pending.snapshot.session_fingerprint.as_deref()
+                        != Some(session_fingerprint.as_str())
+                        || pending.snapshot.session_revision != expected_revision
+                    {
+                        continue;
+                    }
+                    let mut denied = pending.clone();
+                    denied.status = ApprovalStatus::Denied;
+                    denied.decided_unix = Some(guard::env::now_unix());
+                    denied.decided_reason =
+                        Some("originating access session was revoked".to_string());
+                    denials.push((pending, denied, expected_json));
+                }
+                denials
+            };
             for (pending, withdrawn) in &withdrawals {
                 if pending.status != crate::grant_profile::GrantRequestStatus::Pending
                     || withdrawn.status != crate::grant_profile::GrantRequestStatus::Withdrawn
@@ -2196,21 +2231,24 @@ impl SessionStore {
                     ],
                 )?;
             }
-            for (pending, denied) in &approval_denials {
-                let expected_json = serde_json::to_string(pending)
-                    .context("encode pending revoked-session approval")?;
+            for (pending, denied, expected_json) in &approval_denials {
                 Self::compare_and_swap_approval_transaction(
                     &tx,
                     pending,
                     denied,
-                    &expected_json,
+                    expected_json,
                 )?;
             }
+            let denied = approval_denials
+                .into_iter()
+                .map(|(_, denied, _)| denied)
+                .collect();
             tx.commit()?;
-                Ok(generation)
+                Ok((generation, denied))
             },
         )
-        .await
+        .await?
+        .context("access revoke transaction was unexpectedly ignored as stale")
     }
 
     pub async fn load_grant_requests(&self) -> Result<Vec<GrantRequest>> {
@@ -2516,12 +2554,15 @@ impl SessionStore {
         .context("cancel staged provisional task failed")?
     }
 
+    /// Load and transactionally repair legacy provisional rows. The immediate
+    /// write reservation avoids a deferred read-to-write upgrade race, while
+    /// the connection busy timeout bounds contention with another daemon.
     pub async fn load_provisionals(&self) -> Result<Vec<Provisional>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let rows = {
                 let mut stmt = tx
                     .prepare("SELECT handle, status, created_unix, json FROM gating_provisional")?;
@@ -2617,6 +2658,12 @@ impl SessionStore {
         let mut conn = Self::open_connection(path)?;
         Self::init_schema(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if next.status == ApprovalStatus::Pending
+            && next.snapshot.session_fingerprint.is_some()
+            && !Self::approval_session_authority_is_live(&tx, next)?
+        {
+            anyhow::bail!("approval session authority is no longer live");
+        }
         let durable_json = tx
             .query_row(
                 "SELECT json FROM gating_approval WHERE handle = ?1",
@@ -2653,6 +2700,33 @@ impl SessionStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Verify session-bound hold authority under the same write transaction
+    /// that inserts the hold. This makes approval publication and session
+    /// revocation linearizable across daemon processes sharing one database.
+    fn approval_session_authority_is_live(conn: &Connection, approval: &Approval) -> Result<bool> {
+        let (Some(expected_fingerprint), Some(expected_revision)) = (
+            approval.snapshot.session_fingerprint.as_deref(),
+            approval.snapshot.session_revision.as_ref(),
+        ) else {
+            return Ok(false);
+        };
+        let mut statement = conn.prepare("SELECT token FROM session_grants")?;
+        let tokens = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for token in tokens {
+            if session_token_fingerprint(&token) != expected_fingerprint {
+                continue;
+            }
+            let Some(grant) = Self::load_session_grant(conn, &token)? else {
+                return Ok(false);
+            };
+            return Ok(!grant.is_expired(guard::env::now_unix())
+                && session_grant_revision_key(&grant).as_ref() == Some(expected_revision));
+        }
+        Ok(false)
     }
 
     fn compare_and_swap_approval_sync(
@@ -2731,12 +2805,15 @@ impl SessionStore {
         .context("delete_approval task failed")?
     }
 
+    /// Load and transactionally sanitize approval rows. The immediate write
+    /// reservation avoids a deferred read-to-write upgrade race, while the
+    /// connection busy timeout bounds contention with another daemon.
     pub async fn load_approvals(&self) -> Result<Vec<Approval>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let rows = {
                 let mut stmt =
                     tx.prepare("SELECT handle, status, created_unix, json FROM gating_approval")?;
@@ -3794,7 +3871,7 @@ fn repair_sensitive_session_exact_authority(
                     old_revision,
                     new_revision: session_grant_revision_key(&grant)
                         .context("compute sanitized session revision")?,
-                    token_fingerprint: access_session_token_fingerprint(&token),
+                    token_fingerprint: session_token_fingerprint(&token),
                     scope_json: encode_scope(&grant.scope)?,
                 });
                 changed = true;
@@ -6112,7 +6189,6 @@ mod tests {
                     expected_revision,
                     detached_registry,
                     Vec::new(),
-                    Vec::new(),
                 )
                 .await
         });
@@ -6291,8 +6367,7 @@ mod tests {
         request.issued_session_revision = Some(old_revision.clone());
         request.request_key = request.canonical_access_key().unwrap();
         let mut approval = pending_approval("legacy-access-hold");
-        approval.snapshot.session_fingerprint =
-            Some(access_session_token_fingerprint(&permissive_token));
+        approval.snapshot.session_fingerprint = Some(session_token_fingerprint(&permissive_token));
         approval.snapshot.session_revision = Some(old_revision);
         let conn = Connection::open(&path).unwrap();
         conn.execute(
@@ -7239,6 +7314,65 @@ mod tests {
             .expect("approval writer task")
             .expect("approval write retries within the SQLite busy timeout");
         assert_eq!(store.load_approvals().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repair_capable_loaders_wait_for_a_transient_sqlite_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let sensitive = ["transient", "repair", "fixture"].concat();
+        let mut approval = pending_approval("ap-transient-repair");
+        approval.reason = format!("retry with --password={sensitive}");
+        let mut provisional = provisional_row("pv-transient-repair", ProvisionalStatus::Armed);
+        provisional.reason = format!("rollback with --password={sensitive}");
+        let lock = Connection::open(&path).unwrap();
+        lock.execute(
+            "INSERT INTO gating_approval (handle, json, status, created_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                approval.handle,
+                serde_json::to_string(&approval).unwrap(),
+                approval.status.as_str(),
+                encode_u64(approval.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        lock.execute(
+            "INSERT INTO gating_provisional (handle, json, status, created_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                provisional.handle,
+                serde_json::to_string(&provisional).unwrap(),
+                provisional.status.as_str(),
+                encode_u64(provisional.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let approval_store = store.clone();
+        let approval_loader = tokio::spawn(async move { approval_store.load_approvals().await });
+        let provisional_store = store.clone();
+        let provisional_loader =
+            tokio::spawn(async move { provisional_store.load_provisionals().await });
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        lock.execute_batch("COMMIT").unwrap();
+
+        let approvals = tokio::time::timeout(Duration::from_secs(12), approval_loader)
+            .await
+            .expect("approval repair remains bounded")
+            .expect("approval loader task")
+            .expect("approval repair waits within the SQLite busy timeout");
+        let provisionals = tokio::time::timeout(Duration::from_secs(12), provisional_loader)
+            .await
+            .expect("provisional repair remains bounded")
+            .expect("provisional loader task")
+            .expect("provisional repair waits within the SQLite busy timeout");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(provisionals.len(), 1);
+        assert!(!approvals[0].reason.contains(&sensitive));
+        assert!(!provisionals[0].reason.contains(&sensitive));
     }
 
     #[tokio::test]
