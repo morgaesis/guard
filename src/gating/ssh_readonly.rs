@@ -25,36 +25,65 @@ pub struct SshArgumentBoundaries {
     pub command_start: Option<usize>,
 }
 
-/// Find the destination and first remote-command token using OpenSSH's option
-/// zone. The option values themselves are skipped only while locating the
-/// boundary; callers validate those options independently.
+/// Find the destination and first remote-command token using OpenSSH's two
+/// option prefixes. OpenSSH parses options once before the destination and,
+/// unless `--` ended option parsing, once more immediately after it. The first
+/// token after those prefixes starts the remote command; its entire suffix is
+/// left untouched.
 pub fn ssh_argument_boundaries(args: &[String]) -> SshArgumentBoundaries {
-    let mut destination = None;
-    let mut index = 0;
-
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if arg.starts_with('-') {
-            index += usize::from(ssh_option_takes_separate_argument(arg));
-            index += 1;
-            continue;
-        }
-
-        if destination.is_none() {
-            destination = Some(index);
-            index += 1;
-            continue;
-        }
-
+    let leading_options = ssh_option_prefix(args, 0);
+    let destination = (leading_options.end < args.len()).then_some(leading_options.end);
+    let Some(destination) = destination else {
         return SshArgumentBoundaries {
-            destination,
-            command_start: Some(index),
+            destination: None,
+            command_start: None,
         };
-    }
+    };
+
+    let after_destination = destination + 1;
+    let command_start = if leading_options.terminated {
+        (after_destination < args.len()).then_some(after_destination)
+    } else {
+        let trailing_options = ssh_option_prefix(args, after_destination);
+        (trailing_options.end < args.len()).then_some(trailing_options.end)
+    };
 
     SshArgumentBoundaries {
-        destination,
-        command_start: None,
+        destination: Some(destination),
+        command_start,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SshOptionPrefix {
+    end: usize,
+    terminated: bool,
+}
+
+/// Consume only a local SSH-option prefix. Returning at the first positional
+/// token is what prevents dash-prefixed arguments after the remote command
+/// starts from being reconsidered as SSH options.
+fn ssh_option_prefix(args: &[String], start: usize) -> SshOptionPrefix {
+    let mut index = start;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            return SshOptionPrefix {
+                end: index + 1,
+                terminated: true,
+            };
+        }
+        if !arg.starts_with('-') {
+            break;
+        }
+
+        let width = 1 + usize::from(ssh_option_takes_separate_argument(arg));
+        index = index.saturating_add(width).min(args.len());
+    }
+
+    SshOptionPrefix {
+        end: index,
+        terminated: false,
     }
 }
 
@@ -85,16 +114,24 @@ fn ssh_option_takes_separate_argument(arg: &str) -> bool {
 /// Combined short flags such as `-Cq` are treated as unrecognized rather than
 /// decomposed, again forfeiting to the evaluator.
 pub fn ssh_options_all_readonly_safe(args: &[String]) -> bool {
-    let option_zone_end = ssh_argument_boundaries(args)
-        .command_start
-        .unwrap_or(args.len());
+    let boundaries = ssh_argument_boundaries(args);
+    let option_zone_end = boundaries.command_start.unwrap_or(args.len());
     let mut i = 0;
     while i < option_zone_end {
         let arg = args[i].as_str();
 
-        // The sole positional in the option zone is the destination. The
-        // shared boundary parser above has already excluded the remote
-        // command and all of its arguments.
+        // The destination remains positional even when `--` permits a name
+        // beginning with a dash. The shared boundary parser has already
+        // excluded the remote command and every one of its arguments.
+        if boundaries.destination == Some(i) {
+            i += 1;
+            continue;
+        }
+        // The option terminator is syntax, not a local behavior switch.
+        if arg == "--" {
+            i += 1;
+            continue;
+        }
         if !arg.starts_with('-') {
             i += 1;
             continue;

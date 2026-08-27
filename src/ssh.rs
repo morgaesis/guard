@@ -84,6 +84,21 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_command_honors_option_terminator_after_destination() {
+        assert_eq!(
+            extract_command(&args(&["user@host", "--", "-remote-tool", "--flag"])),
+            "-remote-tool --flag"
+        );
+    }
+
+    #[test]
+    fn test_extract_command_honors_option_terminator_before_destination() {
+        let invocation = args(&["--", "-named-host", "id", "-u"]);
+        assert_eq!(extract_destination(&invocation), Some("-named-host".into()));
+        assert_eq!(extract_command(&invocation), "id -u");
+    }
+
+    #[test]
     fn test_extract_command_skips_safe_post_destination_option() {
         assert_eq!(
             extract_command(&args(&["user@host", "-o", "ConnectTimeout=5", "id"])),
