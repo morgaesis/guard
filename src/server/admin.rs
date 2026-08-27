@@ -1,15 +1,17 @@
+#[cfg(test)]
+use crate::grant_profile::EvaluationMode;
 use crate::grant_profile::{
-    normalize_access_intent, EvaluationMode, GrantRequest, GrantRequestDelta, GrantRequestStatus,
+    normalize_access_intent, GrantRequest, GrantRequestDelta, GrantRequestStatus,
 };
 use crate::secrets::legacy_sentinel;
 use crate::session::{
-    session_reference, IssuedGrantScope, SessionGrant, SessionGrantSummary, SessionOwner,
-    SessionRegistry, SessionReport,
+    session_reference, SessionGrant, SessionGrantSummary, SessionOwner, SessionRegistry,
+    SessionReport,
 };
 #[cfg(test)]
 use crate::session::{
-    HistoricalGrant, SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
-    SessionInteraction,
+    HistoricalGrant, IssuedGrantScope, SessionAmendment, SessionDecision, SessionDecisionSource,
+    SessionExecStatus, SessionInteraction,
 };
 use guard::audit::{AuditEvent, AuditKind};
 use guard::gating::verb::{
@@ -2229,34 +2231,6 @@ pub(super) async fn submit_access_request(
     Ok(access_item_for_request(server, &request, &audience).await)
 }
 
-fn new_access_session(requester: PrincipalKey, label: String, expires_at: u64) -> SessionGrant {
-    SessionGrant {
-        allow: Vec::new(),
-        deny: Vec::new(),
-        allow_exact: Vec::new(),
-        deny_exact: Vec::new(),
-        activated_verbs: Vec::new(),
-        override_markers: Vec::new(),
-        scope: IssuedGrantScope {
-            label: Some(label),
-            evaluation_mode: EvaluationMode::Evaluator,
-            access_managed: true,
-            ..IssuedGrantScope::default()
-        },
-        expires_at: Some(expires_at),
-        prompt_append: None,
-        generated_notes: Vec::new(),
-        // Access-managed sessions add their reviewed typed authority to the
-        // caller's ordinary evaluator posture. They are selected implicitly
-        // from the authenticated principal, so making them policy-only would
-        // deny every unrelated command until the session is revoked.
-        static_only: false,
-        auto_amend: false,
-        granted_at: 0,
-        owner: SessionOwner::Principal(requester),
-    }
-}
-
 fn proposed_access_verbs(request: &GrantRequest) -> Result<Vec<Verb>, String> {
     if request.has_access_projection() {
         request
@@ -2605,7 +2579,7 @@ async fn approve_access_request_owned(
                 .unwrap_or_else(|| format!("agent:{requester}"));
             if !staged.grant(
                 token.clone(),
-                new_access_session(requester.clone(), label, expiry),
+                SessionGrant::additive_access_overlay(requester.clone(), label, expiry),
             ) {
                 return AccessDecisionResult {
                     request: handle.to_string(),
@@ -3672,11 +3646,12 @@ async fn handle_session_appeal(
                         risk,
                         exec_status: SessionExecStatus::NotAttempted,
                         exit_code: None,
-                        credential_references: Vec::new(),
+                        exposed_secret_refs: Vec::new(),
                         decision_trace: Some(guard::gating::DecisionTrace::source(
                             format!("{source:?}").to_ascii_lowercase(),
                         )),
                     },
+                    Vec::new(),
                 )
                 .await;
                 return AdminResponse::SessionAppeal {
@@ -3726,11 +3701,12 @@ async fn handle_session_appeal(
                     risk,
                     exec_status: SessionExecStatus::NotAttempted,
                     exit_code: None,
-                    credential_references: Vec::new(),
+                    exposed_secret_refs: Vec::new(),
                     decision_trace: Some(guard::gating::DecisionTrace::source(
                         format!("{source:?}").to_ascii_lowercase(),
                     )),
                 },
+                Vec::new(),
             )
             .await;
             server.emit_audit_ungated(
@@ -3793,11 +3769,12 @@ async fn handle_session_appeal(
                     risk,
                     exec_status: SessionExecStatus::NotAttempted,
                     exit_code: None,
-                    credential_references: Vec::new(),
+                    exposed_secret_refs: Vec::new(),
                     decision_trace: Some(guard::gating::DecisionTrace::source(
                         format!("{source:?}").to_ascii_lowercase(),
                     )),
                 },
+                Vec::new(),
             )
             .await;
             server.emit_audit_ungated(

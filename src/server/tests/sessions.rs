@@ -883,6 +883,17 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     let worker = CallerIdentity::Unix { uid: 1001 };
     let other = CallerIdentity::Unix { uid: 1002 };
 
+    let mut unrelated_without_overlay = request_with_session(
+        "rustc",
+        vec!["--print".to_string(), "target-libdir".to_string()],
+        "unused".to_string(),
+    );
+    unrelated_without_overlay.session_token = None;
+    let unrelated_without_overlay = execute_command(unrelated_without_overlay, &cfg, &worker)
+        .await
+        .into_response();
+    assert!(unrelated_without_overlay.allowed);
+
     let request = || AdminRequest::AccessRequest {
         intent: "Inspect fixture".to_string(),
     };
@@ -953,15 +964,33 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .iter()
         .any(|item| item.reference == isolated.reference));
 
-    let mut baseline = request_with_session(
+    let mut unrelated = request_with_session(
         "rustc",
         vec!["--print".to_string(), "target-libdir".to_string()],
         "unused".to_string(),
     );
-    baseline.session_token = None;
-    assert!(execute_command(baseline, &cfg, &worker)
+    unrelated.session_token = None;
+    let unrelated = execute_command(unrelated, &cfg, &worker)
         .await
-        .policy_allowed());
+        .into_response();
+    assert!(
+        unrelated.allowed,
+        "implicit access authority must not narrow unrelated baseline commands: {}",
+        unrelated.reason
+    );
+    assert!(!unrelated.reason.contains("session policy-only mode"));
+    assert_eq!(unrelated.reason, unrelated_without_overlay.reason);
+    assert_eq!(
+        unrelated
+            .decision_trace
+            .as_ref()
+            .map(|trace| trace.decision_source.as_str()),
+        unrelated_without_overlay
+            .decision_trace
+            .as_ref()
+            .map(|trace| trace.decision_source.as_str()),
+        "an empty additive overlay must preserve the baseline decision path"
+    );
     let remaining_before_access = {
         let sessions = cfg.state.sessions.read().await;
         let token = sessions
@@ -970,18 +999,6 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         sessions.aggregate_access_uses(&token).flatten()
     };
     assert_eq!(remaining_before_access, Some(1));
-
-    let mut unrelated = request_with_session("uptime", Vec::new(), "unused".to_string());
-    unrelated.session_token = None;
-    let unrelated = execute_command(unrelated, &cfg, &worker).await;
-    assert!(
-        unrelated.policy_allowed(),
-        "implicit access authority must not narrow unrelated baseline commands: {}",
-        unrelated.policy_reason()
-    );
-    assert!(!unrelated
-        .policy_reason()
-        .contains("session policy-only mode"));
 
     let mut execution =
         request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
@@ -4366,7 +4383,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
     let registry = crate::session::SessionRegistry::from_parts(
         grants,
         Vec::new(),
-        vec![(
+        vec![crate::session::StoredSessionInteraction::from_typed_parts(
             token.clone(),
             SessionInteraction {
                 at_unix: guard::env::now_unix(),
@@ -4377,9 +4394,10 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                credential_references: Vec::new(),
+                exposed_secret_refs: Vec::new(),
                 decision_trace: None,
             },
+            Vec::new(),
         )],
         crate::session::DEFAULT_HISTORY_RETENTION_SECS,
     );
@@ -4824,7 +4842,7 @@ async fn session_show_reports_recent_stats() {
 
     {
         let mut reg = cfg.state.sessions.write().await;
-        reg.record_interaction(
+        reg.record_interaction_with_credential_references(
             &token,
             SessionInteraction {
                 at_unix: now.saturating_sub(1),
@@ -4835,12 +4853,13 @@ async fn session_show_reports_recent_stats() {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                credential_references: vec![crate::session::CredentialReference::from_store_name(
-                    "service/token",
-                )
-                .expect("valid fixture credential reference")],
+                exposed_secret_refs: Vec::new(),
                 decision_trace: None,
             },
+            vec![
+                crate::session::CredentialReference::from_store_name("service/token")
+                    .expect("valid fixture credential reference"),
+            ],
         );
         reg.record_interaction(
             &token,
@@ -4853,7 +4872,7 @@ async fn session_show_reports_recent_stats() {
                 risk: None,
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
-                credential_references: Vec::new(),
+                exposed_secret_refs: Vec::new(),
                 decision_trace: None,
             },
         );
@@ -4971,7 +4990,7 @@ async fn session_status_self_view_redacts_bearer_and_keeps_decision_trace() {
             risk: Some(0),
             exec_status: SessionExecStatus::Completed,
             exit_code: Some(0),
-            credential_references: Vec::new(),
+            exposed_secret_refs: Vec::new(),
             decision_trace: Some(guard::gating::DecisionTrace::source("static_policy")),
         },
     );
@@ -5382,7 +5401,7 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
             exec_status: SessionExecStatus::NotAttempted,
             exit_code: None,
             at_unix: guard::env::now_unix(),
-            credential_references: Vec::new(),
+            exposed_secret_refs: Vec::new(),
             decision_trace: None,
         },
     );
@@ -6262,7 +6281,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
             exec_status: SessionExecStatus::NotAttempted,
             exit_code: None,
             at_unix: guard::env::now_unix(),
-            credential_references: Vec::new(),
+            exposed_secret_refs: Vec::new(),
             decision_trace: None,
         },
     );

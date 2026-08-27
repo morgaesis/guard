@@ -1606,7 +1606,10 @@ pub(super) struct ExecuteResult {
     /// commands until they explicitly attach an audience.
     operator_guidance: bool,
     /// Typed secret-store references whose values entered the environment of a
-    /// successfully spawned child. This does not prove the child consumed them.
+    /// successfully spawned child. This internal audit/session field is never
+    /// copied into the public [`ExecuteResponse`] wire contract, which has
+    /// never exposed credential references. This does not prove the child
+    /// consumed them.
     credential_references: Vec<CredentialReference>,
     verb_matches: Vec<VerbMatchInfo>,
     verb_guidance: Option<String>,
@@ -2262,6 +2265,17 @@ mod decision_trace_feature_tests {
         assert!(!serde_json::to_string(&response)
             .unwrap()
             .contains(fixture_value));
+    }
+
+    #[test]
+    fn execute_response_omits_internal_credential_reference_metadata() {
+        let response = ExecuteResult::denied("fixture denial")
+            .with_credential_references(vec![CredentialReference::from_store_name("service/token")
+                .expect("valid fixture credential reference")])
+            .into_response();
+        let encoded = serde_json::to_value(response).unwrap();
+        assert!(encoded.get("exposed_secret_refs").is_none());
+        assert!(encoded.get("credential_references").is_none());
     }
 
     #[test]

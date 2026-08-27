@@ -2,7 +2,7 @@ use crate::grant_profile::{EvaluationMode, GrantRequest, SavedGrant};
 use crate::session::{
     session_grant_revision_key, CredentialReference, HistoricalGrant, HistoricalStatus,
     IssuedGrantScope, SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant,
-    SessionInteraction, SessionOwner, SessionRegistry,
+    SessionInteraction, SessionOwner, SessionRegistry, StoredSessionInteraction,
 };
 use anyhow::{Context, Result};
 use guard::gating::approval::{Approval, ApprovalStatus};
@@ -891,8 +891,11 @@ impl SessionStore {
             let rows = stmt.query_map([], |row| {
                 let source: String = row.get(4)?;
                 let exec_status: String = row.get(7)?;
-                Ok((
-                    row.get::<_, String>(0)?,
+                let token = row.get::<_, String>(0)?;
+                let credential_references =
+                    decode_credential_references(&row.get::<_, String>(9)?)?;
+                Ok(StoredSessionInteraction::from_typed_parts(
+                    token,
                     SessionInteraction {
                         at_unix: decode_u64(row.get(1)?)?,
                         command: row.get(2)?,
@@ -902,9 +905,7 @@ impl SessionStore {
                         risk: row.get(6)?,
                         exec_status: decode_exec_status(&exec_status)?,
                         exit_code: row.get(8)?,
-                        credential_references: decode_credential_references(
-                            &row.get::<_, String>(9)?,
-                        )?,
+                        exposed_secret_refs: Vec::new(),
                         decision_trace: row
                             .get::<_, Option<String>>(10)?
                             .map(|json| serde_json::from_str(&json))
@@ -917,6 +918,7 @@ impl SessionStore {
                                 )
                             })?,
                     },
+                    credential_references,
                 ))
             })?;
             for row in rows {
@@ -1127,7 +1129,9 @@ impl SessionStore {
             )?;
         }
 
-        for (token, mut interaction) in snapshot.interactions_snapshot() {
+        for (token, mut interaction, credential_references) in
+            snapshot.typed_interactions_snapshot()
+        {
             interaction.command = redact_output_text(&interaction.command);
             interaction.reason = guard::gating::sanitize_gate_text(&interaction.reason);
             if let Some(trace) = interaction.decision_trace.as_mut() {
@@ -1150,7 +1154,7 @@ impl SessionStore {
                     interaction.risk,
                     encode_exec_status(interaction.exec_status),
                     interaction.exit_code,
-                    encode_credential_references(&interaction.credential_references)?,
+                    encode_credential_references(&credential_references)?,
                     interaction
                         .decision_trace
                         .as_ref()
@@ -4142,7 +4146,12 @@ fn decode_credential_references(value: &str) -> rusqlite::Result<Vec<CredentialR
     })?;
     Ok(names
         .into_iter()
-        .filter_map(CredentialReference::from_persisted_name)
+        .filter_map(|name| {
+            if redact_output_text(&name) != name {
+                return None;
+            }
+            CredentialReference::from_persisted_name(name)
+        })
         .collect())
 }
 
@@ -6756,7 +6765,7 @@ mod tests {
                 risk: Some(0),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                credential_references: Vec::new(),
+                exposed_secret_refs: Vec::new(),
                 decision_trace: None,
             },
         );
@@ -6994,7 +7003,7 @@ mod tests {
         let registry = store.load_registry().await.expect("load migrated store");
         let report = registry.show("legacy-token", 10).expect("legacy report");
         assert_eq!(report.recent[0].exit_code, None);
-        assert!(report.recent[0].credential_references.is_empty());
+        assert!(report.recent[0].exposed_secret_refs.is_empty());
         let conn = Connection::open(&legacy_path).expect("reopen migrated db");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -7089,7 +7098,7 @@ mod tests {
         let registry = SessionRegistry::from_parts(
             HashMap::new(),
             Vec::new(),
-            vec![(
+            vec![StoredSessionInteraction::from_typed_parts(
                 "expired-token".into(),
                 SessionInteraction {
                     at_unix: guard::env::now_unix().saturating_sub(60),
@@ -7100,9 +7109,10 @@ mod tests {
                     risk: Some(0),
                     exec_status: SessionExecStatus::Completed,
                     exit_code: Some(0),
-                    credential_references: Vec::new(),
+                    exposed_secret_refs: Vec::new(),
                     decision_trace: None,
                 },
+                Vec::new(),
             )],
             1,
         );
@@ -8033,7 +8043,7 @@ mod tests {
                 auto_amend: false,
                 owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(4343)),
             }],
-            vec![(
+            vec![StoredSessionInteraction::from_typed_parts(
                 "tok".into(),
                 SessionInteraction {
                     at_unix: now.saturating_sub(1),
@@ -8044,12 +8054,11 @@ mod tests {
                     risk: Some(1),
                     exec_status: SessionExecStatus::CompletedAfterApproval,
                     exit_code: Some(0),
-                    credential_references: vec![CredentialReference::from_store_name(
-                        "service/token",
-                    )
-                    .expect("valid fixture credential reference")],
+                    exposed_secret_refs: Vec::new(),
                     decision_trace: Some(guard::gating::DecisionTrace::source("cache")),
                 },
+                vec![CredentialReference::from_store_name("service/token")
+                    .expect("valid fixture credential reference")],
             )],
             24 * 60 * 60,
         );
@@ -8081,10 +8090,7 @@ mod tests {
             report.recent[0].exec_status,
             SessionExecStatus::CompletedAfterApproval
         );
-        assert_eq!(
-            report.recent[0].credential_references[0].as_reference_name(),
-            "service/token"
-        );
+        assert_eq!(report.recent[0].exposed_secret_refs[0], "service/token");
         assert_eq!(
             report.active.and_then(|grant| grant.prompt_append),
             Some("persistent".into())
@@ -8145,7 +8151,7 @@ mod tests {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                credential_references: Vec::new(),
+                exposed_secret_refs: Vec::new(),
                 decision_trace: Some(guard::gating::DecisionTrace::source("llm")),
             },
         );
@@ -8218,7 +8224,7 @@ mod tests {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                credential_references: Vec::new(),
+                exposed_secret_refs: Vec::new(),
                 decision_trace: Some(guard::gating::DecisionTrace::source("llm")),
             },
         );
