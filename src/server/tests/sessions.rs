@@ -880,8 +880,11 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     let worker = CallerIdentity::Unix { uid: 1001 };
     let other = CallerIdentity::Unix { uid: 1002 };
 
-    let mut unrelated_without_overlay =
-        request_with_session("uptime", Vec::new(), "unused".to_string());
+    let mut unrelated_without_overlay = request_with_session(
+        "rustc",
+        vec!["--print".to_string(), "target-libdir".to_string()],
+        "unused".to_string(),
+    );
     unrelated_without_overlay.session_token = None;
     let unrelated_without_overlay = execute_command(unrelated_without_overlay, &cfg, &worker)
         .await
@@ -958,25 +961,11 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .iter()
         .any(|item| item.reference == isolated.reference));
 
-    let mut baseline = request_with_session(
+    let mut unrelated = request_with_session(
         "rustc",
         vec!["--print".to_string(), "target-libdir".to_string()],
         "unused".to_string(),
     );
-    baseline.session_token = None;
-    assert!(execute_command(baseline, &cfg, &worker)
-        .await
-        .policy_allowed());
-    let remaining_before_access = {
-        let sessions = cfg.state.sessions.read().await;
-        let token = sessions
-            .access_token_for_principal(&PrincipalKey::from_uid(1001))
-            .unwrap();
-        sessions.aggregate_access_uses(&token).flatten()
-    };
-    assert_eq!(remaining_before_access, Some(1));
-
-    let mut unrelated = request_with_session("uptime", Vec::new(), "unused".to_string());
     unrelated.session_token = None;
     let unrelated = execute_command(unrelated, &cfg, &worker)
         .await
@@ -999,6 +988,14 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
             .map(|trace| trace.decision_source.as_str()),
         "an empty additive overlay must preserve the baseline decision path"
     );
+    let remaining_before_access = {
+        let sessions = cfg.state.sessions.read().await;
+        let token = sessions
+            .access_token_for_principal(&PrincipalKey::from_uid(1001))
+            .unwrap();
+        sessions.aggregate_access_uses(&token).flatten()
+    };
+    assert_eq!(remaining_before_access, Some(1));
 
     let mut execution =
         request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
