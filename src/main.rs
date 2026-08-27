@@ -488,6 +488,13 @@ enum AccessCommands {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
+    /// Show this local principal's active access-managed session.
+    Whoami {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
     /// Show detailed request or session coverage and evidence.
     Show {
         reference: String,
@@ -528,7 +535,7 @@ enum VerbCommands {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
-    /// Show one verb, including typed coverage and generation evidence.
+    /// Show one verb. Requesters see invocation details; operators also see policy evidence.
     Show {
         name: String,
         #[arg(long)]

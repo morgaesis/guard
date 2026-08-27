@@ -765,7 +765,7 @@ impl Drop for ProxyHoldOrphanGuard {
 /// registry and state store), and a directory for stored HTTP revert bodies.
 /// The proxy acts as the daemon principal, so the operator manages
 /// proxy-armed provisionals with the same
-/// `guard confirm` / `guard provisionals` / `guard revert` commands.
+/// packaged operator confirmation, inspection, and reversion actions.
 #[derive(Clone)]
 pub(super) struct DaemonGateSink {
     pub(super) server: ServerContext,
@@ -1669,7 +1669,12 @@ async fn assess_revert(
             .unwrap_or("none; deadline always rolls back")
     );
     let session_prompt = match forward.session_token.as_deref() {
-        Some(token) => server.state.sessions.read().await.prompt_append_for(token),
+        Some(token) => server
+            .state
+            .sessions
+            .read()
+            .await
+            .evaluator_prompt_append_for(token),
         None => None,
     };
     let evaluation_context = merge_revert_assessment_prompt(session_prompt.as_deref(), &context);
@@ -2297,7 +2302,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         command_authority,
     )
     .await;
-    let exposed_secret_refs = result.exposed_secret_refs().to_vec();
+    let credential_references = result.credential_references().to_vec();
 
     match result.exec {
         ExecOutcome::Completed {
@@ -2331,7 +2336,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                         stdout,
                         stderr,
                     )
-                    .with_exposed_secret_refs(exposed_secret_refs);
+                    .with_credential_references(credential_references);
             };
             if !persist_provisional_transition(server, provisional.clone(), updated.clone())
                 .await
@@ -2382,7 +2387,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                         stdout,
                         stderr,
                     )
-                    .with_exposed_secret_refs(exposed_secret_refs);
+                    .with_credential_references(credential_references);
             }
             if exit_code.is_none() {
                 let response_reason = format!(
@@ -2405,7 +2410,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                         stdout,
                         stderr,
                     )
-                    .with_exposed_secret_refs(exposed_secret_refs);
+                    .with_credential_references(credential_references);
             }
             if exit_code != Some(0) {
                 let exit_code = exit_code.expect("nonzero containment exit has a code");
@@ -2430,7 +2435,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                         stdout,
                         stderr,
                     )
-                    .with_exposed_secret_refs(exposed_secret_refs);
+                    .with_credential_references(credential_references);
             }
             let armed_deadline = updated.deadline_unix;
             let armed_window = updated.window_secs;
@@ -2465,7 +2470,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 armed_deadline,
                 armed_window,
             )
-            .with_exposed_secret_refs(exposed_secret_refs)
+            .with_credential_references(credential_references)
         }
         // The child was launched and then failed (for example, the client
         // stream dropped). Its partial effects are unknown. Persist that
@@ -2550,7 +2555,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                     None,
                     None,
                 )
-                .with_exposed_secret_refs(exposed_secret_refs)
+                .with_credential_references(credential_references)
         }
         ExecOutcome::Failed {
             started: false,
@@ -3743,7 +3748,7 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
 }
 
 /// Run the revert for a provisional under the original caller's identity, with no
-/// client stream. Used by the sweeper and `guard revert`.
+/// client stream. Used by the sweeper and operator-initiated reversion.
 async fn run_provisional_revert(server: &ServerContext, p: &Provisional) -> ExecuteResult {
     if p.api_revert.is_none()
         && command_contains_sensitive_literals(&p.revert_binary, &p.revert_args)
@@ -4245,8 +4250,8 @@ pub(super) async fn finish_revert(
         }
     };
     // `kind` names who drove this rollback ("auto"/"auto-check-failed" for the
-    // deadline sweeper, "manual" for `guard revert`). Only the sweeper's own
-    // rollback stamps the row, so a later `guard confirm` can say the timer
+    // deadline sweeper, "manual" for operator reversion). Only the sweeper's own
+    // rollback stamps the row, so later operator confirmation can say the timer
     // fired rather than only that the handle is spent.
     let auto_reverted_unix = kind.starts_with("auto").then(now_unix);
     let updated = {

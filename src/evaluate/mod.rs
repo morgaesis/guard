@@ -288,6 +288,18 @@ impl Evaluator {
         Ok(LearnedDenyUseLease { lease: Some(lease) })
     }
 
+    /// Check only explicit operator-authored deny policy for a structured
+    /// command. This is used again at process start so typed authority and
+    /// approved replay cannot bypass a hard static deny.
+    #[doc(hidden)]
+    pub fn static_deny_reason_argv(&self, binary: &str, args: &[String]) -> Option<String> {
+        let command = crate::redact::command_line(binary, args);
+        self.policy_engine
+            .as_ref()?
+            .check_deny_fast_path(&command)
+            .map(|reason| crate::redact::redact_output_text(&reason))
+    }
+
     pub fn mode(&self) -> Option<PolicyMode> {
         self.mode
     }

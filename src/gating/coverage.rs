@@ -24,6 +24,15 @@ use crate::gating::Reversibility;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+/// Whether a learned deny remains authoritative at process start for a routed
+/// verb. Evaluator-reviewed routes enforce it. Only the execution path for an
+/// exact operator-authored typed verb may install the explicit preemption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearnedDenyMatchPolicy {
+    Enforce,
+    TypedVerbPreempts,
+}
+
 /// Resolved verb context threaded into gate routing.
 #[derive(Debug, Clone)]
 pub struct VerbContext {
@@ -43,6 +52,10 @@ pub struct VerbContext {
     /// Canonical digest of the complete composed matcher result, including
     /// every applicable coverage cell and every selected verb definition.
     pub composition_digest: Option<String>,
+    /// Set to `TypedVerbPreempts` only after this exact typed authority has
+    /// preauthorized the command. Evaluator-reviewed contexts remain
+    /// `Enforce` so a newly learned deny can close the process-start race.
+    pub learned_deny_match_policy: LearnedDenyMatchPolicy,
     /// True only when every selected cell is an operator-approved session
     /// `evaluate` cell. The executor may then honor the access grant without
     /// asking the evaluator to decide the same typed operation again.
@@ -304,6 +317,7 @@ pub fn resolve_scoped_matches(
                 catalog_version,
                 verb_digest: None,
                 composition_digest: None,
+                learned_deny_match_policy: LearnedDenyMatchPolicy::Enforce,
                 access_evaluation_override_eligible,
             }),
             revert,

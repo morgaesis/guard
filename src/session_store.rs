@@ -1,8 +1,9 @@
+use crate::grant_profile::EvaluationMode;
 use crate::grant_profile::{GrantRequest, SavedGrant};
 use crate::session::{
-    session_grant_revision_key, HistoricalGrant, HistoricalStatus, IssuedGrantScope,
-    SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant, SessionInteraction,
-    SessionOwner, SessionRegistry,
+    session_grant_revision_key, CredentialReference, HistoricalGrant, HistoricalStatus,
+    IssuedGrantScope, SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant,
+    SessionInteraction, SessionOwner, SessionRegistry, StoredSessionInteraction,
 };
 use anyhow::{Context, Result};
 use guard::gating::approval::{Approval, ApprovalStatus};
@@ -10,6 +11,7 @@ use guard::gating::provisional::{Provisional, ProvisionalStatus, REVERT_BODY_CLE
 use guard::gating::read_grant::ReadGrant;
 use guard::redact::{redact_output_text, SENSITIVE_ARGV_REPLAY_GUIDANCE};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -51,6 +53,26 @@ const SCHEMA_VERSION: i64 = 14;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
+
+#[derive(Debug)]
+struct SessionRevisionUpdate {
+    token: String,
+    old_revision: String,
+    new_revision: String,
+    token_fingerprint: String,
+    scope_json: String,
+}
+
+fn access_session_token_fingerprint(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!(
+        "sha256:{}",
+        digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
 
 #[derive(Debug)]
 struct RegistryGenerationConflict {
@@ -620,6 +642,85 @@ impl SessionStore {
         Self::load_registry_sync_with_hook(path, history_retention_secs, || {})
     }
 
+    fn rebase_pending_session_dependents(
+        conn: &Connection,
+        updates: &[SessionRevisionUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let pending_requests = {
+            let mut stmt = conn.prepare(
+                "SELECT handle, json FROM grant_requests WHERE status = 'pending' ORDER BY handle",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (handle, json) in pending_requests {
+            let mut request: GrantRequest = serde_json::from_str(&json)
+                .with_context(|| format!("decode pending access request {handle}"))?;
+            let Some(update) = updates.iter().find(|update| {
+                request.session_token == update.token
+                    && request.issued_session_revision.as_deref()
+                        == Some(update.old_revision.as_str())
+            }) else {
+                continue;
+            };
+            request.issued_session_revision = Some(update.new_revision.clone());
+            if request.has_access_projection() {
+                request.request_key = request
+                    .canonical_access_key()
+                    .context("rebase pending access request key")?;
+            }
+            validate_persisted_access_request(&request)?;
+            conn.execute(
+                "UPDATE grant_requests SET json = ?1 WHERE handle = ?2",
+                params![
+                    serde_json::to_string(&request).context("encode rebased access request")?,
+                    handle
+                ],
+            )?;
+        }
+
+        let pending_approvals = {
+            let mut stmt = conn.prepare(
+                "SELECT handle, json FROM gating_approval WHERE status = 'pending' ORDER BY handle",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (handle, json) in pending_approvals {
+            let mut approval: Approval = serde_json::from_str(&json)
+                .with_context(|| format!("decode pending approval {handle}"))?;
+            let Some(update) = updates.iter().find(|update| {
+                approval.snapshot.session_revision.as_deref() == Some(update.old_revision.as_str())
+                    && approval.snapshot.session_fingerprint.as_deref()
+                        == Some(update.token_fingerprint.as_str())
+            }) else {
+                continue;
+            };
+            approval.snapshot.session_revision = Some(update.new_revision.clone());
+            validate_persisted_approval(&approval)?;
+            conn.execute(
+                "UPDATE gating_approval SET json = ?1 WHERE handle = ?2",
+                params![
+                    serde_json::to_string(&approval).context("encode rebased approval")?,
+                    handle
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn load_registry_sync_with_hook<F>(
         path: &Path,
         history_retention_secs: u64,
@@ -634,6 +735,7 @@ impl SessionStore {
 
         let mut grants = HashMap::new();
         let mut active_exact_updates = Vec::new();
+        let mut additive_access_updates = Vec::new();
         let mut retired_active = Vec::new();
         {
             let mut stmt = tx.prepare(
@@ -668,6 +770,21 @@ impl SessionStore {
             })?;
             for row in rows {
                 let (token, mut grant) = row?;
+                let additive_access_old_revision = if grant.scope.access_managed
+                    && (!grant.static_only
+                        || grant.scope.evaluation_mode != EvaluationMode::PolicyOnly)
+                {
+                    // Access-managed sessions are policy-only in both
+                    // persisted representations. Normalize legacy rows
+                    // atomically before any authority is admitted.
+                    let old_revision = session_grant_revision_key(&grant)
+                        .context("compute permissive access compatibility revision")?;
+                    grant.static_only = true;
+                    grant.scope.evaluation_mode = EvaluationMode::PolicyOnly;
+                    Some(old_revision)
+                } else {
+                    None
+                };
                 let allow_changed = purge_sensitive_exact_rules(&mut grant.allow_exact);
                 let deny_changed = purge_sensitive_exact_rules(&mut grant.deny_exact);
                 let exact_metadata = serialized_contains_registered_exact_literals(&grant)?;
@@ -686,6 +803,22 @@ impl SessionStore {
                         encode_exact_vec(&grant.allow_exact)?,
                         encode_exact_vec(&grant.deny_exact)?,
                     ));
+                }
+                if let Some(old_revision) = additive_access_old_revision {
+                    // The replacement revision covers every startup mutation,
+                    // including sensitive exact-rule normalization above. A
+                    // dependent must never be rebased to an intermediate
+                    // grant shape that is not the one retained in memory and
+                    // persisted by this transaction.
+                    let new_revision = session_grant_revision_key(&grant)
+                        .context("compute final additive access session revision")?;
+                    additive_access_updates.push(SessionRevisionUpdate {
+                        token: token.clone(),
+                        old_revision,
+                        new_revision,
+                        token_fingerprint: access_session_token_fingerprint(&token),
+                        scope_json: encode_scope(&grant.scope)?,
+                    });
                 }
                 grants.insert(token, grant);
             }
@@ -760,8 +893,11 @@ impl SessionStore {
             let rows = stmt.query_map([], |row| {
                 let source: String = row.get(4)?;
                 let exec_status: String = row.get(7)?;
-                Ok((
-                    row.get::<_, String>(0)?,
+                let token = row.get::<_, String>(0)?;
+                let credential_references =
+                    decode_credential_references(&row.get::<_, String>(9)?)?;
+                Ok(StoredSessionInteraction::from_typed_parts(
+                    token,
                     SessionInteraction {
                         at_unix: decode_u64(row.get(1)?)?,
                         command: row.get(2)?,
@@ -771,7 +907,7 @@ impl SessionStore {
                         risk: row.get(6)?,
                         exec_status: decode_exec_status(&exec_status)?,
                         exit_code: row.get(8)?,
-                        exposed_secret_refs: decode_vec(&row.get::<_, String>(9)?)?,
+                        exposed_secret_refs: Vec::new(),
                         decision_trace: row
                             .get::<_, Option<String>>(10)?
                             .map(|json| serde_json::from_str(&json))
@@ -784,6 +920,7 @@ impl SessionStore {
                                 )
                             })?,
                     },
+                    credential_references,
                 ))
             })?;
             for row in rows {
@@ -791,8 +928,12 @@ impl SessionStore {
             }
         }
 
-        let mut registry =
-            SessionRegistry::from_parts(grants, history, interactions, history_retention_secs);
+        let mut registry = SessionRegistry::from_typed_parts(
+            grants,
+            history,
+            interactions,
+            history_retention_secs,
+        );
         registry.purge_expired();
         let generation = Self::read_registry_generation(&tx)?;
         for (token, allow, deny) in &active_exact_updates {
@@ -801,6 +942,13 @@ impl SessionStore {
                 params![allow, deny, token],
             )?;
         }
+        for update in &additive_access_updates {
+            tx.execute(
+                "UPDATE session_grants SET static_only = 1, scope_json = ?2 WHERE token = ?1",
+                params![update.token, update.scope_json],
+            )?;
+        }
+        Self::rebase_pending_session_dependents(&tx, &additive_access_updates)?;
         for grant in &retired_active {
             tx.execute(
                 "DELETE FROM session_grants WHERE token = ?1",
@@ -819,6 +967,7 @@ impl SessionStore {
             insert_historical_grant(&tx, grant)?;
         }
         let generation = if active_exact_updates.is_empty()
+            && additive_access_updates.is_empty()
             && history_exact_updates.is_empty()
             && history_replacements.is_empty()
             && retired_active.is_empty()
@@ -837,7 +986,7 @@ impl SessionStore {
                 ],
             )?;
             if changed != 1 {
-                anyhow::bail!("session registry generation compare-and-swap was lost during sensitive exact-rule purge");
+                anyhow::bail!("session registry generation compare-and-swap was lost during startup normalization");
             }
             next
         };
@@ -986,7 +1135,9 @@ impl SessionStore {
             )?;
         }
 
-        for (token, mut interaction) in snapshot.interactions_snapshot() {
+        for (token, mut interaction, credential_references) in
+            snapshot.typed_interactions_snapshot()
+        {
             interaction.command = redact_output_text(&interaction.command);
             interaction.reason = guard::gating::sanitize_gate_text(&interaction.reason);
             if let Some(trace) = interaction.decision_trace.as_mut() {
@@ -1009,7 +1160,7 @@ impl SessionStore {
                     interaction.risk,
                     encode_exec_status(interaction.exec_status),
                     interaction.exit_code,
-                    encode_vec(&interaction.exposed_secret_refs)?,
+                    encode_credential_references(&credential_references)?,
                     interaction
                         .decision_trace
                         .as_ref()
@@ -3158,7 +3309,8 @@ fn migrate_v13_dispatch_rows(conn: &Connection) -> Result<()> {
 }
 
 fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
-    let exact_authority_changed = repair_sensitive_session_exact_authority(conn)?;
+    let (exact_authority_changed, exact_revision_updates) =
+        repair_sensitive_session_exact_authority(conn)?;
     {
         let mut stmt = conn.prepare(
             "SELECT rowid, command, reason, secret_refs_json, decision_trace_json FROM session_interactions",
@@ -3450,6 +3602,7 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
             )?;
         }
     }
+    SessionStore::rebase_pending_session_dependents(conn, &exact_revision_updates)?;
     if exact_authority_changed {
         conn.execute(
             "UPDATE state_metadata SET value = value + 1 WHERE key = ?1",
@@ -3538,8 +3691,11 @@ fn insert_historical_grant(conn: &Connection, grant: &HistoricalGrant) -> Result
 /// Sensitive allows can be dropped safely. A sensitive deny on an active
 /// session retires the entire session because preserving broader authority
 /// without that deny would widen access.
-fn repair_sensitive_session_exact_authority(conn: &Connection) -> Result<bool> {
+fn repair_sensitive_session_exact_authority(
+    conn: &Connection,
+) -> Result<(bool, Vec<SessionRevisionUpdate>)> {
     let mut changed = false;
+    let mut revision_updates = Vec::new();
     let mut active = Vec::new();
     {
         let mut stmt = conn.prepare(
@@ -3573,27 +3729,45 @@ fn repair_sensitive_session_exact_authority(conn: &Connection) -> Result<bool> {
     }
 
     for (token, mut grant) in active {
+        let old_revision = session_grant_revision_key(&grant)
+            .context("compute pre-sanitization session revision")?;
         let allow_changed = purge_sensitive_exact_rules(&mut grant.allow_exact);
         let deny_changed = purge_sensitive_exact_rules(&mut grant.deny_exact);
-        if deny_changed {
-            conn.execute(
-                "DELETE FROM session_grants WHERE token = ?1",
-                params![token],
-            )?;
-            insert_historical_grant(
-                conn,
-                &revoked_history_from_grant(token, grant, guard::env::now_unix()),
-            )?;
-            changed = true;
-        } else if allow_changed {
-            conn.execute(
-                "UPDATE session_grants SET allow_exact_json = ?1 WHERE token = ?2",
-                params![encode_exact_vec(&grant.allow_exact)?, token],
-            )?;
-            changed = true;
+        match (allow_changed, deny_changed) {
+            (_, true) => {
+                // Removing a deny would widen authority, so retire the session
+                // instead of manufacturing a replacement revision.
+                conn.execute(
+                    "DELETE FROM session_grants WHERE token = ?1",
+                    params![token],
+                )?;
+                insert_historical_grant(
+                    conn,
+                    &revoked_history_from_grant(token, grant, guard::env::now_unix()),
+                )?;
+                changed = true;
+            }
+            (true, false) => {
+                // Removing an allow narrows authority but keeps the session
+                // active. Rebase pending dependents to that exact retained
+                // revision after their own sensitive fields are sanitized.
+                conn.execute(
+                    "UPDATE session_grants SET allow_exact_json = ?1 WHERE token = ?2",
+                    params![encode_exact_vec(&grant.allow_exact)?, token],
+                )?;
+                revision_updates.push(SessionRevisionUpdate {
+                    token: token.clone(),
+                    old_revision,
+                    new_revision: session_grant_revision_key(&grant)
+                        .context("compute sanitized session revision")?,
+                    token_fingerprint: access_session_token_fingerprint(&token),
+                    scope_json: encode_scope(&grant.scope)?,
+                });
+                changed = true;
+            }
+            (false, false) => {}
         }
     }
-
     let history_rows = {
         let mut stmt =
             conn.prepare("SELECT id, allow_exact_json, deny_exact_json FROM session_history")?;
@@ -3620,7 +3794,7 @@ fn repair_sensitive_session_exact_authority(conn: &Connection) -> Result<bool> {
             changed = true;
         }
     }
-    Ok(changed)
+    Ok((changed, revision_updates))
 }
 
 fn purge_sensitive_exact_rules(rules: &mut Vec<SessionExactRule>) -> bool {
@@ -3649,6 +3823,10 @@ fn should_vacuum(page_count: u64, free_pages: u64) -> bool {
 
 fn encode_vec(values: &[String]) -> Result<String> {
     serde_json::to_string(values).context("failed to encode session list")
+}
+
+fn encode_credential_references(values: &[CredentialReference]) -> Result<String> {
+    serde_json::to_string(values).context("failed to encode credential references")
 }
 
 fn encode_scope(scope: &IssuedGrantScope) -> Result<String> {
@@ -3930,6 +4108,25 @@ fn decode_vec(value: &str) -> rusqlite::Result<Vec<String>> {
             Box::new(err),
         )
     })
+}
+
+fn decode_credential_references(value: &str) -> rusqlite::Result<Vec<CredentialReference>> {
+    let names: Vec<String> = serde_json::from_str(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })?;
+    Ok(names
+        .into_iter()
+        .filter_map(|name| {
+            if redact_output_text(&name) != name {
+                return None;
+            }
+            CredentialReference::from_persisted_name(name)
+        })
+        .collect())
 }
 
 fn decode_scope(value: &str) -> rusqlite::Result<IssuedGrantScope> {
@@ -5561,13 +5758,13 @@ mod tests {
             crate::grant_profile::GrantRequestDelta {
                 prompt_append: Some(format!(
                     "inspect with Authorization: Bearer {}",
-                    FIXTURE_BEARER_JWT
+                    fixture_bearer_jwt()
                 )),
                 ..Default::default()
             },
             format!(
                 "curl -H 'Authorization: Bearer {}' /status",
-                FIXTURE_BEARER_JWT
+                fixture_bearer_jwt()
             ),
         )
         .unwrap();
@@ -5581,7 +5778,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!stored.contains(FIXTURE_BEARER_JWT));
+        assert!(!stored.contains(&fixture_bearer_jwt()));
         assert!(stored.contains("[REDACTED]"));
 
         request.justification = format!("tool {}", FIXTURE_PASSWORD_FLAG);
@@ -6002,6 +6199,179 @@ mod tests {
     }
 
     #[test]
+    fn registry_load_rebases_sensitive_allow_and_fail_closed_access_mutations() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let (_, initial_generation) = SessionStore::load_registry_sync(&path, 3600).unwrap();
+        let permissive_token = "permissive-access-compatibility".to_string();
+        let explicit_token = "explicit-access-policy-only".to_string();
+        let access_grant = |evaluation_mode, static_only| SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["host-inspect".to_string()],
+            override_markers: Vec::new(),
+            scope: IssuedGrantScope {
+                access_managed: true,
+                evaluation_mode,
+                ..IssuedGrantScope::default()
+            },
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            granted_at: 1,
+            static_only,
+            auto_amend: false,
+            owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
+        };
+        let sensitive_exact = SessionExactRule::new(
+            "curl",
+            vec![
+                "--user".to_string(),
+                "SyntheticUser:SyntheticPassphrase123".to_string(),
+            ],
+        );
+        assert!(guard::redact::command_contains_sensitive_literals(
+            &sensitive_exact.binary,
+            &sensitive_exact.args,
+        ));
+        let mut legacy_grant = access_grant(EvaluationMode::Evaluator, false);
+        legacy_grant.allow_exact.push(sensitive_exact.clone());
+        let old_revision = session_grant_revision_key(&legacy_grant).unwrap();
+        let mut persisted_legacy_grant = legacy_grant;
+        persisted_legacy_grant.allow_exact.clear();
+        let legacy_scope_json = encode_scope(&persisted_legacy_grant.scope).unwrap();
+        let mut registry = SessionRegistry::new();
+        registry.grant(permissive_token.clone(), persisted_legacy_grant);
+        registry.grant(
+            explicit_token.clone(),
+            access_grant(EvaluationMode::PolicyOnly, true),
+        );
+        let seeded_generation =
+            SessionStore::persist_registry_sync(&path, 3600, &registry, initial_generation)
+                .unwrap();
+        let mut request = generated_access_request();
+        request.session_token = permissive_token.clone();
+        request.issued_session_revision = Some(old_revision.clone());
+        request.request_key = request.canonical_access_key().unwrap();
+        let mut approval = pending_approval("legacy-access-hold");
+        approval.snapshot.session_fingerprint =
+            Some(access_session_token_fingerprint(&permissive_token));
+        approval.snapshot.session_revision = Some(old_revision);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE session_grants SET allow_exact_json = ?1, static_only = 0, scope_json = ?3 WHERE token = ?2",
+            params![
+                encode_exact_vec(&[sensitive_exact]).unwrap(),
+                permissive_token,
+                legacy_scope_json
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO grant_requests (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                request.handle,
+                serde_json::to_string(&request).unwrap(),
+                request.status.as_str(),
+                encode_u64(request.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gating_approval (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                approval.handle,
+                serde_json::to_string(&approval).unwrap(),
+                approval.status.as_str(),
+                encode_u64(approval.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let (loaded, normalized_generation) =
+            SessionStore::load_registry_sync(&path, 3600).unwrap();
+        let loaded_grants = loaded.grants_snapshot();
+        assert!(loaded_grants[&permissive_token].static_only);
+        assert!(loaded_grants[&explicit_token].static_only);
+        assert_eq!(
+            loaded_grants[&permissive_token].scope.evaluation_mode,
+            EvaluationMode::PolicyOnly
+        );
+        assert_eq!(
+            loaded_grants[&explicit_token].scope.evaluation_mode,
+            EvaluationMode::PolicyOnly
+        );
+        assert_eq!(
+            loaded.evaluator_posture_for(&permissive_token),
+            Some(crate::session::SessionEvaluatorPosture::PolicyOnly)
+        );
+        assert_eq!(
+            loaded.evaluator_posture_for(&explicit_token),
+            Some(crate::session::SessionEvaluatorPosture::PolicyOnly)
+        );
+        assert_eq!(
+            normalized_generation,
+            seeded_generation + 2,
+            "sensitive-rule sanitation and additive access normalization each advance authority"
+        );
+        let new_revision = loaded.effective_revision_key(&permissive_token).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let (normalized, normalized_scope_json): (i64, String) = conn
+            .query_row(
+                "SELECT static_only, scope_json FROM session_grants WHERE token = ?1",
+                params![permissive_token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(normalized, 1);
+        assert_eq!(
+            decode_scope(&normalized_scope_json)
+                .unwrap()
+                .evaluation_mode,
+            EvaluationMode::PolicyOnly
+        );
+        let rebased_request: GrantRequest = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT json FROM grant_requests WHERE handle = ?1",
+                    params![request.handle],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rebased_request.issued_session_revision.as_deref(),
+            Some(new_revision.as_str())
+        );
+        assert_eq!(
+            rebased_request.request_key,
+            rebased_request.canonical_access_key().unwrap()
+        );
+        let rebased_approval: Approval = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT json FROM gating_approval WHERE handle = ?1",
+                    params![approval.handle],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rebased_approval.snapshot.session_revision.as_deref(),
+            Some(new_revision.as_str())
+        );
+        drop(conn);
+
+        let (_, idempotent_generation) = SessionStore::load_registry_sync(&path, 3600).unwrap();
+        assert_eq!(idempotent_generation, normalized_generation);
+    }
+
+    #[test]
     fn registry_load_keeps_grants_and_generation_in_one_sqlite_snapshot() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("state.db");
@@ -6013,27 +6383,21 @@ mod tests {
 
         let token = "snapshot-race".to_string();
         let mut before = SessionRegistry::new();
-        before.grant(
+        assert!(before.grant_policy_only_access_overlay(
             token.clone(),
-            SessionGrant {
-                allow: Vec::new(),
-                deny: Vec::new(),
-                allow_exact: Vec::new(),
-                deny_exact: Vec::new(),
-                activated_verbs: vec!["host-inspect".to_string()],
-                override_markers: Vec::new(),
-                scope: IssuedGrantScope {
-                    access_managed: true,
-                    ..IssuedGrantScope::default()
+            guard::principal::PrincipalKey::from_uid(1001),
+            "snapshot race".to_string(),
+            guard::env::now_unix().saturating_add(3_600),
+        ));
+        assert_eq!(
+            before.apply_delta(
+                &token,
+                &crate::grant_profile::GrantRequestDelta {
+                    activated_verbs: vec!["host-inspect".to_string()],
+                    ..crate::grant_profile::GrantRequestDelta::default()
                 },
-                expires_at: None,
-                prompt_append: None,
-                generated_notes: Vec::new(),
-                granted_at: 1,
-                static_only: true,
-                auto_amend: false,
-                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
-            },
+            ),
+            Some(true)
         );
         before.install_access_grant(
             &token,
@@ -6266,7 +6630,7 @@ mod tests {
                 prompt_append: None,
                 generated_notes: Vec::new(),
                 granted_at: 1,
-                static_only: true,
+                static_only: false,
                 auto_amend: false,
                 owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
             },
@@ -6368,7 +6732,7 @@ mod tests {
                 prompt_append: None,
                 generated_notes: Vec::new(),
                 granted_at: 1,
-                static_only: true,
+                static_only: false,
                 auto_amend: false,
                 owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
             },
@@ -6434,8 +6798,26 @@ mod tests {
     }
 
     // Synthetic test-fixture credential shapes (never real secrets).
-    const FIXTURE_BEARER_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6IlN5bnRoZXRpYyJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50In0.SyntheticSignature123";
+    fn fixture_bearer_jwt() -> String {
+        [
+            "eyJhbGciOiJSUzI1NiJ9",
+            "eyJzdWIiOiJndWFyZC10ZXN0LWZpeHR1cmUifQ",
+            "c3ludGhldGljLXNpZ25hdHVyZS1ub3QtYS1jcmVkZW50aWFs",
+        ]
+        .join(".")
+    }
     const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
+
+    #[test]
+    fn credential_reference_decoder_discards_noncanonical_legacy_entries() {
+        let decoded = decode_credential_references(
+            r#"["service/token","../invalid","api-endpoint:prod:upstream"]"#,
+        )
+        .expect("decode credential references");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].as_reference_name(), "service/token");
+        assert_eq!(decoded[1].as_reference_name(), "api-endpoint:prod:upstream");
+    }
 
     #[tokio::test]
     async fn v5_migration_sanitizes_persisted_credentials_and_bumps_version() {
@@ -6456,7 +6838,7 @@ mod tests {
                 params![
                     serde_json::to_string(&vec![SessionExactRule::new(
                         "kubectl",
-                        vec![format!("--token={FIXTURE_BEARER_JWT}"), "get".to_string()],
+                        vec![format!("--token={}", fixture_bearer_jwt()), "get".to_string()],
                     )])
                     .unwrap(),
                     format!("session context {FIXTURE_PASSWORD_FLAG}"),
@@ -6470,7 +6852,7 @@ mod tests {
                  VALUES ('tok', ?1, ?2, 1, 'llm', ?3, 1, 'completed')",
                 params![
                     encode_u64(guard::env::now_unix()).unwrap(),
-                    format!("kubectl --token={FIXTURE_BEARER_JWT} get pods"),
+                    format!("kubectl --token={} get pods", fixture_bearer_jwt()),
                     format!("allowed with {FIXTURE_PASSWORD_FLAG}"),
                 ],
             )
@@ -6708,10 +7090,10 @@ mod tests {
         let store = SessionStore::open(path.clone(), 1)
             .await
             .expect("open store");
-        let registry = SessionRegistry::from_parts(
+        let registry = SessionRegistry::from_typed_parts(
             HashMap::new(),
             Vec::new(),
-            vec![(
+            vec![StoredSessionInteraction::from_typed_parts(
                 "expired-token".into(),
                 SessionInteraction {
                     at_unix: guard::env::now_unix().saturating_sub(60),
@@ -6725,6 +7107,7 @@ mod tests {
                     exposed_secret_refs: Vec::new(),
                     decision_trace: None,
                 },
+                Vec::new(),
             )],
             1,
         );
@@ -7609,7 +7992,7 @@ mod tests {
                 owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(4242)),
             },
         );
-        let registry = SessionRegistry::from_parts(
+        let registry = SessionRegistry::from_typed_parts(
             grants,
             vec![HistoricalGrant {
                 token: "old".into(),
@@ -7630,7 +8013,7 @@ mod tests {
                 auto_amend: false,
                 owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(4343)),
             }],
-            vec![(
+            vec![StoredSessionInteraction::from_typed_parts(
                 "tok".into(),
                 SessionInteraction {
                     at_unix: now.saturating_sub(1),
@@ -7641,9 +8024,11 @@ mod tests {
                     risk: Some(1),
                     exec_status: SessionExecStatus::CompletedAfterApproval,
                     exit_code: Some(0),
-                    exposed_secret_refs: vec!["service/token".into()],
+                    exposed_secret_refs: Vec::new(),
                     decision_trace: Some(guard::gating::DecisionTrace::source("cache")),
                 },
+                vec![CredentialReference::from_store_name("service/token")
+                    .expect("valid fixture credential reference")],
             )],
             24 * 60 * 60,
         );
@@ -7675,7 +8060,7 @@ mod tests {
             report.recent[0].exec_status,
             SessionExecStatus::CompletedAfterApproval
         );
-        assert_eq!(report.recent[0].exposed_secret_refs, vec!["service/token"]);
+        assert_eq!(report.recent[0].exposed_secret_refs[0], "service/token");
         assert_eq!(
             report.active.and_then(|grant| grant.prompt_append),
             Some("persistent".into())
@@ -7930,7 +8315,8 @@ mod tests {
             auto_amend: true,
             owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
         };
-        let registry = SessionRegistry::from_parts(grants, vec![historical], Vec::new(), 3600);
+        let registry =
+            SessionRegistry::from_typed_parts(grants, vec![historical], Vec::new(), 3600);
         store.persist_registry(&registry).await.unwrap();
 
         let value = ["q", "7"].concat();

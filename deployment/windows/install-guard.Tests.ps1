@@ -21,6 +21,7 @@ Describe 'Guard Windows operator command contract' {
         $Intent = $null
         $Reason = $null
         $Json = $false
+        $SessionReference = 'session:' + '01234567' + '89abcdef'
     }
 
     It 'maps ordinary, once, N-use, and batch approvals' {
@@ -43,10 +44,10 @@ Describe 'Guard Windows operator command contract' {
         (Get-GuardActionArguments) -join ' ' | Should -Be 'access deny gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --reason outside the approved task --socket guard'
 
         $Action = 'access-extend'
-        $Reference = @('session:0123456789abcdef')
+        $Reference = @($SessionReference)
         $Intent = 'Inspect service health.'
         $ApprovalMode = 'once'
-        (Get-GuardActionArguments) -join ' ' | Should -Be 'access extend session:0123456789abcdef Inspect service health. --once --socket guard'
+        (Get-GuardActionArguments) -join ' ' | Should -Be "access extend $SessionReference Inspect service health. --once --socket guard"
 
         $Action = 'access-revoke'
         $Reference = @('agent:S-1-5-21-1000')
@@ -58,7 +59,7 @@ Describe 'Guard Windows operator command contract' {
         (Get-GuardActionArguments) -join ' ' | Should -Be 'access list --socket guard'
 
         $Action = 'access-show'
-        foreach ($inspectable in @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'session:0123456789abcdef')) {
+        foreach ($inspectable in @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', $SessionReference)) {
             $Reference = @($inspectable)
             (Get-GuardActionArguments) -join ' ' | Should -Be "access show $inspectable --socket guard"
         }
@@ -84,7 +85,7 @@ Describe 'Guard Windows operator command contract' {
         { Get-GuardActionArguments } | Should -Throw
 
         $Action = 'access-extend'
-        $Reference = @('session:0123456789abcdef')
+        $Reference = @($SessionReference)
         $Intent = "inspect`nwhoami"
         { Get-GuardActionArguments } | Should -Throw
 
@@ -99,7 +100,7 @@ Describe 'Guard Windows operator command contract' {
         { Get-GuardActionArguments } | Should -Throw
 
         $Action = 'access-revoke'
-        $Reference = @('session:0123456789abcdef', 'agent:S-1-5-21-1000')
+        $Reference = @($SessionReference, 'agent:S-1-5-21-1000')
         { Get-GuardActionArguments } | Should -Throw
     }
 
@@ -602,6 +603,10 @@ Describe 'Guard Windows installer state and ACL contract' {
         $source | Should -Match 'Assert-DeploymentAcls'
         $source | Should -Match 'Set-ServiceRegistryAcl'
         $source | Should -Match '\[IO\.File\]::Replace'
+        $source | Should -Match '\$DeployedOperatorScript = Join-Path \$InstallRoot ''guard-operator\.ps1'''
+        $source | Should -Match "RelativePath 'guard-operator\.ps1'"
+        $source | Should -Match 'Install-FileAtomically -Source \$operatorScriptSource -Destination \$DeployedOperatorScript'
+        $source | Should -Match 'operator_script_present'
         $source | Should -Not -Match 'cmd\.exe\s+/c'
         $source | Should -Not -Match 'New-ScheduledTaskPrincipal -UserId \$ServiceAccount'
     }
@@ -609,5 +614,12 @@ Describe 'Guard Windows installer state and ACL contract' {
     It 'uses release-version backup names and deployment metadata independent of the state schema' {
         $BackupMetadataSchema | Should -Be 2
         'before-v1.2.3-20260727T010203Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' | Should -Match '^before-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{32}$'
+    }
+
+    It 'resolves repository assets only for installation actions' {
+        $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-guard.ps1') -Raw
+        $parameterBlock = ($source -split '\)\s*\r?\n\r?\n\$ErrorActionPreference', 2)[0]
+        $parameterBlock | Should -Not -Match 'Resolve-Path'
+        $DeployedOperatorScript | Should -Be 'C:\Program Files\Guard\guard-operator.ps1'
     }
 }

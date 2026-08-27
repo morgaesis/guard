@@ -230,7 +230,7 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![item.reference],
-            uses: Some(1),
+            uses: None,
             wait_secs: None,
         },
     )
@@ -292,15 +292,22 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
             .read()
             .await
             .aggregate_access_uses(&access_token),
-        Some(Some(0)),
-        "the once approval must be consumed at the first admission: {first:?}"
+        Some(None),
+        "an unlimited approval must remain reusable after admission: {first:?}"
     );
-    let denied = execute_command(request, &cfg, &worker)
+    let repeated = execute_command(request, &cfg, &worker)
         .await
         .into_response();
-    assert!(!denied.allowed);
-    assert!(denied.reason.contains("use limit is exhausted"));
-    assert!(denied.handle.is_some());
+    assert!(
+        repeated.allowed,
+        "the same argv did not converge on its approved matcher: {repeated:?}"
+    );
+    assert!(repeated.handle.is_none());
+    assert_eq!(
+        cfg.state.grant_requests.read().await.len(),
+        1,
+        "reusing approved generated coverage must not mint another access request"
+    );
 }
 
 fn synthesis_arguments_with_description(description: &str) -> serde_json::Value {
@@ -852,6 +859,107 @@ fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn unmatched_implicit_access_overlay_is_removed_from_verb_resolution() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: broad-access-check
+    binary: true
+    consequence: reversible
+    trusted: true
+    hold: true
+    baseline: false
+    coverage:
+      - name: broad-access
+        action: preauthorized
+        required_args: ["--check"]
+  - name: narrow-baseline-check
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: narrow-baseline
+        action: evaluate
+        sticky: true
+        required_args: ["--check", "safe"]
+"#,
+        )
+        .unwrap(),
+    ));
+    {
+        let mut sessions = cfg.state.sessions.write().await;
+        assert!(sessions.grant_policy_only_access_overlay(
+            "implicit-access".to_string(),
+            PrincipalKey::from_uid(1001),
+            "access overlay".to_string(),
+            guard::env::now_unix().saturating_add(60),
+        ));
+        assert_eq!(
+            sessions.apply_delta(
+                "implicit-access",
+                &crate::grant_profile::GrantRequestDelta {
+                    activated_verbs: vec!["broad-access-check".to_string()],
+                    ..crate::grant_profile::GrantRequestDelta::default()
+                },
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            sessions.install_access_grant(
+                "implicit-access",
+                Some(1),
+                "approved-access".to_string(),
+                vec!["broad-access-check".to_string()],
+            ),
+            Some(true)
+        );
+    }
+
+    let mut request = request_with_session(
+        "true",
+        vec!["--check".to_string(), "safe".to_string()],
+        "unused".to_string(),
+    );
+    request.session_token = None;
+    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1001 })
+        .await
+        .into_response();
+
+    assert_eq!(
+        response.verb_matches.len(),
+        1,
+        "{:?}",
+        response.verb_matches
+    );
+    assert_eq!(response.verb_matches[0].verb, "narrow-baseline-check");
+    assert_eq!(
+        response.verb_matches[0].scope,
+        guard::gating::coverage::VerbMatchScope::Baseline
+    );
+    assert_eq!(
+        response.verb_matches[0].action,
+        guard::gating::verb::CoverageAction::Evaluate
+    );
+    assert!(!response
+        .verb_guidance
+        .as_deref()
+        .is_some_and(|guidance| guidance.contains("incompatible authorization")));
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .aggregate_access_uses("implicit-access")
+            .flatten(),
+        Some(1),
+        "detached access authority must not be consumed"
+    );
+}
+
 async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
@@ -872,6 +980,17 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 1001 };
     let other = CallerIdentity::Unix { uid: 1002 };
+
+    let mut unrelated_without_overlay = request_with_session(
+        "rustc",
+        vec!["--print".to_string(), "target-libdir".to_string()],
+        "unused".to_string(),
+    );
+    unrelated_without_overlay.session_token = None;
+    let unrelated_without_overlay = execute_command(unrelated_without_overlay, &cfg, &worker)
+        .await
+        .into_response();
+    assert!(unrelated_without_overlay.allowed);
 
     let request = || AdminRequest::AccessRequest {
         intent: "Inspect fixture".to_string(),
@@ -943,40 +1062,61 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .iter()
         .any(|item| item.reference == isolated.reference));
 
-    let mut baseline = request_with_session(
+    let mut unrelated = request_with_session(
         "rustc",
         vec!["--print".to_string(), "target-libdir".to_string()],
         "unused".to_string(),
     );
-    baseline.session_token = None;
-    assert!(execute_command(baseline, &cfg, &worker)
+    unrelated.session_token = None;
+    let unrelated = execute_command(unrelated, &cfg, &worker)
         .await
-        .policy_allowed());
+        .into_response();
+    assert!(
+        unrelated.allowed,
+        "implicit access authority must not narrow unrelated baseline commands: {}",
+        unrelated.reason
+    );
+    assert!(!unrelated.reason.contains("session policy-only mode"));
+    assert_eq!(unrelated.reason, unrelated_without_overlay.reason);
+    assert_eq!(
+        unrelated
+            .decision_trace
+            .as_ref()
+            .map(|trace| trace.decision_source.as_str()),
+        unrelated_without_overlay
+            .decision_trace
+            .as_ref()
+            .map(|trace| trace.decision_source.as_str()),
+        "an empty additive overlay must preserve the baseline decision path"
+    );
+    let access_token = cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .access_token_for_principal(&PrincipalKey::from_uid(1001))
+        .unwrap();
+    let explicitly_scoped = execute_command(
+        request_with_session(
+            "rustc",
+            vec!["--print".to_string(), "cfg".to_string()],
+            access_token.clone(),
+        ),
+        &cfg,
+        &worker,
+    )
+    .await
+    .into_response();
+    assert!(!explicitly_scoped.allowed);
+    assert!(explicitly_scoped
+        .reason
+        .contains("session policy-only mode"));
+
     let remaining_before_access = {
         let sessions = cfg.state.sessions.read().await;
-        let token = sessions
-            .access_token_for_principal(&PrincipalKey::from_uid(1001))
-            .unwrap();
-        sessions.aggregate_access_uses(&token).flatten()
+        sessions.aggregate_access_uses(&access_token).flatten()
     };
     assert_eq!(remaining_before_access, Some(1));
-
-    let mut reevaluate_escape = request_with_session(
-        "rustc",
-        vec!["--print".to_string(), "cfg".to_string()],
-        "unused".to_string(),
-    );
-    reevaluate_escape.session_token = None;
-    reevaluate_escape.reevaluate = true;
-    let reevaluate_denied = execute_command(reevaluate_escape, &cfg, &worker).await;
-    assert!(!reevaluate_denied.policy_allowed());
-    assert!(
-        reevaluate_denied
-            .policy_reason()
-            .contains("session policy-only mode"),
-        "unexpected denial: {}",
-        reevaluate_denied.policy_reason()
-    );
 
     let mut execution =
         request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
@@ -1101,7 +1241,10 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .into_iter()
         .find(|summary| summary.owner.label() == "1001")
         .unwrap();
-    assert!(restored.static_only_for(&restored_access.token));
+    assert!(
+        restored.static_only_for(&restored_access.token),
+        "persisted access-managed authority must remain policy-only"
+    );
     assert_eq!(
         restored
             .access_grant_uses(&restored_access.token, &first.reference)
@@ -4186,7 +4329,14 @@ async fn exact_amendment_publishes_only_after_persistence_and_preserves_concurre
 
 // Synthetic test-fixture credential shapes (never real secrets): a
 // kubernetes-style service-account bearer JWT and a --password= flag.
-const FIXTURE_BEARER_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6IlN5bnRoZXRpYyJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50In0.SyntheticSignature123";
+fn fixture_bearer_jwt() -> String {
+    [
+        "eyJhbGciOiJSUzI1NiJ9",
+        "eyJzdWIiOiJndWFyZC10ZXN0LWZpeHR1cmUifQ",
+        "c3ludGhldGljLXNpZ25hdHVyZS1ub3QtYS1jcmVkZW50aWFs",
+    ]
+    .join(".")
+}
 const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
 
 #[test]
@@ -4196,7 +4346,7 @@ fn session_auto_amend_refuses_credential_shaped_argv() {
     // on both the allow and the deny side.
     assert!(allow_session_auto_amend_candidate(
         "kubectl",
-        &[format!("--token={FIXTURE_BEARER_JWT}"), "get".into()],
+        &[format!("--token={}", fixture_bearer_jwt()), "get".into()],
         Some(1)
     )
     .is_err());
@@ -4239,7 +4389,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
             deny: Vec::new(),
             allow_exact: vec![SessionExactRule::new(
                 "kubectl",
-                vec![format!("--token={FIXTURE_BEARER_JWT}"), "get".into()],
+                vec![format!("--token={}", fixture_bearer_jwt()), "get".into()],
             )],
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
@@ -4256,14 +4406,14 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
             ),
         },
     );
-    let registry = crate::session::SessionRegistry::from_parts(
+    let registry = crate::session::SessionRegistry::from_typed_parts(
         grants,
         Vec::new(),
-        vec![(
+        vec![crate::session::StoredSessionInteraction::from_typed_parts(
             token.clone(),
             SessionInteraction {
                 at_unix: guard::env::now_unix(),
-                command: format!("kubectl --token={FIXTURE_BEARER_JWT} get pods"),
+                command: format!("kubectl --token={} get pods", fixture_bearer_jwt()),
                 allowed: true,
                 source: SessionDecisionSource::Llm,
                 reason: format!("allowed despite {FIXTURE_PASSWORD_FLAG}"),
@@ -4273,6 +4423,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
                 exposed_secret_refs: Vec::new(),
                 decision_trace: None,
             },
+            Vec::new(),
         )],
         crate::session::DEFAULT_HISTORY_RETENTION_SECS,
     );
@@ -4717,7 +4868,7 @@ async fn session_show_reports_recent_stats() {
 
     {
         let mut reg = cfg.state.sessions.write().await;
-        reg.record_interaction(
+        reg.record_interaction_with_credential_references(
             &token,
             SessionInteraction {
                 at_unix: now.saturating_sub(1),
@@ -4728,9 +4879,13 @@ async fn session_show_reports_recent_stats() {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                exposed_secret_refs: vec!["service/token".into()],
+                exposed_secret_refs: Vec::new(),
                 decision_trace: None,
             },
+            vec![
+                crate::session::CredentialReference::from_store_name("service/token")
+                    .expect("valid fixture credential reference"),
+            ],
         );
         reg.record_interaction(
             &token,

@@ -27,6 +27,8 @@ use crate::server::{
 use crate::session::SessionExactRule;
 use crate::session::SessionGrant;
 use guard::evaluate::{EvalConfig, Evaluator};
+#[cfg(unix)]
+use guard::gating::deny_shape::canonical_argv;
 use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
 #[cfg(unix)]
 use guard::gating::verb::VerbCatalog;
@@ -350,8 +352,12 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
     .await;
     assert_eq!(result.exit_code(), Some(0));
     assert_eq!(
-        result.exposed_secret_refs(),
-        &["test/secret-exposure-success"]
+        result
+            .credential_references()
+            .iter()
+            .map(crate::session::CredentialReference::as_reference_name)
+            .collect::<Vec<_>>(),
+        vec!["test/secret-exposure-success"]
     );
     let logs = String::from_utf8_lossy(&audit.0.lock().unwrap()).to_string();
     assert!(logs.contains("[AUDIT] SECRET_EXPOSED"), "logs={logs}");
@@ -401,7 +407,7 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
         None,
     )
     .await;
-    assert!(result.exposed_secret_refs().is_empty());
+    assert!(result.credential_references().is_empty());
     let logs = String::from_utf8_lossy(&audit.0.lock().unwrap()).to_string();
     assert!(
         !logs.contains("test/secret-exposure-failed-spawn"),
@@ -640,11 +646,12 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
 
     assert_eq!(result.exit_code(), Some(1));
     assert_eq!(
-        result.exposed_secret_refs(),
-        &[
-            "service/primary".to_string(),
-            "service/secondary".to_string()
-        ]
+        result
+            .credential_references()
+            .iter()
+            .map(crate::session::CredentialReference::as_reference_name)
+            .collect::<Vec<_>>(),
+        vec!["service/primary", "service/secondary"]
     );
     assert_eq!(
         logs.matches("[AUDIT] SECRET_EXPOSED").count(),
@@ -1766,6 +1773,30 @@ async fn trusted_ceph_style_verb_with_exact_dimensions_never_reaches_evaluator()
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(run_denying_llm(listener));
 
+    let deny_directory = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        deny_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let mut deny_store = DenyShapeStore::load(DenyLearningConfig::new(
+        deny_directory.path().join("deny.yaml"),
+    ))
+    .unwrap();
+    let denied_args = vec!["ceph".to_string(), "osd".to_string(), "df".to_string()];
+    let evidence = canonical_argv(&denied_args);
+    deny_store
+        .promote_shape(
+            "fixture",
+            "true",
+            &format!("^{}$", regex::escape(&evidence)),
+            &[evidence],
+            "automatic heuristic must not outrank typed authority",
+            1,
+        )
+        .unwrap();
+
     let (mut cfg, _) = make_test_config();
     cfg.config.gate = GateMode::Consequence;
     cfg.state.evaluator = Arc::new(
@@ -1773,7 +1804,8 @@ async fn trusted_ceph_style_verb_with_exact_dimensions_never_reaches_evaluator()
             EvalConfig::default()
                 .llm_api_key("test-key".to_string())
                 .llm_api_url(url)
-                .llm_retries(0),
+                .llm_retries(0)
+                .deny_shapes(Arc::new(RwLock::new(deny_store))),
         )
         .unwrap(),
     );

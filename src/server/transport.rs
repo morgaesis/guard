@@ -445,6 +445,12 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
     }
 
     async fn record(&self, token: &str, event: guard::proxy::ApiSessionEvent) {
+        let credential_references = event
+            .allowed
+            .then(|| crate::session::CredentialReference::from_api_identity(event.credential_ref))
+            .flatten()
+            .into_iter()
+            .collect();
         record_live_session_interaction(
             &self.server,
             Some(token),
@@ -457,13 +463,10 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
                 risk: None,
                 exec_status: api_session_exec_status(event.allowed, event.held),
                 exit_code: None,
-                exposed_secret_refs: if event.allowed {
-                    vec![event.credential_ref]
-                } else {
-                    Vec::new()
-                },
+                exposed_secret_refs: Vec::new(),
                 decision_trace: Some(guard::gating::DecisionTrace::source("api_proxy")),
             },
+            credential_references,
         )
         .await;
     }
@@ -2849,10 +2852,10 @@ mod line_limit_tests {
             .scope
             .access_grants[0]
             .remaining_uses = None;
-        let malformed = crate::session::SessionRegistry::from_parts(
+        let malformed = crate::session::SessionRegistry::from_typed_parts(
             grants,
             registry.history_snapshot(),
-            registry.interactions_snapshot(),
+            registry.stored_interactions_snapshot(),
             3600,
         );
         seed.persist_registry(&malformed).await.unwrap();
@@ -2883,10 +2886,10 @@ mod line_limit_tests {
             .scope
             .access_grants
             .push(grant.scope.access_grants[0].clone());
-        let malformed = crate::session::SessionRegistry::from_parts(
+        let malformed = crate::session::SessionRegistry::from_typed_parts(
             grants,
             registry.history_snapshot(),
-            registry.interactions_snapshot(),
+            registry.stored_interactions_snapshot(),
             3600,
         );
         seed.persist_registry(&malformed).await.unwrap();

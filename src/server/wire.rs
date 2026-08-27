@@ -2,8 +2,8 @@
 use crate::grant_profile::{EvaluationMode, GrantRequestDelta};
 use crate::grant_profile::{GrantRequest, SavedGrant};
 use crate::session::{
-    HistoricalGrant, SessionDecisionSource, SessionExecStatus, SessionGrantSummary, SessionOwner,
-    SessionReport,
+    CredentialReference, HistoricalGrant, SessionDecisionSource, SessionExecStatus,
+    SessionGrantSummary, SessionOwner, SessionReport,
 };
 use guard::gating::approval::{bound_approval_transcript, Approval, WaiterLease};
 use guard::gating::provisional::{Provisional, ProvisionalStatus};
@@ -12,6 +12,9 @@ use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
 
 use super::execute::audit_session_fingerprint;
+
+pub const CAPABILITY_REQUESTER_VERB_SHOW_V1: &str = "requester-verb-show-v1";
+pub const CAPABILITY_ACCESS_WHOAMI_V1: &str = "access-whoami-v1";
 
 // The untrusted request types any socket client can send live in the library
 // crate (`guard::wire`) so their parsing surface can be fuzzed; re-export them
@@ -418,6 +421,8 @@ pub enum AdminRequest {
     },
     /// List the operator-defined verb catalog (the agent's menu).
     VerbList,
+    /// Show one operator-defined verb. Requesters receive the same sanitized
+    /// invocation view that `VerbList` exposes for verbs they can use.
     VerbShow {
         name: String,
     },
@@ -594,6 +599,9 @@ pub enum AdminRequest {
         uses: Option<u64>,
     },
     AccessList,
+    /// Show the authenticated local principal's canonical access-managed
+    /// session without exposing its bearer token.
+    AccessWhoami,
     AccessShow {
         reference: String,
     },
@@ -663,8 +671,10 @@ impl AdminRequest {
                 | Self::ApprovalNote { .. }
                 | Self::ApprovalWithdraw { .. }
                 | Self::VerbList
+                | Self::VerbShow { .. }
                 | Self::AccessRequest { .. }
                 | Self::AccessList
+                | Self::AccessWhoami
                 | Self::AccessShow { .. }
                 | Self::AccessStatus { .. }
                 | Self::EvaluateBatch { .. }
@@ -1434,7 +1444,7 @@ pub enum GateStatus {
     Provisional,
     /// Approved but held for operator approval; not executed.
     Held,
-    /// A revert ran (response from `guard revert`/auto-revert reporting).
+    /// A revert ran (operator or automatic reversion reporting).
     Reverted,
     /// Policy evaluated, not executed (dry-run).
     DryRun,
@@ -1586,6 +1596,13 @@ pub(super) enum ExecOutcome {
     },
 }
 
+#[derive(Default)]
+struct ExecutionAuditMetadata {
+    /// Typed secret-store references whose values entered the environment of a
+    /// successfully spawned child. This does not prove the child consumed them.
+    credential_references: Vec<CredentialReference>,
+}
+
 pub(super) struct ExecuteResult {
     policy: PolicyOutcome,
     pub(super) exec: ExecOutcome,
@@ -1595,9 +1612,9 @@ pub(super) struct ExecuteResult {
     /// default keeps direct tests and new transports from exposing operator
     /// commands until they explicitly attach an audience.
     operator_guidance: bool,
-    /// Secret-store key names whose values entered the environment of a
-    /// successfully spawned child. This does not prove the child consumed them.
-    exposed_secret_refs: Vec<String>,
+    /// Internal audit/session metadata, deliberately separate from the public
+    /// [`ExecuteResponse`] wire contract.
+    audit_metadata: ExecutionAuditMetadata,
     verb_matches: Vec<VerbMatchInfo>,
     verb_guidance: Option<String>,
     decision_source: SessionDecisionSource,
@@ -1617,7 +1634,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1643,7 +1660,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1667,7 +1684,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1692,7 +1709,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1704,7 +1721,7 @@ impl ExecuteResult {
             policy: PolicyOutcome::Allowed {
                 reason: Self::sanitize_prose(reason),
             },
-            exposed_secret_refs: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             exec: ExecOutcome::DryRun { coverage: None },
             request_handle: None,
             access_requests: Vec::new(),
@@ -1728,7 +1745,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1746,7 +1763,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1781,7 +1798,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1814,10 +1831,13 @@ impl ExecuteResult {
         self
     }
 
-    pub(super) fn with_exposed_secret_refs(mut self, mut exposed_secret_refs: Vec<String>) -> Self {
-        exposed_secret_refs.sort();
-        exposed_secret_refs.dedup();
-        self.exposed_secret_refs = exposed_secret_refs;
+    pub(super) fn with_credential_references(
+        mut self,
+        mut credential_references: Vec<CredentialReference>,
+    ) -> Self {
+        credential_references.sort();
+        credential_references.dedup();
+        self.audit_metadata.credential_references = credential_references;
         self
     }
 
@@ -1889,8 +1909,8 @@ impl ExecuteResult {
         self
     }
 
-    pub(super) fn exposed_secret_refs(&self) -> &[String] {
-        &self.exposed_secret_refs
+    pub(super) fn credential_references(&self) -> &[CredentialReference] {
+        &self.audit_metadata.credential_references
     }
 
     pub(super) fn exit_code(&self) -> Option<i32> {
@@ -2153,7 +2173,7 @@ impl ExecuteResult {
                 let containment_failure = ContainmentFailure::from(&outcome);
                 let reason = match (command_may_have_run, handle.as_deref()) {
                     (true, Some(handle)) => format!(
-                        "containment failed: command may have run; {containment_reason}; recovery handle {handle} requires `guard confirm {handle}` or `guard revert {handle}`"
+                        "containment failed: command may have run; {containment_reason}; recovery handle {handle} requires the packaged operator confirmation or reversion action"
                     ),
                     (true, None) => format!(
                         "containment failed: command may have run; {containment_reason}; no recovery handle is available"
@@ -2249,6 +2269,17 @@ mod decision_trace_feature_tests {
         assert!(!serde_json::to_string(&response)
             .unwrap()
             .contains(fixture_value));
+    }
+
+    #[test]
+    fn execute_response_omits_internal_credential_reference_metadata() {
+        let response = ExecuteResult::denied("fixture denial")
+            .with_credential_references(vec![CredentialReference::from_store_name("service/token")
+                .expect("valid fixture credential reference")])
+            .into_response();
+        let encoded = serde_json::to_value(response).unwrap();
+        assert!(encoded.get("exposed_secret_refs").is_none());
+        assert!(encoded.get("credential_references").is_none());
     }
 
     #[test]

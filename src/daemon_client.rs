@@ -78,7 +78,6 @@ impl Client {
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn has_admin_token(&self) -> bool {
         self.admin_token.is_some()
     }
@@ -172,6 +171,7 @@ impl Client {
             AdminRequest::AccessRevoke { .. } => "access_revoke",
             AdminRequest::AccessExtend { .. } => "access_extend",
             AdminRequest::AccessList => "access_list",
+            AdminRequest::AccessWhoami => "access_whoami",
             AdminRequest::AccessShow { .. } => "access_show",
             AdminRequest::AccessStatus { .. } => "access_status",
             AdminRequest::EvaluateBatch { .. } => "evaluate_batch",

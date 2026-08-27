@@ -137,14 +137,19 @@ guard server start --gate consequence \
   --verbs /etc/guard/verbs.yaml
 
 guard access request 'Restart nginx and verify that it is healthy.'
+guard access whoami
 guard access approve <request> --once
 guard approval resume <request>
 guard access status <session>
 guard approval show <request>
 guard run systemctl restart nginx
 guard provisionals
-guard confirm <handle>
+sudo guard-operator confirm <handle>
 ```
+
+On Windows, run
+`& 'C:\Program Files\Guard\guard-operator.ps1' -Action confirm -Reference <handle>`
+from an elevated PowerShell instead of using the Unix wrapper.
 
 Guard preserves the command's argv, working directory, exit behavior, and tool
 semantics. It does not reinterpret Ansible, Helm, SSH, or another tool. See
