@@ -1,7 +1,7 @@
 use crate::injection::is_valid_env_name;
 use crate::session::{
     CredentialReference, SessionAmendment, SessionDecision, SessionDecisionSource,
-    SessionExecStatus, SessionInteraction, SessionOwner, SessionRegistry,
+    SessionEvaluatorPosture, SessionExecStatus, SessionInteraction, SessionOwner, SessionRegistry,
 };
 use crate::session_store::SessionStore;
 use crate::tool_config::{ResolvedToolEnv, ToolRegistry};
@@ -834,9 +834,10 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             risk,
             exec_status: SessionExecStatus::NotAttempted,
             exit_code: None,
-            credential_references: Vec::new(),
+            exposed_secret_refs: Vec::new(),
             decision_trace: Some(decision_trace_for_phase(phase, source, false)),
         },
+        Vec::new(),
     )
     .await;
     ExecuteResult::denied(reason)
@@ -877,6 +878,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
         stream_writer: &mut *phase.stream_writer,
     };
     let result = route_gated_allow(&mut context, request, inputs, Some(trace.clone())).await;
+    let credential_references = result.credential_references().to_vec();
     record_live_session_interaction(
         phase.server,
         phase.session_token.as_deref(),
@@ -889,9 +891,10 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
             risk,
             exec_status: result.session_exec_status(),
             exit_code: result.exit_code(),
-            credential_references: result.credential_references().to_vec(),
+            exposed_secret_refs: Vec::new(),
             decision_trace: Some(trace),
         },
+        credential_references,
     )
     .await;
     result.with_decision_source(source)
@@ -1626,7 +1629,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
 ) -> Result<ExecuteRequest, ExecuteError> {
     let server = phase.server;
     if let Some(ref token) = request.session_token {
-        let (decision, exists, static_only, suspension, owner) = {
+        let (decision, exists, evaluator_posture, suspension, owner) = {
             let reg = server.state.sessions.read().await;
             let decision = reg.check(
                 token,
@@ -1637,7 +1640,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             (
                 decision,
                 reg.has(token),
-                reg.static_only_for(token),
+                reg.evaluator_posture_for(token),
                 reg.suspension_reason(token, &server.config.behavior_limits),
                 reg.owner_for(token),
             )
@@ -1807,7 +1810,13 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             .verb_matches
             .iter()
             .any(|matched| matched.selected && !matched.overridden);
-        if static_only && !force_evaluate && !selected_typed_coverage {
+        let deny_unmatched_coverage = match evaluator_posture {
+            Some(SessionEvaluatorPosture::PolicyOnly) => true,
+            None
+            | Some(SessionEvaluatorPosture::InheritBaselineEvaluator)
+            | Some(SessionEvaluatorPosture::ReadOnly) => false,
+        };
+        if deny_unmatched_coverage && !force_evaluate && !selected_typed_coverage {
             let reason =
                 "session policy-only mode: command is outside active verb coverage".to_string();
             return Err(Box::new(
@@ -1988,21 +1997,26 @@ async fn resolve_session_prompt(
 ) -> Option<String> {
     let session_prompt = if let Some(ref token) = request.session_token {
         let reg = server.state.sessions.read().await;
-        let revision = reg.effective_revision_key(token)?;
-        let mode = reg.evaluation_mode_for(token).unwrap_or_default();
-        let mut sections = vec![format!(
+        let include_session_context = reg.evaluator_context_applies_for(token)?;
+        if !include_session_context {
+            None
+        } else {
+            let revision = reg.effective_revision_key(token)?;
+            let mode = reg.evaluation_mode_for(token).unwrap_or_default();
+            let mut sections = vec![format!(
             "[GUARD AUTHORIZATION CONTEXT]\neffective_grant_revision={revision}\nevaluation_mode={mode}"
         )];
-        if mode == crate::grant_profile::EvaluationMode::ReadOnly {
-            sections.push(
+            if mode == crate::grant_profile::EvaluationMode::ReadOnly {
+                sections.push(
                 "Allow read-only inspection. Deny mutations unless an activated session verb already preauthorized the exact typed operation."
                     .to_string(),
             );
+            }
+            if let Some(prompt) = reg.evaluator_prompt_append_for(token) {
+                sections.push(prompt);
+            }
+            Some(sections.join("\n\n"))
         }
-        if let Some(prompt) = reg.prompt_append_for(token) {
-            sections.push(prompt);
-        }
-        Some(sections.join("\n\n"))
     } else {
         None
     };
@@ -2649,6 +2663,7 @@ pub(super) async fn record_live_session_interaction(
     server: &ServerContext,
     token: Option<&str>,
     interaction: SessionInteraction,
+    credential_references: Vec<CredentialReference>,
 ) {
     let Some(token) = token else {
         return;
@@ -2656,7 +2671,11 @@ pub(super) async fn record_live_session_interaction(
     let (snapshot, behavior) = {
         let mut reg = server.state.sessions.write().await;
         if reg.has(token) {
-            reg.record_interaction(token, interaction);
+            reg.record_interaction_with_credential_references(
+                token,
+                interaction,
+                credential_references,
+            );
             let behavior = reg
                 .show_with_limits(token, 0, &server.config.behavior_limits)
                 .and_then(|report| serde_json::to_value(report.stats).ok());
@@ -5029,6 +5048,52 @@ mod decision_trace_feature_tests {
 mod transactional_access_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn empty_access_overlay_preserves_baseline_evaluator_prompt() {
+        let server = crate::server::tests::config_for_proposal_test();
+        let mut request = ExecuteRequest {
+            binary: "fixture-command".to_string(),
+            args: vec!["inspect".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_files: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let baseline_prompt = resolve_session_prompt(&server, &request).await;
+
+        let token = "additive-overlay".to_string();
+        let mut overlay = crate::session::SessionGrant::additive_access_overlay(
+            guard::principal::PrincipalKey::from_uid(1001),
+            "fixture overlay".to_string(),
+            guard::env::now_unix().saturating_add(60),
+        );
+        overlay.prompt_append = Some("overlay context must stay out of evaluation".to_string());
+        assert!(server
+            .state
+            .sessions
+            .write()
+            .await
+            .grant(token.clone(), overlay));
+        request.session_token = Some(token);
+        let overlay_prompt = resolve_session_prompt(&server, &request).await;
+
+        assert_eq!(overlay_prompt, baseline_prompt);
+        assert!(!overlay_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("[GUARD AUTHORIZATION CONTEXT]"));
+    }
+
     #[derive(Clone)]
     struct PausingSecretBackend {
         reached: std::sync::Arc<tokio::sync::Semaphore>,
@@ -5226,7 +5291,7 @@ mod transactional_access_tests {
                 risk: Some(0),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                credential_references: Vec::new(),
+                exposed_secret_refs: Vec::new(),
                 decision_trace: None,
             },
         );
@@ -5415,7 +5480,7 @@ mod transactional_access_tests {
                 risk: Some(10),
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
-                credential_references: Vec::new(),
+                exposed_secret_refs: Vec::new(),
                 decision_trace: None,
             },
         );

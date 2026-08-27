@@ -2913,7 +2913,7 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
     *sessions = crate::session::SessionRegistry::from_parts(
         grants,
         sessions.history_snapshot(),
-        sessions.interactions_snapshot(),
+        sessions.stored_interactions_snapshot(),
         3_600,
     );
     drop(sessions);

@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use crate::session::SessionDecision;
+use crate::session::{SessionDecision, SessionEvaluatorPosture};
 #[cfg(unix)]
 use anyhow::{bail, Context, Result};
 use guard::gating::read_grant::ReadGrant;
@@ -98,12 +98,12 @@ pub(super) async fn handle_grant_read(
     // deny wins before the evaluator; an allow skips it.
     let mut allow_reason: Option<String> = None;
     if let Some(ref token) = session_token {
-        let (decision, exists, static_only) = {
+        let (decision, exists, evaluator_posture) = {
             let reg = server.state.sessions.read().await;
             (
                 reg.check(token, AUTO_READ_GRANT_LABEL, &audit_args, None),
                 reg.has(token),
-                reg.static_only_for(token),
+                reg.evaluator_posture_for(token),
             )
         };
         if !exists {
@@ -118,6 +118,12 @@ pub(super) async fn handle_grant_read(
             );
             return ExecuteResult::denied(reason);
         }
+        let deny_unmatched_coverage = match evaluator_posture {
+            Some(SessionEvaluatorPosture::PolicyOnly) => true,
+            None
+            | Some(SessionEvaluatorPosture::InheritBaselineEvaluator)
+            | Some(SessionEvaluatorPosture::ReadOnly) => false,
+        };
         match decision {
             Some((SessionDecision::Deny, reason)) => {
                 server.audit_deny(
@@ -130,7 +136,7 @@ pub(super) async fn handle_grant_read(
                 return ExecuteResult::denied(reason);
             }
             Some((SessionDecision::Allow, reason)) => allow_reason = Some(reason),
-            None if static_only => {
+            None if deny_unmatched_coverage => {
                 let reason =
                     "session policy-only mode: read is outside active verb coverage".to_string();
                 server.audit_deny(
@@ -152,7 +158,12 @@ pub(super) async fn handle_grant_read(
     // signal about what reading this path means.
     if allow_reason.is_none() {
         let session_prompt = match session_token.as_deref() {
-            Some(token) => server.state.sessions.read().await.prompt_append_for(token),
+            Some(token) => server
+                .state
+                .sessions
+                .read()
+                .await
+                .evaluator_prompt_append_for(token),
             None => None,
         };
         let command_line = format!(

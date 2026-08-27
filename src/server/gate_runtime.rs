@@ -1669,7 +1669,12 @@ async fn assess_revert(
             .unwrap_or("none; deadline always rolls back")
     );
     let session_prompt = match forward.session_token.as_deref() {
-        Some(token) => server.state.sessions.read().await.prompt_append_for(token),
+        Some(token) => server
+            .state
+            .sessions
+            .read()
+            .await
+            .evaluator_prompt_append_for(token),
         None => None,
     };
     let evaluation_context = merge_revert_assessment_prompt(session_prompt.as_deref(), &context);
