@@ -6383,13 +6383,22 @@ mod tests {
 
         let token = "snapshot-race".to_string();
         let mut before = SessionRegistry::new();
-        let mut snapshot_grant = SessionGrant::policy_only_access_overlay(
+        assert!(before.grant_policy_only_access_overlay(
+            token.clone(),
             guard::principal::PrincipalKey::from_uid(1001),
             "snapshot race".to_string(),
             guard::env::now_unix().saturating_add(3_600),
+        ));
+        assert_eq!(
+            before.apply_delta(
+                &token,
+                &crate::grant_profile::GrantRequestDelta {
+                    activated_verbs: vec!["host-inspect".to_string()],
+                    ..crate::grant_profile::GrantRequestDelta::default()
+                },
+            ),
+            Some(true)
         );
-        snapshot_grant.activated_verbs = vec!["host-inspect".to_string()];
-        before.grant(token.clone(), snapshot_grant);
         before.install_access_grant(
             &token,
             Some(1),

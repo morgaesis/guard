@@ -5,13 +5,12 @@ use crate::grant_profile::{
 };
 use crate::secrets::legacy_sentinel;
 use crate::session::{
-    session_reference, SessionGrant, SessionGrantSummary, SessionOwner, SessionRegistry,
-    SessionReport,
+    session_reference, SessionGrantSummary, SessionOwner, SessionRegistry, SessionReport,
 };
 #[cfg(test)]
 use crate::session::{
     HistoricalGrant, IssuedGrantScope, SessionAmendment, SessionDecision, SessionDecisionSource,
-    SessionExecStatus, SessionInteraction,
+    SessionExecStatus, SessionGrant, SessionInteraction,
 };
 use guard::audit::{AuditEvent, AuditKind};
 use guard::gating::verb::{
@@ -2562,9 +2561,11 @@ async fn approve_access_request_owned(
                 .target
                 .clone()
                 .unwrap_or_else(|| format!("agent:{requester}"));
-            if !staged.grant(
+            if !staged.grant_policy_only_access_overlay(
                 token.clone(),
-                SessionGrant::policy_only_access_overlay(requester.clone(), label, expiry),
+                requester.clone(),
+                label,
+                expiry,
             ) {
                 return AccessDecisionResult {
                     request: handle.to_string(),
