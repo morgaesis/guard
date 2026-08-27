@@ -332,6 +332,56 @@ async fn learned_deny_committed_after_initial_allow_prevents_process_start() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn exact_typed_verb_preempts_matching_learned_deny_at_process_start() {
+    let directory = authority_tempdir();
+    let deny_config = DenyLearningConfig::new(directory.path().join("deny.yaml"));
+    let mut deny_store = DenyShapeStore::load(deny_config).unwrap();
+    let evidence = canonical_argv(&["--check".to_string()]);
+    deny_store
+        .promote_shape(
+            "fixture",
+            "true",
+            &format!("^{}$", regex::escape(&evidence)),
+            &[evidence],
+            "automatic heuristic",
+            1,
+        )
+        .unwrap();
+
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_enabled(false)
+                .deny_shapes(Arc::new(RwLock::new(deny_store))),
+        )
+        .unwrap(),
+    );
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: typed-check\n    binary: true\n    args: [\"--check\"]\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+
+    let response = execute_command(
+        raw_request("true", &["--check"], None),
+        &server,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+
+    assert!(
+        response.allowed,
+        "typed authority should preempt: {response:?}"
+    );
+    assert_eq!(response.exit_code, Some(0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn trusted_verb_still_respects_explicit_static_deny_at_process_start() {
     let directory = authority_tempdir();
     let policy = directory.path().join("policy.yaml");

@@ -40,6 +40,8 @@ use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 #[cfg(unix)]
 use guard::gating::approval::{SecretBinding, ToolSecretBinding};
 #[cfg(unix)]
+use guard::gating::coverage::LearnedDenyMatchPolicy;
+#[cfg(unix)]
 use guard::gating::deny_shape::{canonical_argv, DenyLearningConfig, DenyShapeStore};
 #[cfg(unix)]
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
@@ -3145,7 +3147,7 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
                 catalog_version: 1,
                 verb_digest: None,
                 composition_digest: None,
-                learned_deny_preempted: false,
+                learned_deny_match_policy: LearnedDenyMatchPolicy::Enforce,
                 access_evaluation_override_eligible: false,
             }),
             bypass: false,
@@ -4554,6 +4556,72 @@ async fn approved_replay_still_respects_explicit_static_deny() {
     assert!(!response.allowed);
     assert!(response.reason.contains("static policy"), "{response:?}");
     assert!(response.exit_code.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_replay_preempts_matching_learned_deny() {
+    let (mut cfg, _operator, agent) = gating_config(7_006, 1_000);
+    let directory = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let deny_config = DenyLearningConfig::new(directory.path().join("deny.yaml"));
+    let mut deny_store = DenyShapeStore::load(deny_config).unwrap();
+    let evidence = canonical_argv(&["--check".to_string()]);
+    deny_store
+        .promote_shape(
+            "fixture",
+            "true",
+            &format!("^{}$", regex::escape(&evidence)),
+            &[evidence],
+            "automatic heuristic",
+            1,
+        )
+        .unwrap();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_enabled(false)
+                .deny_shapes(Arc::new(RwLock::new(deny_store))),
+        )
+        .unwrap(),
+    );
+    let snapshot = ApprovalSnapshot {
+        binary: "true".to_string(),
+        args: vec!["--check".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        secret_keys: BTreeMap::new(),
+        secret_file_keys: BTreeMap::new(),
+        secret_binding: None,
+        principal: agent.principal(),
+        session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: Some(Vec::new()),
+        verb_name: None,
+        verb_params: BTreeMap::new(),
+        catalog_version: None,
+        verb_digest: None,
+        verb_composition_digest: None,
+        exec_timeout_secs: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
+    };
+
+    let result = super::super::gate_runtime::execute_snapshot_with_access_request(
+        &cfg,
+        &snapshot,
+        "operator approved",
+        None,
+    )
+    .await;
+
+    let response = result.into_response();
+    assert!(
+        response.allowed,
+        "approved replay should preempt: {response:?}"
+    );
+    assert_eq!(response.exit_code, Some(0));
 }
 
 #[cfg(unix)]
@@ -6539,7 +6607,7 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
                     catalog_version: version,
                     verb_digest: Some(digest),
                     composition_digest: None,
-                    learned_deny_preempted: false,
+                    learned_deny_match_policy: LearnedDenyMatchPolicy::Enforce,
                     access_evaluation_override_eligible: false,
                 }),
                 bypass: true,
@@ -6657,7 +6725,7 @@ verbs:
                     catalog_version: version,
                     verb_digest: Some(digest),
                     composition_digest: None,
-                    learned_deny_preempted: false,
+                    learned_deny_match_policy: LearnedDenyMatchPolicy::Enforce,
                     access_evaluation_override_eligible: false,
                 }),
                 bypass: true,

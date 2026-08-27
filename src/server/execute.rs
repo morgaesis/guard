@@ -7,8 +7,8 @@ use crate::session_store::SessionStore;
 use crate::tool_config::{ResolvedToolEnv, ToolRegistry};
 use anyhow::{bail, Context, Result};
 use guard::gating::coverage::{
-    baseline_override_applies, resolve_scoped_matches, ScopedCoverageMatch, VerbDecision,
-    VerbResolution,
+    baseline_override_applies, resolve_scoped_matches, LearnedDenyMatchPolicy, ScopedCoverageMatch,
+    VerbDecision, VerbResolution,
 };
 use guard::gating::verb::{CoverageAction, VerbCatalog};
 use guard::gating::{Coverage, DecisionTrace};
@@ -976,10 +976,17 @@ impl VerbAuthorityExpectation {
 
 #[derive(Debug, Clone)]
 pub(super) struct CommandAuthorization {
-    deny_on_learned_match: bool,
+    learned_deny_authority: LearnedDenyProcessStartAuthority,
     verb: Option<VerbAuthorityExpectation>,
     session: Option<SessionAuthoritySnapshot>,
     exec_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LearnedDenyProcessStartAuthority {
+    Enforce,
+    TypedVerb,
+    ApprovedReplay,
 }
 
 impl CommandAuthorization {
@@ -988,11 +995,17 @@ impl CommandAuthorization {
         session: Option<&SessionAuthoritySnapshot>,
         exec_timeout_secs: u64,
     ) -> Self {
+        let learned_deny_authority = match verb
+            .map(|verb| verb.learned_deny_match_policy)
+            .unwrap_or(LearnedDenyMatchPolicy::Enforce)
+        {
+            LearnedDenyMatchPolicy::Enforce => LearnedDenyProcessStartAuthority::Enforce,
+            LearnedDenyMatchPolicy::TypedVerbPreempts => {
+                LearnedDenyProcessStartAuthority::TypedVerb
+            }
+        };
         Self {
-            // Exact typed authority can preempt an automatic evaluator
-            // heuristic. Evaluator-reviewed verb contexts leave this false so
-            // a newly learned deny can still close the process-start race.
-            deny_on_learned_match: !verb.is_some_and(|verb| verb.learned_deny_preempted),
+            learned_deny_authority,
             verb: verb.map(VerbAuthorityExpectation::from_context),
             session: session.cloned(),
             exec_timeout_secs: Some(exec_timeout_secs),
@@ -1005,11 +1018,11 @@ impl CommandAuthorization {
         exec_timeout_secs: Option<u64>,
     ) -> Self {
         Self {
-            // Replay executes the immutable snapshot the operator reviewed.
-            // Rechecking model-learned deny shapes here would let an
-            // automatic heuristic veto that explicit approval. Frozen verb,
+            // Replay executes the immutable snapshot the operator reviewed;
+            // the named authority below is the only non-verb path that may
+            // preempt an automatic learned-deny heuristic. Frozen verb,
             // session, secret, and process-start authority checks still run.
-            deny_on_learned_match: false,
+            learned_deny_authority: LearnedDenyProcessStartAuthority::ApprovedReplay,
             verb,
             session,
             exec_timeout_secs,
@@ -1128,9 +1141,17 @@ async fn acquire_command_initiation_lease(
             .lease_learned_deny_for_use()
             .await
             .map_err(|error| format!("learned deny authority is unavailable: {error}"))?;
-        if authorization.deny_on_learned_match {
-            if let Some(reason) = lease.matching_reason(&request.binary, &request.args) {
-                return Err(format!("command denied before process start: {reason}"));
+        if let Some(reason) = lease.matching_reason(&request.binary, &request.args) {
+            match authorization.learned_deny_authority {
+                LearnedDenyProcessStartAuthority::Enforce => {
+                    return Err(format!("command denied before process start: {reason}"));
+                }
+                LearnedDenyProcessStartAuthority::TypedVerb
+                | LearnedDenyProcessStartAuthority::ApprovedReplay => {
+                    // Explicit typed or approved immutable authority outranks
+                    // an automatic heuristic, but the match is still observed
+                    // under the fresh process-start lease.
+                }
             }
         }
         Some(lease)
@@ -2020,7 +2041,7 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
 ) -> Result<ExecuteRequest, ExecuteError> {
     if let Some(mut vc) = verb_ctx.clone() {
         if vc.trusted {
-            vc.learned_deny_preempted = true;
+            vc.learned_deny_match_policy = LearnedDenyMatchPolicy::TypedVerbPreempts;
             let reason = format!("trusted verb '{}'", vc.name);
             if !log_audit_policy_for_request(phase.server, phase.caller, &request, true, &reason) {
                 return Err(ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON).into());
