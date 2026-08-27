@@ -3720,29 +3720,38 @@ fn repair_sensitive_session_exact_authority(
             .context("compute pre-sanitization session revision")?;
         let allow_changed = purge_sensitive_exact_rules(&mut grant.allow_exact);
         let deny_changed = purge_sensitive_exact_rules(&mut grant.deny_exact);
-        if deny_changed {
-            conn.execute(
-                "DELETE FROM session_grants WHERE token = ?1",
-                params![token],
-            )?;
-            insert_historical_grant(
-                conn,
-                &revoked_history_from_grant(token, grant, guard::env::now_unix()),
-            )?;
-            changed = true;
-        } else if allow_changed {
-            conn.execute(
-                "UPDATE session_grants SET allow_exact_json = ?1 WHERE token = ?2",
-                params![encode_exact_vec(&grant.allow_exact)?, token],
-            )?;
-            revision_updates.push(SessionRevisionUpdate {
-                token: token.clone(),
-                old_revision,
-                new_revision: session_grant_revision_key(&grant)
-                    .context("compute sanitized session revision")?,
-                token_fingerprint: access_session_token_fingerprint(&token),
-            });
-            changed = true;
+        match (allow_changed, deny_changed) {
+            (_, true) => {
+                // Removing a deny would widen authority, so retire the session
+                // instead of manufacturing a replacement revision.
+                conn.execute(
+                    "DELETE FROM session_grants WHERE token = ?1",
+                    params![token],
+                )?;
+                insert_historical_grant(
+                    conn,
+                    &revoked_history_from_grant(token, grant, guard::env::now_unix()),
+                )?;
+                changed = true;
+            }
+            (true, false) => {
+                // Removing an allow narrows authority but keeps the session
+                // active. Rebase pending dependents to that exact retained
+                // revision after their own sensitive fields are sanitized.
+                conn.execute(
+                    "UPDATE session_grants SET allow_exact_json = ?1 WHERE token = ?2",
+                    params![encode_exact_vec(&grant.allow_exact)?, token],
+                )?;
+                revision_updates.push(SessionRevisionUpdate {
+                    token: token.clone(),
+                    old_revision,
+                    new_revision: session_grant_revision_key(&grant)
+                        .context("compute sanitized session revision")?,
+                    token_fingerprint: access_session_token_fingerprint(&token),
+                });
+                changed = true;
+            }
+            (false, false) => {}
         }
     }
     let history_rows = {
@@ -6153,7 +6162,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_load_normalizes_legacy_access_sessions_to_additive_mode() {
+    fn registry_load_rebases_sensitive_allow_and_additive_access_mutations() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("state.db");
         let (_, initial_generation) = SessionStore::load_registry_sync(&path, 3600).unwrap();
