@@ -5119,18 +5119,27 @@ mod transactional_access_tests {
         let baseline_prompt = resolve_session_prompt(&server, &request).await;
 
         let token = "additive-overlay".to_string();
-        let mut overlay = crate::session::SessionGrant::policy_only_access_overlay(
-            guard::principal::PrincipalKey::from_uid(1001),
-            "fixture overlay".to_string(),
-            guard::env::now_unix().saturating_add(60),
-        );
-        overlay.prompt_append = Some("overlay context must stay out of evaluation".to_string());
-        assert!(server
-            .state
-            .sessions
-            .write()
-            .await
-            .grant(token.clone(), overlay));
+        {
+            let mut sessions = server.state.sessions.write().await;
+            assert!(sessions.grant_policy_only_access_overlay(
+                token.clone(),
+                guard::principal::PrincipalKey::from_uid(1001),
+                "fixture overlay".to_string(),
+                guard::env::now_unix().saturating_add(60),
+            ));
+            assert_eq!(
+                sessions.apply_delta(
+                    &token,
+                    &crate::grant_profile::GrantRequestDelta {
+                        prompt_append: Some(
+                            "overlay context must stay out of evaluation".to_string(),
+                        ),
+                        ..crate::grant_profile::GrantRequestDelta::default()
+                    },
+                ),
+                Some(true)
+            );
+        }
         request.session_token = Some(token);
         let overlay_prompt = resolve_session_prompt(&server, &request).await;
 

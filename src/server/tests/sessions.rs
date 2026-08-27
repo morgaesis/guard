@@ -893,25 +893,34 @@ verbs:
         )
         .unwrap(),
     ));
-    let mut overlay = SessionGrant::policy_only_access_overlay(
-        PrincipalKey::from_uid(1001),
-        "access overlay".to_string(),
-        guard::env::now_unix().saturating_add(60),
-    );
-    overlay.activated_verbs = vec!["broad-access-check".to_string()];
-    overlay.scope.access_grants = vec![AccessUseGrant {
-        request: "approved-access".to_string(),
-        verbs: vec!["broad-access-check".to_string()],
-        use_limit: Some(1),
-        remaining_uses: Some(1),
-        pending: false,
-    }];
-    assert!(cfg
-        .state
-        .sessions
-        .write()
-        .await
-        .grant("implicit-access".to_string(), overlay));
+    {
+        let mut sessions = cfg.state.sessions.write().await;
+        assert!(sessions.grant_policy_only_access_overlay(
+            "implicit-access".to_string(),
+            PrincipalKey::from_uid(1001),
+            "access overlay".to_string(),
+            guard::env::now_unix().saturating_add(60),
+        ));
+        assert_eq!(
+            sessions.apply_delta(
+                "implicit-access",
+                &crate::grant_profile::GrantRequestDelta {
+                    activated_verbs: vec!["broad-access-check".to_string()],
+                    ..crate::grant_profile::GrantRequestDelta::default()
+                },
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            sessions.install_access_grant(
+                "implicit-access",
+                Some(1),
+                "approved-access".to_string(),
+                vec!["broad-access-check".to_string()],
+            ),
+            Some(true)
+        );
+    }
 
     let mut request = request_with_session(
         "true",

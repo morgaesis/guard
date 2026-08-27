@@ -243,11 +243,7 @@ impl SessionGrant {
     /// after durable operator review. The session is policy-only. Command
     /// execution detaches an implicitly selected overlay when it contributes
     /// no selected session verb, leaving the caller's baseline policy intact.
-    pub(crate) fn policy_only_access_overlay(
-        owner: PrincipalKey,
-        label: String,
-        expires_at: u64,
-    ) -> Self {
+    fn policy_only_access_overlay(owner: PrincipalKey, label: String, expires_at: u64) -> Self {
         let (evaluation_mode, static_only) = SessionEvaluatorPosture::PolicyOnly.persisted_fields();
         Self {
             allow: Vec::new(),
@@ -919,6 +915,22 @@ impl SessionRegistry {
                 )
             })
             .collect()
+    }
+
+    /// Install access-managed authority through its sole production
+    /// constructor. The resulting grant is policy-only before it crosses the
+    /// registry authority boundary.
+    pub(crate) fn grant_policy_only_access_overlay(
+        &mut self,
+        token: String,
+        owner: PrincipalKey,
+        label: String,
+        expires_at: u64,
+    ) -> bool {
+        self.grant(
+            token,
+            SessionGrant::policy_only_access_overlay(owner, label, expires_at),
+        )
     }
 
     /// Install a session only when its bearer token has never represented a
