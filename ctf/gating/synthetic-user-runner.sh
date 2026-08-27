@@ -842,6 +842,30 @@ OUTCOMES_FILE="${MANIFEST}.outcomes"
   fi
 } > "$OUTCOMES_FILE"
 finalize_manifest_status "$manifest_status" "$OUTCOMES_FILE"
+cat "$OUTCOMES_FILE"
+if [ "$failures" -ne 0 ]; then
+  for scenario in "${SELECTED[@]}"; do
+    evidence="$RESULTS_DIR/$scenario.md"
+    if grep -Fqx -- '- Result: failed' "$evidence"; then
+      echo
+      echo "## Failure evidence: $scenario"
+      # Print only collector-authored summary fields. Raw transcripts and
+      # principal phase output remain inside the ephemeral scenario volume.
+      sed -n \
+        -e '/^- Result: /p' \
+        -e '/^- Classification: /p' \
+        -e '/^- Evidence: /p' \
+        "$evidence"
+      if [ -f "$RESULTS_DIR/$scenario.host-failure.md" ]; then
+        sed -n \
+          -e '/^- Phase: /p' \
+          -e '/^- Command category: /p' \
+          -e '/^- Podman exec status: /p' \
+          "$RESULTS_DIR/$scenario.host-failure.md"
+      fi
+    fi
+  done
+fi
 rm -- "$OUTCOMES_FILE"
 OUTCOMES_FILE=""
 write_status "complete" "none" "none" "$((TOTAL - failures)) passed, $failures failed" \
