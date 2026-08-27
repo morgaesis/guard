@@ -1702,11 +1702,15 @@ async fn run_main() -> Result<()> {
         }
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
-                || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
                 || e.kind() == clap::error::ErrorKind::DisplayVersion =>
         {
             write!(cli_output::stdout(), "{e}")?;
             Ok(())
+        }
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            let exit_code = e.exit_code();
+            eprint!("{e}");
+            std::process::exit(exit_code);
         }
         Err(e) => {
             log_cli_usage_error(&args, &e);

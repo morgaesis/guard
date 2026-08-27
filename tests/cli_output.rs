@@ -44,3 +44,14 @@ fn generated_output_survives_a_closed_stdout_consumer() {
 fn clap_help_survives_a_closed_stdout_consumer() {
     assert_closed_stdout_is_success(&["--help"]);
 }
+
+#[test]
+fn missing_subcommand_remains_invalid_usage() {
+    let output = Command::new(GUARD_BIN)
+        .arg("verb")
+        .output()
+        .expect("run guard with a missing verb subcommand");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage: guard verb"));
+}
