@@ -48,12 +48,11 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 /// canonicalizes the full generated-access proposal envelope. Version 14 adds
 /// the inert pre-handoff provisional state and classifies ambiguous v13 API
 /// dispatch rows before older binaries can interpret their rollback authority.
-/// Version 15 canonicalizes inert terminal generated-access proposals from
-/// older schemas while current-schema authority tampering remains fail-closed.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 14;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
+const TERMINAL_ACCESS_CANONICALIZATION_KEY: &str = "terminal_access_canonicalization_v1";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
@@ -1262,6 +1261,7 @@ impl SessionStore {
             // timeout then provides bounded waiting instead of an upgrade race.
             let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
             sanitize_persisted_credentials(&tx)?;
+            migrate_terminal_generated_requests_once(&tx)?;
             Self::validate_authority_row_indexes(&tx, true)?;
             tx.commit()?;
             return Ok(());
@@ -1494,9 +1494,7 @@ impl SessionStore {
         // whose sensitive exact denies cannot be preserved, removes sensitive
         // exact authority from history, and repairs durable gate snapshots.
         sanitize_persisted_credentials(&tx)?;
-        if version <= 14 {
-            migrate_v14_terminal_generated_requests(&tx)?;
-        }
+        migrate_terminal_generated_requests_once(&tx)?;
         Self::validate_authority_row_indexes(&tx, true)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -3408,10 +3406,19 @@ fn canonicalized_terminal_access_request(request: &GrantRequest) -> Option<Grant
     (canonical != *request).then_some(canonical)
 }
 
-/// One-time schema migration for terminal generated proposals written before
-/// the complete canonical envelope became durable. Restricting this repair to
-/// a version transition keeps post-migration matcher tampering observable.
-fn migrate_v14_terminal_generated_requests(conn: &Connection) -> Result<()> {
+/// One-time migration for terminal generated proposals written before the
+/// complete canonical envelope became durable. The additive marker is ignored
+/// by older binaries, preserving binary rollback without letting a later
+/// current-schema tamper be normalized as historical compatibility state.
+fn migrate_terminal_generated_requests_once(conn: &Connection) -> Result<()> {
+    let already_migrated = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM state_metadata WHERE key = ?1)",
+        params![TERMINAL_ACCESS_CANONICALIZATION_KEY],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if already_migrated {
+        return Ok(());
+    }
     let rows = {
         let mut statement = conn.prepare("SELECT rowid, json FROM grant_requests")?;
         let rows = statement
@@ -3440,6 +3447,10 @@ fn migrate_v14_terminal_generated_requests(conn: &Connection) -> Result<()> {
             ],
         )?;
     }
+    conn.execute(
+        "INSERT INTO state_metadata (key, value) VALUES (?1, 1)",
+        params![TERMINAL_ACCESS_CANONICALIZATION_KEY],
+    )?;
     Ok(())
 }
 
@@ -4857,8 +4868,11 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-            .unwrap();
+        conn.execute(
+            "DELETE FROM state_metadata WHERE key = ?1",
+            params![TERMINAL_ACCESS_CANONICALIZATION_KEY],
+        )
+        .unwrap();
         drop(conn);
 
         drop(store);
