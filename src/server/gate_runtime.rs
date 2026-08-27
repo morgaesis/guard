@@ -2787,6 +2787,20 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         notes: Vec::new(),
     };
 
+    // Serialize the final session check with access admission and revocation.
+    // A revocation that wins this lock prevents the hold from being published;
+    // a hold that wins commits first and the revoke transaction denies it.
+    let transition = server.state.authority_transition_gate.lock().await;
+    if approval.snapshot.session_fingerprint.is_some() {
+        let sessions = server.state.sessions.read().await;
+        if super::admin::session_token_for_approval_snapshot(&sessions, &approval.snapshot)
+            .is_none()
+        {
+            return ExecuteResult::denied(
+                "session expired, was revoked, or changed before approval hold creation",
+            );
+        }
+    }
     if let Err(message) = persist_approval(server, &approval).await {
         return ExecuteResult::exec_failed(reason, message);
     }
@@ -2796,6 +2810,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         .write()
         .await
         .enqueue(approval.clone());
+    drop(transition);
     #[cfg(test)]
     signal_approval_lifecycle(server, false);
     server.emit_audit_ungated(
@@ -2986,7 +3001,7 @@ pub(super) async fn resume_approval(
     caller: &CallerIdentity,
     handle: &str,
 ) -> ExecuteResult {
-    let transition = server.state.grant_request_transition_gate.lock().await;
+    let transition = server.state.authority_transition_gate.lock().await;
     let Some(expected) = server.state.approvals.read().await.get(handle).cloned() else {
         return ExecuteResult::denied("no armed held command for this requester");
     };

@@ -4,6 +4,93 @@
 //! divergence here skips evaluation entirely. They are pure functions on the
 //! untrusted argv, kept in the library crate so they can be fuzzed.
 
+/// SSH options that consume the following argument as their value.
+///
+/// This mirrors the option forms listed in OpenSSH's usage synopsis. Keeping
+/// it with [`ssh_argument_boundaries`] makes all consumers agree on which
+/// tokens are destination/command positionals rather than option values.
+const SSH_OPTIONS_WITH_ARGUMENT: &[&str] = &[
+    "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-P",
+    "-p", "-Q", "-R", "-S", "-W", "-w",
+];
+
+/// Indexes that split an SSH argv into its option zone, destination, and
+/// remote command. SSH accepts options before the destination and between the
+/// destination and the first remote-command token. Once that command token is
+/// reached, every remaining token belongs to the remote command, including
+/// dash-prefixed arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshArgumentBoundaries {
+    pub destination: Option<usize>,
+    pub command_start: Option<usize>,
+}
+
+/// Find the destination and first remote-command token using OpenSSH's two
+/// option prefixes. OpenSSH parses options once before the destination and,
+/// unless `--` ended option parsing, once more immediately after it. The first
+/// token after those prefixes starts the remote command; its entire suffix is
+/// left untouched.
+pub fn ssh_argument_boundaries(args: &[String]) -> SshArgumentBoundaries {
+    let leading_options = ssh_option_prefix(args, 0);
+    let destination = (leading_options.end < args.len()).then_some(leading_options.end);
+    let Some(destination) = destination else {
+        return SshArgumentBoundaries {
+            destination: None,
+            command_start: None,
+        };
+    };
+
+    let after_destination = destination + 1;
+    let command_start = if leading_options.terminated {
+        (after_destination < args.len()).then_some(after_destination)
+    } else {
+        let trailing_options = ssh_option_prefix(args, after_destination);
+        (trailing_options.end < args.len()).then_some(trailing_options.end)
+    };
+
+    SshArgumentBoundaries {
+        destination: Some(destination),
+        command_start,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SshOptionPrefix {
+    end: usize,
+    terminated: bool,
+}
+
+/// Consume only a local SSH-option prefix. Returning at the first positional
+/// token is what prevents dash-prefixed arguments after the remote command
+/// starts from being reconsidered as SSH options.
+fn ssh_option_prefix(args: &[String], start: usize) -> SshOptionPrefix {
+    let mut index = start;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            return SshOptionPrefix {
+                end: index + 1,
+                terminated: true,
+            };
+        }
+        if !arg.starts_with('-') {
+            break;
+        }
+
+        let width = 1 + usize::from(ssh_option_takes_separate_argument(arg));
+        index = index.saturating_add(width).min(args.len());
+    }
+
+    SshOptionPrefix {
+        end: index,
+        terminated: false,
+    }
+}
+
+fn ssh_option_takes_separate_argument(arg: &str) -> bool {
+    SSH_OPTIONS_WITH_ARGUMENT.contains(&arg)
+}
+
 /// Allow-list (deny-by-default) check on the ssh options in an invocation.
 /// Returns true only when every option is on a small set known to be safe for
 /// a read-only diagnostic: no command execution, no agent / X11 / port /
@@ -27,20 +114,25 @@
 /// Combined short flags such as `-Cq` are treated as unrecognized rather than
 /// decomposed, again forfeiting to the evaluator.
 pub fn ssh_options_all_readonly_safe(args: &[String]) -> bool {
-    // 0 = before the destination, 1 = between destination and remote command.
-    let mut positionals_seen = 0;
+    let boundaries = ssh_argument_boundaries(args);
+    let option_zone_end = boundaries.command_start.unwrap_or(args.len());
     let mut i = 0;
-    while i < args.len() {
+    while i < option_zone_end {
         let arg = args[i].as_str();
 
-        // A non-option token is either the destination (first) or the start
-        // of the remote command (second). Once the command starts, the rest
-        // are command arguments that ssh does not treat as options.
+        // The destination remains positional even when `--` permits a name
+        // beginning with a dash. The shared boundary parser has already
+        // excluded the remote command and every one of its arguments.
+        if boundaries.destination == Some(i) {
+            i += 1;
+            continue;
+        }
+        // The option terminator is syntax, not a local behavior switch.
+        if arg == "--" {
+            i += 1;
+            continue;
+        }
         if !arg.starts_with('-') {
-            positionals_seen += 1;
-            if positionals_seen >= 2 {
-                return true;
-            }
             i += 1;
             continue;
         }
@@ -51,7 +143,7 @@ pub fn ssh_options_all_readonly_safe(args: &[String]) -> bool {
 
         // `-o directive` (separate value): only a vetted keyword is allowed.
         if arg == "-o" {
-            match args.get(i + 1) {
+            match args.get(i + 1).filter(|_| i + 1 < option_zone_end) {
                 Some(value) if ssh_o_directive_readonly_safe(value) => {
                     i += 2;
                     continue;
@@ -71,7 +163,7 @@ pub fn ssh_options_all_readonly_safe(args: &[String]) -> bool {
         // `-p port` / `-l login`: the value is an inert port or username.
         // Consume the value token so it is not mistaken for a positional.
         if arg == "-p" || arg == "-l" {
-            if args.get(i + 1).is_none() {
+            if i + 1 >= option_zone_end {
                 return false;
             }
             i += 2;

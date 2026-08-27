@@ -557,10 +557,11 @@ phase_su13() {
       expect_failure synthesized-revoked-hold-approve \
         guard access approve "$handle" --once --json
       grep -q '"success": false' /scenario/journey/synthesized-revoked-hold-approve.out
-      grep -Eq 'expired|revoked' /scenario/journey/synthesized-revoked-hold-approve.out
-      capture_phase synthesized-revoked-hold-deny \
-        guard access deny "$handle" --reason 'originating access revoked' --json
-      grep -q '"state": "denied"' /scenario/journey/synthesized-revoked-hold-deny.out
+      grep -q '"state": "denied"' /scenario/journey/synthesized-revoked-hold-approve.out
+      capture_phase synthesized-revoked-hold-show guard access show "$handle" --json
+      grep -q '"state": "denied"' /scenario/journey/synthesized-revoked-hold-show.out
+      grep -q 'originating access session was revoked' \
+        /scenario/journey/synthesized-revoked-hold-show.out
       ;;
     after-revoke)
       [ "$(id -u)" -eq 1001 ]

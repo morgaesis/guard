@@ -87,6 +87,23 @@ impl ParamSpec {
         format!("{SINGLE_ARGV_PATTERN_PREFIX}{max_length}:{pattern}")
     }
 
+    /// Construct the bounded one-argv form used by mechanically generated
+    /// matchers. The public YAML representation keeps this metadata separate
+    /// from the pattern, while the in-memory representation preserves the
+    /// existing `ParamSpec` struct shape for catalog callers.
+    pub(crate) fn bounded_single_argv(
+        pattern: String,
+        max_length: usize,
+        allow_dash: bool,
+    ) -> Self {
+        Self {
+            pattern: Self::encoded_single_argv(pattern, max_length),
+            required: true,
+            default: None,
+            allow_dash,
+        }
+    }
+
     fn semantics(&self) -> (ParamValueType, Option<usize>, &str) {
         let Some(encoded) = self.pattern.strip_prefix(SINGLE_ARGV_PATTERN_PREFIX) else {
             return (ParamValueType::Token, None, &self.pattern);
@@ -2266,6 +2283,63 @@ fn validate_param_not_overbroad(pname: &str, spec: &ParamSpec, context: &str) ->
     Ok(())
 }
 
+/// Verify the generated representation of an exact finite parameter domain.
+/// Whitespace-bearing values stay one bounded argv element; all other values
+/// retain token semantics. Both forms reject control characters that could
+/// become shell syntax if a downstream tool ever reparsed the value.
+fn validate_auto_promoted_param_spec(pname: &str, spec: &ParamSpec) -> Result<Vec<String>> {
+    validate_param_not_overbroad(pname, spec, "auto-promoted verb")?;
+    let literals = enumerate_pattern_literals(spec.pattern_text()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "auto-promoted verb parameter '{}' must be a finite plain literal alternation",
+            pname
+        )
+    })?;
+    let contains_whitespace = literals
+        .iter()
+        .any(|value| value.chars().any(char::is_whitespace));
+    let expected_value_type = if contains_whitespace {
+        ParamValueType::SingleArgv
+    } else {
+        ParamValueType::Token
+    };
+    if spec.value_type() != expected_value_type {
+        bail!(
+            "auto-promoted verb parameter '{}' must use {} semantics for its exact observed values",
+            pname,
+            match expected_value_type {
+                ParamValueType::Token => "token",
+                ParamValueType::SingleArgv => "single_argv",
+            }
+        );
+    }
+    if expected_value_type == ParamValueType::SingleArgv {
+        let maximum = literals
+            .iter()
+            .map(|value| value.chars().count())
+            .max()
+            .expect("literal enumeration is non-empty");
+        if spec.max_length() != Some(maximum) {
+            bail!(
+                "auto-promoted verb parameter '{}' max_length must equal the longest exact observed value ({})",
+                pname,
+                maximum
+            );
+        }
+    }
+    for value in &literals {
+        if value.chars().any(|character| {
+            character.is_control() || matches!(character, ';' | '|' | '&' | '$' | '`' | '>' | '<')
+        }) {
+            bail!(
+                "auto-promoted verb parameter '{}' contains a shell control character in an exact observed value",
+                pname
+            );
+        }
+    }
+    Ok(literals)
+}
+
 fn path_is_absolute(value: &str) -> bool {
     value.starts_with('/')
         || value.starts_with("\\\\")
@@ -3029,7 +3103,7 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
         bail!("an auto-promoted verb may not contain literal credential argv");
     }
     for (pname, spec) in &verb.params {
-        validate_param_not_overbroad(pname, spec, "auto-promoted verb")?;
+        validate_auto_promoted_param_spec(pname, spec)?;
     }
     debug_assert_eq!(verb.consequence, Reversibility::Reversible);
     // Re-render every evidence sample against the verb's own template and
@@ -3086,13 +3160,6 @@ pub fn validate_auto_promoted_verb_durable_safety(verb: &Verb) -> Result<()> {
                 pname
             )
         })?;
-        if spec.value_type() != ParamValueType::Token {
-            bail!(
-                "auto-promoted verb '{}' durable parameter '{}' must use token semantics",
-                verb.name,
-                pname
-            );
-        }
         if !spec.required || spec.default.is_some() {
             bail!(
                 "auto-promoted verb '{}' durable parameter '{}' must be required and have no default",
@@ -3100,11 +3167,10 @@ pub fn validate_auto_promoted_verb_durable_safety(verb: &Verb) -> Result<()> {
                 pname
             );
         }
-        let literals = enumerate_pattern_literals(spec.pattern_text()).ok_or_else(|| {
-            anyhow::anyhow!(
-                "auto-promoted verb '{}' durable parameter '{}' must be a finite plain literal alternation",
-                verb.name,
-                pname
+        let literals = validate_auto_promoted_param_spec(pname, spec).with_context(|| {
+            format!(
+                "auto-promoted verb '{}' durable parameter '{}' is invalid",
+                verb.name, pname
             )
         })?;
         let canonical_pattern = format!(
@@ -5769,6 +5835,103 @@ verbs:
         )
         .unwrap();
         assert!(catalog.get("generated-pod-read").is_some());
+    }
+
+    #[test]
+    fn auto_promoted_spaced_promql_values_render_reverse_match_and_reload() {
+        let api_query = r#"sum(rate(http_requests_total{job="api"}[5m])) by (job)"#;
+        let worker_query = r#"sum(rate(http_requests_total{job="worker"}[5m])) by (job)"#;
+        let pattern = format!(
+            "^({}|{})$",
+            regex::escape(api_query),
+            regex::escape(worker_query)
+        );
+        let mut verb = synth_verb("kubectl", None, true, "generated-prom-query");
+        verb.args = args_vec(&["get", "pods", "--field-selector", "{query}"]);
+        verb.params.insert(
+            "query".to_string(),
+            ParamSpec::bounded_single_argv(
+                pattern,
+                api_query.chars().count().max(worker_query.chars().count()),
+                false,
+            ),
+        );
+        verb.auto_promoted = true;
+        verb.promotion_stamp = Some("test-stamp".to_string());
+
+        let evidence = vec![
+            args_vec(&["get", "pods", "--field-selector", api_query]),
+            args_vec(&["get", "pods", "--field-selector", worker_query]),
+        ];
+        validate_auto_promoted_verb_safety(&verb, &evidence).unwrap();
+
+        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        assert!(yaml.contains("value_type: single_argv"));
+        assert!(yaml.contains("max_length:"));
+        let catalog = VerbCatalog::from_yaml(&yaml).unwrap();
+        let rendered = catalog
+            .render("generated-prom-query", &params(&[("query", api_query)]))
+            .unwrap();
+        assert_eq!(rendered.args, evidence[0]);
+        assert_eq!(
+            catalog.match_command_all("kubectl", &rendered.args).len(),
+            1,
+            "the reloaded matcher must reverse-match one spaced argv element"
+        );
+        let outside = args_vec(&[
+            "get",
+            "pods",
+            "--field-selector",
+            r#"sum(rate(http_requests_total[5m])) by (job)"#,
+        ]);
+        assert!(catalog.match_command_all("kubectl", &outside).is_empty());
+    }
+
+    #[test]
+    fn auto_promoted_spaced_values_reject_shell_controls_and_unbounded_text() {
+        let spaced_query = r#"sum(rate(http_requests_total[5m])) by (job)"#;
+        let mut unsafe_verb = synth_verb("kubectl", None, true, "generated-prom-query");
+        unsafe_verb.args = args_vec(&["get", "pods", "--field-selector", "{query}"]);
+        unsafe_verb.params.insert(
+            "query".to_string(),
+            ParamSpec {
+                pattern: format!("^({})$", regex::escape(spaced_query)),
+                required: true,
+                default: None,
+                allow_dash: false,
+            },
+        );
+        unsafe_verb.auto_promoted = true;
+        unsafe_verb.promotion_stamp = Some("test-stamp".to_string());
+        let error = validate_auto_promoted_verb_safety(
+            &unsafe_verb,
+            &[args_vec(&["get", "pods", "--field-selector", spaced_query])],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("single_argv"), "got: {error}");
+
+        let unsafe_query = r#"sum(rate(http_requests_total[5m])) by (job); delete"#;
+        unsafe_verb.params.insert(
+            "query".to_string(),
+            ParamSpec::bounded_single_argv(
+                format!("^({})$", regex::escape(unsafe_query)),
+                unsafe_query.chars().count(),
+                false,
+            ),
+        );
+        let error = validate_auto_promoted_verb_safety(
+            &unsafe_verb,
+            &[args_vec(&["get", "pods", "--field-selector", unsafe_query])],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("shell control"), "got: {error}");
+
+        unsafe_verb.params.insert(
+            "query".to_string(),
+            ParamSpec::bounded_single_argv("^.+$".to_string(), 4096, false),
+        );
+        let error = validate_auto_promoted_verb_safety(&unsafe_verb, &[]).unwrap_err();
+        assert!(error.to_string().contains("too permissive"), "got: {error}");
     }
 
     #[test]

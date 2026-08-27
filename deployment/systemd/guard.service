@@ -72,7 +72,6 @@ NoNewPrivileges=true
 # relies on. AmbientCapabilities= grants the two capabilities without lowering
 # that ceiling.
 AmbientCapabilities=CAP_FOWNER CAP_DAC_READ_SEARCH
-PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/run/guard /var/lib/guard
