@@ -76,6 +76,26 @@ fn access_session_token_fingerprint(token: &str) -> String {
 }
 
 #[derive(Debug)]
+struct SessionRevisionUpdate {
+    token: String,
+    old_revision: String,
+    new_revision: String,
+    token_fingerprint: String,
+    scope_json: String,
+}
+
+fn access_session_token_fingerprint(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!(
+        "sha256:{}",
+        digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+#[derive(Debug)]
 struct RegistryGenerationConflict {
     expected: u64,
     found: u64,
