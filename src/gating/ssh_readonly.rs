@@ -4,6 +4,64 @@
 //! divergence here skips evaluation entirely. They are pure functions on the
 //! untrusted argv, kept in the library crate so they can be fuzzed.
 
+/// SSH options that consume the following argument as their value.
+///
+/// This mirrors the option forms listed in OpenSSH's usage synopsis. Keeping
+/// it with [`ssh_argument_boundaries`] makes all consumers agree on which
+/// tokens are destination/command positionals rather than option values.
+const SSH_OPTIONS_WITH_ARGUMENT: &[&str] = &[
+    "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-P",
+    "-p", "-Q", "-R", "-S", "-W", "-w",
+];
+
+/// Indexes that split an SSH argv into its option zone, destination, and
+/// remote command. SSH accepts options before the destination and between the
+/// destination and the first remote-command token. Once that command token is
+/// reached, every remaining token belongs to the remote command, including
+/// dash-prefixed arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshArgumentBoundaries {
+    pub destination: Option<usize>,
+    pub command_start: Option<usize>,
+}
+
+/// Find the destination and first remote-command token using OpenSSH's option
+/// zone. The option values themselves are skipped only while locating the
+/// boundary; callers validate those options independently.
+pub fn ssh_argument_boundaries(args: &[String]) -> SshArgumentBoundaries {
+    let mut destination = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg.starts_with('-') {
+            index += usize::from(ssh_option_takes_separate_argument(arg));
+            index += 1;
+            continue;
+        }
+
+        if destination.is_none() {
+            destination = Some(index);
+            index += 1;
+            continue;
+        }
+
+        return SshArgumentBoundaries {
+            destination,
+            command_start: Some(index),
+        };
+    }
+
+    SshArgumentBoundaries {
+        destination,
+        command_start: None,
+    }
+}
+
+fn ssh_option_takes_separate_argument(arg: &str) -> bool {
+    SSH_OPTIONS_WITH_ARGUMENT.contains(&arg)
+}
+
 /// Allow-list (deny-by-default) check on the ssh options in an invocation.
 /// Returns true only when every option is on a small set known to be safe for
 /// a read-only diagnostic: no command execution, no agent / X11 / port /
@@ -27,20 +85,17 @@
 /// Combined short flags such as `-Cq` are treated as unrecognized rather than
 /// decomposed, again forfeiting to the evaluator.
 pub fn ssh_options_all_readonly_safe(args: &[String]) -> bool {
-    // 0 = before the destination, 1 = between destination and remote command.
-    let mut positionals_seen = 0;
+    let option_zone_end = ssh_argument_boundaries(args)
+        .command_start
+        .unwrap_or(args.len());
     let mut i = 0;
-    while i < args.len() {
+    while i < option_zone_end {
         let arg = args[i].as_str();
 
-        // A non-option token is either the destination (first) or the start
-        // of the remote command (second). Once the command starts, the rest
-        // are command arguments that ssh does not treat as options.
+        // The sole positional in the option zone is the destination. The
+        // shared boundary parser above has already excluded the remote
+        // command and all of its arguments.
         if !arg.starts_with('-') {
-            positionals_seen += 1;
-            if positionals_seen >= 2 {
-                return true;
-            }
             i += 1;
             continue;
         }
@@ -51,7 +106,7 @@ pub fn ssh_options_all_readonly_safe(args: &[String]) -> bool {
 
         // `-o directive` (separate value): only a vetted keyword is allowed.
         if arg == "-o" {
-            match args.get(i + 1) {
+            match args.get(i + 1).filter(|_| i + 1 < option_zone_end) {
                 Some(value) if ssh_o_directive_readonly_safe(value) => {
                     i += 2;
                     continue;
@@ -71,7 +126,7 @@ pub fn ssh_options_all_readonly_safe(args: &[String]) -> bool {
         // `-p port` / `-l login`: the value is an inert port or username.
         // Consume the value token so it is not mistaken for a positional.
         if arg == "-p" || arg == "-l" {
-            if args.get(i + 1).is_none() {
+            if i + 1 >= option_zone_end {
                 return false;
             }
             i += 2;

@@ -433,6 +433,9 @@ audit purposes.
 Guard runs approved commands in the caller's canonical working directory while
 retaining the daemon's clean environment, identity, SSH configuration, agent
 socket, and secret bindings. It does not stage or copy project files.
+The execution identity needs traversal and read access to the project tree.
+Tool-native configuration discovery remains rooted in that working directory,
+including discovery of files such as `ansible.cfg`.
 
 On Unix, a brokered command that cannot read one named non-secret file can enter
 the transparent read-grant path. The packaged system service grants the daemon

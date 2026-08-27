@@ -34,6 +34,9 @@ include the binary, systemd units, operator wrapper, hardening examples, and
 generic verb examples. The Windows archive includes `guard.exe`, the PowerShell
 installer and tests, an inner binary digest manifest, and the same examples.
 Installation uses files from the expanded archive rather than a source checkout.
+The packaged execution-capable systemd services share the host `/tmp` namespace
+with brokered children, so their temporary files remain visible to the caller
+subject to normal file permissions.
 
 Published targets are:
 

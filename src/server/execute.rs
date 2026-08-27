@@ -1831,11 +1831,21 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
         ));
     }
 
-    if server.config.preflight && !binary_exists_on_path(&request.binary) {
-        let reason = format!(
-            "unknown binary: '{}' is not available on the guard server PATH",
-            request.binary
-        );
+    let unavailable_binary = server.config.preflight.then(|| {
+        if server.config.shim_dir.is_some() {
+            resolve_primary_binary(server, &request.binary)
+                .err()
+                .map(|error| error.to_string())
+        } else if !binary_exists_on_path(&request.binary) {
+            Some(format!(
+                "unknown binary: '{}' is not available on the guard server PATH",
+                request.binary
+            ))
+        } else {
+            None
+        }
+    });
+    if let Some(reason) = unavailable_binary.flatten() {
         return Err(Box::new(
             deny_and_record(
                 phase,
@@ -2863,7 +2873,10 @@ fn resolve_primary_binary(server: &ServerContext, binary: &str) -> Result<PathBu
     };
     let shim_dir = shim_dir.canonicalize().unwrap_or_else(|_| shim_dir.clone());
     let Some(path) = std::env::var_os("PATH") else {
-        return Ok(PathBuf::from(binary));
+        bail!(
+            "underlying executable '{}' is unavailable outside Guard's shim directory; install it or add its non-shim directory to the daemon PATH",
+            binary
+        );
     };
     for dir in std::env::split_paths(&path) {
         if dir.as_os_str().is_empty() || !dir.is_absolute() {
@@ -2879,9 +2892,8 @@ fn resolve_primary_binary(server: &ServerContext, binary: &str) -> Result<PathBu
         }
     }
     bail!(
-        "failed to resolve '{}' outside shim directory {}",
-        binary,
-        shim_dir.display()
+        "underlying executable '{}' is unavailable outside Guard's shim directory; install it or add its non-shim directory to the daemon PATH",
+        binary
     )
 }
 

@@ -1,90 +1,19 @@
-/// SSH options that take a separate argument value.
-const OPTS_WITH_ARG: &[&str] = &[
-    "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q",
-    "-R", "-S", "-W", "-w",
-];
+use guard::gating::ssh_readonly::ssh_argument_boundaries;
 
 /// Extract the remote command from SSH arguments.
 /// SSH syntax: ssh [options] destination [command [argument ...]]
 pub fn extract_command(args: &[String]) -> String {
-    let mut skip_next = false;
-    let mut found_destination = false;
-    let mut cmd_parts: Vec<&str> = Vec::new();
-
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-
-        let mut is_opt_with_arg = false;
-        for opt in OPTS_WITH_ARG {
-            if arg == *opt {
-                is_opt_with_arg = true;
-                skip_next = true;
-                break;
-            }
-            // Handle -oValue (option+value concatenated)
-            if arg.starts_with(opt) && arg.len() > 2 {
-                is_opt_with_arg = true;
-                break;
-            }
-        }
-        if is_opt_with_arg {
-            continue;
-        }
-
-        // Skip standalone flags
-        if arg.starts_with('-') {
-            continue;
-        }
-
-        // First non-option is destination, rest is the command
-        if !found_destination {
-            found_destination = true;
-            continue;
-        }
-
-        cmd_parts.push(arg);
-    }
-
-    cmd_parts.join(" ")
+    ssh_argument_boundaries(args)
+        .command_start
+        .map(|index| args[index..].join(" "))
+        .unwrap_or_default()
 }
 
 /// Extract the destination host from SSH arguments.
 pub fn extract_destination(args: &[String]) -> Option<String> {
-    let mut skip_next = false;
-
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-
-        let mut is_opt_with_arg = false;
-        for opt in OPTS_WITH_ARG {
-            if arg == *opt {
-                is_opt_with_arg = true;
-                skip_next = true;
-                break;
-            }
-            if arg.starts_with(opt) && arg.len() > 2 {
-                is_opt_with_arg = true;
-                break;
-            }
-        }
-        if is_opt_with_arg {
-            continue;
-        }
-
-        if arg.starts_with('-') {
-            continue;
-        }
-
-        return Some(arg.clone());
-    }
-
-    None
+    ssh_argument_boundaries(args)
+        .destination
+        .map(|index| args[index].clone())
 }
 
 #[cfg(test)]
@@ -103,8 +32,10 @@ mod tests {
 
     #[test]
     fn test_extract_command_separate_args() {
-        // Separate args: -la looks like a flag and gets skipped (matches bash behavior)
-        assert_eq!(extract_command(&args(&["user@host", "ls", "-la"])), "ls");
+        assert_eq!(
+            extract_command(&args(&["user@host", "ls", "-la"])),
+            "ls -la"
+        );
     }
 
     #[test]
@@ -141,6 +72,22 @@ mod tests {
         assert_eq!(
             extract_command(&args(&["-i", "/path/to/key", "host", "whoami"])),
             "whoami"
+        );
+    }
+
+    #[test]
+    fn test_extract_command_preserves_post_command_dash_arguments() {
+        assert_eq!(
+            extract_command(&args(&["user@host", "id", "-u", "--format=verbose"])),
+            "id -u --format=verbose"
+        );
+    }
+
+    #[test]
+    fn test_extract_command_skips_safe_post_destination_option() {
+        assert_eq!(
+            extract_command(&args(&["user@host", "-o", "ConnectTimeout=5", "id"])),
+            "id"
         );
     }
 

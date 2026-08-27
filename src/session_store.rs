@@ -52,6 +52,7 @@ const SCHEMA_VERSION: i64 = 14;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 struct SessionRevisionUpdate {
@@ -1224,7 +1225,7 @@ impl SessionStore {
         prepare_state_path(path)?;
         let conn = open_state_connection(path)
             .with_context(|| format!("failed to open {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(2))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         enforce_private_state_files(path)?;
         Ok(conn)
     }
@@ -2064,14 +2065,15 @@ impl SessionStore {
         Ok(generation)
     }
 
-    /// Revoke one access session and withdraw every pending request targeting
-    /// it in the same transaction.
+    /// Revoke one access session and terminalize every pending dependent in
+    /// the same transaction.
     pub async fn commit_access_revoke(
         &self,
         token: String,
         expected_revision: Option<String>,
         registry: SessionRegistry,
         withdrawals: Vec<(GrantRequest, GrantRequest)>,
+        approval_denials: Vec<(Approval, Approval)>,
     ) -> Result<()> {
         #[cfg(test)]
         if self
@@ -2092,6 +2094,28 @@ impl SessionStore {
         for (previous, next) in &withdrawals {
             validate_persisted_access_request(previous)?;
             validate_persisted_access_request(next)?;
+        }
+        let approval_denials = approval_denials
+            .into_iter()
+            .map(|(mut previous, mut next)| {
+                previous.sanitize_explanatory_text();
+                next.sanitize_explanatory_text();
+                (previous, next)
+            })
+            .collect::<Vec<_>>();
+        let session_fingerprint = access_session_token_fingerprint(&token);
+        for (previous, next) in &approval_denials {
+            validate_persisted_approval(previous)?;
+            validate_persisted_approval(next)?;
+            if previous.status != ApprovalStatus::Pending
+                || next.status != ApprovalStatus::Denied
+                || previous.snapshot.session_fingerprint.as_deref()
+                    != Some(session_fingerprint.as_str())
+                || previous.snapshot.session_revision != expected_revision
+                || !valid_approval_transition(previous, next)?
+            {
+                anyhow::bail!("invalid revoked-session approval denial");
+            }
         }
         let path = self.path.clone();
         let retention = self.history_retention_secs;
@@ -2157,6 +2181,16 @@ impl SessionStore {
                         encode_u64(withdrawn.created_unix)?,
                         withdrawn.handle
                     ],
+                )?;
+            }
+            for (pending, denied) in &approval_denials {
+                let expected_json = serde_json::to_string(pending)
+                    .context("encode pending revoked-session approval")?;
+                Self::compare_and_swap_approval_transaction(
+                    &tx,
+                    pending,
+                    denied,
+                    &expected_json,
                 )?;
             }
             tx.commit()?;
@@ -2474,7 +2508,7 @@ impl SessionStore {
         tokio::task::spawn_blocking(move || {
             let mut conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
             let rows = {
                 let mut stmt = tx
                     .prepare("SELECT handle, status, created_unix, json FROM gating_provisional")?;
@@ -2689,7 +2723,7 @@ impl SessionStore {
         tokio::task::spawn_blocking(move || {
             let mut conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
             let rows = {
                 let mut stmt =
                     tx.prepare("SELECT handle, status, created_unix, json FROM gating_approval")?;
@@ -6041,6 +6075,7 @@ mod tests {
                     expected_revision,
                     detached_registry,
                     Vec::new(),
+                    Vec::new(),
                 )
                 .await
         });
@@ -7101,6 +7136,31 @@ mod tests {
         let durable = first.load_approvals().await.unwrap();
         assert_eq!(durable.len(), 1);
         assert_eq!(durable[0].status, ApprovalStatus::Approving);
+    }
+
+    #[tokio::test]
+    async fn approval_write_survives_a_transient_external_sqlite_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let lock = Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let writer_store = store.clone();
+        let writer = tokio::spawn(async move {
+            writer_store
+                .save_approval(pending_approval("ap-transient-lock"))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        lock.execute_batch("COMMIT").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(12), writer)
+            .await
+            .expect("approval write remains bounded")
+            .expect("approval writer task")
+            .expect("approval write retries within the SQLite busy timeout");
+        assert_eq!(store.load_approvals().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -580,6 +580,8 @@ pub(crate) fn is_fully_literal(slots: &[TemplateSlot]) -> bool {
 /// Build the verb's `args` template tokens and named `ParamSpec`s from
 /// derived slots. A parameter's pattern is a plain anchored alternation of
 /// its exact, regex-escaped observed values -- never a free-form regex.
+/// Whitespace-bearing values use `single_argv` semantics and the exact
+/// observed maximum length, so they remain one bounded argv element.
 ///
 /// Two distinct varying positions can derive the same base name (e.g. a
 /// repeated flag: `rsync --exclude A --exclude B`), which would otherwise
@@ -608,15 +610,29 @@ pub(crate) fn build_args_and_params(
                     .collect::<Vec<_>>()
                     .join("|");
                 args.push(format!("{{{name}}}"));
-                params.insert(
-                    name,
+                let pattern = format!("^({alternation})$");
+                let spec = if values
+                    .iter()
+                    .any(|value| value.chars().any(char::is_whitespace))
+                {
+                    ParamSpec::bounded_single_argv(
+                        pattern,
+                        values
+                            .iter()
+                            .map(|value| value.chars().count())
+                            .max()
+                            .expect("parameter values are non-empty"),
+                        allow_dash,
+                    )
+                } else {
                     ParamSpec {
-                        pattern: format!("^({alternation})$"),
+                        pattern,
                         required: true,
                         default: None,
                         allow_dash,
-                    },
-                );
+                    }
+                };
+                params.insert(name, spec);
             }
         }
     }
@@ -1293,6 +1309,33 @@ mod tests {
         assert!(!re.is_match("kube-system"));
         assert!(re.is_match("foo"));
         assert!(re.is_match("bar"));
+    }
+
+    #[test]
+    fn build_args_and_params_preserves_spaced_promql_values_as_bounded_single_argv() {
+        let api_query = r#"sum(rate(http_requests_total{job="api"}[5m])) by (job)"#;
+        let worker_query = r#"sum(rate(http_requests_total{job="worker"}[5m])) by (job)"#;
+        let samples = vec![
+            args(&["get", "pods", "--query", api_query]),
+            args(&["get", "pods", "--query", worker_query]),
+        ];
+        let slots = derive_template(&samples).unwrap();
+        let (built_args, params) = build_args_and_params(&slots);
+
+        assert_eq!(built_args, args(&["get", "pods", "--query", "{query}"]));
+        let spec = params.get("query").unwrap();
+        assert_eq!(
+            spec.value_type(),
+            crate::gating::verb::ParamValueType::SingleArgv
+        );
+        assert_eq!(
+            spec.max_length(),
+            Some(api_query.chars().count().max(worker_query.chars().count()))
+        );
+        let re = regex::Regex::new(spec.pattern_text()).unwrap();
+        assert!(re.is_match(api_query));
+        assert!(re.is_match(worker_query));
+        assert!(!re.is_match(r#"sum(rate(http_requests_total[5m])) by (job)"#));
     }
 
     #[test]
