@@ -3056,6 +3056,10 @@ async fn cleanup_buffer_rejects_declared_and_chunked_oversize_without_resolution
             .await
             .unwrap();
         assert_eq!(create.status(), 201);
+        create
+            .bytes()
+            .await
+            .expect("create response completes before same-connection cleanup");
         let cleanup = client
             .delete(format!("{base}/api/v1/namespaces/dev/pods/cleanup-bounded"))
             .send()
