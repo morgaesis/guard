@@ -47,11 +47,9 @@ use guard::gating::verb::VerbCatalog;
 use guard::gating::{Coverage, GateMode, Reversibility};
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
-#[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
 use tokio::io::AsyncWrite;
-#[cfg(unix)]
 use tokio::sync::RwLock;
 
 use super::make_test_config;
