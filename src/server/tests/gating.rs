@@ -2910,7 +2910,7 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
     let mut sessions = cfg.state.sessions.write().await;
     let mut grants = sessions.grants_snapshot();
     grants.insert("expired-during-eval".to_string(), expired);
-    *sessions = crate::session::SessionRegistry::from_parts(
+    *sessions = crate::session::SessionRegistry::from_typed_parts(
         grants,
         sessions.history_snapshot(),
         sessions.stored_interactions_snapshot(),

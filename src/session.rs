@@ -123,6 +123,27 @@ pub(crate) enum SessionEvaluatorPosture {
     ReadOnly,
 }
 
+impl SessionEvaluatorPosture {
+    fn persisted_fields(self) -> (EvaluationMode, bool) {
+        match self {
+            Self::InheritBaselineEvaluator => (EvaluationMode::Evaluator, false),
+            Self::PolicyOnly => (EvaluationMode::PolicyOnly, true),
+            Self::ReadOnly => (EvaluationMode::ReadOnly, false),
+        }
+    }
+
+    fn from_persisted(evaluation_mode: EvaluationMode, legacy_static_only: bool) -> Self {
+        if legacy_static_only {
+            return Self::PolicyOnly;
+        }
+        match evaluation_mode {
+            EvaluationMode::Evaluator => Self::InheritBaselineEvaluator,
+            EvaluationMode::PolicyOnly => Self::PolicyOnly,
+            EvaluationMode::ReadOnly => Self::ReadOnly,
+        }
+    }
+}
+
 pub(crate) fn session_grant_revision_key(grant: &SessionGrant) -> Option<String> {
     let mut authority = grant.clone();
     // Accounting metadata changes on every bounded admission but does not
@@ -204,19 +225,30 @@ fn access_selection_rank(grant: &SessionGrant, selected: &[usize]) -> (usize, us
 }
 
 impl SessionGrant {
+    fn normalize_access_managed_posture(&mut self) {
+        if !self.scope.access_managed {
+            return;
+        }
+        let (evaluation_mode, static_only) = SessionEvaluatorPosture::PolicyOnly.persisted_fields();
+        self.scope.evaluation_mode = evaluation_mode;
+        self.static_only = static_only;
+        self.auto_amend = false;
+    }
+
     /// Build the implicit session installed for approved access requests.
     ///
     /// This is an additive typed-authority overlay, not a general command
     /// grant: every legacy allow/deny collection starts empty, automatic
     /// amendment is disabled, and approved verbs are added separately only
-    /// after durable operator review. `static_only` remains false because an
-    /// implicit overlay must not narrow the caller's unrelated base evaluator
-    /// posture; that evaluator fallback receives no authority from this grant.
+    /// after durable operator review. The session is policy-only. Command
+    /// execution detaches an implicitly selected overlay when it contributes
+    /// no selected session verb, leaving the caller's baseline policy intact.
     pub(crate) fn additive_access_overlay(
         owner: PrincipalKey,
         label: String,
         expires_at: u64,
     ) -> Self {
+        let (evaluation_mode, static_only) = SessionEvaluatorPosture::PolicyOnly.persisted_fields();
         Self {
             allow: Vec::new(),
             deny: Vec::new(),
@@ -226,16 +258,14 @@ impl SessionGrant {
             override_markers: Vec::new(),
             scope: IssuedGrantScope {
                 label: Some(label),
-                evaluation_mode: EvaluationMode::Evaluator,
+                evaluation_mode,
                 access_managed: true,
                 ..IssuedGrantScope::default()
             },
             expires_at: Some(expires_at),
             prompt_append: None,
             generated_notes: Vec::new(),
-            // Legacy persisted representation of
-            // `SessionEvaluatorPosture::InheritBaselineEvaluator`.
-            static_only: false,
+            static_only,
             auto_amend: false,
             granted_at: 0,
             owner: SessionOwner::Principal(owner),
@@ -574,6 +604,15 @@ impl CredentialReference {
         Self::from_store_name(name.clone()).or_else(|| Self::from_api_identity(name))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn from_compatibility_name(name: impl Into<String>) -> Option<Self> {
+        let name = name.into();
+        if redact_output_text(&name) != name {
+            return None;
+        }
+        Self::from_persisted_name(name)
+    }
+
     pub fn as_reference_name(&self) -> &str {
         &self.0
     }
@@ -630,8 +669,9 @@ pub struct SessionInteraction {
     /// source compatibility and keeps the existing JSON key. The daemon treats
     /// it as a presentation field only: internal session storage retains nominal
     /// [`CredentialReference`] values and populates these strings when a report
-    /// is projected. Directly constructed strings never become stored daemon
-    /// credential metadata. Resolved credential values are never retained.
+    /// is projected. Compatibility entry points validate and convert canonical
+    /// reference names before storage; malformed and credential-shaped strings
+    /// are discarded. Resolved credential values are never retained.
     #[serde(default, alias = "secret_refs", skip_serializing_if = "Vec::is_empty")]
     pub exposed_secret_refs: Vec<String>,
     /// Versioned admission explanation for this interaction.
@@ -718,7 +758,23 @@ pub(crate) struct StoredSessionInteraction {
     credential_references: Vec<CredentialReference>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn take_compatibility_credential_references(
+    interaction: &mut SessionInteraction,
+) -> Vec<CredentialReference> {
+    std::mem::take(&mut interaction.exposed_secret_refs)
+        .into_iter()
+        .filter_map(CredentialReference::from_compatibility_name)
+        .collect()
+}
+
 impl StoredSessionInteraction {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn from_compatibility_parts(token: String, mut interaction: SessionInteraction) -> Self {
+        let credential_references = take_compatibility_credential_references(&mut interaction);
+        Self::from_typed_parts(token, interaction, credential_references)
+    }
+
     pub(crate) fn from_typed_parts(
         token: String,
         mut interaction: SessionInteraction,
@@ -783,12 +839,38 @@ impl SessionRegistry {
         self
     }
 
-    pub(crate) fn from_parts(
+    /// Reconstruct a registry from the public compatibility representation.
+    /// Credential-reference strings cross into daemon storage only after they
+    /// have been validated and converted to their nominal internal type.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn from_parts(
+        grants: HashMap<String, SessionGrant>,
+        history: Vec<HistoricalGrant>,
+        interactions: Vec<(String, SessionInteraction)>,
+        history_retention_secs: u64,
+    ) -> Self {
+        let interactions = interactions
+            .into_iter()
+            .map(|(token, interaction)| {
+                StoredSessionInteraction::from_compatibility_parts(token, interaction)
+            })
+            .collect();
+        Self::from_typed_parts(grants, history, interactions, history_retention_secs)
+    }
+
+    pub(crate) fn from_typed_parts(
         grants: HashMap<String, SessionGrant>,
         history: Vec<HistoricalGrant>,
         interactions: Vec<StoredSessionInteraction>,
         history_retention_secs: u64,
     ) -> Self {
+        let grants = grants
+            .into_iter()
+            .map(|(token, mut grant)| {
+                grant.normalize_access_managed_posture();
+                (token, grant)
+            })
+            .collect();
         Self {
             grants,
             history,
@@ -811,7 +893,7 @@ impl SessionRegistry {
         self.history.clone()
     }
 
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn interactions_snapshot(&self) -> Vec<(String, SessionInteraction)> {
         self.interactions
             .iter()
@@ -855,6 +937,7 @@ impl SessionRegistry {
         if grant.granted_at == 0 {
             grant.granted_at = now_unix();
         }
+        grant.normalize_access_managed_posture();
         // Free-form grant text is persisted to the state database and echoed
         // by inspection commands; credential-shaped material must not enter
         // it. Rule patterns are left as authored: sanitizing them would
@@ -1322,13 +1405,18 @@ impl SessionRegistry {
             .collect()
     }
 
-    #[cfg(test)]
+    /// Record an interaction supplied through the public compatibility model.
+    /// Reference strings are validated and converted before storage; daemon
+    /// execution paths supply already typed references through the private
+    /// entry point below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_interaction(&mut self, token: &str, mut interaction: SessionInteraction) {
-        // This public compatibility entry point does not trust presentation
-        // strings as credential provenance. Daemon execution paths use the
-        // typed method below.
-        interaction.exposed_secret_refs.clear();
-        self.record_interaction_with_credential_references(token, interaction, Vec::new());
+        let credential_references = take_compatibility_credential_references(&mut interaction);
+        self.record_interaction_with_credential_references(
+            token,
+            interaction,
+            credential_references,
+        );
     }
 
     pub(crate) fn record_interaction_with_credential_references(
@@ -1541,13 +1629,13 @@ impl SessionRegistry {
     }
 
     /// Whether this session contributes authority context to an evaluator
-    /// request. An implicit additive access overlay inherits the caller's
-    /// baseline evaluator unchanged; its reviewed typed verbs are enforced by
-    /// admission before evaluation instead of by prompt text.
+    /// request. Access-managed sessions are policy-only and never contribute
+    /// evaluator context; unmatched implicit overlays are detached before
+    /// policy evaluation.
     pub(crate) fn evaluator_context_applies_for(&self, token: &str) -> Option<bool> {
         let posture = self.evaluator_posture_for(token)?;
         Some(match (self.is_access_managed(token), posture) {
-            (true, SessionEvaluatorPosture::InheritBaselineEvaluator) => false,
+            (true, _) => false,
             (
                 _,
                 SessionEvaluatorPosture::InheritBaselineEvaluator
@@ -1616,14 +1704,10 @@ impl SessionRegistry {
         if grant.is_expired(now_unix()) {
             return None;
         }
-        if grant.static_only {
-            return Some(SessionEvaluatorPosture::PolicyOnly);
-        }
-        Some(match grant.scope.evaluation_mode {
-            EvaluationMode::Evaluator => SessionEvaluatorPosture::InheritBaselineEvaluator,
-            EvaluationMode::PolicyOnly => SessionEvaluatorPosture::PolicyOnly,
-            EvaluationMode::ReadOnly => SessionEvaluatorPosture::ReadOnly,
-        })
+        Some(SessionEvaluatorPosture::from_persisted(
+            grant.scope.evaluation_mode,
+            grant.static_only,
+        ))
     }
 
     pub fn evaluation_mode_for(&self, token: &str) -> Option<EvaluationMode> {
@@ -1734,6 +1818,7 @@ impl SessionRegistry {
         if let Some(mode) = delta.evaluation_mode {
             grant.scope.evaluation_mode = mode;
         }
+        grant.normalize_access_managed_posture();
         let changed = before != serde_json::to_vec(grant).ok()?;
         if changed {
             self.revision = self.revision.saturating_add(1);
@@ -2036,8 +2121,8 @@ mod tests {
         assert!(grant.allow_exact.is_empty());
         assert!(grant.activated_verbs.is_empty());
         assert!(grant.scope.access_managed);
-        assert_eq!(grant.scope.evaluation_mode, EvaluationMode::Evaluator);
-        assert!(!grant.static_only);
+        assert_eq!(grant.scope.evaluation_mode, EvaluationMode::PolicyOnly);
+        assert!(grant.static_only);
         assert!(!grant.auto_amend);
         grant.prompt_append = Some("must not alter the baseline evaluator".to_string());
 
@@ -2048,12 +2133,99 @@ mod tests {
             .is_none());
         assert_eq!(
             registry.evaluator_posture_for("access-token"),
-            Some(SessionEvaluatorPosture::InheritBaselineEvaluator)
+            Some(SessionEvaluatorPosture::PolicyOnly)
         );
         assert!(registry
             .evaluator_prompt_append_for("access-token")
             .is_none());
-        assert!(!registry.static_only_for("access-token"));
+        assert!(registry.static_only_for("access-token"));
+    }
+
+    #[test]
+    fn registry_boundaries_normalize_access_managed_posture() {
+        let malformed_access_grant = || {
+            let mut grant = SessionGrant::additive_access_overlay(
+                PrincipalKey::from_uid(1000),
+                "compatibility fields".to_string(),
+                now_unix().saturating_add(60),
+            );
+            grant.scope.evaluation_mode = EvaluationMode::Evaluator;
+            grant.static_only = false;
+            grant.auto_amend = true;
+            grant
+        };
+
+        let mut registry = SessionRegistry::new();
+        assert!(registry.grant("live-access".to_string(), malformed_access_grant()));
+        let live = registry.grants_snapshot().remove("live-access").unwrap();
+        assert_eq!(live.scope.evaluation_mode, EvaluationMode::PolicyOnly);
+        assert!(live.static_only);
+        assert!(!live.auto_amend);
+        assert_eq!(
+            registry.apply_delta(
+                "live-access",
+                &GrantRequestDelta {
+                    evaluation_mode: Some(EvaluationMode::ReadOnly),
+                    ..GrantRequestDelta::default()
+                },
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            registry.evaluator_posture_for("live-access"),
+            Some(SessionEvaluatorPosture::PolicyOnly)
+        );
+
+        let reconstructed = SessionRegistry::from_parts(
+            HashMap::from([("restored-access".to_string(), malformed_access_grant())]),
+            Vec::new(),
+            Vec::new(),
+            60,
+        );
+        let restored = reconstructed
+            .grants_snapshot()
+            .remove("restored-access")
+            .unwrap();
+        assert_eq!(restored.scope.evaluation_mode, EvaluationMode::PolicyOnly);
+        assert!(restored.static_only);
+        assert!(!restored.auto_amend);
+    }
+
+    #[test]
+    fn evaluator_posture_round_trips_compatibility_fields() {
+        for posture in [
+            SessionEvaluatorPosture::InheritBaselineEvaluator,
+            SessionEvaluatorPosture::PolicyOnly,
+            SessionEvaluatorPosture::ReadOnly,
+        ] {
+            let (evaluation_mode, static_only) = posture.persisted_fields();
+            assert_eq!(
+                SessionEvaluatorPosture::from_persisted(evaluation_mode, static_only),
+                posture
+            );
+        }
+        assert_eq!(
+            SessionEvaluatorPosture::from_persisted(EvaluationMode::ReadOnly, true),
+            SessionEvaluatorPosture::PolicyOnly
+        );
+
+        let access_grant = SessionGrant::additive_access_overlay(
+            PrincipalKey::from_uid(1000),
+            "compatibility fields".to_string(),
+            now_unix().saturating_add(60),
+        );
+        assert_eq!(
+            access_grant.scope.evaluation_mode,
+            EvaluationMode::PolicyOnly
+        );
+        assert!(access_grant.static_only);
+        assert_eq!(
+            SessionEvaluatorPosture::from_persisted(
+                access_grant.scope.evaluation_mode,
+                access_grant.static_only,
+            ),
+            SessionEvaluatorPosture::PolicyOnly
+        );
     }
 
     #[test]
@@ -2096,16 +2268,41 @@ mod tests {
         );
 
         let mut manually_untrusted = interaction.clone();
-        manually_untrusted.exposed_secret_refs = vec!["looks-valid".to_string()];
+        manually_untrusted.exposed_secret_refs = vec![
+            "service/token".to_string(),
+            "../invalid".to_string(),
+            fixture_bearer_jwt(),
+            FIXTURE_PASSWORD_FLAG.to_string(),
+        ];
         assert_eq!(
             serde_json::to_value(&manually_untrusted).unwrap()["exposed_secret_refs"][0],
-            "looks-valid"
+            "service/token"
         );
         let mut registry = SessionRegistry::new();
         registry.record_interaction("compatibility-token", manually_untrusted);
-        assert!(registry.show("compatibility-token", 1).unwrap().recent[0]
-            .exposed_secret_refs
-            .is_empty());
+        assert_eq!(
+            registry.show("compatibility-token", 1).unwrap().recent[0].exposed_secret_refs,
+            vec!["service/token"]
+        );
+
+        let mut reconstructed_interaction = interaction.clone();
+        reconstructed_interaction.exposed_secret_refs = vec![
+            "api-endpoint:prod:upstream".to_string(),
+            "../invalid".to_string(),
+            fixture_bearer_jwt(),
+        ];
+        let reconstructed = SessionRegistry::from_parts(
+            HashMap::new(),
+            Vec::new(),
+            vec![("reconstructed-token".to_string(), reconstructed_interaction)],
+            3_600,
+        );
+        assert_eq!(
+            reconstructed.interactions_snapshot()[0]
+                .1
+                .exposed_secret_refs,
+            vec!["api-endpoint:prod:upstream"]
+        );
 
         let object = encoded.as_object_mut().unwrap();
         let references = object.remove("exposed_secret_refs").unwrap();
@@ -2807,7 +3004,7 @@ mod tests {
             },
         );
         let trace_value = ["q", "7"].concat();
-        let registry = SessionRegistry::from_parts(
+        let registry = SessionRegistry::from_typed_parts(
             grants,
             Vec::new(),
             vec![StoredSessionInteraction::from_typed_parts(

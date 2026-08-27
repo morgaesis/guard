@@ -145,6 +145,11 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
+    let mut session_attachment = request
+        .session_token
+        .as_ref()
+        .map(|_| SessionAttachmentOrigin::ExplicitRequest);
+
     // Local access authority is selected by the kernel-authenticated principal.
     // Replace only an unknown or expired supplied handle; a known handle stays
     // attached so the owner check below rejects cross-principal use.
@@ -160,6 +165,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                     super::admin::access_token_for_principal_ci(&sessions, &principal)
                 {
                     request.session_token = Some(token);
+                    session_attachment = Some(SessionAttachmentOrigin::ImplicitAccessOverlay);
                 }
             }
         }
@@ -226,12 +232,35 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         return *result;
     }
 
-    let verb_resolution = match resolve_verb_context(&mut phase, &mut request).await {
+    let request_before_verb_resolution = request.clone();
+    let mut verb_resolution = match resolve_verb_context(&mut phase, &mut request).await {
         Ok(resolution) => resolution,
         Err(result) => return *result,
     };
     phase.verb_matches = verb_resolution.matches.clone();
     phase.verb_guidance = verb_resolution.guidance.clone();
+
+    // An access overlay is additive only when one of its reviewed session
+    // verbs is selected. Detach an unmatched implicit overlay before policy
+    // validation so unrelated commands follow the caller's baseline policy.
+    // Restoring the pre-resolution request also discards session-derived
+    // rendering and revert state. An explicitly requested session remains
+    // attached and policy-only.
+    if matches!(
+        session_attachment,
+        Some(SessionAttachmentOrigin::ImplicitAccessOverlay)
+    ) && selected_session_verbs(&phase).is_empty()
+    {
+        request = request_before_verb_resolution;
+        request.session_token = None;
+        phase.session_token = None;
+        verb_resolution = match resolve_verb_context(&mut phase, &mut request).await {
+            Ok(resolution) => resolution,
+            Err(result) => return *result,
+        };
+        phase.verb_matches = verb_resolution.matches.clone();
+        phase.verb_guidance = verb_resolution.guidance.clone();
+    }
 
     let (depth, command_line) = match validate_exec_request(&mut phase, &request).await {
         Ok(validated) => validated,
@@ -498,6 +527,12 @@ struct ExecPhase<'a, W> {
     session_token: Option<String>,
     verb_matches: Vec<VerbMatchInfo>,
     verb_guidance: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionAttachmentOrigin {
+    ExplicitRequest,
+    ImplicitAccessOverlay,
 }
 
 fn decision_trace_for_phase<W: AsyncWrite + Unpin>(

@@ -1596,6 +1596,13 @@ pub(super) enum ExecOutcome {
     },
 }
 
+#[derive(Default)]
+struct ExecutionAuditMetadata {
+    /// Typed secret-store references whose values entered the environment of a
+    /// successfully spawned child. This does not prove the child consumed them.
+    credential_references: Vec<CredentialReference>,
+}
+
 pub(super) struct ExecuteResult {
     policy: PolicyOutcome,
     pub(super) exec: ExecOutcome,
@@ -1605,12 +1612,9 @@ pub(super) struct ExecuteResult {
     /// default keeps direct tests and new transports from exposing operator
     /// commands until they explicitly attach an audience.
     operator_guidance: bool,
-    /// Typed secret-store references whose values entered the environment of a
-    /// successfully spawned child. This internal audit/session field is never
-    /// copied into the public [`ExecuteResponse`] wire contract, which has
-    /// never exposed credential references. This does not prove the child
-    /// consumed them.
-    credential_references: Vec<CredentialReference>,
+    /// Internal audit/session metadata, deliberately separate from the public
+    /// [`ExecuteResponse`] wire contract.
+    audit_metadata: ExecutionAuditMetadata,
     verb_matches: Vec<VerbMatchInfo>,
     verb_guidance: Option<String>,
     decision_source: SessionDecisionSource,
@@ -1630,7 +1634,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            credential_references: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1656,7 +1660,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            credential_references: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1680,7 +1684,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            credential_references: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1705,7 +1709,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            credential_references: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1717,7 +1721,7 @@ impl ExecuteResult {
             policy: PolicyOutcome::Allowed {
                 reason: Self::sanitize_prose(reason),
             },
-            credential_references: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             exec: ExecOutcome::DryRun { coverage: None },
             request_handle: None,
             access_requests: Vec::new(),
@@ -1741,7 +1745,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            credential_references: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1759,7 +1763,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            credential_references: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1794,7 +1798,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            credential_references: Vec::new(),
+            audit_metadata: ExecutionAuditMetadata::default(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1833,7 +1837,7 @@ impl ExecuteResult {
     ) -> Self {
         credential_references.sort();
         credential_references.dedup();
-        self.credential_references = credential_references;
+        self.audit_metadata.credential_references = credential_references;
         self
     }
 
@@ -1906,7 +1910,7 @@ impl ExecuteResult {
     }
 
     pub(super) fn credential_references(&self) -> &[CredentialReference] {
-        &self.credential_references
+        &self.audit_metadata.credential_references
     }
 
     pub(super) fn exit_code(&self) -> Option<i32> {
