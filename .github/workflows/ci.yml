@@ -153,6 +153,7 @@ jobs:
     name: Required release package validation
     uses: ./.github/workflows/release.yml
     permissions:
+      actions: read
       contents: read
 
   # Branch protection requires a status check literally named "Test & Lint".
