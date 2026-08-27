@@ -54,7 +54,7 @@ const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
 
 #[derive(Debug)]
-struct AdditiveAccessRevisionUpdate {
+struct SessionRevisionUpdate {
     token: String,
     old_revision: String,
     new_revision: String,
@@ -640,16 +640,16 @@ impl SessionStore {
         Self::load_registry_sync_with_hook(path, history_retention_secs, || {})
     }
 
-    fn rebase_additive_access_dependents(
-        tx: &Transaction<'_>,
-        updates: &[AdditiveAccessRevisionUpdate],
+    fn rebase_pending_session_dependents(
+        conn: &Connection,
+        updates: &[SessionRevisionUpdate],
     ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
 
         let pending_requests = {
-            let mut stmt = tx.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT handle, json FROM grant_requests WHERE status = 'pending' ORDER BY handle",
             )?;
             let rows = stmt
@@ -676,7 +676,7 @@ impl SessionStore {
                     .context("rebase pending access request key")?;
             }
             validate_persisted_access_request(&request)?;
-            tx.execute(
+            conn.execute(
                 "UPDATE grant_requests SET json = ?1 WHERE handle = ?2",
                 params![
                     serde_json::to_string(&request).context("encode rebased access request")?,
@@ -686,7 +686,7 @@ impl SessionStore {
         }
 
         let pending_approvals = {
-            let mut stmt = tx.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT handle, json FROM gating_approval WHERE status = 'pending' ORDER BY handle",
             )?;
             let rows = stmt
@@ -708,7 +708,7 @@ impl SessionStore {
             };
             approval.snapshot.session_revision = Some(update.new_revision.clone());
             validate_persisted_approval(&approval)?;
-            tx.execute(
+            conn.execute(
                 "UPDATE gating_approval SET json = ?1 WHERE handle = ?2",
                 params![
                     serde_json::to_string(&approval).context("encode rebased approval")?,
@@ -768,7 +768,7 @@ impl SessionStore {
             })?;
             for row in rows {
                 let (token, mut grant) = row?;
-                if grant.scope.access_managed
+                let additive_access_old_revision = if grant.scope.access_managed
                     && grant.static_only
                     && grant.scope.evaluation_mode != EvaluationMode::PolicyOnly
                 {
@@ -779,15 +779,10 @@ impl SessionStore {
                     let old_revision = session_grant_revision_key(&grant)
                         .context("compute legacy access session revision")?;
                     grant.static_only = false;
-                    let new_revision = session_grant_revision_key(&grant)
-                        .context("compute additive access session revision")?;
-                    additive_access_updates.push(AdditiveAccessRevisionUpdate {
-                        token: token.clone(),
-                        old_revision,
-                        new_revision,
-                        token_fingerprint: access_session_token_fingerprint(&token),
-                    });
-                }
+                    Some(old_revision)
+                } else {
+                    None
+                };
                 let allow_changed = purge_sensitive_exact_rules(&mut grant.allow_exact);
                 let deny_changed = purge_sensitive_exact_rules(&mut grant.deny_exact);
                 let exact_metadata = serialized_contains_registered_exact_literals(&grant)?;
@@ -806,6 +801,21 @@ impl SessionStore {
                         encode_exact_vec(&grant.allow_exact)?,
                         encode_exact_vec(&grant.deny_exact)?,
                     ));
+                }
+                if let Some(old_revision) = additive_access_old_revision {
+                    // The replacement revision covers every startup mutation,
+                    // including sensitive exact-rule normalization above. A
+                    // dependent must never be rebased to an intermediate
+                    // grant shape that is not the one retained in memory and
+                    // persisted by this transaction.
+                    let new_revision = session_grant_revision_key(&grant)
+                        .context("compute final additive access session revision")?;
+                    additive_access_updates.push(SessionRevisionUpdate {
+                        token: token.clone(),
+                        old_revision,
+                        new_revision,
+                        token_fingerprint: access_session_token_fingerprint(&token),
+                    });
                 }
                 grants.insert(token, grant);
             }
@@ -927,7 +937,7 @@ impl SessionStore {
                 params![update.token],
             )?;
         }
-        Self::rebase_additive_access_dependents(&tx, &additive_access_updates)?;
+        Self::rebase_pending_session_dependents(&tx, &additive_access_updates)?;
         for grant in &retired_active {
             tx.execute(
                 "DELETE FROM session_grants WHERE token = ?1",
@@ -3286,7 +3296,8 @@ fn migrate_v13_dispatch_rows(conn: &Connection) -> Result<()> {
 }
 
 fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
-    let exact_authority_changed = repair_sensitive_session_exact_authority(conn)?;
+    let (exact_authority_changed, exact_revision_updates) =
+        repair_sensitive_session_exact_authority(conn)?;
     {
         let mut stmt = conn.prepare(
             "SELECT rowid, command, reason, secret_refs_json, decision_trace_json FROM session_interactions",
@@ -3578,6 +3589,7 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
             )?;
         }
     }
+    SessionStore::rebase_pending_session_dependents(conn, &exact_revision_updates)?;
     if exact_authority_changed {
         conn.execute(
             "UPDATE state_metadata SET value = value + 1 WHERE key = ?1",
@@ -3666,8 +3678,11 @@ fn insert_historical_grant(conn: &Connection, grant: &HistoricalGrant) -> Result
 /// Sensitive allows can be dropped safely. A sensitive deny on an active
 /// session retires the entire session because preserving broader authority
 /// without that deny would widen access.
-fn repair_sensitive_session_exact_authority(conn: &Connection) -> Result<bool> {
+fn repair_sensitive_session_exact_authority(
+    conn: &Connection,
+) -> Result<(bool, Vec<SessionRevisionUpdate>)> {
     let mut changed = false;
+    let mut revision_updates = Vec::new();
     let mut active = Vec::new();
     {
         let mut stmt = conn.prepare(
@@ -3701,6 +3716,8 @@ fn repair_sensitive_session_exact_authority(conn: &Connection) -> Result<bool> {
     }
 
     for (token, mut grant) in active {
+        let old_revision = session_grant_revision_key(&grant)
+            .context("compute pre-sanitization session revision")?;
         let allow_changed = purge_sensitive_exact_rules(&mut grant.allow_exact);
         let deny_changed = purge_sensitive_exact_rules(&mut grant.deny_exact);
         if deny_changed {
@@ -3718,10 +3735,16 @@ fn repair_sensitive_session_exact_authority(conn: &Connection) -> Result<bool> {
                 "UPDATE session_grants SET allow_exact_json = ?1 WHERE token = ?2",
                 params![encode_exact_vec(&grant.allow_exact)?, token],
             )?;
+            revision_updates.push(SessionRevisionUpdate {
+                token: token.clone(),
+                old_revision,
+                new_revision: session_grant_revision_key(&grant)
+                    .context("compute sanitized session revision")?,
+                token_fingerprint: access_session_token_fingerprint(&token),
+            });
             changed = true;
         }
     }
-
     let history_rows = {
         let mut stmt =
             conn.prepare("SELECT id, allow_exact_json, deny_exact_json FROM session_history")?;
@@ -3748,7 +3771,7 @@ fn repair_sensitive_session_exact_authority(conn: &Connection) -> Result<bool> {
             changed = true;
         }
     }
-    Ok(changed)
+    Ok((changed, revision_updates))
 }
 
 fn purge_sensitive_exact_rules(rules: &mut Vec<SessionExactRule>) -> bool {
@@ -6156,11 +6179,24 @@ mod tests {
             auto_amend: false,
             owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
         };
-        let mut registry = SessionRegistry::new();
-        registry.grant(
-            legacy_token.clone(),
-            access_grant(EvaluationMode::Evaluator),
+        let sensitive_exact = SessionExactRule::new(
+            "curl",
+            vec![
+                "--user".to_string(),
+                "SyntheticUser:SyntheticPassphrase123".to_string(),
+            ],
         );
+        assert!(guard::redact::command_contains_sensitive_literals(
+            &sensitive_exact.binary,
+            &sensitive_exact.args,
+        ));
+        let mut legacy_grant = access_grant(EvaluationMode::Evaluator);
+        legacy_grant.allow_exact.push(sensitive_exact.clone());
+        let old_revision = session_grant_revision_key(&legacy_grant).unwrap();
+        let mut persisted_legacy_grant = legacy_grant;
+        persisted_legacy_grant.allow_exact.clear();
+        let mut registry = SessionRegistry::new();
+        registry.grant(legacy_token.clone(), persisted_legacy_grant);
         registry.grant(
             explicit_token.clone(),
             access_grant(EvaluationMode::PolicyOnly),
@@ -6168,7 +6204,6 @@ mod tests {
         let seeded_generation =
             SessionStore::persist_registry_sync(&path, 3600, &registry, initial_generation)
                 .unwrap();
-        let old_revision = registry.effective_revision_key(&legacy_token).unwrap();
         let mut request = generated_access_request();
         request.session_token = legacy_token.clone();
         request.issued_session_revision = Some(old_revision.clone());
@@ -6178,6 +6213,11 @@ mod tests {
             Some(access_session_token_fingerprint(&legacy_token));
         approval.snapshot.session_revision = Some(old_revision);
         let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE session_grants SET allow_exact_json = ?1 WHERE token = ?2",
+            params![encode_exact_vec(&[sensitive_exact]).unwrap(), legacy_token],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO grant_requests (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -6204,7 +6244,11 @@ mod tests {
             SessionStore::load_registry_sync(&path, 3600).unwrap();
         assert!(!loaded.static_only_for(&legacy_token));
         assert!(loaded.static_only_for(&explicit_token));
-        assert_eq!(normalized_generation, seeded_generation + 1);
+        assert_eq!(
+            normalized_generation,
+            seeded_generation + 2,
+            "sensitive-rule sanitation and additive access normalization each advance authority"
+        );
         let new_revision = loaded.effective_revision_key(&legacy_token).unwrap();
         let conn = Connection::open(&path).unwrap();
         let normalized: i64 = conn
