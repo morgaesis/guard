@@ -859,6 +859,94 @@ fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn unmatched_implicit_access_overlay_is_removed_from_verb_resolution() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: broad-access-check
+    binary: true
+    consequence: reversible
+    trusted: true
+    hold: true
+    baseline: false
+    coverage:
+      - name: broad-access
+        action: preauthorized
+        required_args: ["--check"]
+  - name: narrow-baseline-check
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: narrow-baseline
+        action: evaluate
+        sticky: true
+        required_args: ["--check", "safe"]
+"#,
+        )
+        .unwrap(),
+    ));
+    let mut overlay = SessionGrant::additive_access_overlay(
+        PrincipalKey::from_uid(1001),
+        "access overlay".to_string(),
+        guard::env::now_unix().saturating_add(60),
+    );
+    overlay.activated_verbs = vec!["broad-access-check".to_string()];
+    overlay.scope.access_grants = vec![AccessUseGrant {
+        request: "approved-access".to_string(),
+        verbs: vec!["broad-access-check".to_string()],
+        use_limit: Some(1),
+        remaining_uses: Some(1),
+        pending: false,
+    }];
+    assert!(cfg
+        .state
+        .sessions
+        .write()
+        .await
+        .grant("implicit-access".to_string(), overlay));
+
+    let mut request = request_with_session(
+        "true",
+        vec!["--check".to_string(), "safe".to_string()],
+        "unused".to_string(),
+    );
+    request.session_token = None;
+    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1001 })
+        .await
+        .into_response();
+
+    assert_eq!(
+        response.verb_matches.len(),
+        1,
+        "{:?}",
+        response.verb_matches
+    );
+    assert_eq!(response.verb_matches[0].verb, "narrow-baseline-check");
+    assert_eq!(
+        response.verb_matches[0].scope,
+        guard::gating::coverage::VerbMatchScope::Baseline
+    );
+    assert_eq!(
+        response.verb_matches[0].action,
+        guard::gating::verb::CoverageAction::Evaluate
+    );
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .aggregate_access_uses("implicit-access")
+            .flatten(),
+        Some(1),
+        "detached access authority must not be consumed"
+    );
+}
+
 async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
@@ -988,12 +1076,32 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
             .map(|trace| trace.decision_source.as_str()),
         "an empty additive overlay must preserve the baseline decision path"
     );
+    let access_token = cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .access_token_for_principal(&PrincipalKey::from_uid(1001))
+        .unwrap();
+    let explicitly_scoped = execute_command(
+        request_with_session(
+            "rustc",
+            vec!["--print".to_string(), "cfg".to_string()],
+            access_token.clone(),
+        ),
+        &cfg,
+        &worker,
+    )
+    .await
+    .into_response();
+    assert!(!explicitly_scoped.allowed);
+    assert!(explicitly_scoped
+        .reason
+        .contains("session policy-only mode"));
+
     let remaining_before_access = {
         let sessions = cfg.state.sessions.read().await;
-        let token = sessions
-            .access_token_for_principal(&PrincipalKey::from_uid(1001))
-            .unwrap();
-        sessions.aggregate_access_uses(&token).flatten()
+        sessions.aggregate_access_uses(&access_token).flatten()
     };
     assert_eq!(remaining_before_access, Some(1));
 
@@ -1121,8 +1229,8 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .find(|summary| summary.owner.label() == "1001")
         .unwrap();
     assert!(
-        !restored.static_only_for(&restored_access.token),
-        "persisted access-managed authority must remain additive"
+        restored.static_only_for(&restored_access.token),
+        "persisted access-managed authority must remain policy-only"
     );
     assert_eq!(
         restored

@@ -142,24 +142,6 @@ impl SessionEvaluatorPosture {
             EvaluationMode::ReadOnly => Self::ReadOnly,
         }
     }
-
-    fn access_overlay_persisted_fields(self) -> (EvaluationMode, bool) {
-        let (evaluation_mode, _) = self.persisted_fields();
-        // Readers that do not understand additive access overlays must treat
-        // one as policy-only rather than as evaluator authority.
-        (evaluation_mode, true)
-    }
-
-    fn from_grant(grant: &SessionGrant) -> Self {
-        if grant.scope.access_managed {
-            return match grant.scope.evaluation_mode {
-                EvaluationMode::Evaluator => Self::InheritBaselineEvaluator,
-                EvaluationMode::PolicyOnly => Self::PolicyOnly,
-                EvaluationMode::ReadOnly => Self::ReadOnly,
-            };
-        }
-        Self::from_persisted(grant.scope.evaluation_mode, grant.static_only)
-    }
 }
 
 pub(crate) fn session_grant_revision_key(grant: &SessionGrant) -> Option<String> {
@@ -243,21 +225,30 @@ fn access_selection_rank(grant: &SessionGrant, selected: &[usize]) -> (usize, us
 }
 
 impl SessionGrant {
+    fn normalize_access_managed_posture(&mut self) {
+        if !self.scope.access_managed {
+            return;
+        }
+        let (evaluation_mode, static_only) = SessionEvaluatorPosture::PolicyOnly.persisted_fields();
+        self.scope.evaluation_mode = evaluation_mode;
+        self.static_only = static_only;
+        self.auto_amend = false;
+    }
+
     /// Build the implicit session installed for approved access requests.
     ///
     /// This is an additive typed-authority overlay, not a general command
     /// grant: every legacy allow/deny collection starts empty, automatic
     /// amendment is disabled, and approved verbs are added separately only
-    /// after durable operator review. Current readers derive
-    /// `InheritBaselineEvaluator` from the explicit overlay scope, while the
-    /// legacy static-policy field remains fail-closed for older readers.
+    /// after durable operator review. The session is policy-only. Command
+    /// execution detaches an implicitly selected overlay when it contributes
+    /// no selected session verb, leaving the caller's baseline policy intact.
     pub(crate) fn additive_access_overlay(
         owner: PrincipalKey,
         label: String,
         expires_at: u64,
     ) -> Self {
-        let (evaluation_mode, static_only) =
-            SessionEvaluatorPosture::InheritBaselineEvaluator.access_overlay_persisted_fields();
+        let (evaluation_mode, static_only) = SessionEvaluatorPosture::PolicyOnly.persisted_fields();
         Self {
             allow: Vec::new(),
             deny: Vec::new(),
@@ -873,6 +864,13 @@ impl SessionRegistry {
         interactions: Vec<StoredSessionInteraction>,
         history_retention_secs: u64,
     ) -> Self {
+        let grants = grants
+            .into_iter()
+            .map(|(token, mut grant)| {
+                grant.normalize_access_managed_posture();
+                (token, grant)
+            })
+            .collect();
         Self {
             grants,
             history,
@@ -939,6 +937,7 @@ impl SessionRegistry {
         if grant.granted_at == 0 {
             grant.granted_at = now_unix();
         }
+        grant.normalize_access_managed_posture();
         // Free-form grant text is persisted to the state database and echoed
         // by inspection commands; credential-shaped material must not enter
         // it. Rule patterns are left as authored: sanitizing them would
@@ -1630,13 +1629,13 @@ impl SessionRegistry {
     }
 
     /// Whether this session contributes authority context to an evaluator
-    /// request. An implicit additive access overlay inherits the caller's
-    /// baseline evaluator unchanged; its reviewed typed verbs are enforced by
-    /// admission before evaluation instead of by prompt text.
+    /// request. Access-managed sessions are policy-only and never contribute
+    /// evaluator context; unmatched implicit overlays are detached before
+    /// policy evaluation.
     pub(crate) fn evaluator_context_applies_for(&self, token: &str) -> Option<bool> {
         let posture = self.evaluator_posture_for(token)?;
         Some(match (self.is_access_managed(token), posture) {
-            (true, SessionEvaluatorPosture::InheritBaselineEvaluator) => false,
+            (true, _) => false,
             (
                 _,
                 SessionEvaluatorPosture::InheritBaselineEvaluator
@@ -1705,7 +1704,10 @@ impl SessionRegistry {
         if grant.is_expired(now_unix()) {
             return None;
         }
-        Some(SessionEvaluatorPosture::from_grant(grant))
+        Some(SessionEvaluatorPosture::from_persisted(
+            grant.scope.evaluation_mode,
+            grant.static_only,
+        ))
     }
 
     pub fn evaluation_mode_for(&self, token: &str) -> Option<EvaluationMode> {
@@ -1816,6 +1818,7 @@ impl SessionRegistry {
         if let Some(mode) = delta.evaluation_mode {
             grant.scope.evaluation_mode = mode;
         }
+        grant.normalize_access_managed_posture();
         let changed = before != serde_json::to_vec(grant).ok()?;
         if changed {
             self.revision = self.revision.saturating_add(1);
@@ -2118,7 +2121,7 @@ mod tests {
         assert!(grant.allow_exact.is_empty());
         assert!(grant.activated_verbs.is_empty());
         assert!(grant.scope.access_managed);
-        assert_eq!(grant.scope.evaluation_mode, EvaluationMode::Evaluator);
+        assert_eq!(grant.scope.evaluation_mode, EvaluationMode::PolicyOnly);
         assert!(grant.static_only);
         assert!(!grant.auto_amend);
         grant.prompt_append = Some("must not alter the baseline evaluator".to_string());
@@ -2130,12 +2133,62 @@ mod tests {
             .is_none());
         assert_eq!(
             registry.evaluator_posture_for("access-token"),
-            Some(SessionEvaluatorPosture::InheritBaselineEvaluator)
+            Some(SessionEvaluatorPosture::PolicyOnly)
         );
         assert!(registry
             .evaluator_prompt_append_for("access-token")
             .is_none());
-        assert!(!registry.static_only_for("access-token"));
+        assert!(registry.static_only_for("access-token"));
+    }
+
+    #[test]
+    fn registry_boundaries_normalize_access_managed_posture() {
+        let malformed_access_grant = || {
+            let mut grant = SessionGrant::additive_access_overlay(
+                PrincipalKey::from_uid(1000),
+                "compatibility fields".to_string(),
+                now_unix().saturating_add(60),
+            );
+            grant.scope.evaluation_mode = EvaluationMode::Evaluator;
+            grant.static_only = false;
+            grant.auto_amend = true;
+            grant
+        };
+
+        let mut registry = SessionRegistry::new();
+        assert!(registry.grant("live-access".to_string(), malformed_access_grant()));
+        let live = registry.grants_snapshot().remove("live-access").unwrap();
+        assert_eq!(live.scope.evaluation_mode, EvaluationMode::PolicyOnly);
+        assert!(live.static_only);
+        assert!(!live.auto_amend);
+        assert_eq!(
+            registry.apply_delta(
+                "live-access",
+                &GrantRequestDelta {
+                    evaluation_mode: Some(EvaluationMode::ReadOnly),
+                    ..GrantRequestDelta::default()
+                },
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            registry.evaluator_posture_for("live-access"),
+            Some(SessionEvaluatorPosture::PolicyOnly)
+        );
+
+        let reconstructed = SessionRegistry::from_parts(
+            HashMap::from([("restored-access".to_string(), malformed_access_grant())]),
+            Vec::new(),
+            Vec::new(),
+            60,
+        );
+        let restored = reconstructed
+            .grants_snapshot()
+            .remove("restored-access")
+            .unwrap();
+        assert_eq!(restored.scope.evaluation_mode, EvaluationMode::PolicyOnly);
+        assert!(restored.static_only);
+        assert!(!restored.auto_amend);
     }
 
     #[test]
@@ -2156,22 +2209,23 @@ mod tests {
             SessionEvaluatorPosture::PolicyOnly
         );
 
-        let mut access_grant = SessionGrant::additive_access_overlay(
+        let access_grant = SessionGrant::additive_access_overlay(
             PrincipalKey::from_uid(1000),
             "compatibility fields".to_string(),
             now_unix().saturating_add(60),
         );
-        for posture in [
-            SessionEvaluatorPosture::InheritBaselineEvaluator,
-            SessionEvaluatorPosture::PolicyOnly,
-            SessionEvaluatorPosture::ReadOnly,
-        ] {
-            let (evaluation_mode, static_only) = posture.access_overlay_persisted_fields();
-            assert!(static_only);
-            access_grant.scope.evaluation_mode = evaluation_mode;
-            access_grant.static_only = static_only;
-            assert_eq!(SessionEvaluatorPosture::from_grant(&access_grant), posture);
-        }
+        assert_eq!(
+            access_grant.scope.evaluation_mode,
+            EvaluationMode::PolicyOnly
+        );
+        assert!(access_grant.static_only);
+        assert_eq!(
+            SessionEvaluatorPosture::from_persisted(
+                access_grant.scope.evaluation_mode,
+                access_grant.static_only,
+            ),
+            SessionEvaluatorPosture::PolicyOnly
+        );
     }
 
     #[test]

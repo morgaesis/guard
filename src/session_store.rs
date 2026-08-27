@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::grant_profile::EvaluationMode;
 use crate::grant_profile::{GrantRequest, SavedGrant};
 use crate::session::{
@@ -61,6 +60,7 @@ struct SessionRevisionUpdate {
     old_revision: String,
     new_revision: String,
     token_fingerprint: String,
+    scope_json: String,
 }
 
 fn access_session_token_fingerprint(token: &str) -> String {
@@ -770,18 +770,21 @@ impl SessionStore {
             })?;
             for row in rows {
                 let (token, mut grant) = row?;
-                let additive_access_old_revision =
-                    if grant.scope.access_managed && !grant.static_only {
-                        // The compatibility bit stays fail-closed for readers that
-                        // do not understand additive access overlays. Current
-                        // readers derive effective posture from the typed scope.
-                        let old_revision = session_grant_revision_key(&grant)
-                            .context("compute permissive access compatibility revision")?;
-                        grant.static_only = true;
-                        Some(old_revision)
-                    } else {
-                        None
-                    };
+                let additive_access_old_revision = if grant.scope.access_managed
+                    && (!grant.static_only
+                        || grant.scope.evaluation_mode != EvaluationMode::PolicyOnly)
+                {
+                    // Access-managed sessions are policy-only in both
+                    // persisted representations. Normalize legacy rows
+                    // atomically before any authority is admitted.
+                    let old_revision = session_grant_revision_key(&grant)
+                        .context("compute permissive access compatibility revision")?;
+                    grant.static_only = true;
+                    grant.scope.evaluation_mode = EvaluationMode::PolicyOnly;
+                    Some(old_revision)
+                } else {
+                    None
+                };
                 let allow_changed = purge_sensitive_exact_rules(&mut grant.allow_exact);
                 let deny_changed = purge_sensitive_exact_rules(&mut grant.deny_exact);
                 let exact_metadata = serialized_contains_registered_exact_literals(&grant)?;
@@ -814,6 +817,7 @@ impl SessionStore {
                         old_revision,
                         new_revision,
                         token_fingerprint: access_session_token_fingerprint(&token),
+                        scope_json: encode_scope(&grant.scope)?,
                     });
                 }
                 grants.insert(token, grant);
@@ -940,8 +944,8 @@ impl SessionStore {
         }
         for update in &additive_access_updates {
             tx.execute(
-                "UPDATE session_grants SET static_only = 1 WHERE token = ?1",
-                params![update.token],
+                "UPDATE session_grants SET static_only = 1, scope_json = ?2 WHERE token = ?1",
+                params![update.token, update.scope_json],
             )?;
         }
         Self::rebase_pending_session_dependents(&tx, &additive_access_updates)?;
@@ -3757,6 +3761,7 @@ fn repair_sensitive_session_exact_authority(
                     new_revision: session_grant_revision_key(&grant)
                         .context("compute sanitized session revision")?,
                     token_fingerprint: access_session_token_fingerprint(&token),
+                    scope_json: encode_scope(&grant.scope)?,
                 });
                 changed = true;
             }
@@ -6236,6 +6241,7 @@ mod tests {
         let old_revision = session_grant_revision_key(&legacy_grant).unwrap();
         let mut persisted_legacy_grant = legacy_grant;
         persisted_legacy_grant.allow_exact.clear();
+        let legacy_scope_json = encode_scope(&persisted_legacy_grant.scope).unwrap();
         let mut registry = SessionRegistry::new();
         registry.grant(permissive_token.clone(), persisted_legacy_grant);
         registry.grant(
@@ -6255,10 +6261,11 @@ mod tests {
         approval.snapshot.session_revision = Some(old_revision);
         let conn = Connection::open(&path).unwrap();
         conn.execute(
-            "UPDATE session_grants SET allow_exact_json = ?1 WHERE token = ?2",
+            "UPDATE session_grants SET allow_exact_json = ?1, static_only = 0, scope_json = ?3 WHERE token = ?2",
             params![
                 encode_exact_vec(&[sensitive_exact]).unwrap(),
-                permissive_token
+                permissive_token,
+                legacy_scope_json
             ],
         )
         .unwrap();
@@ -6290,8 +6297,16 @@ mod tests {
         assert!(loaded_grants[&permissive_token].static_only);
         assert!(loaded_grants[&explicit_token].static_only);
         assert_eq!(
+            loaded_grants[&permissive_token].scope.evaluation_mode,
+            EvaluationMode::PolicyOnly
+        );
+        assert_eq!(
+            loaded_grants[&explicit_token].scope.evaluation_mode,
+            EvaluationMode::PolicyOnly
+        );
+        assert_eq!(
             loaded.evaluator_posture_for(&permissive_token),
-            Some(crate::session::SessionEvaluatorPosture::InheritBaselineEvaluator)
+            Some(crate::session::SessionEvaluatorPosture::PolicyOnly)
         );
         assert_eq!(
             loaded.evaluator_posture_for(&explicit_token),
@@ -6304,14 +6319,20 @@ mod tests {
         );
         let new_revision = loaded.effective_revision_key(&permissive_token).unwrap();
         let conn = Connection::open(&path).unwrap();
-        let normalized: i64 = conn
+        let (normalized, normalized_scope_json): (i64, String) = conn
             .query_row(
-                "SELECT static_only FROM session_grants WHERE token = ?1",
+                "SELECT static_only, scope_json FROM session_grants WHERE token = ?1",
                 params![permissive_token],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(normalized, 1);
+        assert_eq!(
+            decode_scope(&normalized_scope_json)
+                .unwrap()
+                .evaluation_mode,
+            EvaluationMode::PolicyOnly
+        );
         let rebased_request: GrantRequest = serde_json::from_str(
             &conn
                 .query_row(
