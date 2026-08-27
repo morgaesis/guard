@@ -3093,6 +3093,10 @@ async fn cleanup_revocation_linearizes_at_the_final_header_handoff() {
             .await
             .unwrap();
         assert_eq!(created.status(), 201);
+        created
+            .bytes()
+            .await
+            .expect("create response completes before cleanup handoff");
 
         let cleanup = tokio::spawn(async move {
             client
