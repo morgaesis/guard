@@ -249,9 +249,9 @@ admin envelope accepts only the current operation and field grammar, so removed
 or malformed authority operations fail closed instead of selecting a
 compatibility path.
 
-The state database uses schema version 9. Startup migrates an older database in
+The state database uses schema version 14. Startup migrates an older database in
 place. Treat the installed binary, configuration, API-revert body tree, and
-complete SQLite file set as one rollback unit. Before the first schema-9
+complete SQLite file set as one rollback unit. Before the first schema-14
 startup, resolve armed provisionals where practical, stop the service, verify
 that it is inactive, and create a consistent SQLite backup with the SQLite
 backup API. Copying only `state.db` while a process can write it can omit
@@ -267,8 +267,7 @@ rollback.
 On Unix, the packaged paths use this upgrade sequence:
 
 ```bash
-release_version=0.8.0
-backup_dir="/var/backups/guard-before-v${release_version}"
+release_version=0.8.1
 standard_state="$(systemctl is-active guard.service || true)"
 caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
 case "$standard_state:$caller_state" in
@@ -277,11 +276,12 @@ case "$standard_state:$caller_state" in
   *:active) guard_unit=guard-exec-as-caller.service ;;
   *) echo 'no packaged Guard service is active' >&2; exit 1 ;;
 esac
-test ! -e "$backup_dir"
 sha256sum --check BINARY-SHA256
 expected_binary_hash="$(awk '$2 == "guard" {print $1}' BINARY-SHA256)"
 test "${#expected_binary_hash}" -eq 64
 test ! -f /var/lib/guard/verbs.yaml || ./guard verb lint --file /var/lib/guard/verbs.yaml
+backup_dir="$(mktemp -d "/var/backups/guard-before-v${release_version}-XXXXXXXX")"
+printf 'GUARD_ROLLBACK_BACKUP_DIR=%q\n' "$backup_dir"
 install -d -o root -g root -m 0700 "$backup_dir"
 systemctl stop "$guard_unit"
 test "$(systemctl is-active "$guard_unit" || true)" = inactive
@@ -328,8 +328,8 @@ database and every WAL, SHM, or rollback-journal sidecar before installing the
 backup so SQLite cannot combine files from different snapshots:
 
 ```bash
-release_version=0.8.0
-backup_dir="/var/backups/guard-before-v${release_version}"
+: "${GUARD_ROLLBACK_BACKUP_DIR:?set it to the value printed by the upgrade sequence}"
+backup_dir="$GUARD_ROLLBACK_BACKUP_DIR"
 standard_state="$(systemctl is-active guard.service || true)"
 caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
 case "$standard_state:$caller_state" in

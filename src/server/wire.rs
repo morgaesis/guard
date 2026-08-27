@@ -2,8 +2,8 @@
 use crate::grant_profile::{EvaluationMode, GrantRequestDelta};
 use crate::grant_profile::{GrantRequest, SavedGrant};
 use crate::session::{
-    HistoricalGrant, SessionDecisionSource, SessionExecStatus, SessionGrantSummary, SessionOwner,
-    SessionReport,
+    CredentialReference, HistoricalGrant, SessionDecisionSource, SessionExecStatus,
+    SessionGrantSummary, SessionOwner, SessionReport,
 };
 use guard::gating::approval::{bound_approval_transcript, Approval, WaiterLease};
 use guard::gating::provisional::{Provisional, ProvisionalStatus};
@@ -1605,9 +1605,9 @@ pub(super) struct ExecuteResult {
     /// default keeps direct tests and new transports from exposing operator
     /// commands until they explicitly attach an audience.
     operator_guidance: bool,
-    /// Secret-store key names whose values entered the environment of a
+    /// Typed secret-store references whose values entered the environment of a
     /// successfully spawned child. This does not prove the child consumed them.
-    exposed_secret_refs: Vec<String>,
+    credential_references: Vec<CredentialReference>,
     verb_matches: Vec<VerbMatchInfo>,
     verb_guidance: Option<String>,
     decision_source: SessionDecisionSource,
@@ -1627,7 +1627,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1653,7 +1653,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1677,7 +1677,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1702,7 +1702,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1714,7 +1714,7 @@ impl ExecuteResult {
             policy: PolicyOutcome::Allowed {
                 reason: Self::sanitize_prose(reason),
             },
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             exec: ExecOutcome::DryRun { coverage: None },
             request_handle: None,
             access_requests: Vec::new(),
@@ -1738,7 +1738,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1756,7 +1756,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1791,7 +1791,7 @@ impl ExecuteResult {
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1824,10 +1824,13 @@ impl ExecuteResult {
         self
     }
 
-    pub(super) fn with_exposed_secret_refs(mut self, mut exposed_secret_refs: Vec<String>) -> Self {
-        exposed_secret_refs.sort();
-        exposed_secret_refs.dedup();
-        self.exposed_secret_refs = exposed_secret_refs;
+    pub(super) fn with_credential_references(
+        mut self,
+        mut credential_references: Vec<CredentialReference>,
+    ) -> Self {
+        credential_references.sort();
+        credential_references.dedup();
+        self.credential_references = credential_references;
         self
     }
 
@@ -1899,8 +1902,8 @@ impl ExecuteResult {
         self
     }
 
-    pub(super) fn exposed_secret_refs(&self) -> &[String] {
-        &self.exposed_secret_refs
+    pub(super) fn credential_references(&self) -> &[CredentialReference] {
+        &self.credential_references
     }
 
     pub(super) fn exit_code(&self) -> Option<i32> {

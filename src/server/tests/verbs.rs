@@ -493,7 +493,7 @@ async fn interaction_suspension_before_process_start_denies_execution() {
             risk: None,
             exec_status: SessionExecStatus::NotAttempted,
             exit_code: None,
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             decision_trace: None,
         },
     );
@@ -640,7 +640,7 @@ async fn held_replay_rejects_interaction_suspension_before_process_start() {
             risk: None,
             exec_status: SessionExecStatus::NotAttempted,
             exit_code: None,
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             decision_trace: None,
         },
     );

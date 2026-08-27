@@ -4286,7 +4286,14 @@ async fn exact_amendment_publishes_only_after_persistence_and_preserves_concurre
 
 // Synthetic test-fixture credential shapes (never real secrets): a
 // kubernetes-style service-account bearer JWT and a --password= flag.
-const FIXTURE_BEARER_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6IlN5bnRoZXRpYyJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50In0.SyntheticSignature123";
+fn fixture_bearer_jwt() -> String {
+    [
+        "eyJhbGciOiJSUzI1NiJ9",
+        "eyJzdWIiOiJndWFyZC10ZXN0LWZpeHR1cmUifQ",
+        "c3ludGhldGljLXNpZ25hdHVyZS1ub3QtYS1jcmVkZW50aWFs",
+    ]
+    .join(".")
+}
 const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
 
 #[test]
@@ -4296,7 +4303,7 @@ fn session_auto_amend_refuses_credential_shaped_argv() {
     // on both the allow and the deny side.
     assert!(allow_session_auto_amend_candidate(
         "kubectl",
-        &[format!("--token={FIXTURE_BEARER_JWT}"), "get".into()],
+        &[format!("--token={}", fixture_bearer_jwt()), "get".into()],
         Some(1)
     )
     .is_err());
@@ -4339,7 +4346,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
             deny: Vec::new(),
             allow_exact: vec![SessionExactRule::new(
                 "kubectl",
-                vec![format!("--token={FIXTURE_BEARER_JWT}"), "get".into()],
+                vec![format!("--token={}", fixture_bearer_jwt()), "get".into()],
             )],
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
@@ -4363,14 +4370,14 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
             token.clone(),
             SessionInteraction {
                 at_unix: guard::env::now_unix(),
-                command: format!("kubectl --token={FIXTURE_BEARER_JWT} get pods"),
+                command: format!("kubectl --token={} get pods", fixture_bearer_jwt()),
                 allowed: true,
                 source: SessionDecisionSource::Llm,
                 reason: format!("allowed despite {FIXTURE_PASSWORD_FLAG}"),
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: None,
             },
         )],
@@ -4828,7 +4835,10 @@ async fn session_show_reports_recent_stats() {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                exposed_secret_refs: vec!["service/token".into()],
+                credential_references: vec![crate::session::CredentialReference::from_store_name(
+                    "service/token",
+                )
+                .expect("valid fixture credential reference")],
                 decision_trace: None,
             },
         );
@@ -4843,7 +4853,7 @@ async fn session_show_reports_recent_stats() {
                 risk: None,
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: None,
             },
         );
@@ -4961,7 +4971,7 @@ async fn session_status_self_view_redacts_bearer_and_keeps_decision_trace() {
             risk: Some(0),
             exec_status: SessionExecStatus::Completed,
             exit_code: Some(0),
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             decision_trace: Some(guard::gating::DecisionTrace::source("static_policy")),
         },
     );
@@ -5372,7 +5382,7 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
             exec_status: SessionExecStatus::NotAttempted,
             exit_code: None,
             at_unix: guard::env::now_unix(),
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             decision_trace: None,
         },
     );
@@ -6252,7 +6262,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
             exec_status: SessionExecStatus::NotAttempted,
             exit_code: None,
             at_unix: guard::env::now_unix(),
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             decision_trace: None,
         },
     );

@@ -3672,7 +3672,7 @@ async fn handle_session_appeal(
                         risk,
                         exec_status: SessionExecStatus::NotAttempted,
                         exit_code: None,
-                        exposed_secret_refs: Vec::new(),
+                        credential_references: Vec::new(),
                         decision_trace: Some(guard::gating::DecisionTrace::source(
                             format!("{source:?}").to_ascii_lowercase(),
                         )),
@@ -3726,7 +3726,7 @@ async fn handle_session_appeal(
                     risk,
                     exec_status: SessionExecStatus::NotAttempted,
                     exit_code: None,
-                    exposed_secret_refs: Vec::new(),
+                    credential_references: Vec::new(),
                     decision_trace: Some(guard::gating::DecisionTrace::source(
                         format!("{source:?}").to_ascii_lowercase(),
                     )),
@@ -3793,7 +3793,7 @@ async fn handle_session_appeal(
                     risk,
                     exec_status: SessionExecStatus::NotAttempted,
                     exit_code: None,
-                    exposed_secret_refs: Vec::new(),
+                    credential_references: Vec::new(),
                     decision_trace: Some(guard::gating::DecisionTrace::source(
                         format!("{source:?}").to_ascii_lowercase(),
                     )),
