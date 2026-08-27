@@ -2297,7 +2297,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         command_authority,
     )
     .await;
-    let exposed_secret_refs = result.exposed_secret_refs().to_vec();
+    let credential_references = result.credential_references().to_vec();
 
     match result.exec {
         ExecOutcome::Completed {
@@ -2331,7 +2331,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                         stdout,
                         stderr,
                     )
-                    .with_exposed_secret_refs(exposed_secret_refs);
+                    .with_credential_references(credential_references);
             };
             if !persist_provisional_transition(server, provisional.clone(), updated.clone())
                 .await
@@ -2382,7 +2382,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                         stdout,
                         stderr,
                     )
-                    .with_exposed_secret_refs(exposed_secret_refs);
+                    .with_credential_references(credential_references);
             }
             if exit_code.is_none() {
                 let response_reason = format!(
@@ -2405,7 +2405,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                         stdout,
                         stderr,
                     )
-                    .with_exposed_secret_refs(exposed_secret_refs);
+                    .with_credential_references(credential_references);
             }
             if exit_code != Some(0) {
                 let exit_code = exit_code.expect("nonzero containment exit has a code");
@@ -2430,7 +2430,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                         stdout,
                         stderr,
                     )
-                    .with_exposed_secret_refs(exposed_secret_refs);
+                    .with_credential_references(credential_references);
             }
             let armed_deadline = updated.deadline_unix;
             let armed_window = updated.window_secs;
@@ -2465,7 +2465,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 armed_deadline,
                 armed_window,
             )
-            .with_exposed_secret_refs(exposed_secret_refs)
+            .with_credential_references(credential_references)
         }
         // The child was launched and then failed (for example, the client
         // stream dropped). Its partial effects are unknown. Persist that
@@ -2550,7 +2550,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                     None,
                     None,
                 )
-                .with_exposed_secret_refs(exposed_secret_refs)
+                .with_credential_references(credential_references)
         }
         ExecOutcome::Failed {
             started: false,

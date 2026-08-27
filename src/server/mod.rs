@@ -107,8 +107,8 @@ pub use wire::{
     AccessItem, AccessRequestGuidance, AdminRequest, AdminResponse, ApprovalSummary, CommandSpec,
     ContainmentFailure, ContainmentFailureKind, ExecuteRequest, ExecuteResponse, GateStatus,
     OutputStream, ProvisionalSummary, RevertSpec, SshHostKeyMode, VerbInvocation, VerbMatchInfo,
-    VerbMenuItem, VerbSummary, CAPABILITY_ACCESS_WHOAMI_V1, CONSEQUENCE_ARM, CONSEQUENCE_GRANT,
-    CONSEQUENCE_RELEASE,
+    VerbMenuItem, VerbSummary, CAPABILITY_ACCESS_WHOAMI_V1, CAPABILITY_REQUESTER_VERB_SHOW_V1,
+    CONSEQUENCE_ARM, CONSEQUENCE_GRANT, CONSEQUENCE_RELEASE,
 };
 pub(crate) use wire::{
     ExecuteStreamMessage, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_FEATURE_TCP_NO_CWD,
@@ -1103,23 +1103,7 @@ fn deterministic_safe_allow_reason(
 }
 
 fn is_valid_secret_key(value: &str) -> bool {
-    if value.is_empty()
-        || value.contains('\0')
-        || value.starts_with('/')
-        || value.ends_with('/')
-        || value.contains("//")
-    {
-        return false;
-    }
-
-    value.split('/').all(|part| {
-        !part.is_empty()
-            && part != "."
-            && part != ".."
-            && part
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-    })
+    crate::session::CredentialReference::is_valid_store_name(value)
 }
 
 fn invalid_shell_secret_reference(

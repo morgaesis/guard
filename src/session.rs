@@ -489,6 +489,78 @@ pub enum SessionExecStatus {
     Provisional,
 }
 
+/// A canonical secret-store key or generated API credential identity that is
+/// safe to retain as audit metadata.
+///
+/// Keeping references nominally distinct from resolved credential values
+/// prevents execution results and session records from accepting arbitrary
+/// value-bearing strings by accident.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct CredentialReference(String);
+
+impl CredentialReference {
+    pub(crate) fn from_store_name(name: impl Into<String>) -> Option<Self> {
+        let name = name.into();
+        Self::is_valid_store_name(&name).then_some(Self(name))
+    }
+
+    pub(crate) fn from_api_identity(identity: impl Into<String>) -> Option<Self> {
+        let identity = identity.into();
+        if identity == "upstream" {
+            return Some(Self(identity));
+        }
+        let endpoint = identity
+            .strip_prefix("api-endpoint:")?
+            .strip_suffix(":upstream")?;
+        (!endpoint.is_empty()
+            && endpoint.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            }))
+        .then_some(Self(identity))
+    }
+
+    pub(crate) fn from_persisted_name(name: impl Into<String>) -> Option<Self> {
+        let name = name.into();
+        Self::from_store_name(name.clone()).or_else(|| Self::from_api_identity(name))
+    }
+
+    pub fn as_reference_name(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn is_valid_store_name(value: &str) -> bool {
+        if value.is_empty()
+            || value.contains('\0')
+            || value.starts_with('/')
+            || value.ends_with('/')
+            || value.contains("//")
+        {
+            return false;
+        }
+
+        value.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+                })
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CredentialReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        Self::from_persisted_name(name)
+            .ok_or_else(|| serde::de::Error::custom("invalid credential reference"))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInteraction {
     pub at_unix: u64,
@@ -504,9 +576,14 @@ pub struct SessionInteraction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     /// Safe references to brokered credentials made available to the operation.
-    /// Values are never persisted.
-    #[serde(default, alias = "secret_refs", skip_serializing_if = "Vec::is_empty")]
-    pub exposed_secret_refs: Vec<String>,
+    /// Resolved credential values are never retained.
+    #[serde(
+        default,
+        rename = "exposed_secret_refs",
+        alias = "secret_refs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub credential_references: Vec<CredentialReference>,
     /// Versioned admission explanation for this interaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_trace: Option<guard::gating::DecisionTrace>,
@@ -1795,6 +1872,50 @@ mod tests {
     }
 
     #[test]
+    fn credential_reference_metadata_preserves_legacy_wire_shape() {
+        assert!(CredentialReference::from_store_name("service/token").is_some());
+        assert!(CredentialReference::from_store_name("../invalid").is_none());
+        assert!(CredentialReference::from_api_identity("api-endpoint:prod:upstream").is_some());
+        assert!(CredentialReference::from_api_identity("api-endpoint:bad/name:upstream").is_none());
+        assert!(
+            serde_json::from_value::<CredentialReference>(serde_json::json!("invalid reference"))
+                .is_err()
+        );
+
+        let interaction = SessionInteraction {
+            at_unix: 1,
+            command: "true".to_string(),
+            allowed: true,
+            source: SessionDecisionSource::Validation,
+            reason: "safe".to_string(),
+            risk: None,
+            exec_status: SessionExecStatus::Completed,
+            exit_code: Some(0),
+            credential_references: vec![CredentialReference::from_store_name("service/token")
+                .expect("valid fixture credential reference")],
+            decision_trace: None,
+        };
+
+        let mut encoded = serde_json::to_value(&interaction).unwrap();
+        assert_eq!(encoded["exposed_secret_refs"][0], "service/token");
+        assert!(encoded.get("credential_references").is_none());
+        let current: SessionInteraction = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(
+            current.credential_references[0].as_reference_name(),
+            "service/token"
+        );
+
+        let object = encoded.as_object_mut().unwrap();
+        let references = object.remove("exposed_secret_refs").unwrap();
+        object.insert("secret_refs".to_string(), references);
+        let decoded: SessionInteraction = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            decoded.credential_references[0].as_reference_name(),
+            "service/token"
+        );
+    }
+
+    #[test]
     fn allow_pattern_matches() {
         let reg = reg_with("tok", &["mkdir /tmp/work/*"], &[]);
         let hit = reg
@@ -2224,7 +2345,7 @@ mod tests {
                 risk: Some(2),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: None,
             },
         );
@@ -2239,7 +2360,7 @@ mod tests {
                 risk: None,
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: None,
             },
         );
@@ -2254,7 +2375,7 @@ mod tests {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Failed,
                 exit_code: None,
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: None,
             },
         );
@@ -2320,7 +2441,7 @@ mod tests {
                     risk: None,
                     exec_status: status,
                     exit_code: None,
-                    exposed_secret_refs: Vec::new(),
+                    credential_references: Vec::new(),
                     decision_trace: None,
                 },
             );
@@ -2364,7 +2485,14 @@ mod tests {
 
     // Synthetic test-fixture credential shapes (never real secrets): a
     // kubernetes-style service-account bearer JWT and a --password= flag.
-    const FIXTURE_BEARER_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6IlN5bnRoZXRpYyJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50In0.SyntheticSignature123";
+    fn fixture_bearer_jwt() -> String {
+        [
+            "eyJhbGciOiJSUzI1NiJ9",
+            "eyJzdWIiOiJndWFyZC10ZXN0LWZpeHR1cmUifQ",
+            "c3ludGhldGljLXNpZ25hdHVyZS1ub3QtYS1jcmVkZW50aWFs",
+        ]
+        .join(".")
+    }
     const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
 
     #[test]
@@ -2374,14 +2502,14 @@ mod tests {
             "tok",
             SessionInteraction {
                 at_unix: 10,
-                command: format!("kubectl --token={FIXTURE_BEARER_JWT} get pods"),
+                command: format!("kubectl --token={} get pods", fixture_bearer_jwt()),
                 allowed: false,
                 source: SessionDecisionSource::Llm,
                 reason: format!("denied: command carried {FIXTURE_PASSWORD_FLAG}"),
                 risk: Some(7),
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: None,
             },
         );
@@ -2425,7 +2553,7 @@ mod tests {
                 prompt_append: Some(format!(
                     "restoring backups; connect with {FIXTURE_PASSWORD_FLAG}"
                 )),
-                generated_notes: vec![format!("migrated from token={FIXTURE_BEARER_JWT}")],
+                generated_notes: vec![format!("migrated from token={}", fixture_bearer_jwt())],
                 static_only: false,
                 auto_amend: false,
                 owner: crate::session::SessionOwner::Principal(
@@ -2459,7 +2587,10 @@ mod tests {
                 deny: vec![],
                 allow_exact: vec![SessionExactRule::new(
                     "kubectl",
-                    vec![format!("--token={FIXTURE_BEARER_JWT}"), "get".to_string()],
+                    vec![
+                        format!("--token={}", fixture_bearer_jwt()),
+                        "get".to_string(),
+                    ],
                 )],
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
@@ -2484,14 +2615,14 @@ mod tests {
                 "tok".to_string(),
                 SessionInteraction {
                     at_unix: now_unix(),
-                    command: format!("curl -H 'Authorization: Bearer {FIXTURE_BEARER_JWT}'"),
+                    command: format!("curl -H 'Authorization: Bearer {}'", fixture_bearer_jwt()),
                     allowed: true,
                     source: SessionDecisionSource::Llm,
                     reason: "ok".into(),
                     risk: Some(1),
                     exec_status: SessionExecStatus::Completed,
                     exit_code: Some(0),
-                    exposed_secret_refs: Vec::new(),
+                    credential_references: Vec::new(),
                     decision_trace: Some(guard::gating::DecisionTrace {
                         verb_matches: vec![guard::gating::DecisionVerbMatch {
                             verb: format!("password={trace_value}"),

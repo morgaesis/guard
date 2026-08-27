@@ -1,7 +1,7 @@
 use crate::injection::is_valid_env_name;
 use crate::session::{
-    SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
-    SessionInteraction, SessionOwner, SessionRegistry,
+    CredentialReference, SessionAmendment, SessionDecision, SessionDecisionSource,
+    SessionExecStatus, SessionInteraction, SessionOwner, SessionRegistry,
 };
 use crate::session_store::SessionStore;
 use crate::tool_config::{ResolvedToolEnv, ToolRegistry};
@@ -834,7 +834,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             risk,
             exec_status: SessionExecStatus::NotAttempted,
             exit_code: None,
-            exposed_secret_refs: Vec::new(),
+            credential_references: Vec::new(),
             decision_trace: Some(decision_trace_for_phase(phase, source, false)),
         },
     )
@@ -889,7 +889,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
             risk,
             exec_status: result.session_exec_status(),
             exit_code: result.exit_code(),
-            exposed_secret_refs: result.exposed_secret_refs().to_vec(),
+            credential_references: result.credential_references().to_vec(),
             decision_trace: Some(trace),
         },
     )
@@ -3207,32 +3207,43 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         .filter_map(|key| tool_env.env.get(key).cloned())
         .collect::<Vec<_>>();
     let trusted_tool_env = tool_env.env;
-    let mut exposed_secret_refs = tool_env.secret_refs;
-    exposed_secret_refs.extend(request.secrets.values().cloned());
-    exposed_secret_refs.extend(request.secret_files.values().cloned());
-    exposed_secret_refs.sort();
-    exposed_secret_refs.dedup();
+    let mut credential_reference_names = tool_env.secret_refs;
+    credential_reference_names.extend(request.secrets.values().cloned());
+    credential_reference_names.extend(request.secret_files.values().cloned());
+    credential_reference_names.sort();
+    credential_reference_names.dedup();
+    let Some(credential_references) = credential_reference_names
+        .into_iter()
+        .map(CredentialReference::from_store_name)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return ExecuteResult::exec_failed(
+            allow_reason,
+            "invalid credential reference reached execution after request validation".to_string(),
+        );
+    };
     let mut request_env = HashMap::new();
 
-    for secret_name in &exposed_secret_refs {
+    for credential_reference in &credential_references {
+        let store_name = credential_reference.as_reference_name();
         let allowed = match &authority {
             Some(None) => true,
             Some(Some(selectors)) => selectors.iter().any(|selector| {
-                selector == secret_name
+                selector == store_name
                     || selector == "*"
                     || selector
                         .strip_suffix('*')
-                        .is_some_and(|prefix| secret_name.starts_with(prefix))
+                        .is_some_and(|prefix| store_name.starts_with(prefix))
             }),
             None => match request.session_token.as_deref() {
                 Some(token) => match server.state.sessions.read().await.authority_snapshot(token) {
                     Some((_, None)) => true,
                     Some((_, Some(selectors))) => selectors.iter().any(|selector| {
-                        selector == secret_name
+                        selector == store_name
                             || selector == "*"
                             || selector
                                 .strip_suffix('*')
-                                .is_some_and(|prefix| secret_name.starts_with(prefix))
+                                .is_some_and(|prefix| store_name.starts_with(prefix))
                     }),
                     None => false,
                 },
@@ -3243,7 +3254,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             return ExecuteResult::exec_failed(
                     allow_reason,
                     format!(
-                        "saved authority does not entitle secret '{secret_name}'; next: guard access request 'Use credential selector {secret_name} for this task'"
+                        "saved authority does not entitle secret '{store_name}'; next: guard access request 'Use credential selector {store_name} for this task'"
                     ),
                 );
         }
@@ -3593,7 +3604,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             SpawnAuditContext {
                 caller,
                 request: &request,
-                exposed_secret_refs,
+                credential_references,
             },
             &mut *context.stream_writer,
             ProcessInitiationLeases {
@@ -3624,7 +3635,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
     let mut process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
-    audit_secret_exposure(server, caller, &request, &exposed_secret_refs);
+    audit_credential_access(server, caller, &request, &credential_references);
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
     let exact_secrets = server
@@ -3667,12 +3678,12 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                 allow_reason,
                 exec_timeout_reason(exec_timeout_secs),
             )
-            .with_exposed_secret_refs(exposed_secret_refs);
+            .with_credential_references(credential_references);
         }
         Ok(Err(error)) => {
             terminate_spawned_child(&mut child, &mut process_guard).await;
             return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
-                .with_exposed_secret_refs(exposed_secret_refs);
+                .with_credential_references(credential_references);
         }
         Ok(Ok(output)) => output,
     };
@@ -3691,7 +3702,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                 allow_reason,
                 exec_timeout_reason(exec_timeout_secs),
             )
-            .with_exposed_secret_refs(exposed_secret_refs);
+            .with_credential_references(credential_references);
         }
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
@@ -3699,7 +3710,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                 allow_reason,
                 format!("failed to wait for '{}': {}", request.binary, e),
             )
-            .with_exposed_secret_refs(exposed_secret_refs);
+            .with_credential_references(credential_references);
         }
     };
     if let Some(guard) = process_guard {
@@ -3721,7 +3732,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             Ok(redacted) => redacted,
             Err(error) => {
                 return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
-                    .with_exposed_secret_refs(exposed_secret_refs);
+                    .with_credential_references(credential_references);
             }
         };
         Some(redacted)
@@ -3740,7 +3751,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             Ok(redacted) => redacted,
             Err(error) => {
                 return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
-                    .with_exposed_secret_refs(exposed_secret_refs);
+                    .with_credential_references(credential_references);
             }
         };
         Some(redacted)
@@ -3764,7 +3775,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
 
     drop(secret_file_lease);
     ExecuteResult::completed(allow_reason, exit_code, stdout, stderr)
-        .with_exposed_secret_refs(exposed_secret_refs)
+        .with_credential_references(credential_references)
 }
 
 fn truncate_utf8_bytes(value: &mut String, limit: usize) {
@@ -4097,11 +4108,11 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     let mut process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
-    audit_secret_exposure(
+    audit_credential_access(
         server,
         audit.caller,
         audit.request,
-        &audit.exposed_secret_refs,
+        &audit.credential_references,
     );
 
     let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
@@ -4150,7 +4161,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                     allow_reason,
                     "command redaction context exceeded its resource limit".to_string(),
                 )
-                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                .with_credential_references(audit.credential_references);
             }
         };
     let mut stderr_exact = ExactSecretStreamRedactor::new(exact_secrets, MAX_OUTPUT_BYTES)
@@ -4170,7 +4181,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                     allow_reason,
                     exec_timeout_reason(exec_timeout_secs),
                 )
-                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                .with_credential_references(audit.credential_references);
             }
             maybe_chunk = rx.recv() => {
                 match maybe_chunk {
@@ -4188,7 +4199,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                             allow_reason,
                             "command output exceeded the redacted byte limit".to_string(),
                         )
-                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                        .with_credential_references(audit.credential_references);
                     };
                     let data = match heuristic_redactor.push(&data, |line, state| {
                         redact_command_text_with_state(
@@ -4206,7 +4217,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                                 allow_reason,
                                 "command output exceeded the redacted byte limit".to_string(),
                             )
-                            .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            .with_credential_references(audit.credential_references);
                         }
                     };
                     if data.is_empty() {
@@ -4218,7 +4229,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                             allow_reason,
                             "command output exceeded the redacted byte limit".to_string(),
                         )
-                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                        .with_credential_references(audit.credential_references);
                     }
                     let message = match stream {
                         OutputStream::Stdout => ExecuteStreamMessage::Stdout { data },
@@ -4231,7 +4242,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                             allow_reason,
                             format!("client stream error: {}", e),
                         )
-                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                        .with_credential_references(audit.credential_references);
                     }
                     }
                     Some(StreamChunk::LimitExceeded) => {
@@ -4240,7 +4251,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                             allow_reason,
                             "command output exceeded the byte limit".to_string(),
                         )
-                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                        .with_credential_references(audit.credential_references);
                     }
                     Some(StreamChunk::PipeError { stream, detail }) => {
                         cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
@@ -4252,7 +4263,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                                 detail
                             ),
                         )
-                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                        .with_credential_references(audit.credential_references);
                     }
                     None => {
                         for (stream, exact_redactor, heuristic_redactor) in [
@@ -4273,7 +4284,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                                     allow_reason,
                                     "command output exceeded the redacted byte limit".to_string(),
                                 )
-                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                                .with_credential_references(audit.credential_references);
                             };
                             let mut data = match heuristic_redactor.push(&data, |line, state| {
                                 redact_command_text_with_state(
@@ -4291,7 +4302,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                                         allow_reason,
                                         "command output exceeded the redacted byte limit".to_string(),
                                     )
-                                    .with_exposed_secret_refs(audit.exposed_secret_refs);
+                                    .with_credential_references(audit.credential_references);
                                 }
                             };
                             let tail = match heuristic_redactor.finish(|line, state| {
@@ -4310,7 +4321,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                                         allow_reason,
                                         "command output exceeded the redacted byte limit".to_string(),
                                     )
-                                    .with_exposed_secret_refs(audit.exposed_secret_refs);
+                                    .with_credential_references(audit.credential_references);
                                 }
                             };
                             let Some(total_len) = data.len().checked_add(tail.len()) else {
@@ -4319,7 +4330,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                                     allow_reason,
                                     "command output exceeded the redacted byte limit".to_string(),
                                 )
-                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                                .with_credential_references(audit.credential_references);
                             };
                             if total_len > MAX_OUTPUT_BYTES {
                                 cleanup_streaming_failure(&mut child, &mut process_guard, &mut stream_tasks).await;
@@ -4327,7 +4338,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                                     allow_reason,
                                     "command output exceeded the redacted byte limit".to_string(),
                                 )
-                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                                .with_credential_references(audit.credential_references);
                             }
                             data.push_str(&tail);
                             if data.is_empty() {
@@ -4339,7 +4350,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                                     allow_reason,
                                     "command output exceeded the redacted byte limit".to_string(),
                                 )
-                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                                .with_credential_references(audit.credential_references);
                             }
                             let message = match stream {
                                 OutputStream::Stdout => ExecuteStreamMessage::Stdout { data },
@@ -4351,7 +4362,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                                     allow_reason,
                                     format!("client stream error: {error}"),
                                 )
-                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                                .with_credential_references(audit.credential_references);
                             }
                         }
                         break;
@@ -4365,7 +4376,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                         allow_reason,
                         format!("client stream error: {}", e),
                     )
-                    .with_exposed_secret_refs(audit.exposed_secret_refs);
+                    .with_credential_references(audit.credential_references);
                 }
             }
         }
@@ -4381,7 +4392,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                 error.detail
             ),
         )
-        .with_exposed_secret_refs(audit.exposed_secret_refs);
+        .with_credential_references(audit.credential_references);
     }
 
     let wait_result = if exec_timeout_secs == 0 {
@@ -4399,7 +4410,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                 allow_reason,
                 exec_timeout_reason(exec_timeout_secs),
             )
-            .with_exposed_secret_refs(audit.exposed_secret_refs);
+            .with_credential_references(audit.credential_references);
         }
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
@@ -4407,7 +4418,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                 allow_reason,
                 format!("failed to wait for '{}': {}", audit.request.binary, e),
             )
-            .with_exposed_secret_refs(audit.exposed_secret_refs);
+            .with_credential_references(audit.credential_references);
         }
     };
     if let Some(guard) = process_guard {
@@ -4432,36 +4443,36 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                     allow_reason,
                     format!("client stream error: {}", e),
                 )
-                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                .with_credential_references(audit.credential_references);
             }
         }
     }
 
     ExecuteResult::completed(allow_reason, exit_code, None, None)
-        .with_exposed_secret_refs(audit.exposed_secret_refs)
+        .with_credential_references(audit.credential_references)
 }
 
 struct SpawnAuditContext<'a> {
     caller: &'a CallerIdentity,
     request: &'a ExecuteRequest,
-    exposed_secret_refs: Vec<String>,
+    credential_references: Vec<CredentialReference>,
 }
 
-fn audit_secret_exposure(
+fn audit_credential_access(
     server: &ServerContext,
     caller: &CallerIdentity,
     request: &ExecuteRequest,
-    exposed_secret_refs: &[String],
+    credential_references: &[CredentialReference],
 ) {
-    for secret_ref in exposed_secret_refs {
-        let secret_name = serde_json::to_string(secret_ref)
-            .unwrap_or_else(|_| "\"<invalid-secret-name>\"".to_string());
+    for credential_reference in credential_references {
+        let serialized_reference = serde_json::to_string(credential_reference.as_reference_name())
+            .unwrap_or_else(|_| "\"<invalid-credential-reference>\"".to_string());
         server.emit_audit_ungated(
             guard::audit::AuditEvent::new(guard::audit::AuditKind::SecretExposed)
                 .caller(caller)
                 .session_fingerprint(audit_session_fingerprint(request.session_token.as_deref()))
                 .cmd(server.redact_command_line(&request.binary, &request.args))
-                .field("secret", secret_name),
+                .field("secret", serialized_reference),
         );
     }
 }
@@ -5194,7 +5205,7 @@ mod transactional_access_tests {
                 risk: Some(0),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: None,
             },
         );
@@ -5383,7 +5394,7 @@ mod transactional_access_tests {
                 risk: Some(10),
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: None,
             },
         );

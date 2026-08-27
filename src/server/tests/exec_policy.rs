@@ -352,8 +352,12 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
     .await;
     assert_eq!(result.exit_code(), Some(0));
     assert_eq!(
-        result.exposed_secret_refs(),
-        &["test/secret-exposure-success"]
+        result
+            .credential_references()
+            .iter()
+            .map(crate::session::CredentialReference::as_reference_name)
+            .collect::<Vec<_>>(),
+        vec!["test/secret-exposure-success"]
     );
     let logs = String::from_utf8_lossy(&audit.0.lock().unwrap()).to_string();
     assert!(logs.contains("[AUDIT] SECRET_EXPOSED"), "logs={logs}");
@@ -403,7 +407,7 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
         None,
     )
     .await;
-    assert!(result.exposed_secret_refs().is_empty());
+    assert!(result.credential_references().is_empty());
     let logs = String::from_utf8_lossy(&audit.0.lock().unwrap()).to_string();
     assert!(
         !logs.contains("test/secret-exposure-failed-spawn"),
@@ -642,11 +646,12 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
 
     assert_eq!(result.exit_code(), Some(1));
     assert_eq!(
-        result.exposed_secret_refs(),
-        &[
-            "service/primary".to_string(),
-            "service/secondary".to_string()
-        ]
+        result
+            .credential_references()
+            .iter()
+            .map(crate::session::CredentialReference::as_reference_name)
+            .collect::<Vec<_>>(),
+        vec!["service/primary", "service/secondary"]
     );
     assert_eq!(
         logs.matches("[AUDIT] SECRET_EXPOSED").count(),

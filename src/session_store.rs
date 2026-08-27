@@ -1,8 +1,8 @@
 use crate::grant_profile::{EvaluationMode, GrantRequest, SavedGrant};
 use crate::session::{
-    session_grant_revision_key, HistoricalGrant, HistoricalStatus, IssuedGrantScope,
-    SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant, SessionInteraction,
-    SessionOwner, SessionRegistry,
+    session_grant_revision_key, CredentialReference, HistoricalGrant, HistoricalStatus,
+    IssuedGrantScope, SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant,
+    SessionInteraction, SessionOwner, SessionRegistry,
 };
 use anyhow::{Context, Result};
 use guard::gating::approval::{Approval, ApprovalStatus};
@@ -901,7 +901,9 @@ impl SessionStore {
                         risk: row.get(6)?,
                         exec_status: decode_exec_status(&exec_status)?,
                         exit_code: row.get(8)?,
-                        exposed_secret_refs: decode_vec(&row.get::<_, String>(9)?)?,
+                        credential_references: decode_credential_references(
+                            &row.get::<_, String>(9)?,
+                        )?,
                         decision_trace: row
                             .get::<_, Option<String>>(10)?
                             .map(|json| serde_json::from_str(&json))
@@ -1147,7 +1149,7 @@ impl SessionStore {
                     interaction.risk,
                     encode_exec_status(interaction.exec_status),
                     interaction.exit_code,
-                    encode_vec(&interaction.exposed_secret_refs)?,
+                    encode_credential_references(&interaction.credential_references)?,
                     interaction
                         .decision_trace
                         .as_ref()
@@ -3811,6 +3813,10 @@ fn encode_vec(values: &[String]) -> Result<String> {
     serde_json::to_string(values).context("failed to encode session list")
 }
 
+fn encode_credential_references(values: &[CredentialReference]) -> Result<String> {
+    serde_json::to_string(values).context("failed to encode credential references")
+}
+
 fn encode_scope(scope: &IssuedGrantScope) -> Result<String> {
     serde_json::to_string(scope).context("failed to encode issued grant scope")
 }
@@ -4090,6 +4096,20 @@ fn decode_vec(value: &str) -> rusqlite::Result<Vec<String>> {
             Box::new(err),
         )
     })
+}
+
+fn decode_credential_references(value: &str) -> rusqlite::Result<Vec<CredentialReference>> {
+    let names: Vec<String> = serde_json::from_str(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })?;
+    Ok(names
+        .into_iter()
+        .filter_map(CredentialReference::from_persisted_name)
+        .collect())
 }
 
 fn decode_scope(value: &str) -> rusqlite::Result<IssuedGrantScope> {
@@ -5721,13 +5741,13 @@ mod tests {
             crate::grant_profile::GrantRequestDelta {
                 prompt_append: Some(format!(
                     "inspect with Authorization: Bearer {}",
-                    FIXTURE_BEARER_JWT
+                    fixture_bearer_jwt()
                 )),
                 ..Default::default()
             },
             format!(
                 "curl -H 'Authorization: Bearer {}' /status",
-                FIXTURE_BEARER_JWT
+                fixture_bearer_jwt()
             ),
         )
         .unwrap();
@@ -5741,7 +5761,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!stored.contains(FIXTURE_BEARER_JWT));
+        assert!(!stored.contains(&fixture_bearer_jwt()));
         assert!(stored.contains("[REDACTED]"));
 
         request.justification = format!("tool {}", FIXTURE_PASSWORD_FLAG);
@@ -6701,7 +6721,7 @@ mod tests {
                 risk: Some(0),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: None,
             },
         );
@@ -6739,8 +6759,26 @@ mod tests {
     }
 
     // Synthetic test-fixture credential shapes (never real secrets).
-    const FIXTURE_BEARER_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6IlN5bnRoZXRpYyJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50In0.SyntheticSignature123";
+    fn fixture_bearer_jwt() -> String {
+        [
+            "eyJhbGciOiJSUzI1NiJ9",
+            "eyJzdWIiOiJndWFyZC10ZXN0LWZpeHR1cmUifQ",
+            "c3ludGhldGljLXNpZ25hdHVyZS1ub3QtYS1jcmVkZW50aWFs",
+        ]
+        .join(".")
+    }
     const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
+
+    #[test]
+    fn credential_reference_decoder_discards_noncanonical_legacy_entries() {
+        let decoded = decode_credential_references(
+            r#"["service/token","../invalid","api-endpoint:prod:upstream"]"#,
+        )
+        .expect("decode credential references");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].as_reference_name(), "service/token");
+        assert_eq!(decoded[1].as_reference_name(), "api-endpoint:prod:upstream");
+    }
 
     #[tokio::test]
     async fn v5_migration_sanitizes_persisted_credentials_and_bumps_version() {
@@ -6761,7 +6799,7 @@ mod tests {
                 params![
                     serde_json::to_string(&vec![SessionExactRule::new(
                         "kubectl",
-                        vec![format!("--token={FIXTURE_BEARER_JWT}"), "get".to_string()],
+                        vec![format!("--token={}", fixture_bearer_jwt()), "get".to_string()],
                     )])
                     .unwrap(),
                     format!("session context {FIXTURE_PASSWORD_FLAG}"),
@@ -6775,7 +6813,7 @@ mod tests {
                  VALUES ('tok', ?1, ?2, 1, 'llm', ?3, 1, 'completed')",
                 params![
                     encode_u64(guard::env::now_unix()).unwrap(),
-                    format!("kubectl --token={FIXTURE_BEARER_JWT} get pods"),
+                    format!("kubectl --token={} get pods", fixture_bearer_jwt()),
                     format!("allowed with {FIXTURE_PASSWORD_FLAG}"),
                 ],
             )
@@ -6921,7 +6959,7 @@ mod tests {
         let registry = store.load_registry().await.expect("load migrated store");
         let report = registry.show("legacy-token", 10).expect("legacy report");
         assert_eq!(report.recent[0].exit_code, None);
-        assert!(report.recent[0].exposed_secret_refs.is_empty());
+        assert!(report.recent[0].credential_references.is_empty());
         let conn = Connection::open(&legacy_path).expect("reopen migrated db");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -7027,7 +7065,7 @@ mod tests {
                     risk: Some(0),
                     exec_status: SessionExecStatus::Completed,
                     exit_code: Some(0),
-                    exposed_secret_refs: Vec::new(),
+                    credential_references: Vec::new(),
                     decision_trace: None,
                 },
             )],
@@ -7946,7 +7984,10 @@ mod tests {
                     risk: Some(1),
                     exec_status: SessionExecStatus::CompletedAfterApproval,
                     exit_code: Some(0),
-                    exposed_secret_refs: vec!["service/token".into()],
+                    credential_references: vec![CredentialReference::from_store_name(
+                        "service/token",
+                    )
+                    .expect("valid fixture credential reference")],
                     decision_trace: Some(guard::gating::DecisionTrace::source("cache")),
                 },
             )],
@@ -7980,7 +8021,10 @@ mod tests {
             report.recent[0].exec_status,
             SessionExecStatus::CompletedAfterApproval
         );
-        assert_eq!(report.recent[0].exposed_secret_refs, vec!["service/token"]);
+        assert_eq!(
+            report.recent[0].credential_references[0].as_reference_name(),
+            "service/token"
+        );
         assert_eq!(
             report.active.and_then(|grant| grant.prompt_append),
             Some("persistent".into())
@@ -8041,7 +8085,7 @@ mod tests {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: Some(guard::gating::DecisionTrace::source("llm")),
             },
         );
@@ -8114,7 +8158,7 @@ mod tests {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                exposed_secret_refs: Vec::new(),
+                credential_references: Vec::new(),
                 decision_trace: Some(guard::gating::DecisionTrace::source("llm")),
             },
         );

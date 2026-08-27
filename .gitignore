@@ -5,6 +5,7 @@ tmp/
 *.log
 *.html
 /target/
+/.worktrees/
 /docs/demo.svg
 TODO.md
 wt/

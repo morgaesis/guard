@@ -457,11 +457,14 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
                 risk: None,
                 exec_status: api_session_exec_status(event.allowed, event.held),
                 exit_code: None,
-                exposed_secret_refs: if event.allowed {
-                    vec![event.credential_ref]
-                } else {
-                    Vec::new()
-                },
+                credential_references: event
+                    .allowed
+                    .then(|| {
+                        crate::session::CredentialReference::from_api_identity(event.credential_ref)
+                    })
+                    .flatten()
+                    .into_iter()
+                    .collect(),
                 decision_trace: Some(guard::gating::DecisionTrace::source("api_proxy")),
             },
         )

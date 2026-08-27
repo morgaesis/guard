@@ -78,7 +78,6 @@ impl Client {
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn has_admin_token(&self) -> bool {
         self.admin_token.is_some()
     }

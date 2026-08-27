@@ -1419,6 +1419,15 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
         }
         VerbCommands::Show { name, socket, json } => {
             let (client, source) = gate_client(socket, json)?;
+            if requester_verb_show_requires_capability(&client) {
+                require_daemon_capability(
+                    &client,
+                    "guard verb show",
+                    server::CAPABILITY_REQUESTER_VERB_SHOW_V1,
+                )
+                .await
+                .map_err(|error| describe_connect_failure(error, &client, source))?;
+            }
             let response = client
                 .send_admin(server::AdminRequest::VerbShow { name })
                 .await
@@ -3640,6 +3649,10 @@ pub(crate) fn admin_client(
     }
 }
 
+fn requester_verb_show_requires_capability(client: &daemon_client::Client) -> bool {
+    !client.has_admin_token()
+}
+
 fn validate_daemon_capability(
     server_version: &str,
     capabilities: &[String],
@@ -4063,6 +4076,25 @@ mod tests {
         assert_eq!(document["projection"], "agent_menu");
         assert_eq!(document["item"]["name"], "inspect-fixture");
         assert!(document["item"].get("binary").is_none());
+    }
+
+    #[test]
+    fn requester_verb_show_negotiates_old_daemons_without_operator_authority() {
+        let requester = daemon_client::Client::new(None, Some(7331));
+        assert!(requester_verb_show_requires_capability(&requester));
+        let error = validate_daemon_capability(
+            "0.8.0",
+            &[],
+            "guard verb show",
+            server::CAPABILITY_REQUESTER_VERB_SHOW_V1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unavailable on Guard daemon 0.8.0"));
+        assert!(error.contains("upgrade and restart the daemon"));
+
+        let operator = requester.with_admin_token("configured-admin".to_string());
+        assert!(!requester_verb_show_requires_capability(&operator));
     }
 
     #[test]
@@ -4577,8 +4609,9 @@ mod tests {
     #[test]
     fn a_default_deny_keeps_its_tag_once_the_daemon_appends_request_context() {
         let mut response = denied_response("static_policy");
+        let request_reference = ["gr", "fixture"].join("-");
         response.reason = format!(
-            "{}; access_request=gr-27e22174de1485fd77aacf889c524a42",
+            "{}; access_request={request_reference}",
             guard::policy::DEFAULT_DENY_REASON
         );
         assert_eq!(
