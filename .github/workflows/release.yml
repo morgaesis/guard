@@ -5,6 +5,7 @@ name: Release Validation
   workflow_call:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -59,6 +60,17 @@ jobs:
           }
           test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag_commit}" --jq '.commit.verification.verified')" = true || {
             echo "release commit signature is not verified"
+            exit 1
+          }
+          ci_run_id=$(gh run list --workflow CI --commit "$tag_commit" --event push --limit 10 \
+            --json databaseId,headSha \
+            --jq "map(select(.headSha == \"${tag_commit}\")) | first | .databaseId // empty")
+          test -n "$ci_run_id" || {
+            echo "mainline CI run was not found for the release commit"
+            exit 1
+          }
+          timeout 1800s gh run watch "$ci_run_id" --compact --exit-status || {
+            echo "mainline CI did not pass for the release commit"
             exit 1
           }
           check_runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag_commit}/check-runs?per_page=100")
