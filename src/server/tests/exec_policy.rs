@@ -27,7 +27,7 @@ use crate::server::{
 use crate::session::SessionExactRule;
 use crate::session::SessionGrant;
 use guard::evaluate::{EvalConfig, Evaluator};
-use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
+use guard::gating::deny_shape::{canonical_argv, DenyLearningConfig, DenyShapeStore};
 #[cfg(unix)]
 use guard::gating::verb::VerbCatalog;
 #[cfg(unix)]
@@ -1766,6 +1766,30 @@ async fn trusted_ceph_style_verb_with_exact_dimensions_never_reaches_evaluator()
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(run_denying_llm(listener));
 
+    let deny_directory = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        deny_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let mut deny_store = DenyShapeStore::load(DenyLearningConfig::new(
+        deny_directory.path().join("deny.yaml"),
+    ))
+    .unwrap();
+    let denied_args = vec!["ceph".to_string(), "osd".to_string(), "df".to_string()];
+    let evidence = canonical_argv(&denied_args);
+    deny_store
+        .promote_shape(
+            "fixture",
+            "true",
+            &format!("^{}$", regex::escape(&evidence)),
+            &[evidence],
+            "automatic heuristic must not outrank typed authority",
+            1,
+        )
+        .unwrap();
+
     let (mut cfg, _) = make_test_config();
     cfg.config.gate = GateMode::Consequence;
     cfg.state.evaluator = Arc::new(
@@ -1773,7 +1797,8 @@ async fn trusted_ceph_style_verb_with_exact_dimensions_never_reaches_evaluator()
             EvalConfig::default()
                 .llm_api_key("test-key".to_string())
                 .llm_api_url(url)
-                .llm_retries(0),
+                .llm_retries(0)
+                .deny_shapes(Arc::new(RwLock::new(deny_store))),
         )
         .unwrap(),
     );

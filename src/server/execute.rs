@@ -62,6 +62,8 @@ use super::{
 };
 use super::{DEFAULT_CONFIRM_WITHIN_SECS, MAX_CONFIRM_WITHIN_SECS};
 
+type ExecuteError = Box<ExecuteResult>;
+
 /// Emit the ALLOWED/DENIED policy record for one execute request. Returns
 /// whether the record is durable; an allow that cannot be durably audited
 /// must fail closed before anything acts on it.
@@ -221,12 +223,12 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     }
 
     if let Err(result) = canonicalize_request_cwd(&mut phase, &mut request).await {
-        return result;
+        return *result;
     }
 
     let verb_resolution = match resolve_verb_context(&mut phase, &mut request).await {
         Ok(resolution) => resolution,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
     phase.verb_matches = verb_resolution.matches.clone();
     phase.verb_guidance = verb_resolution.guidance.clone();
@@ -234,7 +236,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     let (depth, command_line) = match validate_exec_request(&mut phase, &request).await {
         Ok(validated) => validated,
         Err(result) => {
-            return result.with_verb_resolution(
+            return (*result).with_verb_resolution(
                 verb_resolution.matches.clone(),
                 verb_resolution.guidance.clone(),
             )
@@ -260,7 +262,7 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
     depth: u32,
 ) -> ExecuteResult {
     if let Err(result) = enforce_binary_policy(phase, &request).await {
-        return result;
+        return *result;
     }
 
     if matches!(verb_resolution.decision, VerbDecision::Deny) {
@@ -296,7 +298,7 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
     .await
     {
         Ok(request) => request,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
 
     let mut session_prompt = resolve_session_prompt(phase.server, &request).await;
@@ -311,12 +313,12 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
         request =
             match try_trusted_verb_allow(phase, request, &verb_resolution.context, depth).await {
                 Ok(request) => request,
-                Err(result) => return result,
+                Err(result) => return *result,
             };
 
         request = match try_static_fast_allow(phase, request, depth).await {
             Ok(request) => request,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
     }
 
@@ -361,32 +363,36 @@ async fn access_evaluation_is_approved<W: AsyncWrite + Unpin>(
 async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &mut ExecuteRequest,
-) -> Result<(), ExecuteResult> {
+) -> Result<(), ExecuteError> {
     let Some(cwd) = request.cwd.clone() else {
         return Ok(());
     };
     if !phase.caller.is_local_peer() {
         let reason =
             "working directory propagation requires an authenticated local caller".to_string();
-        return Err(deny_and_record(
-            phase,
-            request,
-            SessionDecisionSource::Validation,
-            None,
-            reason,
-        )
-        .await);
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        ));
     }
     if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
         let reason = format!("invalid working directory: '{}'", cwd.display());
-        return Err(deny_and_record(
-            phase,
-            request,
-            SessionDecisionSource::Validation,
-            None,
-            reason,
-        )
-        .await);
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        ));
     }
     let canonical = match tokio::fs::canonicalize(&cwd).await {
         Ok(path) => path,
@@ -396,14 +402,16 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
                 cwd.display(),
                 e
             );
-            return Err(deny_and_record(
-                phase,
-                request,
-                SessionDecisionSource::Validation,
-                None,
-                reason,
-            )
-            .await);
+            return Err(Box::new(
+                deny_and_record(
+                    phase,
+                    request,
+                    SessionDecisionSource::Validation,
+                    None,
+                    reason,
+                )
+                .await,
+            ));
         }
     };
     let meta = match tokio::fs::metadata(&canonical).await {
@@ -414,14 +422,16 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
                 canonical.display(),
                 e
             );
-            return Err(deny_and_record(
-                phase,
-                request,
-                SessionDecisionSource::Validation,
-                None,
-                reason,
-            )
-            .await);
+            return Err(Box::new(
+                deny_and_record(
+                    phase,
+                    request,
+                    SessionDecisionSource::Validation,
+                    None,
+                    reason,
+                )
+                .await,
+            ));
         }
     };
     if !meta.is_dir() {
@@ -429,14 +439,16 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
             "invalid working directory '{}': not a directory",
             canonical.display()
         );
-        return Err(deny_and_record(
-            phase,
-            request,
-            SessionDecisionSource::Validation,
-            None,
-            reason,
-        )
-        .await);
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        ));
     }
     request.cwd = Some(canonical);
     Ok(())
@@ -964,7 +976,7 @@ impl VerbAuthorityExpectation {
 
 #[derive(Debug, Clone)]
 pub(super) struct CommandAuthorization {
-    check_learned_deny: bool,
+    deny_on_learned_match: bool,
     verb: Option<VerbAuthorityExpectation>,
     session: Option<SessionAuthoritySnapshot>,
     exec_timeout_secs: Option<u64>,
@@ -977,7 +989,10 @@ impl CommandAuthorization {
         exec_timeout_secs: u64,
     ) -> Self {
         Self {
-            check_learned_deny: true,
+            // Exact typed authority can preempt an automatic evaluator
+            // heuristic. Evaluator-reviewed verb contexts leave this false so
+            // a newly learned deny can still close the process-start race.
+            deny_on_learned_match: !verb.is_some_and(|verb| verb.learned_deny_preempted),
             verb: verb.map(VerbAuthorityExpectation::from_context),
             session: session.cloned(),
             exec_timeout_secs: Some(exec_timeout_secs),
@@ -990,7 +1005,11 @@ impl CommandAuthorization {
         exec_timeout_secs: Option<u64>,
     ) -> Self {
         Self {
-            check_learned_deny: true,
+            // Replay executes the immutable snapshot the operator reviewed.
+            // Rechecking model-learned deny shapes here would let an
+            // automatic heuristic veto that explicit approval. Frozen verb,
+            // session, secret, and process-start authority checks still run.
+            deny_on_learned_match: false,
             verb,
             session,
             exec_timeout_secs,
@@ -1073,6 +1092,18 @@ async fn acquire_command_initiation_lease(
     request: &ExecuteRequest,
     authorization: Option<&CommandAuthorization>,
 ) -> Result<CommandInitiationLease, String> {
+    // Explicit operator policy is immutable within this evaluator instance and
+    // remains absolute for trusted verbs and approved replay alike.
+    if let Some(reason) = server
+        .state
+        .evaluator
+        .static_deny_reason_argv(&request.binary, &request.args)
+    {
+        return Err(format!(
+            "command denied by static policy before process start: {reason}"
+        ));
+    }
+
     // Revocable command authority is acquired in one order: learned denies,
     // verb catalog, then session registry. Administrative mutations acquire
     // the same resources in that order so initiation cannot form a lock cycle.
@@ -1090,15 +1121,17 @@ async fn acquire_command_initiation_lease(
             .map_err(|_| "command initiation test hook closed".to_string())?
             .forget();
     }
-    let learned_deny = if authorization.is_some_and(|authority| authority.check_learned_deny) {
+    let learned_deny = if let Some(authorization) = authorization {
         let lease = server
             .state
             .evaluator
             .lease_learned_deny_for_use()
             .await
             .map_err(|error| format!("learned deny authority is unavailable: {error}"))?;
-        if let Some(reason) = lease.matching_reason(&request.binary, &request.args) {
-            return Err(format!("command denied before process start: {reason}"));
+        if authorization.deny_on_learned_match {
+            if let Some(reason) = lease.matching_reason(&request.binary, &request.args) {
+                return Err(format!("command denied before process start: {reason}"));
+            }
         }
         Some(lease)
     } else {
@@ -1202,7 +1235,7 @@ async fn acquire_command_initiation_lease(
 async fn resolve_verb_context<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &mut ExecuteRequest,
-) -> Result<VerbResolution, ExecuteResult> {
+) -> Result<VerbResolution, ExecuteError> {
     let server = phase.server;
     if request.verb.is_some() && !server.config.gate.is_on() {
         let reason = "verbs require consequence gating (start the daemon with --gate consequence)"
@@ -1214,7 +1247,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             &reason,
         )
         .await;
-        return Err(ExecuteResult::denied(reason));
+        return Err(ExecuteResult::denied(reason).into());
     }
     if server.config.gate.is_on() {
         if let Err(error) = server.refresh_verb_catalog_for_decision().await {
@@ -1226,7 +1259,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
                 &reason,
             )
             .await;
-            return Err(ExecuteResult::denied(reason));
+            return Err(ExecuteResult::denied(reason).into());
         }
     }
     let catalog_lease = if server.config.gate.is_on() {
@@ -1244,7 +1277,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
                     &reason,
                 )
                 .await;
-                return Err(ExecuteResult::denied(reason));
+                return Err(ExecuteResult::denied(reason).into());
             }
         }
     } else {
@@ -1281,7 +1314,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
                     &reason,
                 )
                 .await;
-                return Err(ExecuteResult::denied(reason));
+                return Err(ExecuteResult::denied(reason).into());
             }
         }
     }
@@ -1466,7 +1499,7 @@ async fn compose_verb_authority_with_session(
 async fn validate_exec_request<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &ExecuteRequest,
-) -> Result<(u32, String), ExecuteResult> {
+) -> Result<(u32, String), ExecuteError> {
     // Check recursion depth
     let depth: u32 = std::env::var("GUARD_DEPTH")
         .ok()
@@ -1474,40 +1507,46 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         .unwrap_or(0);
     if depth >= MAX_GUARD_DEPTH {
         let reason = format!("guard recursion depth exceeded (max {})", MAX_GUARD_DEPTH);
-        return Err(deny_and_record(
-            phase,
-            request,
-            SessionDecisionSource::Validation,
-            None,
-            reason,
-        )
-        .await);
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        ));
     }
 
     // Validate binary name: reject paths, traversal, and shell metacharacters.
     // The check itself lives in `guard::wire` (the fuzzed parsing surface).
     if let Err(reason) = guard::wire::validate_binary_name(&request.binary) {
-        return Err(deny_and_record(
-            phase,
-            request,
-            SessionDecisionSource::Validation,
-            None,
-            reason,
-        )
-        .await);
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        ));
     }
 
     // Reject NUL bytes in argv at the boundary; the check itself lives in
     // `guard::wire` (the fuzzed parsing surface) next to the binary-name rule.
     if let Err(reason) = guard::wire::validate_args(&request.args) {
-        return Err(deny_and_record(
-            phase,
-            request,
-            SessionDecisionSource::Validation,
-            None,
-            reason,
-        )
-        .await);
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        ));
     }
     let trusted_secrets = phase
         .server
@@ -1517,7 +1556,7 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         .map(String::as_str)
         .collect::<Vec<_>>();
     if command_contains_exact_secrets(&request.binary, &request.args, &trusted_secrets) {
-        return Err(deny_and_record(
+        return Err(Box::new(deny_and_record(
             phase,
             request,
             SessionDecisionSource::Validation,
@@ -1525,7 +1564,7 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
             "command contains a daemon-managed credential literal; use a managed secret binding"
                 .to_string(),
         )
-        .await);
+        .await));
     }
 
     // Reconstruct the local-policy command line. The provider path receives
@@ -1535,14 +1574,16 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
     if let Err(reason) =
         validate_request_injections(request, phase.server, phase.caller, &command_line).await
     {
-        return Err(deny_and_record(
-            phase,
-            request,
-            SessionDecisionSource::Validation,
-            None,
-            reason,
-        )
-        .await);
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        ));
     }
 
     Ok((depth, command_line))
@@ -1561,7 +1602,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
     verb_ctx: &Option<VerbContext>,
     depth: u32,
     force_evaluate: bool,
-) -> Result<ExecuteRequest, ExecuteResult> {
+) -> Result<ExecuteRequest, ExecuteError> {
     let server = phase.server;
     if let Some(ref token) = request.session_token {
         let (decision, exists, static_only, suspension, owner) = {
@@ -1599,7 +1640,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                 &reason,
             )
             .await;
-            return Err(ExecuteResult::denied(reason));
+            return Err(ExecuteResult::denied(reason).into());
         }
         // Principal binding: a session's authority may be exercised only by the
         // principal that owns it or an authenticated operator, verified
@@ -1648,30 +1689,34 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                     &reason,
                 )
                 .await;
-                return Err(ExecuteResult::denied(reason));
+                return Err(ExecuteResult::denied(reason).into());
             }
         }
         if let Some(reason) = suspension {
-            return Err(deny_and_record(
-                phase,
-                &request,
-                SessionDecisionSource::SessionDeny,
-                None,
-                reason,
-            )
-            .await);
+            return Err(Box::new(
+                deny_and_record(
+                    phase,
+                    &request,
+                    SessionDecisionSource::SessionDeny,
+                    None,
+                    reason,
+                )
+                .await,
+            ));
         }
         if let Some((decision, reason)) = decision {
             match decision {
                 SessionDecision::Deny => {
-                    return Err(deny_and_record(
-                        phase,
-                        &request,
-                        SessionDecisionSource::SessionDeny,
-                        None,
-                        reason,
-                    )
-                    .await);
+                    return Err(Box::new(
+                        deny_and_record(
+                            phase,
+                            &request,
+                            SessionDecisionSource::SessionDeny,
+                            None,
+                            reason,
+                        )
+                        .await,
+                    ));
                 }
                 SessionDecision::Allow => {
                     if force_evaluate {
@@ -1679,7 +1724,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                     }
                     if !log_audit_policy_for_request(server, phase.caller, &request, true, &reason)
                     {
-                        return Err(ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON));
+                        return Err(ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON).into());
                     }
                     if let Err(e) = write_policy_decision(
                         phase.stream_output,
@@ -1692,7 +1737,8 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                         return Err(ExecuteResult::exec_failed(
                             reason,
                             format!("client stream error: {}", e),
-                        ));
+                        )
+                        .into());
                     }
                     // Session allows skip only the evaluator. They do not
                     // bypass the consequence gate or any spawn-time invariant:
@@ -1701,14 +1747,16 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                     let authority = match capture_session_authority(server, &request).await {
                         Ok(authority) => authority,
                         Err(reason) => {
-                            return Err(deny_and_record(
-                                phase,
-                                &request,
-                                SessionDecisionSource::SessionDeny,
-                                None,
-                                reason,
-                            )
-                            .await)
+                            return Err(Box::new(
+                                deny_and_record(
+                                    phase,
+                                    &request,
+                                    SessionDecisionSource::SessionDeny,
+                                    None,
+                                    reason,
+                                )
+                                .await,
+                            ))
                         }
                     };
                     let inputs = GateInputs {
@@ -1730,7 +1778,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                         depth,
                     )
                     .await;
-                    return Err(result);
+                    return Err(result.into());
                 }
             }
         }
@@ -1741,14 +1789,16 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
         if static_only && !force_evaluate && !selected_typed_coverage {
             let reason =
                 "session policy-only mode: command is outside active verb coverage".to_string();
-            return Err(deny_and_record(
-                phase,
-                &request,
-                SessionDecisionSource::SessionStaticOnly,
-                None,
-                reason,
-            )
-            .await);
+            return Err(Box::new(
+                deny_and_record(
+                    phase,
+                    &request,
+                    SessionDecisionSource::SessionStaticOnly,
+                    None,
+                    reason,
+                )
+                .await,
+            ));
         }
     }
     Ok(request)
@@ -1759,7 +1809,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
 async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &ExecuteRequest,
-) -> Result<(), ExecuteResult> {
+) -> Result<(), ExecuteError> {
     let server = phase.server;
     // Server-wide binary allow-list: a hard floor enforced before evaluation on
     // every execution route, so a disallowed binary never reaches the LLM or an
@@ -1769,14 +1819,16 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
             "binary '{}' is not in the server allow-list",
             request.binary
         );
-        return Err(deny_and_record(
-            phase,
-            request,
-            SessionDecisionSource::Validation,
-            None,
-            reason,
-        )
-        .await);
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        ));
     }
 
     if server.config.preflight && !binary_exists_on_path(&request.binary) {
@@ -1784,14 +1836,16 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
             "unknown binary: '{}' is not available on the guard server PATH",
             request.binary
         );
-        return Err(deny_and_record(
-            phase,
-            request,
-            SessionDecisionSource::Validation,
-            None,
-            reason,
-        )
-        .await);
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        ));
     }
 
     // Guard's own state directory and verb catalog are authorization
@@ -1810,14 +1864,16 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
             .then(|| deterministic_credential_deny_reason(&request.binary, &request.args))
             .flatten()
     }) {
-        return Err(deny_and_record(
-            phase,
-            request,
-            SessionDecisionSource::Validation,
-            None,
-            reason,
-        )
-        .await);
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        ));
     }
     Ok(())
 }
@@ -1834,7 +1890,7 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
     depth: u32,
-) -> Result<ExecuteRequest, ExecuteResult> {
+) -> Result<ExecuteRequest, ExecuteError> {
     let server = phase.server;
     if request.env.is_empty()
         && request.secrets.is_empty()
@@ -1845,7 +1901,7 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
             deterministic_safe_allow_reason(server, &request.binary, &request.args)
         {
             if !log_audit_policy_for_request(server, phase.caller, &request, true, &reason) {
-                return Err(ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON));
+                return Err(ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON).into());
             }
             if let Err(e) = write_policy_decision(
                 phase.stream_output,
@@ -1858,19 +1914,22 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
                 return Err(ExecuteResult::exec_failed_after_start(
                     reason,
                     format!("client stream error: {}", e),
-                ));
+                )
+                .into());
             }
             let authority = match capture_session_authority(server, &request).await {
                 Ok(authority) => authority,
                 Err(reason) => {
-                    return Err(deny_and_record(
-                        phase,
-                        &request,
-                        SessionDecisionSource::SessionDeny,
-                        None,
-                        reason,
-                    )
-                    .await)
+                    return Err(Box::new(
+                        deny_and_record(
+                            phase,
+                            &request,
+                            SessionDecisionSource::SessionDeny,
+                            None,
+                            reason,
+                        )
+                        .await,
+                    ))
                 }
             };
             let inputs = GateInputs {
@@ -1884,14 +1943,16 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
                 consume_access_verbs: Vec::new(),
                 force_hold: false,
             };
-            return Err(route_allow_and_record(
-                phase,
-                request,
-                inputs,
-                SessionDecisionSource::StaticPolicy,
-                depth,
-            )
-            .await);
+            return Err(Box::new(
+                route_allow_and_record(
+                    phase,
+                    request,
+                    inputs,
+                    SessionDecisionSource::StaticPolicy,
+                    depth,
+                )
+                .await,
+            ));
         }
     }
     Ok(request)
@@ -1946,12 +2007,13 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     verb_ctx: &Option<VerbContext>,
     depth: u32,
-) -> Result<ExecuteRequest, ExecuteResult> {
-    if let Some(vc) = verb_ctx.clone() {
+) -> Result<ExecuteRequest, ExecuteError> {
+    if let Some(mut vc) = verb_ctx.clone() {
         if vc.trusted {
+            vc.learned_deny_preempted = true;
             let reason = format!("trusted verb '{}'", vc.name);
             if !log_audit_policy_for_request(phase.server, phase.caller, &request, true, &reason) {
-                return Err(ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON));
+                return Err(ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON).into());
             }
             if let Err(e) = write_policy_decision(
                 phase.stream_output,
@@ -1964,19 +2026,22 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
                 return Err(ExecuteResult::exec_failed_after_start(
                     reason,
                     format!("client stream error: {}", e),
-                ));
+                )
+                .into());
             }
             let authority = match capture_session_authority(phase.server, &request).await {
                 Ok(authority) => authority,
                 Err(reason) => {
-                    return Err(deny_and_record(
-                        phase,
-                        &request,
-                        SessionDecisionSource::SessionDeny,
-                        None,
-                        reason,
-                    )
-                    .await)
+                    return Err(Box::new(
+                        deny_and_record(
+                            phase,
+                            &request,
+                            SessionDecisionSource::SessionDeny,
+                            None,
+                            reason,
+                        )
+                        .await,
+                    ))
                 }
             };
             let inputs = GateInputs {
@@ -1990,14 +2055,16 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
                 consume_access_verbs: selected_session_verbs(phase),
                 force_hold: false,
             };
-            return Err(route_allow_and_record(
-                phase,
-                request,
-                inputs,
-                SessionDecisionSource::StaticPolicy,
-                depth,
-            )
-            .await);
+            return Err(Box::new(
+                route_allow_and_record(
+                    phase,
+                    request,
+                    inputs,
+                    SessionDecisionSource::StaticPolicy,
+                    depth,
+                )
+                .await,
+            ));
         }
     }
     Ok(request)

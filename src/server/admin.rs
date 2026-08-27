@@ -2231,7 +2231,11 @@ fn new_access_session(requester: PrincipalKey, label: String, expires_at: u64) -
         expires_at: Some(expires_at),
         prompt_append: None,
         generated_notes: Vec::new(),
-        static_only: true,
+        // Access-managed sessions add their reviewed typed authority to the
+        // caller's ordinary evaluator posture. They are selected implicitly
+        // from the authenticated principal, so making them policy-only would
+        // deny every unrelated command until the session is revoked.
+        static_only: false,
         auto_amend: false,
         granted_at: 0,
         owner: SessionOwner::Principal(requester),
@@ -3023,7 +3027,7 @@ async fn approve_held_access(
     if is_release_class(server, &approval.snapshot) {
         let snapshot = match claim_approval(server, handle).await {
             Ok(snapshot) => snapshot,
-            Err(AdminResponse::Error { message }) => {
+            Err(message) => {
                 return AccessDecisionResult {
                     request: handle.to_string(),
                     success: false,
@@ -3035,7 +3039,6 @@ async fn approve_held_access(
                     consequence: String::new(),
                 }
             }
-            Err(_) => unreachable!("claim errors use the error response"),
         };
         drop(transition);
         return match handle_approve_claimed(server, caller, handle, snapshot).await {
@@ -3293,7 +3296,7 @@ async fn authorize_session_inspection(
     server: &ServerContext,
     caller: &CallerIdentity,
     token: &str,
-) -> Result<(), AdminResponse> {
+) -> Result<(), String> {
     let owner = server.state.sessions.read().await.owner_for(token);
     let decision = match &owner {
         Some(owner) => {
@@ -3311,9 +3314,7 @@ async fn authorize_session_inspection(
                     .caller(caller)
                     .reason(SESSION_UNOWNED_REFUSED),
             );
-            Err(AdminResponse::Error {
-                message: format!("not authorized: {SESSION_UNOWNED_REFUSED}"),
-            })
+            Err(format!("not authorized: {SESSION_UNOWNED_REFUSED}"))
         }
         SessionAuthz::Mismatch => {
             server.emit_audit_ungated(
@@ -3321,11 +3322,9 @@ async fn authorize_session_inspection(
                     .caller(caller)
                     .reason(SESSION_PRINCIPAL_MISMATCH),
             );
-            Err(AdminResponse::Error {
-                message: format!(
-                    "not authorized: {SESSION_PRINCIPAL_MISMATCH}; a session may only be inspected by its owning principal"
-                ),
-            })
+            Err(format!(
+                "not authorized: {SESSION_PRINCIPAL_MISMATCH}; a session may only be inspected by its owning principal"
+            ))
         }
     }
 }
@@ -3776,6 +3775,42 @@ async fn list_access_items(server: &ServerContext, caller: &CallerIdentity) -> A
     AdminResponse::AccessItems { items }
 }
 
+/// Return the canonical active access-managed session for the kernel-authenticated
+/// local caller. The response deliberately uses the standard `AccessItem`
+/// projection, whose reference never contains the bearer token.
+async fn access_whoami_item(server: &ServerContext, caller: &CallerIdentity) -> AdminResponse {
+    let principal = match authenticated_local_principal(caller) {
+        Ok(principal) => principal,
+        Err(message) => return AdminResponse::Error { message },
+    };
+    let summary = {
+        let sessions = server.state.sessions.read().await;
+        access_token_for_principal_ci(&sessions, &principal).and_then(|token| {
+            sessions
+                .list()
+                .into_iter()
+                .find(|summary| summary.token == token)
+        })
+    };
+    match summary {
+        Some(summary) => {
+            let audience = AccessAudience::from_caller(server, caller);
+            let mut item = access_item_for_session(server, &summary, &audience).await;
+            // `whoami` identifies the attached session without unexpectedly
+            // expanding its reviewed matcher internals. Detailed access
+            // inspection remains an explicit `access show` operation.
+            item.intent = None;
+            item.capabilities.clear();
+            item.next_action = format!("guard access status {}", item.reference);
+            AdminResponse::AccessItem { item }
+        }
+        None => AdminResponse::Error {
+            message: "no active access-managed session for the authenticated local principal"
+                .to_string(),
+        },
+    }
+}
+
 async fn show_access_item(
     server: &ServerContext,
     caller: &CallerIdentity,
@@ -3835,11 +3870,46 @@ async fn show_access_item(
     }
 }
 
+async fn visible_activated_verbs(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+) -> std::collections::BTreeSet<String> {
+    let Some(principal) = caller.principal().filter(|_| caller.is_local_peer()) else {
+        return std::collections::BTreeSet::new();
+    };
+    let sessions = server.state.sessions.read().await;
+    access_token_for_principal_ci(&sessions, &principal)
+        .and_then(|token| {
+            sessions.verb_scope_for(&token).map(|(activated, _)| {
+                activated
+                    .into_iter()
+                    .filter(|name| {
+                        sessions
+                            .select_access_requests(&token, std::slice::from_ref(name))
+                            .is_ok()
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn verb_menu_item(verb: &Verb) -> VerbMenuItem {
+    VerbMenuItem {
+        name: verb.name.clone(),
+        description: verb.description.clone(),
+        params: verb.params.keys().cloned().collect(),
+        consequence: verb.consequence.as_str().to_string(),
+        hold: verb.hold,
+        has_revert: verb.revert.is_some(),
+    }
+}
+
 async fn access_session_token(
     server: &ServerContext,
     caller: &CallerIdentity,
     reference: &str,
-) -> Result<String, AdminResponse> {
+) -> Result<String, String> {
     let admin = caller_is_session_admin(server, caller);
     let principal = caller.principal();
     let mut candidates = server
@@ -3867,12 +3937,8 @@ async fn access_session_token(
     candidates.sort();
     match candidates.as_slice() {
         [token] => Ok(token.clone()),
-        [] => Err(AdminResponse::Error {
-            message: "unknown or unauthorized access session reference".to_string(),
-        }),
-        _ => Err(AdminResponse::Error {
-            message: format!("access target '{reference}' is ambiguous"),
-        }),
+        [] => Err("unknown or unauthorized access session reference".to_string()),
+        _ => Err(format!("access target '{reference}' is ambiguous")),
     }
 }
 
@@ -4272,8 +4338,8 @@ async fn dispatch_admin_request(
             // session's bound owner. Presenting the bearer token is no longer
             // sufficient - a leaked token cannot be used by another local peer.
             if !is_admin {
-                if let Err(response) = authorize_session_inspection(server, caller, &token).await {
-                    return response;
+                if let Err(message) = authorize_session_inspection(server, caller, &token).await {
+                    return AdminResponse::Error { message };
                 }
             }
             let reg = server.state.sessions.read().await;
@@ -4304,8 +4370,8 @@ async fn dispatch_admin_request(
             let _ = caller_token;
             let is_admin = caller_is_session_admin(server, caller);
             if !is_admin {
-                if let Err(response) = authorize_session_inspection(server, caller, &token).await {
-                    return response;
+                if let Err(message) = authorize_session_inspection(server, caller, &token).await {
+                    return AdminResponse::Error { message };
                 }
             }
             let Some(mut report) = server.state.sessions.read().await.show_with_limits(
@@ -4610,7 +4676,11 @@ async fn dispatch_admin_request(
                 uptime_secs: now.saturating_sub(server.config.started_at_unix),
                 mode,
                 dry_run: server.config.dry_run,
-                capabilities: vec!["approval-consequences-v1".to_string()],
+                capabilities: vec![
+                    "approval-consequences-v1".to_string(),
+                    super::wire::CAPABILITY_REQUESTER_VERB_SHOW_V1.to_string(),
+                    super::wire::CAPABILITY_ACCESS_WHOAMI_V1.to_string(),
+                ],
             }
         }
         AdminRequest::AuditVerify => {
@@ -4787,7 +4857,7 @@ async fn dispatch_admin_request(
                 Ok((approval, _is_operator)) => AdminResponse::ApprovalShow {
                     item: ApprovalSummary::from_row(&approval),
                 },
-                Err(response) => response,
+                Err(message) => AdminResponse::Error { message },
             }
         }
         AdminRequest::ApprovalWait {
@@ -4839,42 +4909,12 @@ async fn dispatch_admin_request(
                     .collect();
                 AdminResponse::Verbs { items }
             } else {
-                let visible_session_verbs =
-                    match caller.principal().filter(|_| caller.is_local_peer()) {
-                        Some(principal) => {
-                            let sessions = server.state.sessions.read().await;
-                            access_token_for_principal_ci(&sessions, &principal)
-                                .and_then(|token| {
-                                    sessions.verb_scope_for(&token).map(|(activated, _)| {
-                                        activated
-                                            .into_iter()
-                                            .filter(|name| {
-                                                sessions
-                                                    .select_access_requests(
-                                                        &token,
-                                                        std::slice::from_ref(name),
-                                                    )
-                                                    .is_ok()
-                                            })
-                                            .collect::<std::collections::BTreeSet<_>>()
-                                    })
-                                })
-                                .unwrap_or_default()
-                        }
-                        None => std::collections::BTreeSet::new(),
-                    };
+                let visible_session_verbs = visible_activated_verbs(server, caller).await;
                 let items = cat
                     .list()
                     .iter()
                     .filter(|verb| verb.baseline || visible_session_verbs.contains(&verb.name))
-                    .map(|verb| VerbMenuItem {
-                        name: verb.name.clone(),
-                        description: verb.description.clone(),
-                        params: verb.params.keys().cloned().collect(),
-                        consequence: verb.consequence.as_str().to_string(),
-                        hold: verb.hold,
-                        has_revert: verb.revert.is_some(),
-                    })
+                    .map(verb_menu_item)
                     .collect();
                 AdminResponse::VerbMenu { items }
             }
@@ -4891,14 +4931,28 @@ async fn dispatch_admin_request(
                     }
                 }
             };
-            match catalog.get(&name).cloned() {
-                Some(verb) => AdminResponse::VerbCreated {
-                    verb,
-                    persisted: true,
-                    preview_digest: None,
+            if caller_is_session_admin(server, caller) {
+                return match catalog.get(&name).cloned() {
+                    Some(verb) => AdminResponse::VerbCreated {
+                        verb,
+                        persisted: true,
+                        preview_digest: None,
+                    },
+                    None => AdminResponse::Error {
+                        message: format!("unknown verb: '{name}'"),
+                    },
+                };
+            }
+            let visible_session_verbs = visible_activated_verbs(server, caller).await;
+            match catalog
+                .get(&name)
+                .filter(|verb| verb.baseline || visible_session_verbs.contains(&verb.name))
+            {
+                Some(verb) => AdminResponse::VerbMenu {
+                    items: vec![verb_menu_item(verb)],
                 },
                 None => AdminResponse::Error {
-                    message: format!("unknown verb: '{name}'"),
+                    message: "unknown or unavailable verb".to_string(),
                 },
             }
         }
@@ -5889,13 +5943,14 @@ async fn dispatch_admin_request(
             }
         }
         AdminRequest::AccessList => Box::pin(list_access_items(server, caller)).await,
+        AdminRequest::AccessWhoami => Box::pin(access_whoami_item(server, caller)).await,
         AdminRequest::AccessShow { reference } => {
             Box::pin(show_access_item(server, caller, &reference)).await
         }
         AdminRequest::AccessStatus { reference } => {
             let token = match Box::pin(access_session_token(server, caller, &reference)).await {
                 Ok(token) => token,
-                Err(response) => return response,
+                Err(message) => return AdminResponse::Error { message },
             };
             Box::pin(session_status_response(server, &token, true)).await
         }
@@ -7154,7 +7209,7 @@ async fn handle_manual_revert(
 async fn claim_approval(
     server: &ServerContext,
     handle: &str,
-) -> Result<guard::gating::approval::ApprovalSnapshot, AdminResponse> {
+) -> Result<guard::gating::approval::ApprovalSnapshot, String> {
     let now = now_unix();
     let pending = server.state.approvals.read().await.get(handle).cloned();
     let snapshot = {
@@ -7169,9 +7224,7 @@ async fn claim_approval(
                     let _ = persist_approval(server, &approval).await;
                 }
             }
-            return Err(AdminResponse::Error {
-                message: e.to_string(),
-            });
+            return Err(e.to_string());
         }
     };
     let approving = server.state.approvals.read().await.get(handle).cloned();
@@ -7183,9 +7236,7 @@ async fn claim_approval(
             .await
         {
             reconcile_approval_from_store(server, handle).await;
-            return Err(AdminResponse::Error {
-                message: format!("failed to claim approval: {error}"),
-            });
+            return Err(format!("failed to claim approval: {error}"));
         }
     }
     Ok(snapshot)
@@ -7723,7 +7774,7 @@ async fn handle_approve(
     }
     let snapshot = match claim_approval(server, handle).await {
         Ok(snapshot) => snapshot,
-        Err(response) => return response,
+        Err(message) => return AdminResponse::Error { message },
     };
     drop(transition);
     handle_approve_claimed(server, caller, handle, snapshot).await
@@ -7734,8 +7785,12 @@ const APPROVAL_WAIT_MAX_SECS: u64 = 3600;
 
 fn approval_not_found(handle: &str) -> AdminResponse {
     AdminResponse::Error {
-        message: format!("no approval with handle '{}'", handle),
+        message: approval_not_found_message(handle),
     }
+}
+
+fn approval_not_found_message(handle: &str) -> String {
+    format!("no approval with handle '{handle}'")
 }
 
 /// Resolve one hold for a scoped reader, returning the row and whether the
@@ -7748,14 +7803,14 @@ async fn approval_scope_check(
     server: &ServerContext,
     caller: &CallerIdentity,
     handle: &str,
-) -> Result<(Approval, bool), AdminResponse> {
+) -> Result<(Approval, bool), String> {
     let (is_operator, caller_key) = caller_scope(server, caller);
     let found = server.state.approvals.read().await.get(handle).cloned();
     match found {
         Some(approval) if is_operator || scope_eq(&approval.snapshot.principal, &caller_key) => {
             Ok((approval, is_operator))
         }
-        _ => Err(approval_not_found(handle)),
+        _ => Err(approval_not_found_message(handle)),
     }
 }
 
@@ -7990,7 +8045,7 @@ async fn observe_approval_with_lease(
     handle: &str,
     notify: std::sync::Arc<tokio::sync::Notify>,
     timeout_secs: u64,
-) -> Result<(ApprovalSummary, String), AdminResponse> {
+) -> Result<(ApprovalSummary, String), String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         let notified = notify.notified();
@@ -7998,7 +8053,7 @@ async fn observe_approval_with_lease(
         notified.as_mut().enable();
         let current = server.state.approvals.read().await.get(handle).cloned();
         let Some(current) = current else {
-            return Err(approval_not_found(handle));
+            return Err(approval_not_found_message(handle));
         };
         if let Some(outcome) = approval_wait_outcome(&current) {
             return Ok((ApprovalSummary::from_row(&current), outcome.to_string()));
@@ -8035,12 +8090,14 @@ pub(super) async fn handle_admin_request_owned(
                 waiter_lease: None,
             };
         }
-        if let Err(response) = approval_scope_check(server, caller, &handle).await {
+        if let Err(scope_message) = approval_scope_check(server, caller, &handle).await {
             let response =
                 if let Some(message) = grant_request_wait_refusal(server, caller, &handle).await {
                     AdminResponse::Error { message }
                 } else {
-                    response
+                    AdminResponse::Error {
+                        message: scope_message,
+                    }
                 };
             return OwnedAdminResponse {
                 response,
@@ -8069,8 +8126,8 @@ pub(super) async fn handle_admin_request_owned(
                 },
                 waiter_lease: Some(lease),
             },
-            Err(response) => OwnedAdminResponse {
-                response,
+            Err(message) => OwnedAdminResponse {
+                response: AdminResponse::Error { message },
                 waiter_lease: Some(lease),
             },
         };
@@ -8106,12 +8163,14 @@ pub(super) async fn handle_admin_request_owned(
     }
     let handle = handles.into_iter().next().expect("checked one handle");
 
-    if let Err(response) = approval_scope_check(server, caller, &handle).await {
+    if let Err(scope_message) = approval_scope_check(server, caller, &handle).await {
         let response =
             if let Some(message) = grant_request_wait_refusal(server, caller, &handle).await {
                 AdminResponse::Error { message }
             } else {
-                response
+                AdminResponse::Error {
+                    message: scope_message,
+                }
             };
         return OwnedAdminResponse {
             response,
@@ -8159,8 +8218,8 @@ pub(super) async fn handle_admin_request_owned(
             },
             waiter_lease: Some(lease),
         },
-        Err(response) => OwnedAdminResponse {
-            response,
+        Err(message) => OwnedAdminResponse {
+            response: AdminResponse::Error { message },
             waiter_lease: Some(lease),
         },
     }

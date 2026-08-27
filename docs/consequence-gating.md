@@ -62,13 +62,17 @@ check, an unconfirmed envelope rolls back. An operator can decide early:
 
 ```bash
 guard provisionals
-guard confirm <handle>
-guard revert <handle>
+sudo guard-operator confirm <handle>
+sudo guard-operator revert <handle>
 ```
 
-A `guard confirm` or `guard revert` on a handle whose deadline already fired
-reports when the automatic rollback ran and the window that elapsed, so an
-envelope that did what it was armed to do is distinguishable from a fault.
+On Windows, run
+`& 'C:\Program Files\Guard\guard-operator.ps1' -Action confirm -Reference <handle>`
+or the corresponding `-Action revert` from an elevated PowerShell. A Unix
+`guard-operator confirm` or `guard-operator revert` on a handle whose deadline
+already fired reports when the automatic rollback ran and the window that
+elapsed, so an envelope that did what it was armed to do is distinguishable
+from a fault.
 
 Forward, verification, and rollback preserve the canonical working directory,
 principal, and approved daemon-side credential bindings. Persisted plans store

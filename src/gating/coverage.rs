@@ -43,6 +43,10 @@ pub struct VerbContext {
     /// Canonical digest of the complete composed matcher result, including
     /// every applicable coverage cell and every selected verb definition.
     pub composition_digest: Option<String>,
+    /// Set only by the execution path after this exact typed authority has
+    /// preauthorized the command. Evaluator-reviewed contexts remain false so
+    /// a newly learned deny can still close the process-start race.
+    pub learned_deny_preempted: bool,
     /// True only when every selected cell is an operator-approved session
     /// `evaluate` cell. The executor may then honor the access grant without
     /// asking the evaluator to decide the same typed operation again.
@@ -304,6 +308,7 @@ pub fn resolve_scoped_matches(
                 catalog_version,
                 verb_digest: None,
                 composition_digest: None,
+                learned_deny_preempted: false,
                 access_evaluation_override_eligible,
             }),
             revert,

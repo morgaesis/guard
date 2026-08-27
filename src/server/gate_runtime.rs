@@ -765,7 +765,7 @@ impl Drop for ProxyHoldOrphanGuard {
 /// registry and state store), and a directory for stored HTTP revert bodies.
 /// The proxy acts as the daemon principal, so the operator manages
 /// proxy-armed provisionals with the same
-/// `guard confirm` / `guard provisionals` / `guard revert` commands.
+/// packaged operator confirmation, inspection, and reversion actions.
 #[derive(Clone)]
 pub(super) struct DaemonGateSink {
     pub(super) server: ServerContext,
@@ -3743,7 +3743,7 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
 }
 
 /// Run the revert for a provisional under the original caller's identity, with no
-/// client stream. Used by the sweeper and `guard revert`.
+/// client stream. Used by the sweeper and operator-initiated reversion.
 async fn run_provisional_revert(server: &ServerContext, p: &Provisional) -> ExecuteResult {
     if p.api_revert.is_none()
         && command_contains_sensitive_literals(&p.revert_binary, &p.revert_args)
@@ -4245,8 +4245,8 @@ pub(super) async fn finish_revert(
         }
     };
     // `kind` names who drove this rollback ("auto"/"auto-check-failed" for the
-    // deadline sweeper, "manual" for `guard revert`). Only the sweeper's own
-    // rollback stamps the row, so a later `guard confirm` can say the timer
+    // deadline sweeper, "manual" for operator reversion). Only the sweeper's own
+    // rollback stamps the row, so later operator confirmation can say the timer
     // fired rather than only that the handle is spent.
     let auto_reverted_unix = kind.starts_with("auto").then(now_unix);
     let updated = {

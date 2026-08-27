@@ -172,6 +172,7 @@ impl Client {
             AdminRequest::AccessRevoke { .. } => "access_revoke",
             AdminRequest::AccessExtend { .. } => "access_extend",
             AdminRequest::AccessList => "access_list",
+            AdminRequest::AccessWhoami => "access_whoami",
             AdminRequest::AccessShow { .. } => "access_show",
             AdminRequest::AccessStatus { .. } => "access_status",
             AdminRequest::EvaluateBatch { .. } => "evaluate_batch",

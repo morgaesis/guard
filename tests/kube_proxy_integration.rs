@@ -3099,7 +3099,11 @@ async fn cleanup_revocation_linearizes_at_the_final_header_handoff() {
                 .await
                 .unwrap()
         });
-        sink.reached.acquire().await.unwrap().forget();
+        tokio::time::timeout(Duration::from_secs(10), sink.reached.acquire())
+            .await
+            .expect("cleanup reaches the final authority handoff")
+            .unwrap()
+            .forget();
         let coordination = sink.coordination.clone();
         let mut revoke = tokio::spawn(async move {
             *coordination.write().await = false;
@@ -3113,7 +3117,14 @@ async fn cleanup_revocation_linearizes_at_the_final_header_handoff() {
                 .unwrap();
         }
         sink.release.add_permits(1);
-        assert_eq!(cleanup.await.unwrap().status(), expected_status);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), cleanup)
+                .await
+                .expect("cleanup completes after final authority handoff")
+                .unwrap()
+                .status(),
+            expected_status
+        );
         if matches!(pause, CleanupLeasePause::AfterLease) {
             tokio::time::timeout(Duration::from_secs(2), &mut revoke)
                 .await
@@ -4301,7 +4312,11 @@ async fn proxy_arms_auto_revert_for_writes() {
         .get("warning")
         .and_then(|value| value.to_str().ok())
         .unwrap();
-    assert!(warning.contains("guard confirm test-handle-0"));
+    assert!(
+        warning.contains(&guard::gating::provisional::operator_confirm_command(
+            "test-handle-0"
+        ))
+    );
     assert!(warning.contains(&format!("deadline_unix={deadline_unix}")));
     assert!(warning.contains("seconds_remaining="));
 

@@ -2511,8 +2511,10 @@ fn render_tool_text(result: &Value) -> String {
             "Operator action required: inspect `guard provisionals`; no recovery handle is available."
                 .to_string()
         } else {
+            let confirm = guard::gating::provisional::operator_confirm_command(handle);
+            let revert = guard::gating::provisional::operator_revert_command(handle);
             format!(
-                "Operator action required for handle {handle}: inspect `guard provisionals`, then run `guard confirm {handle}` or `guard revert {handle}`."
+                "Operator action required for handle {handle}: inspect `guard provisionals`, then run `{confirm}` or `{revert}`."
             )
         };
         let mut out = String::new();
@@ -2546,13 +2548,14 @@ fn render_tool_text(result: &Value) -> String {
             ) + &decision + &guidance;
         }
         Some("provisional") => {
+            let confirm = guard::gating::provisional::operator_confirm_command(handle);
             let mut out = String::new();
             if !stdout.is_empty() {
                 out.push_str(stdout);
                 out.push('\n');
             }
             out.push_str(&format!(
-                "PROVISIONAL (handle {handle}): applied behind an auto-revert envelope; it reverts unless the operator runs `guard confirm {handle}`.{}",
+                "PROVISIONAL (handle {handle}): applied behind an auto-revert envelope; it reverts unless the operator runs `{confirm}`.{}",
                 coverage_text(result)
             ));
             if let (Some(deadline), Some(window)) = (
@@ -4152,8 +4155,16 @@ mod tests {
         assert!(!text.is_empty());
         assert!(text.contains("CONTAINMENT FAILED"));
         assert!(text.contains("pv-recovery"));
-        assert!(text.contains("guard confirm pv-recovery"));
-        assert!(text.contains("guard revert pv-recovery"));
+        assert!(
+            text.contains(&guard::gating::provisional::operator_confirm_command(
+                "pv-recovery"
+            ))
+        );
+        assert!(
+            text.contains(&guard::gating::provisional::operator_revert_command(
+                "pv-recovery"
+            ))
+        );
         assert!(text.contains("durable outcome unavailable"));
     }
 
@@ -4186,8 +4197,16 @@ mod tests {
         assert!(text.contains("No auto-revert timer is armed"));
         assert!(text.contains("Operator action required"));
         assert!(text.contains("legacy-recovery"));
-        assert!(text.contains("guard confirm legacy-recovery"));
-        assert!(text.contains("guard revert legacy-recovery"));
+        assert!(
+            text.contains(&guard::gating::provisional::operator_confirm_command(
+                "legacy-recovery"
+            ))
+        );
+        assert!(
+            text.contains(&guard::gating::provisional::operator_revert_command(
+                "legacy-recovery"
+            ))
+        );
         assert!(!text.contains("applied behind an auto-revert envelope"));
     }
 

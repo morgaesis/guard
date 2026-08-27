@@ -4,7 +4,7 @@
 //! undo it (the prior object, or the identity of a created one) and hands it to
 //! a [`GateSink`]. The daemon implements the sink by arming a `Provisional` in
 //! the shared registry with an API-revert request, so the existing auto-revert
-//! sweeper and `guard confirm`/`guard provisionals` apply unchanged. Keeping the
+//! sweeper and packaged operator actions apply unchanged. Keeping the
 //! sink a trait keeps the proxy (lib) free of the daemon's persistence types.
 
 use crate::gating::Reversibility;

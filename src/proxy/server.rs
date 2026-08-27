@@ -12,7 +12,7 @@
 //! A recoverable write the policy allows is wrapped in an auto-revert envelope
 //! when the daemon's consequence gate is active: the proxy snapshots the prior
 //! object (or notes the created one) and hands a synthesized revert to the
-//! [`GateSink`], so the operator's `guard confirm` keeps it and the sweeper rolls
+//! [`GateSink`], so operator confirmation keeps it and the sweeper rolls
 //! it back otherwise. Interactive subresources (`exec`/`attach`/`portforward`)
 //! and Secret `watch`es are denied: their streams cannot be redacted or gated
 //! per object.
@@ -70,6 +70,7 @@ const UPSTREAM_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const POLICY_RELOAD_SECS: u64 = 5;
 
 type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+type ProxyErrorResponse = Box<Response<ProxyBody>>;
 type ReqwestByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + Sync>>;
 type RedactingStreamState = (ReqwestByteStream, ExactSecretRedactor, bool);
 type JudgeBuilder = dyn Fn(Option<String>) -> Option<Arc<dyn ApiJudge>> + Send + Sync;
@@ -1830,7 +1831,7 @@ impl ApiProxy {
                         body_sha256: body_sha256(&body),
                     })
                 }
-                Err(response) => return response,
+                Err(response) => return *response,
             }
         } else {
             None
@@ -1840,7 +1841,7 @@ impl ApiProxy {
         } else {
             match self.prepare_revert(op, path, &route_authority).await {
                 Ok(prepared) => prepared,
-                Err(response) => return response,
+                Err(response) => return *response,
             }
         };
         if let Some(prepared) = prepared_mutation.as_ref() {
@@ -1996,7 +1997,7 @@ impl ApiProxy {
                         // forwarding path repeats these checks immediately
                         // before the mutation.
                         if let Err(response) = self.revalidate_session(&parts).await {
-                            return response;
+                            return *response;
                         }
                         if let Some(response) = self
                             .recheck_final_authority(&route_authority, Some(op))
@@ -2048,7 +2049,7 @@ impl ApiProxy {
                                         )
                                         .await;
                                 }
-                                Err(response) => return response,
+                                Err(response) => return *response,
                             }
                         } else {
                             // A named create's delete revert is built from the
@@ -2145,7 +2146,7 @@ impl ApiProxy {
                         body_sha256: body_sha256(&body),
                     })
                 }
-                Err(response) => return response,
+                Err(response) => return *response,
             }
         } else {
             None
@@ -2310,7 +2311,7 @@ impl ApiProxy {
                 // upstream, so an unavailable concurrency snapshot must not
                 // bypass the operator's denial. If the operator approves, the
                 // preparation failure is returned and no bytes are sent.
-                Err(response) => preparation_error = Some(response),
+                Err(response) => preparation_error = Some(*response),
             }
         }
         if let Some(pending) = authorization.as_mut() {
@@ -2533,7 +2534,7 @@ impl ApiProxy {
                         body_sha256: body_sha256(&body),
                     });
                 }
-                Err(response) => return response,
+                Err(response) => return *response,
             }
         }
         if let Some(approved) = parts.extensions.get::<ApprovedApiHold>() {
@@ -2563,12 +2564,12 @@ impl ApiProxy {
                     prior_snapshot: snapshot,
                     body_sha256: body_sha256(&body),
                 }),
-                Err(response) => return response,
+                Err(response) => return *response,
             };
         }
         let session_context = match self.revalidate_session(&parts).await {
             Ok(context) => context,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         let staged_revert = if track_write {
             let operation = op.as_ref().expect("tracked write has operation");
@@ -3223,9 +3224,8 @@ impl ApiProxy {
                         .header(hyper::header::WARNING, warning);
                 } else {
                     let warning = if containment_active {
-                        format!(
-                            "299 guard \"change is provisional; confirm with guard confirm {handle}\""
-                        )
+                        let confirm = crate::gating::provisional::operator_confirm_command(&handle);
+                        format!("299 guard \"change is provisional; confirm with {confirm}\"")
                     } else {
                         format!(
                             "299 guard \"mutation outcome is uncertain; inspect provisional {handle}\""
@@ -3343,24 +3343,24 @@ impl ApiProxy {
     async fn revalidate_session(
         &self,
         parts: &Parts,
-    ) -> Result<Option<ApiSessionContext>, Response<ProxyBody>> {
+    ) -> Result<Option<ApiSessionContext>, ProxyErrorResponse> {
         let Some(auth) = parts.extensions.get::<SessionAuth>() else {
             return Ok(None);
         };
         let Some(sink) = self.session_sink.get() else {
-            return Err(self.status_resp(
+            return Err(Box::new(self.status_resp(
                 StatusCode::FORBIDDEN,
                 "guard api-proxy: session attribution is unavailable",
                 "Forbidden",
-            ));
+            )));
         };
         let current = sink.resolve(&auth.token).await;
         if current.as_ref() != Some(&auth.context) {
-            return Err(self.status_resp(
+            return Err(Box::new(self.status_resp(
                 StatusCode::FORBIDDEN,
                 "guard api-proxy: session expired, was revoked, or is suspended",
                 "Forbidden",
-            ));
+            )));
         }
         Ok(current)
     }
@@ -3431,49 +3431,50 @@ impl ApiProxy {
         op: &ApiOp,
         route_authority: &RouteAuthority,
         prepared_snapshot: Option<&[u8]>,
-    ) -> Result<(Bytes, Option<Vec<u8>>), Response<ProxyBody>> {
+    ) -> Result<(Bytes, Option<Vec<u8>>), ProxyErrorResponse> {
         let Some(auth) = parts.extensions.get::<SessionAuth>() else {
-            return Err(self.status_resp(
+            return Err(Box::new(self.status_resp(
                 StatusCode::FORBIDDEN,
                 "guard api-proxy: Kubernetes mutations require an attributable Guard session or an operator-approved typed verb",
                 "Forbidden",
-            ));
+            )));
         };
         if op.verb == Verb::Create && op.name.is_none() {
             return Ok((Bytes::copy_from_slice(body), None));
         }
         if !matches!(op.verb, Verb::Update | Verb::Patch | Verb::Delete) || op.name.is_none() {
-            return Err(self.kubernetes_conflict(
+            return Err(Box::new(self.kubernetes_conflict(
                 "Kubernetes mutation cannot be bound to one observed object",
-            ));
+            )));
         }
         let snapshot = match prepared_snapshot {
             Some(snapshot) => snapshot.to_vec(),
             None => {
                 let Some(snapshot) = self.fetch_prior_object(path, route_authority).await? else {
-                    return Err(self.kubernetes_conflict(
+                    return Err(Box::new(self.kubernetes_conflict(
                         "current Kubernetes object could not be read for write arbitration",
-                    ));
+                    )));
                 };
                 snapshot
             }
         };
         let Some(state) = object_state(op, &snapshot) else {
-            return Err(self.kubernetes_conflict(
+            return Err(Box::new(self.kubernetes_conflict(
                 "current Kubernetes object has no usable UID and resourceVersion",
-            ));
+            )));
         };
         let key = self.observation_key(op, &state, &auth.context);
         let Some(observed) = self.observations.lock().unwrap().get(&key) else {
-            return Err(self.kubernetes_conflict(
+            return Err(Box::new(self.kubernetes_conflict(
                 "this session has not observed the current Kubernetes object UID",
-            ));
+            )));
         };
         if observed.resource_version != state.resource_version
             && observed.contention_fingerprint != state.contention_fingerprint
         {
-            return Err(self
-                .kubernetes_conflict("Kubernetes object changed since this session observed it"));
+            return Err(Box::new(self.kubernetes_conflict(
+                "Kubernetes object changed since this session observed it",
+            )));
         }
         let guarded = bind_mutation_preconditions(
             op,
@@ -3482,7 +3483,7 @@ impl ApiProxy {
             &state,
             &observed.resource_version,
         )
-        .map_err(|reason| self.kubernetes_conflict(&reason))?;
+        .map_err(|reason| Box::new(self.kubernetes_conflict(&reason)))?;
         self.observations.lock().unwrap().remember(
             key,
             ObservedVersion {
@@ -3565,9 +3566,9 @@ impl ApiProxy {
         &self,
         path: &str,
         route_authority: &RouteAuthority,
-    ) -> Result<Option<Vec<u8>>, Response<ProxyBody>> {
+    ) -> Result<Option<Vec<u8>>, ProxyErrorResponse> {
         if let Some(response) = self.recheck_final_authority(route_authority, None).await {
-            return Err(response);
+            return Err(Box::new(response));
         }
         let url = format!("{}{}", self.upstream.base(), path);
         let mut rb = self
@@ -3683,7 +3684,7 @@ impl ApiProxy {
         op: &ApiOp,
         path: &str,
         route_authority: &RouteAuthority,
-    ) -> Result<Option<Vec<u8>>, Response<ProxyBody>> {
+    ) -> Result<Option<Vec<u8>>, ProxyErrorResponse> {
         let Some(snapshot) = self.fetch_prior_object(path, route_authority).await? else {
             return Ok(None);
         };
@@ -3702,7 +3703,7 @@ impl ApiProxy {
         op: &ApiOp,
         path: &str,
         route_authority: &RouteAuthority,
-    ) -> Result<RevertConstructible, Response<ProxyBody>> {
+    ) -> Result<RevertConstructible, ProxyErrorResponse> {
         let track_write = self.gate.get().is_some() && self.protocol.tracks_write(op);
         if !track_write {
             return Ok(RevertConstructible::None);
@@ -4007,12 +4008,13 @@ fn provisional_response_metadata(
     now_unix: u64,
 ) -> (String, String) {
     let seconds_remaining = deadline_unix.saturating_sub(now_unix);
+    let confirm = crate::gating::provisional::operator_confirm_command(handle);
     (
         format!(
             "{handle}; deadline_unix={deadline_unix}; seconds_remaining={seconds_remaining}"
         ),
         format!(
-            "299 guard \"change is provisional; confirm with guard confirm {handle}; auto-revert deadline_unix={deadline_unix}; seconds_remaining={seconds_remaining}\""
+            "299 guard \"change is provisional; confirm with {confirm}; auto-revert deadline_unix={deadline_unix}; seconds_remaining={seconds_remaining}\""
         ),
     )
 }
@@ -4969,7 +4971,10 @@ mod tests {
         );
         assert_eq!(
             warning,
-            "299 guard \"change is provisional; confirm with guard confirm handle-123; auto-revert deadline_unix=1700000123; seconds_remaining=23\""
+            format!(
+                "299 guard \"change is provisional; confirm with {}; auto-revert deadline_unix=1700000123; seconds_remaining=23\"",
+                crate::gating::provisional::operator_confirm_command("handle-123")
+            )
         );
     }
 

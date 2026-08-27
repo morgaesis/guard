@@ -1,4 +1,4 @@
-use crate::grant_profile::{GrantRequest, SavedGrant};
+use crate::grant_profile::{EvaluationMode, GrantRequest, SavedGrant};
 use crate::session::{
     session_grant_revision_key, HistoricalGrant, HistoricalStatus, IssuedGrantScope,
     SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant, SessionInteraction,
@@ -10,6 +10,7 @@ use guard::gating::provisional::{Provisional, ProvisionalStatus, REVERT_BODY_CLE
 use guard::gating::read_grant::ReadGrant;
 use guard::redact::{redact_output_text, SENSITIVE_ARGV_REPLAY_GUIDANCE};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -51,6 +52,25 @@ const SCHEMA_VERSION: i64 = 14;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
+
+#[derive(Debug)]
+struct AdditiveAccessRevisionUpdate {
+    token: String,
+    old_revision: String,
+    new_revision: String,
+    token_fingerprint: String,
+}
+
+fn access_session_token_fingerprint(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!(
+        "sha256:{}",
+        digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
 
 #[derive(Debug)]
 struct RegistryGenerationConflict {
@@ -620,6 +640,85 @@ impl SessionStore {
         Self::load_registry_sync_with_hook(path, history_retention_secs, || {})
     }
 
+    fn rebase_additive_access_dependents(
+        tx: &Transaction<'_>,
+        updates: &[AdditiveAccessRevisionUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let pending_requests = {
+            let mut stmt = tx.prepare(
+                "SELECT handle, json FROM grant_requests WHERE status = 'pending' ORDER BY handle",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (handle, json) in pending_requests {
+            let mut request: GrantRequest = serde_json::from_str(&json)
+                .with_context(|| format!("decode pending access request {handle}"))?;
+            let Some(update) = updates.iter().find(|update| {
+                request.session_token == update.token
+                    && request.issued_session_revision.as_deref()
+                        == Some(update.old_revision.as_str())
+            }) else {
+                continue;
+            };
+            request.issued_session_revision = Some(update.new_revision.clone());
+            if request.has_access_projection() {
+                request.request_key = request
+                    .canonical_access_key()
+                    .context("rebase pending access request key")?;
+            }
+            validate_persisted_access_request(&request)?;
+            tx.execute(
+                "UPDATE grant_requests SET json = ?1 WHERE handle = ?2",
+                params![
+                    serde_json::to_string(&request).context("encode rebased access request")?,
+                    handle
+                ],
+            )?;
+        }
+
+        let pending_approvals = {
+            let mut stmt = tx.prepare(
+                "SELECT handle, json FROM gating_approval WHERE status = 'pending' ORDER BY handle",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (handle, json) in pending_approvals {
+            let mut approval: Approval = serde_json::from_str(&json)
+                .with_context(|| format!("decode pending approval {handle}"))?;
+            let Some(update) = updates.iter().find(|update| {
+                approval.snapshot.session_revision.as_deref() == Some(update.old_revision.as_str())
+                    && approval.snapshot.session_fingerprint.as_deref()
+                        == Some(update.token_fingerprint.as_str())
+            }) else {
+                continue;
+            };
+            approval.snapshot.session_revision = Some(update.new_revision.clone());
+            validate_persisted_approval(&approval)?;
+            tx.execute(
+                "UPDATE gating_approval SET json = ?1 WHERE handle = ?2",
+                params![
+                    serde_json::to_string(&approval).context("encode rebased approval")?,
+                    handle
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn load_registry_sync_with_hook<F>(
         path: &Path,
         history_retention_secs: u64,
@@ -634,6 +733,7 @@ impl SessionStore {
 
         let mut grants = HashMap::new();
         let mut active_exact_updates = Vec::new();
+        let mut additive_access_updates = Vec::new();
         let mut retired_active = Vec::new();
         {
             let mut stmt = tx.prepare(
@@ -668,6 +768,26 @@ impl SessionStore {
             })?;
             for row in rows {
                 let (token, mut grant) = row?;
+                if grant.scope.access_managed
+                    && grant.static_only
+                    && grant.scope.evaluation_mode != EvaluationMode::PolicyOnly
+                {
+                    // Access-managed sessions issued before additive access
+                    // semantics persisted this legacy flag. Preserve an
+                    // explicit policy-only mode, but otherwise normalize and
+                    // durably rewrite the session during startup.
+                    let old_revision = session_grant_revision_key(&grant)
+                        .context("compute legacy access session revision")?;
+                    grant.static_only = false;
+                    let new_revision = session_grant_revision_key(&grant)
+                        .context("compute additive access session revision")?;
+                    additive_access_updates.push(AdditiveAccessRevisionUpdate {
+                        token: token.clone(),
+                        old_revision,
+                        new_revision,
+                        token_fingerprint: access_session_token_fingerprint(&token),
+                    });
+                }
                 let allow_changed = purge_sensitive_exact_rules(&mut grant.allow_exact);
                 let deny_changed = purge_sensitive_exact_rules(&mut grant.deny_exact);
                 let exact_metadata = serialized_contains_registered_exact_literals(&grant)?;
@@ -801,6 +921,13 @@ impl SessionStore {
                 params![allow, deny, token],
             )?;
         }
+        for update in &additive_access_updates {
+            tx.execute(
+                "UPDATE session_grants SET static_only = 0 WHERE token = ?1",
+                params![update.token],
+            )?;
+        }
+        Self::rebase_additive_access_dependents(&tx, &additive_access_updates)?;
         for grant in &retired_active {
             tx.execute(
                 "DELETE FROM session_grants WHERE token = ?1",
@@ -819,6 +946,7 @@ impl SessionStore {
             insert_historical_grant(&tx, grant)?;
         }
         let generation = if active_exact_updates.is_empty()
+            && additive_access_updates.is_empty()
             && history_exact_updates.is_empty()
             && history_replacements.is_empty()
             && retired_active.is_empty()
@@ -837,7 +965,7 @@ impl SessionStore {
                 ],
             )?;
             if changed != 1 {
-                anyhow::bail!("session registry generation compare-and-swap was lost during sensitive exact-rule purge");
+                anyhow::bail!("session registry generation compare-and-swap was lost during startup normalization");
             }
             next
         };
@@ -6002,6 +6130,130 @@ mod tests {
     }
 
     #[test]
+    fn registry_load_normalizes_legacy_access_sessions_to_additive_mode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let (_, initial_generation) = SessionStore::load_registry_sync(&path, 3600).unwrap();
+        let legacy_token = "legacy-access-policy-only".to_string();
+        let explicit_token = "explicit-access-policy-only".to_string();
+        let access_grant = |evaluation_mode| SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["host-inspect".to_string()],
+            override_markers: Vec::new(),
+            scope: IssuedGrantScope {
+                access_managed: true,
+                evaluation_mode,
+                ..IssuedGrantScope::default()
+            },
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            granted_at: 1,
+            static_only: true,
+            auto_amend: false,
+            owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
+        };
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            legacy_token.clone(),
+            access_grant(EvaluationMode::Evaluator),
+        );
+        registry.grant(
+            explicit_token.clone(),
+            access_grant(EvaluationMode::PolicyOnly),
+        );
+        let seeded_generation =
+            SessionStore::persist_registry_sync(&path, 3600, &registry, initial_generation)
+                .unwrap();
+        let old_revision = registry.effective_revision_key(&legacy_token).unwrap();
+        let mut request = generated_access_request();
+        request.session_token = legacy_token.clone();
+        request.issued_session_revision = Some(old_revision.clone());
+        request.request_key = request.canonical_access_key().unwrap();
+        let mut approval = pending_approval("legacy-access-hold");
+        approval.snapshot.session_fingerprint =
+            Some(access_session_token_fingerprint(&legacy_token));
+        approval.snapshot.session_revision = Some(old_revision);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO grant_requests (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                request.handle,
+                serde_json::to_string(&request).unwrap(),
+                request.status.as_str(),
+                encode_u64(request.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gating_approval (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                approval.handle,
+                serde_json::to_string(&approval).unwrap(),
+                approval.status.as_str(),
+                encode_u64(approval.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let (loaded, normalized_generation) =
+            SessionStore::load_registry_sync(&path, 3600).unwrap();
+        assert!(!loaded.static_only_for(&legacy_token));
+        assert!(loaded.static_only_for(&explicit_token));
+        assert_eq!(normalized_generation, seeded_generation + 1);
+        let new_revision = loaded.effective_revision_key(&legacy_token).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let normalized: i64 = conn
+            .query_row(
+                "SELECT static_only FROM session_grants WHERE token = ?1",
+                params![legacy_token],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normalized, 0);
+        let rebased_request: GrantRequest = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT json FROM grant_requests WHERE handle = ?1",
+                    params![request.handle],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rebased_request.issued_session_revision.as_deref(),
+            Some(new_revision.as_str())
+        );
+        assert_eq!(
+            rebased_request.request_key,
+            rebased_request.canonical_access_key().unwrap()
+        );
+        let rebased_approval: Approval = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT json FROM gating_approval WHERE handle = ?1",
+                    params![approval.handle],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rebased_approval.snapshot.session_revision.as_deref(),
+            Some(new_revision.as_str())
+        );
+        drop(conn);
+
+        let (_, idempotent_generation) = SessionStore::load_registry_sync(&path, 3600).unwrap();
+        assert_eq!(idempotent_generation, normalized_generation);
+    }
+
+    #[test]
     fn registry_load_keeps_grants_and_generation_in_one_sqlite_snapshot() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("state.db");
@@ -6030,7 +6282,7 @@ mod tests {
                 prompt_append: None,
                 generated_notes: Vec::new(),
                 granted_at: 1,
-                static_only: true,
+                static_only: false,
                 auto_amend: false,
                 owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
             },
@@ -6266,7 +6518,7 @@ mod tests {
                 prompt_append: None,
                 generated_notes: Vec::new(),
                 granted_at: 1,
-                static_only: true,
+                static_only: false,
                 auto_amend: false,
                 owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
             },
@@ -6368,7 +6620,7 @@ mod tests {
                 prompt_append: None,
                 generated_notes: Vec::new(),
                 granted_at: 1,
-                static_only: true,
+                static_only: false,
                 auto_amend: false,
                 owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
             },

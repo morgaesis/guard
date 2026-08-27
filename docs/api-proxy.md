@@ -196,11 +196,13 @@ upstream credential identity. A create and its cleanup are correlated only
 inside the same connection and attribution context, and explicit policy deny
 still wins.
 Every successful contained write returns `X-Guard-Provisional: <handle>` and an
-HTTP `Warning` naming `guard confirm <handle>`. Kubernetes clients display the
+HTTP `Warning` that identifies the provisional. Kubernetes clients display the
 warning on standard error, and automation can read the header before treating
-the write as durable.
-`guard provisionals`, `guard confirm`, and `guard revert` manage API and command
-envelopes through the same interface.
+the write as durable. Unix operators use `sudo guard-operator confirm <handle>`
+or `sudo guard-operator revert <handle>`; Windows operators use the installer
+script installed at `C:\Program Files\Guard\guard-operator.ps1` from an elevated
+PowerShell. `guard provisionals`
+manages API and command envelopes through the same interface.
 
 A held request that returns HTTP 403 includes its approval reference in the
 Kubernetes status message and in `X-Guard-Approval`. Client error output can

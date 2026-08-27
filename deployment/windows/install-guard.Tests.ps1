@@ -602,6 +602,10 @@ Describe 'Guard Windows installer state and ACL contract' {
         $source | Should -Match 'Assert-DeploymentAcls'
         $source | Should -Match 'Set-ServiceRegistryAcl'
         $source | Should -Match '\[IO\.File\]::Replace'
+        $source | Should -Match '\$DeployedOperatorScript = Join-Path \$InstallRoot ''guard-operator\.ps1'''
+        $source | Should -Match "RelativePath 'guard-operator\.ps1'"
+        $source | Should -Match 'Install-FileAtomically -Source \$operatorScriptSource -Destination \$DeployedOperatorScript'
+        $source | Should -Match 'operator_script_present'
         $source | Should -Not -Match 'cmd\.exe\s+/c'
         $source | Should -Not -Match 'New-ScheduledTaskPrincipal -UserId \$ServiceAccount'
     }
@@ -609,5 +613,12 @@ Describe 'Guard Windows installer state and ACL contract' {
     It 'uses release-version backup names and deployment metadata independent of the state schema' {
         $BackupMetadataSchema | Should -Be 2
         'before-v1.2.3-20260727T010203Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' | Should -Match '^before-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{32}$'
+    }
+
+    It 'resolves repository assets only for installation actions' {
+        $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-guard.ps1') -Raw
+        $parameterBlock = ($source -split '\)\s*\r?\n\r?\n\$ErrorActionPreference', 2)[0]
+        $parameterBlock | Should -Not -Match 'Resolve-Path'
+        $DeployedOperatorScript | Should -Be 'C:\Program Files\Guard\guard-operator.ps1'
     }
 }

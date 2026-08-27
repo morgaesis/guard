@@ -19,6 +19,30 @@ use std::path::PathBuf;
 use super::{sanitize_gate_text, DecisionTrace, GateError};
 use crate::principal::{scope_eq, PrincipalKey};
 
+/// Packaged operator action for preserving a provisional result.
+#[cfg(unix)]
+pub fn operator_confirm_command(handle: &str) -> String {
+    format!("sudo guard-operator confirm {handle}")
+}
+
+/// Packaged operator action for preserving a provisional result.
+#[cfg(windows)]
+pub fn operator_confirm_command(handle: &str) -> String {
+    format!(r"& 'C:\Program Files\Guard\guard-operator.ps1' -Action confirm -Reference {handle}")
+}
+
+/// Packaged operator action for reverting a provisional result.
+#[cfg(unix)]
+pub fn operator_revert_command(handle: &str) -> String {
+    format!("sudo guard-operator revert {handle}")
+}
+
+/// Packaged operator action for reverting a provisional result.
+#[cfg(windows)]
+pub fn operator_revert_command(handle: &str) -> String {
+    format!(r"& 'C:\Program Files\Guard\guard-operator.ps1' -Action revert -Reference {handle}")
+}
+
 /// Marks a terminal row whose rollback body still requires durable deletion.
 pub const REVERT_BODY_CLEANUP_PREFIX: &str = "rollback body cleanup pending; ";
 
@@ -172,7 +196,7 @@ pub struct Provisional {
     #[serde(default)]
     pub window_secs: u64,
     /// When the deadline sweeper's automatic rollback ran. `None` while the
-    /// envelope is live and after an operator-initiated `guard revert`, so it
+    /// envelope is live and after operator-initiated reversion, so it
     /// distinguishes "the timer fired" from "somebody reverted this".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_reverted_unix: Option<u64>,
@@ -642,7 +666,7 @@ impl ProvisionalRegistry {
         Ok(p.clone())
     }
 
-    /// Claim a handle for revert (operator-initiated `guard revert`, allowed
+    /// Claim a handle for operator-initiated reversion (allowed
     /// from `Armed`/`NeedsOperatorDecision`). Transitions to `Reverting` and
     /// returns the row so the daemon can run the revert.
     pub fn begin_revert(&mut self, handle: &str) -> Result<Provisional, GateError> {
@@ -1030,7 +1054,7 @@ mod tests {
             "handle 'h1' cannot transition: auto-reverted at 2023-11-14T22:18:21Z \
              (deadline 300s elapsed)"
         );
-        // `guard revert` on the same spent handle explains itself the same way.
+        // Another reversion attempt on the same spent handle explains itself the same way.
         assert_eq!(r.begin_revert("h1").unwrap_err(), error);
     }
 

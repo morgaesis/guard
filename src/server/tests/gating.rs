@@ -34,9 +34,13 @@ use crate::session::SessionGrant;
 use crate::session::{AccessUseGrant, IssuedGrantScope, SessionOwner};
 #[cfg(unix)]
 use crate::session_store::SessionStore;
+#[cfg(unix)]
+use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 #[cfg(unix)]
 use guard::gating::approval::{SecretBinding, ToolSecretBinding};
+#[cfg(unix)]
+use guard::gating::deny_shape::{canonical_argv, DenyLearningConfig, DenyShapeStore};
 #[cfg(unix)]
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
 use guard::gating::verb::VerbCatalog;
@@ -3143,6 +3147,7 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
                 catalog_version: 1,
                 verb_digest: None,
                 composition_digest: None,
+                learned_deny_preempted: false,
                 access_evaluation_override_eligible: false,
             }),
             bypass: false,
@@ -3184,7 +3189,7 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
 #[cfg(unix)]
 #[tokio::test]
 async fn hold_approval_arms_then_requester_resumes_once_with_output() {
-    let (cfg, operator, agent) = gating_config(7005, 1000);
+    let (mut cfg, operator, agent) = gating_config(7005, 1000);
     let agent_principal = agent.principal();
     let state = tempfile::tempdir().unwrap();
     let marker = state.path().join("resumed");
@@ -3215,6 +3220,32 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
         wait_approval_secs: None,
         verb: None,
     };
+    let deny_directory = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        deny_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let mut deny_store = DenyShapeStore::load(DenyLearningConfig::new(
+        deny_directory.path().join("deny.yaml"),
+    ))
+    .unwrap();
+    let evidence = canonical_argv(&request.args);
+    deny_store
+        .promote_shape(
+            "fixture",
+            &request.binary,
+            &format!("^{}$", regex::escape(&evidence)),
+            &[evidence],
+            "automatic heuristic must not veto an approved snapshot",
+            1,
+        )
+        .unwrap();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(EvalConfig::default().deny_shapes(Arc::new(RwLock::new(deny_store))))
+            .unwrap(),
+    );
     let mut sink = tokio::io::sink();
     let held = hold_for_approval_with_authority(
         &mut RequestContext {
@@ -3698,6 +3729,81 @@ async fn access_projection_excludes_and_rejects_legacy_sessions() {
         .await,
         AdminResponse::Error { .. }
     ));
+}
+
+#[tokio::test]
+async fn access_whoami_returns_the_callers_redacted_access_session() {
+    let (mut cfg, _operator, agent) = gating_config(7_005, 1_000);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: private-scope\n    binary: fixture-private-binary\n    args: [\"{target}\"]\n    baseline: false\n    params:\n      target: { pattern: \"^private-[a-z]+$\" }\n    consequence: reversible\n    evidence: private evidence\n",
+        )
+        .unwrap(),
+    ));
+    let token = "access-whoami-bearer-token";
+    let mut managed = active_session();
+    managed.scope.access_managed = true;
+    managed.scope.label = Some("self-managed-access".to_string());
+    managed.activated_verbs = vec!["private-scope".to_string()];
+    {
+        let mut sessions = cfg.state.sessions.write().await;
+        sessions.grant(token.to_string(), managed);
+    }
+
+    assert!(!AdminRequest::AccessWhoami.requires_admin_token());
+    let AdminResponse::AccessItem { item } =
+        handle_admin_request_for_test(&cfg, &agent, AdminRequest::AccessWhoami).await
+    else {
+        panic!("expected the caller's active access session");
+    };
+    assert_eq!(item.kind, "session");
+    assert_eq!(item.target, "self-managed-access");
+    assert_eq!(item.reference, crate::session::session_reference(token));
+    assert_eq!(item.effective_scope, vec!["private-scope"]);
+    assert!(item.capabilities.is_empty());
+    assert!(item.intent.is_none());
+    let encoded = serde_json::to_string(&item).unwrap();
+    assert!(
+        !encoded.contains(token),
+        "access whoami leaked the bearer token"
+    );
+    for private in [
+        "fixture-private-binary",
+        "^private-[a-z]+$",
+        "private evidence",
+    ] {
+        assert!(!encoded.contains(private), "access whoami leaked {private}");
+    }
+
+    let no_session = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::Unix { uid: 2_000 },
+        AdminRequest::AccessWhoami,
+    )
+    .await;
+    assert!(matches!(
+        no_session,
+        AdminResponse::Error { ref message }
+            if message == "no active access-managed session for the authenticated local principal"
+    ));
+}
+
+#[tokio::test]
+async fn public_ping_advertises_requester_safe_capabilities() {
+    let (cfg, _operator, agent) = gating_config(7_006, 1_000);
+    assert!(!AdminRequest::Ping.requires_admin_token());
+
+    let AdminResponse::Ping { capabilities, .. } =
+        handle_admin_request_for_test(&cfg, &agent, AdminRequest::Ping).await
+    else {
+        panic!("expected public ping response");
+    };
+    assert!(capabilities
+        .iter()
+        .any(|capability| capability == super::super::wire::CAPABILITY_REQUESTER_VERB_SHOW_V1));
+    assert!(capabilities
+        .iter()
+        .any(|capability| capability == super::super::CAPABILITY_ACCESS_WHOAMI_V1));
 }
 
 #[tokio::test]
@@ -4398,6 +4504,58 @@ async fn held_access_replay_fails_if_staged_session_was_revoked() {
             ref reason
         } if reason.contains("expired or was revoked")
     ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_replay_still_respects_explicit_static_deny() {
+    let (mut cfg, _operator, agent) = gating_config(7_006, 1_000);
+    let directory = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let policy = directory.path().join("policy.yaml");
+    std::fs::write(
+        &policy,
+        "policy:\n  commands:\n    deny:\n      - \"true --blocked\"\n",
+    )
+    .unwrap();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(EvalConfig::default().llm_enabled(false).policy_path(policy)).unwrap(),
+    );
+    let snapshot = ApprovalSnapshot {
+        binary: "true".to_string(),
+        args: vec!["--blocked".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        secret_keys: BTreeMap::new(),
+        secret_file_keys: BTreeMap::new(),
+        secret_binding: None,
+        principal: agent.principal(),
+        session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: Some(Vec::new()),
+        verb_name: None,
+        verb_params: BTreeMap::new(),
+        catalog_version: None,
+        verb_digest: None,
+        verb_composition_digest: None,
+        exec_timeout_secs: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
+    };
+
+    let result = super::super::gate_runtime::execute_snapshot_with_access_request(
+        &cfg,
+        &snapshot,
+        "operator approved",
+        None,
+    )
+    .await;
+
+    let response = result.into_response();
+    assert!(!response.allowed);
+    assert!(response.reason.contains("static policy"), "{response:?}");
+    assert!(response.exit_code.is_none());
 }
 
 #[cfg(unix)]
@@ -6383,6 +6541,7 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
                     catalog_version: version,
                     verb_digest: Some(digest),
                     composition_digest: None,
+                    learned_deny_preempted: false,
                     access_evaluation_override_eligible: false,
                 }),
                 bypass: true,
@@ -6500,6 +6659,7 @@ verbs:
                     catalog_version: version,
                     verb_digest: Some(digest),
                     composition_digest: None,
+                    learned_deny_preempted: false,
                     access_evaluation_override_eligible: false,
                 }),
                 bypass: true,

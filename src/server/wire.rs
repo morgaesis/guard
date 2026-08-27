@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use super::execute::audit_session_fingerprint;
 
+pub const CAPABILITY_REQUESTER_VERB_SHOW_V1: &str = "requester-verb-show-v1";
+pub const CAPABILITY_ACCESS_WHOAMI_V1: &str = "access-whoami-v1";
+
 // The untrusted request types any socket client can send live in the library
 // crate (`guard::wire`) so their parsing surface can be fuzzed; re-export them
 // here so daemon-side code keeps its existing `server::wire::*` paths.
@@ -418,6 +421,8 @@ pub enum AdminRequest {
     },
     /// List the operator-defined verb catalog (the agent's menu).
     VerbList,
+    /// Show one operator-defined verb. Requesters receive the same sanitized
+    /// invocation view that `VerbList` exposes for verbs they can use.
     VerbShow {
         name: String,
     },
@@ -594,6 +599,9 @@ pub enum AdminRequest {
         uses: Option<u64>,
     },
     AccessList,
+    /// Show the authenticated local principal's canonical access-managed
+    /// session without exposing its bearer token.
+    AccessWhoami,
     AccessShow {
         reference: String,
     },
@@ -663,8 +671,10 @@ impl AdminRequest {
                 | Self::ApprovalNote { .. }
                 | Self::ApprovalWithdraw { .. }
                 | Self::VerbList
+                | Self::VerbShow { .. }
                 | Self::AccessRequest { .. }
                 | Self::AccessList
+                | Self::AccessWhoami
                 | Self::AccessShow { .. }
                 | Self::AccessStatus { .. }
                 | Self::EvaluateBatch { .. }
@@ -1434,7 +1444,7 @@ pub enum GateStatus {
     Provisional,
     /// Approved but held for operator approval; not executed.
     Held,
-    /// A revert ran (response from `guard revert`/auto-revert reporting).
+    /// A revert ran (operator or automatic reversion reporting).
     Reverted,
     /// Policy evaluated, not executed (dry-run).
     DryRun,
@@ -2153,7 +2163,7 @@ impl ExecuteResult {
                 let containment_failure = ContainmentFailure::from(&outcome);
                 let reason = match (command_may_have_run, handle.as_deref()) {
                     (true, Some(handle)) => format!(
-                        "containment failed: command may have run; {containment_reason}; recovery handle {handle} requires `guard confirm {handle}` or `guard revert {handle}`"
+                        "containment failed: command may have run; {containment_reason}; recovery handle {handle} requires the packaged operator confirmation or reversion action"
                     ),
                     (true, None) => format!(
                         "containment failed: command may have run; {containment_reason}; no recovery handle is available"

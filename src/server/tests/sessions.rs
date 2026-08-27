@@ -230,7 +230,7 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![item.reference],
-            uses: Some(1),
+            uses: None,
             wait_secs: None,
         },
     )
@@ -292,15 +292,22 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
             .read()
             .await
             .aggregate_access_uses(&access_token),
-        Some(Some(0)),
-        "the once approval must be consumed at the first admission: {first:?}"
+        Some(None),
+        "an unlimited approval must remain reusable after admission: {first:?}"
     );
-    let denied = execute_command(request, &cfg, &worker)
+    let repeated = execute_command(request, &cfg, &worker)
         .await
         .into_response();
-    assert!(!denied.allowed);
-    assert!(denied.reason.contains("use limit is exhausted"));
-    assert!(denied.handle.is_some());
+    assert!(
+        repeated.allowed,
+        "the same argv did not converge on its approved matcher: {repeated:?}"
+    );
+    assert!(repeated.handle.is_none());
+    assert_eq!(
+        cfg.state.grant_requests.read().await.len(),
+        1,
+        "reusing approved generated coverage must not mint another access request"
+    );
 }
 
 fn synthesis_arguments_with_description(description: &str) -> serde_json::Value {
@@ -961,22 +968,17 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     };
     assert_eq!(remaining_before_access, Some(1));
 
-    let mut reevaluate_escape = request_with_session(
-        "rustc",
-        vec!["--print".to_string(), "cfg".to_string()],
-        "unused".to_string(),
-    );
-    reevaluate_escape.session_token = None;
-    reevaluate_escape.reevaluate = true;
-    let reevaluate_denied = execute_command(reevaluate_escape, &cfg, &worker).await;
-    assert!(!reevaluate_denied.policy_allowed());
+    let mut unrelated = request_with_session("uptime", Vec::new(), "unused".to_string());
+    unrelated.session_token = None;
+    let unrelated = execute_command(unrelated, &cfg, &worker).await;
     assert!(
-        reevaluate_denied
-            .policy_reason()
-            .contains("session policy-only mode"),
-        "unexpected denial: {}",
-        reevaluate_denied.policy_reason()
+        unrelated.policy_allowed(),
+        "implicit access authority must not narrow unrelated baseline commands: {}",
+        unrelated.policy_reason()
     );
+    assert!(!unrelated
+        .policy_reason()
+        .contains("session policy-only mode"));
 
     let mut execution =
         request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
@@ -1101,7 +1103,10 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .into_iter()
         .find(|summary| summary.owner.label() == "1001")
         .unwrap();
-    assert!(restored.static_only_for(&restored_access.token));
+    assert!(
+        !restored.static_only_for(&restored_access.token),
+        "persisted access-managed authority must remain additive"
+    );
     assert_eq!(
         restored
             .access_grant_uses(&restored_access.token, &first.reference)

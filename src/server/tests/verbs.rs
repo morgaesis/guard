@@ -23,6 +23,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::make_test_config;
+#[cfg(unix)]
+use super::run_verb_synthesis_llm_with_preflight;
 
 fn authority_tempdir() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("catalog test dir");
@@ -266,15 +268,30 @@ async fn learned_deny_committed_after_initial_allow_prevents_process_start() {
     let path = directory.path().join("deny.yaml");
     let deny_config = DenyLearningConfig::new(path.clone());
     let deny_store = DenyShapeStore::load(deny_config.clone()).unwrap();
-    let evaluator =
-        Evaluator::new(EvalConfig::default().deny_shapes(Arc::new(RwLock::new(deny_store))))
-            .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let llm_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_verb_synthesis_llm_with_preflight(
+        listener,
+        |_| serde_json::json!({}),
+        "APPROVE",
+        "fixture evaluator allow",
+    ));
+    let evaluator = Evaluator::new(
+        EvalConfig::default()
+            .cache_enabled(false)
+            .llm_api_key("test-key".to_string())
+            .llm_api_url(llm_url)
+            .llm_retries(0)
+            .gate_mode(GateMode::Consequence)
+            .deny_shapes(Arc::new(RwLock::new(deny_store))),
+    )
+    .unwrap();
     let (mut server, _buffer) = make_test_config();
     server.config.gate = GateMode::Consequence;
     server.state.evaluator = Arc::new(evaluator);
     server.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
-            "verbs:\n  - name: checked\n    binary: true\n    args: [\"--check\"]\n    consequence: reversible\n    trusted: true\n",
+            "verbs:\n  - name: checked\n    binary: true\n    args: [\"--check\"]\n    consequence: reversible\n    coverage:\n      - name: checked\n        action: evaluate\n        required_args: [\"--check\"]\n",
         )
         .unwrap(),
     ));
@@ -289,7 +306,11 @@ async fn learned_deny_committed_after_initial_allow_prevents_process_start() {
         .await
         .into_response()
     });
-    reached.acquire().await.unwrap().forget();
+    tokio::time::timeout(std::time::Duration::from_secs(10), reached.acquire())
+        .await
+        .expect("command reaches the process-start authority boundary")
+        .unwrap()
+        .forget();
     let mut independent = DenyShapeStore::load(deny_config).unwrap();
     let evidence = canonical_argv(&["--check".to_string()]);
     independent
@@ -307,6 +328,83 @@ async fn learned_deny_committed_after_initial_allow_prevents_process_start() {
     let response = execution.await.unwrap();
     assert!(!response.allowed);
     assert!(response.exit_code.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trusted_verb_still_respects_explicit_static_deny_at_process_start() {
+    let directory = authority_tempdir();
+    let policy = directory.path().join("policy.yaml");
+    std::fs::write(
+        &policy,
+        "policy:\n  commands:\n    deny:\n      - \"true --blocked\"\n",
+    )
+    .unwrap();
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.state.evaluator = Arc::new(
+        Evaluator::new(EvalConfig::default().llm_enabled(false).policy_path(policy)).unwrap(),
+    );
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: blocked\n    binary: true\n    args: [\"--blocked\"]\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+
+    let response = execute_command(
+        raw_request("true", &["--blocked"], None),
+        &server,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+
+    assert!(!response.allowed);
+    assert!(response.exit_code.is_none());
+    assert!(response.reason.contains("static policy"), "{response:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trusted_verb_still_fails_closed_when_learned_deny_authority_is_unavailable() {
+    let directory = authority_tempdir();
+    let path = directory.path().join("deny.yaml");
+    let deny_store = DenyShapeStore::load(DenyLearningConfig::new(path.clone())).unwrap();
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_enabled(false)
+                .deny_shapes(Arc::new(RwLock::new(deny_store))),
+        )
+        .unwrap(),
+    );
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: trusted-status\n    binary: true\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    std::fs::write(path, "invalid: [").unwrap();
+
+    let response = execute_command(
+        raw_request("true", &[], None),
+        &server,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+
+    assert!(!response.allowed);
+    assert!(response.exit_code.is_none());
+    assert!(
+        response
+            .reason
+            .contains("learned deny authority is unavailable"),
+        "{response:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -1340,7 +1438,7 @@ verbs:
         assert!(!encoded.contains(private), "leaked {private}: {encoded}");
     }
 
-    assert!(AdminRequest::VerbShow {
+    assert!(!AdminRequest::VerbShow {
         name: "inspect-fixture".to_string()
     }
     .requires_admin_token());
@@ -1447,6 +1545,149 @@ verbs:
         panic!("operator must keep the complete catalog view");
     };
     assert_eq!(items.len(), 3);
+}
+
+/// Requester verb detail uses the same baseline and usable principal-bound
+/// activated-verb visibility as the menu. It returns only the menu projection,
+/// while an operator retains the complete catalog definition. Missing and
+/// unavailable names share one response so callers cannot enumerate the
+/// catalog through `verb show`.
+#[tokio::test]
+async fn requester_verb_show_matches_menu_visibility_without_leaking_catalog_detail() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: baseline-read
+    description: Read a fixture
+    binary: fixturectl
+    args: ["read", "{target}"]
+    params:
+      target: { pattern: "^[a-z0-9-]+$" }
+    consequence: reversible
+    evidence: private catalog evidence
+  - name: requester-maintenance
+    description: Maintain one fixture
+    binary: fixturectl
+    args: ["maintain", "{target}"]
+    baseline: false
+    params:
+      target: { pattern: "^[a-z0-9-]+$" }
+    consequence: recoverable
+    evidence: requester-only evidence
+  - name: foreign-maintenance
+    description: Maintain a foreign fixture
+    binary: fixturectl
+    baseline: false
+    consequence: recoverable
+"#,
+        )
+        .unwrap(),
+    ));
+    let mut grant = SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: vec!["requester-maintenance".to_string()],
+        override_markers: Vec::new(),
+        scope: Default::default(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1001)),
+    };
+    grant.scope.access_managed = true;
+    {
+        let mut sessions = cfg.state.sessions.write().await;
+        sessions.grant("requester-show-token".to_string(), grant);
+        assert_eq!(
+            sessions.install_access_grant(
+                "requester-show-token",
+                Some(2),
+                "gr-requester-show".to_string(),
+                vec!["requester-maintenance".to_string()],
+            ),
+            Some(true)
+        );
+    }
+
+    let requester = CallerIdentity::Unix { uid: 1001 };
+    let stranger = CallerIdentity::Unix { uid: 2002 };
+    let operator = CallerIdentity::UnixAdmin { uid: 777 };
+    assert!(!AdminRequest::VerbShow {
+        name: "baseline-read".to_string(),
+    }
+    .requires_admin_token());
+
+    for name in ["baseline-read", "requester-maintenance"] {
+        let response = handle_admin_request_for_test(
+            &cfg,
+            &requester,
+            AdminRequest::VerbShow {
+                name: name.to_string(),
+            },
+        )
+        .await;
+        let AdminResponse::VerbMenu { items } = response else {
+            panic!("requester must receive a sanitized menu detail for {name}");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, name);
+        let encoded = serde_json::to_string(&items).unwrap();
+        for private in [
+            "fixturectl",
+            "^[a-z0-9-]+$",
+            "private catalog evidence",
+            "requester-only evidence",
+        ] {
+            assert!(
+                !encoded.contains(private),
+                "requester detail leaked {private}"
+            );
+        }
+    }
+
+    let unavailable = handle_admin_request_for_test(
+        &cfg,
+        &stranger,
+        AdminRequest::VerbShow {
+            name: "requester-maintenance".to_string(),
+        },
+    )
+    .await;
+    let unknown = handle_admin_request_for_test(
+        &cfg,
+        &stranger,
+        AdminRequest::VerbShow {
+            name: "not-a-verb".to_string(),
+        },
+    )
+    .await;
+    let error_message = |response: AdminResponse| match response {
+        AdminResponse::Error { message } => message,
+        other => panic!("expected non-leaking error, got {other:?}"),
+    };
+    assert_eq!(error_message(unavailable), error_message(unknown));
+
+    let operator_detail = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::VerbShow {
+            name: "foreign-maintenance".to_string(),
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated { verb, .. } = operator_detail else {
+        panic!("operator must retain complete verb detail");
+    };
+    assert_eq!(verb.binary, "fixturectl");
 }
 
 fn overbroad_until_gate_feedback_arrives(request: &str) -> serde_json::Value {

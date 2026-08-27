@@ -2455,7 +2455,7 @@ mod tests {
         grants.insert(
             "tok".to_string(),
             SessionGrant {
-                allow: vec![format!("psql postgres://app:SyntheticDbPass1@db/x*")],
+                allow: vec!["psql postgres://app:SyntheticDbPass1@db/x*".to_string()],
                 deny: vec![],
                 allow_exact: vec![SessionExactRule::new(
                     "kubectl",

@@ -280,8 +280,8 @@ fn print_containment_failure(response: &server::ExecuteResponse, streamed: bool)
     );
     if let Some(handle) = &response.handle {
         eprintln!("  handle:  {handle}");
-        eprintln!("  confirm: guard confirm {handle}");
-        eprintln!("  revert:  guard revert {handle}");
+        eprintln!("  confirm: {}", operator_confirm_command(handle));
+        eprintln!("  revert:  {}", operator_revert_command(handle));
         eprintln!("  inspect: guard provisionals");
     }
     print_provisional_window(response);
@@ -291,6 +291,14 @@ fn print_containment_failure(response: &server::ExecuteResponse, streamed: bool)
         .as_ref()
         .expect("containment failure detail");
     std::process::exit(containment_failure_exit_code(failure));
+}
+
+fn operator_confirm_command(handle: &str) -> String {
+    guard::gating::provisional::operator_confirm_command(handle)
+}
+
+fn operator_revert_command(handle: &str) -> String {
+    guard::gating::provisional::operator_revert_command(handle)
 }
 
 fn access_request_guidance_lines(response: &server::ExecuteResponse) -> Vec<String> {
@@ -551,7 +559,7 @@ pub(crate) async fn run_exec(
                 resp.reason
             );
             eprintln!("  handle:  {}", handle);
-            eprintln!("  confirm: guard confirm {}", handle);
+            eprintln!("  confirm: {}", operator_confirm_command(&handle));
             eprintln!("  inspect: guard provisionals");
             print_provisional_window(&resp);
             print_coverage(&resp.coverage);
@@ -1395,17 +1403,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                         println!("(no verbs; start the daemon with --verbs <catalog.yaml>)");
                     }
                     for verb in &items {
-                        println!(
-                            "{} [{}]{}{} - {}",
-                            verb.name,
-                            verb.consequence,
-                            if verb.hold { " hold" } else { "" },
-                            if verb.has_revert { " revertable" } else { "" },
-                            verb.description
-                        );
-                        for parameter in &verb.params {
-                            println!("    --param {parameter}=<value>");
-                        }
+                        print_verb_menu_item(verb);
                     }
                     Ok(())
                 }
@@ -1431,6 +1429,15 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                         print_json(&verb)
                     } else {
                         println!("{}", serde_json::to_string_pretty(&verb)?);
+                        Ok(())
+                    }
+                }
+                server::AdminResponse::VerbMenu { items } if items.len() == 1 => {
+                    let item = &items[0];
+                    if json {
+                        print_json(&verb_show_menu_json(item))
+                    } else {
+                        print_verb_menu_item(item);
                         Ok(())
                     }
                 }
@@ -1888,6 +1895,8 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
     let mut raw_matcher = false;
     let mut list_state_filter: Option<String> = None;
     let mut list_agent_filter: Option<String> = None;
+    let mut response_type_override: Option<&str> = None;
+    let mut require_access_whoami_capability = false;
     let (socket, request, json) = match command {
         AccessCommands::Request {
             intent,
@@ -1968,6 +1977,11 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             list_agent_filter = agent;
             (socket, server::AdminRequest::AccessList, json)
         }
+        AccessCommands::Whoami { socket, json } => {
+            response_type_override = Some("access_whoami");
+            require_access_whoami_capability = true;
+            (socket, server::AdminRequest::AccessWhoami, json)
+        }
         AccessCommands::Show {
             reference,
             raw,
@@ -1990,6 +2004,21 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
     let config = load_client_config(json)?;
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = admin_client(socket_path, tcp_port, &config);
+    if require_access_whoami_capability {
+        if let Err(error) = require_daemon_capability(
+            &client,
+            "guard access whoami",
+            server::CAPABILITY_ACCESS_WHOAMI_V1,
+        )
+        .await
+        {
+            let error = describe_connect_failure(error, &client, source);
+            if json {
+                exit_access_json_error(error.to_string());
+            }
+            return Err(error);
+        }
+    }
     let mut response = match client.send_admin(request).await {
         Ok(response) => response,
         Err(error) => {
@@ -2010,10 +2039,13 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
     }
     let decision_failed = access_decision_failed(&response);
     if json {
-        let document = match access_json_response(&response) {
+        let mut document = match access_json_response(&response) {
             Ok(document) => document,
             Err(message) => exit_access_json_error(message),
         };
+        if let Some(response_type) = response_type_override {
+            document["type"] = serde_json::Value::String(response_type.to_string());
+        }
         print_json(&document)?;
         if decision_failed {
             std::process::exit(EXIT_GUARD_ACCESS_DECISION_FAILED);
@@ -2078,6 +2110,38 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
         std::process::exit(EXIT_GUARD_ACCESS_DECISION_FAILED);
     }
     Ok(())
+}
+
+fn verb_menu_human_lines(item: &server::VerbMenuItem) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{} [{}]{}{} - {}",
+        item.name,
+        item.consequence,
+        if item.hold { " hold" } else { "" },
+        if item.has_revert { " revertable" } else { "" },
+        item.description
+    )];
+    lines.extend(
+        item.params
+            .iter()
+            .map(|parameter| format!("    --param {parameter}=<value>")),
+    );
+    lines
+}
+
+fn print_verb_menu_item(item: &server::VerbMenuItem) {
+    for line in verb_menu_human_lines(item) {
+        println!("{line}");
+    }
+}
+
+fn verb_show_menu_json(item: &server::VerbMenuItem) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "type": "verb_show",
+        "projection": "agent_menu",
+        "item": item,
+    })
 }
 
 fn access_json_error(message: impl Into<String>) -> serde_json::Value {
@@ -3262,7 +3326,7 @@ fn render_gated_response(
                 resp.reason
             );
             eprintln!("  handle:  {}", handle);
-            eprintln!("  confirm: guard confirm {}", handle);
+            eprintln!("  confirm: {}", operator_confirm_command(&handle));
             eprintln!("  inspect: guard provisionals");
             print_provisional_window(resp);
             print_coverage(&resp.coverage);
@@ -3573,6 +3637,36 @@ pub(crate) fn admin_client(
         client.with_admin_token(token)
     } else {
         client
+    }
+}
+
+fn validate_daemon_capability(
+    server_version: &str,
+    capabilities: &[String],
+    operation: &str,
+    capability: &str,
+) -> Result<()> {
+    if capabilities.iter().any(|current| current == capability) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{operation} is unavailable on Guard daemon {server_version}; upgrade and restart the daemon"
+    )
+}
+
+async fn require_daemon_capability(
+    client: &daemon_client::Client,
+    operation: &str,
+    capability: &str,
+) -> Result<()> {
+    match client.send_admin(server::AdminRequest::Ping).await? {
+        server::AdminResponse::Ping {
+            version,
+            capabilities,
+            ..
+        } => validate_daemon_capability(&version, &capabilities, operation, capability),
+        server::AdminResponse::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("{operation} could not negotiate the daemon protocol: {other:?}"),
     }
 }
 
@@ -3944,6 +4038,67 @@ mod tests {
         };
         let client = admin_client(None, Some(7331), &config);
         assert!(client.has_admin_token());
+    }
+
+    #[test]
+    fn requester_verb_show_has_stable_human_and_json_menu_projections() {
+        let item = server::VerbMenuItem {
+            name: "inspect-fixture".to_string(),
+            description: "Inspect one fixture".to_string(),
+            params: vec!["target".to_string()],
+            consequence: "reversible".to_string(),
+            hold: false,
+            has_revert: false,
+        };
+        assert_eq!(
+            verb_menu_human_lines(&item),
+            vec![
+                "inspect-fixture [reversible] - Inspect one fixture".to_string(),
+                "    --param target=<value>".to_string(),
+            ]
+        );
+        let document = verb_show_menu_json(&item);
+        assert_eq!(document["schema_version"], JSON_SCHEMA_VERSION);
+        assert_eq!(document["type"], "verb_show");
+        assert_eq!(document["projection"], "agent_menu");
+        assert_eq!(document["item"]["name"], "inspect-fixture");
+        assert!(document["item"].get("binary").is_none());
+    }
+
+    #[test]
+    fn unix_operator_guidance_uses_the_packaged_wrapper() {
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                operator_confirm_command("pv-1"),
+                "sudo guard-operator confirm pv-1"
+            );
+            assert_eq!(
+                operator_revert_command("pv-1"),
+                "sudo guard-operator revert pv-1"
+            );
+        }
+    }
+
+    #[test]
+    fn access_whoami_negotiates_an_explicit_daemon_capability() {
+        assert!(validate_daemon_capability(
+            "compatible-version",
+            &[server::CAPABILITY_ACCESS_WHOAMI_V1.to_string()],
+            "guard access whoami",
+            server::CAPABILITY_ACCESS_WHOAMI_V1,
+        )
+        .is_ok());
+        let error = validate_daemon_capability(
+            "0.8.0",
+            &[],
+            "guard access whoami",
+            server::CAPABILITY_ACCESS_WHOAMI_V1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unavailable on Guard daemon 0.8.0"));
+        assert!(error.contains("upgrade and restart the daemon"));
     }
 
     #[test]

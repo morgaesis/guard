@@ -107,7 +107,8 @@ pub use wire::{
     AccessItem, AccessRequestGuidance, AdminRequest, AdminResponse, ApprovalSummary, CommandSpec,
     ContainmentFailure, ContainmentFailureKind, ExecuteRequest, ExecuteResponse, GateStatus,
     OutputStream, ProvisionalSummary, RevertSpec, SshHostKeyMode, VerbInvocation, VerbMatchInfo,
-    VerbSummary, CONSEQUENCE_ARM, CONSEQUENCE_GRANT, CONSEQUENCE_RELEASE,
+    VerbMenuItem, VerbSummary, CAPABILITY_ACCESS_WHOAMI_V1, CONSEQUENCE_ARM, CONSEQUENCE_GRANT,
+    CONSEQUENCE_RELEASE,
 };
 pub(crate) use wire::{
     ExecuteStreamMessage, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_FEATURE_TCP_NO_CWD,
