@@ -6353,28 +6353,13 @@ mod tests {
 
         let token = "snapshot-race".to_string();
         let mut before = SessionRegistry::new();
-        before.grant(
-            token.clone(),
-            SessionGrant {
-                allow: Vec::new(),
-                deny: Vec::new(),
-                allow_exact: Vec::new(),
-                deny_exact: Vec::new(),
-                activated_verbs: vec!["host-inspect".to_string()],
-                override_markers: Vec::new(),
-                scope: IssuedGrantScope {
-                    access_managed: true,
-                    ..IssuedGrantScope::default()
-                },
-                expires_at: None,
-                prompt_append: None,
-                generated_notes: Vec::new(),
-                granted_at: 1,
-                static_only: false,
-                auto_amend: false,
-                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
-            },
+        let mut snapshot_grant = SessionGrant::additive_access_overlay(
+            guard::principal::PrincipalKey::from_uid(1001),
+            "snapshot race".to_string(),
+            guard::env::now_unix().saturating_add(3_600),
         );
+        snapshot_grant.activated_verbs = vec!["host-inspect".to_string()];
+        before.grant(token.clone(), snapshot_grant);
         before.install_access_grant(
             &token,
             Some(1),
