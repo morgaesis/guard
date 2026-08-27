@@ -142,6 +142,24 @@ impl SessionEvaluatorPosture {
             EvaluationMode::ReadOnly => Self::ReadOnly,
         }
     }
+
+    fn access_overlay_persisted_fields(self) -> (EvaluationMode, bool) {
+        let (evaluation_mode, _) = self.persisted_fields();
+        // Readers that do not understand additive access overlays must treat
+        // one as policy-only rather than as evaluator authority.
+        (evaluation_mode, true)
+    }
+
+    fn from_grant(grant: &SessionGrant) -> Self {
+        if grant.scope.access_managed {
+            return match grant.scope.evaluation_mode {
+                EvaluationMode::Evaluator => Self::InheritBaselineEvaluator,
+                EvaluationMode::PolicyOnly => Self::PolicyOnly,
+                EvaluationMode::ReadOnly => Self::ReadOnly,
+            };
+        }
+        Self::from_persisted(grant.scope.evaluation_mode, grant.static_only)
+    }
 }
 
 pub(crate) fn session_grant_revision_key(grant: &SessionGrant) -> Option<String> {
@@ -230,16 +248,16 @@ impl SessionGrant {
     /// This is an additive typed-authority overlay, not a general command
     /// grant: every legacy allow/deny collection starts empty, automatic
     /// amendment is disabled, and approved verbs are added separately only
-    /// after durable operator review. Its persisted compatibility fields encode
-    /// `InheritBaselineEvaluator`, so the overlay cannot narrow the caller's
-    /// unrelated base evaluator posture or grant authority to that fallback.
+    /// after durable operator review. Current readers derive
+    /// `InheritBaselineEvaluator` from the explicit overlay scope, while the
+    /// legacy static-policy field remains fail-closed for older readers.
     pub(crate) fn additive_access_overlay(
         owner: PrincipalKey,
         label: String,
         expires_at: u64,
     ) -> Self {
         let (evaluation_mode, static_only) =
-            SessionEvaluatorPosture::InheritBaselineEvaluator.persisted_fields();
+            SessionEvaluatorPosture::InheritBaselineEvaluator.access_overlay_persisted_fields();
         Self {
             allow: Vec::new(),
             deny: Vec::new(),
@@ -1687,10 +1705,7 @@ impl SessionRegistry {
         if grant.is_expired(now_unix()) {
             return None;
         }
-        Some(SessionEvaluatorPosture::from_persisted(
-            grant.scope.evaluation_mode,
-            grant.static_only,
-        ))
+        Some(SessionEvaluatorPosture::from_grant(grant))
     }
 
     pub fn evaluation_mode_for(&self, token: &str) -> Option<EvaluationMode> {
@@ -2104,7 +2119,7 @@ mod tests {
         assert!(grant.activated_verbs.is_empty());
         assert!(grant.scope.access_managed);
         assert_eq!(grant.scope.evaluation_mode, EvaluationMode::Evaluator);
-        assert!(!grant.static_only);
+        assert!(grant.static_only);
         assert!(!grant.auto_amend);
         grant.prompt_append = Some("must not alter the baseline evaluator".to_string());
 
@@ -2140,6 +2155,23 @@ mod tests {
             SessionEvaluatorPosture::from_persisted(EvaluationMode::ReadOnly, true),
             SessionEvaluatorPosture::PolicyOnly
         );
+
+        let mut access_grant = SessionGrant::additive_access_overlay(
+            PrincipalKey::from_uid(1000),
+            "compatibility fields".to_string(),
+            now_unix().saturating_add(60),
+        );
+        for posture in [
+            SessionEvaluatorPosture::InheritBaselineEvaluator,
+            SessionEvaluatorPosture::PolicyOnly,
+            SessionEvaluatorPosture::ReadOnly,
+        ] {
+            let (evaluation_mode, static_only) = posture.access_overlay_persisted_fields();
+            assert!(static_only);
+            access_grant.scope.evaluation_mode = evaluation_mode;
+            access_grant.static_only = static_only;
+            assert_eq!(SessionEvaluatorPosture::from_grant(&access_grant), posture);
+        }
     }
 
     #[test]

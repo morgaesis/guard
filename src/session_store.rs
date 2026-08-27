@@ -1,4 +1,6 @@
-use crate::grant_profile::{EvaluationMode, GrantRequest, SavedGrant};
+#[cfg(test)]
+use crate::grant_profile::EvaluationMode;
+use crate::grant_profile::{GrantRequest, SavedGrant};
 use crate::session::{
     session_grant_revision_key, CredentialReference, HistoricalGrant, HistoricalStatus,
     IssuedGrantScope, SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant,
@@ -768,21 +770,18 @@ impl SessionStore {
             })?;
             for row in rows {
                 let (token, mut grant) = row?;
-                let additive_access_old_revision = if grant.scope.access_managed
-                    && grant.static_only
-                    && grant.scope.evaluation_mode != EvaluationMode::PolicyOnly
-                {
-                    // Access-managed sessions issued before additive access
-                    // semantics persisted this legacy flag. Preserve an
-                    // explicit policy-only mode, but otherwise normalize and
-                    // durably rewrite the session during startup.
-                    let old_revision = session_grant_revision_key(&grant)
-                        .context("compute legacy access session revision")?;
-                    grant.static_only = false;
-                    Some(old_revision)
-                } else {
-                    None
-                };
+                let additive_access_old_revision =
+                    if grant.scope.access_managed && !grant.static_only {
+                        // The compatibility bit stays fail-closed for readers that
+                        // do not understand additive access overlays. Current
+                        // readers derive effective posture from the typed scope.
+                        let old_revision = session_grant_revision_key(&grant)
+                            .context("compute permissive access compatibility revision")?;
+                        grant.static_only = true;
+                        Some(old_revision)
+                    } else {
+                        None
+                    };
                 let allow_changed = purge_sensitive_exact_rules(&mut grant.allow_exact);
                 let deny_changed = purge_sensitive_exact_rules(&mut grant.deny_exact);
                 let exact_metadata = serialized_contains_registered_exact_literals(&grant)?;
@@ -941,7 +940,7 @@ impl SessionStore {
         }
         for update in &additive_access_updates {
             tx.execute(
-                "UPDATE session_grants SET static_only = 0 WHERE token = ?1",
+                "UPDATE session_grants SET static_only = 1 WHERE token = ?1",
                 params![update.token],
             )?;
         }
@@ -6195,13 +6194,13 @@ mod tests {
     }
 
     #[test]
-    fn registry_load_rebases_sensitive_allow_and_additive_access_mutations() {
+    fn registry_load_rebases_sensitive_allow_and_fail_closed_access_mutations() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("state.db");
         let (_, initial_generation) = SessionStore::load_registry_sync(&path, 3600).unwrap();
-        let legacy_token = "legacy-access-policy-only".to_string();
+        let permissive_token = "permissive-access-compatibility".to_string();
         let explicit_token = "explicit-access-policy-only".to_string();
-        let access_grant = |evaluation_mode| SessionGrant {
+        let access_grant = |evaluation_mode, static_only| SessionGrant {
             allow: Vec::new(),
             deny: Vec::new(),
             allow_exact: Vec::new(),
@@ -6217,7 +6216,7 @@ mod tests {
             prompt_append: None,
             generated_notes: Vec::new(),
             granted_at: 1,
-            static_only: true,
+            static_only,
             auto_amend: false,
             owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
         };
@@ -6232,32 +6231,35 @@ mod tests {
             &sensitive_exact.binary,
             &sensitive_exact.args,
         ));
-        let mut legacy_grant = access_grant(EvaluationMode::Evaluator);
+        let mut legacy_grant = access_grant(EvaluationMode::Evaluator, false);
         legacy_grant.allow_exact.push(sensitive_exact.clone());
         let old_revision = session_grant_revision_key(&legacy_grant).unwrap();
         let mut persisted_legacy_grant = legacy_grant;
         persisted_legacy_grant.allow_exact.clear();
         let mut registry = SessionRegistry::new();
-        registry.grant(legacy_token.clone(), persisted_legacy_grant);
+        registry.grant(permissive_token.clone(), persisted_legacy_grant);
         registry.grant(
             explicit_token.clone(),
-            access_grant(EvaluationMode::PolicyOnly),
+            access_grant(EvaluationMode::PolicyOnly, true),
         );
         let seeded_generation =
             SessionStore::persist_registry_sync(&path, 3600, &registry, initial_generation)
                 .unwrap();
         let mut request = generated_access_request();
-        request.session_token = legacy_token.clone();
+        request.session_token = permissive_token.clone();
         request.issued_session_revision = Some(old_revision.clone());
         request.request_key = request.canonical_access_key().unwrap();
         let mut approval = pending_approval("legacy-access-hold");
         approval.snapshot.session_fingerprint =
-            Some(access_session_token_fingerprint(&legacy_token));
+            Some(access_session_token_fingerprint(&permissive_token));
         approval.snapshot.session_revision = Some(old_revision);
         let conn = Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE session_grants SET allow_exact_json = ?1 WHERE token = ?2",
-            params![encode_exact_vec(&[sensitive_exact]).unwrap(), legacy_token],
+            params![
+                encode_exact_vec(&[sensitive_exact]).unwrap(),
+                permissive_token
+            ],
         )
         .unwrap();
         conn.execute(
@@ -6284,23 +6286,23 @@ mod tests {
 
         let (loaded, normalized_generation) =
             SessionStore::load_registry_sync(&path, 3600).unwrap();
-        assert!(!loaded.static_only_for(&legacy_token));
+        assert!(!loaded.static_only_for(&permissive_token));
         assert!(loaded.static_only_for(&explicit_token));
         assert_eq!(
             normalized_generation,
             seeded_generation + 2,
             "sensitive-rule sanitation and additive access normalization each advance authority"
         );
-        let new_revision = loaded.effective_revision_key(&legacy_token).unwrap();
+        let new_revision = loaded.effective_revision_key(&permissive_token).unwrap();
         let conn = Connection::open(&path).unwrap();
         let normalized: i64 = conn
             .query_row(
                 "SELECT static_only FROM session_grants WHERE token = ?1",
-                params![legacy_token],
+                params![permissive_token],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(normalized, 0);
+        assert_eq!(normalized, 1);
         let rebased_request: GrantRequest = serde_json::from_str(
             &conn
                 .query_row(
