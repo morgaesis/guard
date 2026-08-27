@@ -6286,8 +6286,17 @@ mod tests {
 
         let (loaded, normalized_generation) =
             SessionStore::load_registry_sync(&path, 3600).unwrap();
-        assert!(!loaded.static_only_for(&permissive_token));
-        assert!(loaded.static_only_for(&explicit_token));
+        let loaded_grants = loaded.grants_snapshot();
+        assert!(loaded_grants[&permissive_token].static_only);
+        assert!(loaded_grants[&explicit_token].static_only);
+        assert_eq!(
+            loaded.evaluator_posture_for(&permissive_token),
+            Some(crate::session::SessionEvaluatorPosture::InheritBaselineEvaluator)
+        );
+        assert_eq!(
+            loaded.evaluator_posture_for(&explicit_token),
+            Some(crate::session::SessionEvaluatorPosture::PolicyOnly)
+        );
         assert_eq!(
             normalized_generation,
             seeded_generation + 2,
