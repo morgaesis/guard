@@ -123,6 +123,27 @@ pub(crate) enum SessionEvaluatorPosture {
     ReadOnly,
 }
 
+impl SessionEvaluatorPosture {
+    fn persisted_fields(self) -> (EvaluationMode, bool) {
+        match self {
+            Self::InheritBaselineEvaluator => (EvaluationMode::Evaluator, false),
+            Self::PolicyOnly => (EvaluationMode::PolicyOnly, true),
+            Self::ReadOnly => (EvaluationMode::ReadOnly, false),
+        }
+    }
+
+    fn from_persisted(evaluation_mode: EvaluationMode, legacy_static_only: bool) -> Self {
+        if legacy_static_only {
+            return Self::PolicyOnly;
+        }
+        match evaluation_mode {
+            EvaluationMode::Evaluator => Self::InheritBaselineEvaluator,
+            EvaluationMode::PolicyOnly => Self::PolicyOnly,
+            EvaluationMode::ReadOnly => Self::ReadOnly,
+        }
+    }
+}
+
 pub(crate) fn session_grant_revision_key(grant: &SessionGrant) -> Option<String> {
     let mut authority = grant.clone();
     // Accounting metadata changes on every bounded admission but does not
@@ -209,14 +230,16 @@ impl SessionGrant {
     /// This is an additive typed-authority overlay, not a general command
     /// grant: every legacy allow/deny collection starts empty, automatic
     /// amendment is disabled, and approved verbs are added separately only
-    /// after durable operator review. `static_only` remains false because an
-    /// implicit overlay must not narrow the caller's unrelated base evaluator
-    /// posture; that evaluator fallback receives no authority from this grant.
+    /// after durable operator review. Its persisted compatibility fields encode
+    /// `InheritBaselineEvaluator`, so the overlay cannot narrow the caller's
+    /// unrelated base evaluator posture or grant authority to that fallback.
     pub(crate) fn additive_access_overlay(
         owner: PrincipalKey,
         label: String,
         expires_at: u64,
     ) -> Self {
+        let (evaluation_mode, static_only) =
+            SessionEvaluatorPosture::InheritBaselineEvaluator.persisted_fields();
         Self {
             allow: Vec::new(),
             deny: Vec::new(),
@@ -226,16 +249,14 @@ impl SessionGrant {
             override_markers: Vec::new(),
             scope: IssuedGrantScope {
                 label: Some(label),
-                evaluation_mode: EvaluationMode::Evaluator,
+                evaluation_mode,
                 access_managed: true,
                 ..IssuedGrantScope::default()
             },
             expires_at: Some(expires_at),
             prompt_append: None,
             generated_notes: Vec::new(),
-            // Legacy persisted representation of
-            // `SessionEvaluatorPosture::InheritBaselineEvaluator`.
-            static_only: false,
+            static_only,
             auto_amend: false,
             granted_at: 0,
             owner: SessionOwner::Principal(owner),
@@ -1666,14 +1687,10 @@ impl SessionRegistry {
         if grant.is_expired(now_unix()) {
             return None;
         }
-        if grant.static_only {
-            return Some(SessionEvaluatorPosture::PolicyOnly);
-        }
-        Some(match grant.scope.evaluation_mode {
-            EvaluationMode::Evaluator => SessionEvaluatorPosture::InheritBaselineEvaluator,
-            EvaluationMode::PolicyOnly => SessionEvaluatorPosture::PolicyOnly,
-            EvaluationMode::ReadOnly => SessionEvaluatorPosture::ReadOnly,
-        })
+        Some(SessionEvaluatorPosture::from_persisted(
+            grant.scope.evaluation_mode,
+            grant.static_only,
+        ))
     }
 
     pub fn evaluation_mode_for(&self, token: &str) -> Option<EvaluationMode> {
@@ -2104,6 +2121,25 @@ mod tests {
             .evaluator_prompt_append_for("access-token")
             .is_none());
         assert!(!registry.static_only_for("access-token"));
+    }
+
+    #[test]
+    fn evaluator_posture_round_trips_compatibility_fields() {
+        for posture in [
+            SessionEvaluatorPosture::InheritBaselineEvaluator,
+            SessionEvaluatorPosture::PolicyOnly,
+            SessionEvaluatorPosture::ReadOnly,
+        ] {
+            let (evaluation_mode, static_only) = posture.persisted_fields();
+            assert_eq!(
+                SessionEvaluatorPosture::from_persisted(evaluation_mode, static_only),
+                posture
+            );
+        }
+        assert_eq!(
+            SessionEvaluatorPosture::from_persisted(EvaluationMode::ReadOnly, true),
+            SessionEvaluatorPosture::PolicyOnly
+        );
     }
 
     #[test]
