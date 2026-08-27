@@ -1,6 +1,88 @@
 //! guard - evaluator-gated command execution for AI agents
 //!
 
+/// Fallible stdout boundary for the CLI process.
+///
+/// Rust's standard `print!` and `println!` macros panic when a downstream pipe
+/// closes. A CLI consumer such as `head` closing stdout is not a Guard failure,
+/// and it must not interrupt an already-admitted command lifecycle. Once the
+/// process observes `EPIPE`, later stdout writes become no-ops while normal
+/// command completion and exit-status handling continue.
+mod cli_output {
+    use std::fmt;
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) struct Stdout;
+
+    pub(super) fn stdout() -> Stdout {
+        Stdout
+    }
+
+    impl Write for Stdout {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if STDOUT_CLOSED.load(Ordering::Relaxed) {
+                return Ok(buffer.len());
+            }
+
+            match io::stdout().lock().write(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    STDOUT_CLOSED.store(true, Ordering::Relaxed);
+                    Ok(buffer.len())
+                }
+                result => result,
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if STDOUT_CLOSED.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            match io::stdout().lock().flush() {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    STDOUT_CLOSED.store(true, Ordering::Relaxed);
+                    Ok(())
+                }
+                result => result,
+            }
+        }
+    }
+
+    pub(super) fn write_stdout(arguments: fmt::Arguments<'_>, newline: bool) {
+        let mut writer = stdout();
+        let result = writer.write_fmt(arguments).and_then(|()| {
+            if newline {
+                writer.write_all(b"\n")
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = result {
+            panic!("failed writing to stdout: {error}");
+        }
+    }
+}
+
+// Shadow only the infallible standard stdout macros in this binary crate. The
+// explicit writer paths continue to return `io::Result` to their callers.
+macro_rules! print {
+    ($($argument:tt)*) => {{
+        crate::cli_output::write_stdout(format_args!($($argument)*), false)
+    }};
+}
+
+macro_rules! println {
+    () => {{
+        crate::cli_output::write_stdout(format_args!(""), true)
+    }};
+    ($($argument:tt)*) => {{
+        crate::cli_output::write_stdout(format_args!($($argument)*), true)
+    }};
+}
+
 mod cli_client;
 mod cli_secrets;
 mod cli_server;
@@ -61,10 +143,9 @@ fn parse_unbounded_secs(value: &str) -> Result<u64, String> {
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    serde_json::to_writer_pretty(&mut lock, value)?;
-    writeln!(lock)?;
+    let mut stdout = cli_output::stdout();
+    serde_json::to_writer_pretty(&mut stdout, value)?;
+    writeln!(stdout)?;
     Ok(())
 }
 
@@ -1616,7 +1697,7 @@ async fn run_main() -> Result<()> {
         }
         Ok(MainArgs::Completions { shell }) => {
             let mut command = MainArgs::command();
-            clap_complete::generate(shell, &mut command, "guard", &mut std::io::stdout());
+            clap_complete::generate(shell, &mut command, "guard", &mut cli_output::stdout());
             Ok(())
         }
         Err(ref e)
@@ -1624,8 +1705,8 @@ async fn run_main() -> Result<()> {
                 || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
                 || e.kind() == clap::error::ErrorKind::DisplayVersion =>
         {
-            // Let clap render help/version to stdout and exit 0.
-            e.exit();
+            write!(cli_output::stdout(), "{e}")?;
+            Ok(())
         }
         Err(e) => {
             log_cli_usage_error(&args, &e);
@@ -1668,7 +1749,7 @@ fn print_nested_help(path: &[&str], bin_name: &str) -> Result<()> {
         })?;
     }
     command = command.bin_name(bin_name);
-    command.print_help()?;
+    command.write_help(&mut cli_output::stdout())?;
     println!();
     Ok(())
 }

@@ -1798,7 +1798,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         match stream {
                             server::OutputStream::Stdout => {
                                 print!("{}", data);
-                                let _ = std::io::stdout().flush();
+                                let _ = crate::cli_output::stdout().flush();
                             }
                             server::OutputStream::Stderr => {
                                 eprint!("{}", data);

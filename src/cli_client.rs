@@ -512,7 +512,7 @@ pub(crate) async fn run_exec(
                     match stream {
                         server::OutputStream::Stdout => {
                             print!("{}", data);
-                            let _ = std::io::stdout().flush();
+                            let _ = crate::cli_output::stdout().flush();
                         }
                         server::OutputStream::Stderr => {
                             eprint!("{}", data);
@@ -1132,7 +1132,7 @@ pub(crate) async fn handle_resume(
             } else {
                 if let Some(stdout) = stdout.as_deref() {
                     print!("{stdout}");
-                    std::io::stdout().flush()?;
+                    crate::cli_output::stdout().flush()?;
                 }
                 if let Some(stderr) = stderr.as_deref() {
                     eprint!("{stderr}");
@@ -1584,7 +1584,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                             match stream {
                                 server::OutputStream::Stdout => {
                                     print!("{}", data);
-                                    let _ = std::io::stdout().flush();
+                                    let _ = crate::cli_output::stdout().flush();
                                 }
                                 server::OutputStream::Stderr => {
                                     eprint!("{}", data);
