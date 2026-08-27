@@ -48,7 +48,9 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 /// canonicalizes the full generated-access proposal envelope. Version 14 adds
 /// the inert pre-handoff provisional state and classifies ambiguous v13 API
 /// dispatch rows before older binaries can interpret their rollback authority.
-const SCHEMA_VERSION: i64 = 14;
+/// Version 15 canonicalizes inert terminal generated-access proposals from
+/// older schemas while current-schema authority tampering remains fail-closed.
+const SCHEMA_VERSION: i64 = 15;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
@@ -1492,6 +1494,9 @@ impl SessionStore {
         // whose sensitive exact denies cannot be preserved, removes sensitive
         // exact authority from history, and repairs durable gate snapshots.
         sanitize_persisted_credentials(&tx)?;
+        if version <= 14 {
+            migrate_v14_terminal_generated_requests(&tx)?;
+        }
         Self::validate_authority_row_indexes(&tx, true)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -3363,6 +3368,81 @@ fn sanitize_grant_request_for_migration(request: GrantRequest) -> Result<GrantRe
     Ok(request)
 }
 
+/// Canonicalize inert historical proposals without changing their executable
+/// matcher shape. Pending requests remain fail-closed because rewriting their
+/// authority after submission would change what an operator is reviewing.
+fn canonicalized_terminal_access_request(request: &GrantRequest) -> Option<GrantRequest> {
+    if request.status == crate::grant_profile::GrantRequestStatus::Pending
+        || request.proposed_verbs.is_empty()
+    {
+        return None;
+    }
+    let mut canonical = request.clone();
+    let mut renamed = Vec::new();
+    for proposal in &mut canonical.proposed_verbs {
+        let original =
+            serde_json::from_value::<guard::gating::verb::Verb>(proposal.clone()).ok()?;
+        let original_name = original.name.clone();
+        let mut normalized = guard::gating::verb::normalize_generated_access_verb(original).ok()?;
+        normalized.consequence =
+            guard::gating::verb::canonical_generated_access_consequence(&normalized);
+        normalized.name = guard::gating::verb::generated_access_verb_name(&normalized);
+        let normalized_value = serde_json::to_value(&normalized).ok()?;
+        guard::gating::verb::parse_normalized_generated_access_verb(&normalized_value).ok()?;
+        if original_name != normalized.name {
+            renamed.push((original_name, normalized.name.clone()));
+        }
+        *proposal = normalized_value;
+    }
+    for name in canonical
+        .authority_verbs
+        .iter_mut()
+        .chain(canonical.delta.activated_verbs.iter_mut())
+    {
+        if let Some((_, replacement)) = renamed.iter().find(|(original, _)| original == name) {
+            *name = replacement.clone();
+        }
+    }
+    canonical.request_key = canonical.canonical_access_key().ok()?;
+    canonical.validate_principal_access_shape().ok()?;
+    (canonical != *request).then_some(canonical)
+}
+
+/// One-time schema migration for terminal generated proposals written before
+/// the complete canonical envelope became durable. Restricting this repair to
+/// a version transition keeps post-migration matcher tampering observable.
+fn migrate_v14_terminal_generated_requests(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut statement = conn.prepare("SELECT rowid, json FROM grant_requests")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (rowid, json) in rows {
+        let Ok(request) = serde_json::from_str::<GrantRequest>(&json) else {
+            continue;
+        };
+        let Some(canonical) = canonicalized_terminal_access_request(&request) else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE grant_requests SET json = ?1, status = ?2, created_unix = ?3
+             WHERE rowid = ?4 AND json = ?5",
+            params![
+                serde_json::to_string(&canonical)?,
+                canonical.status.as_str(),
+                encode_u64(canonical.created_unix)?,
+                rowid,
+                json
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 /// Migration pass for persisted command-derived text and durable gate state.
 /// Rows first move to a fail-closed lifecycle state where necessary, then
 /// literal-sensitive structured commands are removed. New writes enforce the
@@ -4717,7 +4797,7 @@ mod tests {
         let store = SessionStore::open(path.clone(), 3600).await.unwrap();
         assert!(store.save_grant_request(request.clone()).await.is_err());
 
-        let conn = Connection::open(path).unwrap();
+        let conn = Connection::open(&path).unwrap();
         conn.execute(
             "INSERT INTO grant_requests (handle, json, status, created_unix)
              VALUES (?1, ?2, ?3, ?4)",
@@ -4733,6 +4813,74 @@ mod tests {
         // A row an older binary wrote under a superseded scheme must not
         // refuse the daemon boot: it is skipped fail-closed instead.
         assert!(store.load_grant_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_legacy_generated_request_is_canonicalized_and_retained() {
+        let mut terminal = generated_access_request();
+        let original: Verb = serde_json::from_value(terminal.proposed_verbs[0].clone()).unwrap();
+        let matcher = guard::gating::verb::generated_access_matcher_shape(&original);
+        let legacy_name = "access-generated-legacy-fixture".to_string();
+        let mut legacy = original;
+        legacy.name = legacy_name.clone();
+        legacy.description = "legacy model-authored description".to_string();
+        legacy.baseline = true;
+        legacy.trusted = true;
+        legacy.revert = Some(guard::gating::verb::VerbCommand {
+            binary: "fixturectl".to_string(),
+            args: vec!["undo".to_string()],
+        });
+        legacy.consequence = match legacy.consequence {
+            guard::gating::Reversibility::Reversible => guard::gating::Reversibility::Irreversible,
+            _ => guard::gating::Reversibility::Reversible,
+        };
+        terminal.authority_verbs = vec![legacy_name.clone()];
+        terminal.delta.activated_verbs = vec![legacy_name];
+        terminal.proposed_verbs = vec![serde_json::to_value(legacy).unwrap()];
+        terminal.request_key = terminal.canonical_access_key().unwrap();
+        terminal.status = crate::grant_profile::GrantRequestStatus::Approved;
+        terminal.decided_unix = Some(guard::env::now_unix());
+        terminal.decided_reason = Some("fixture approved".to_string());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO grant_requests (handle, json, status, created_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                terminal.handle,
+                serde_json::to_string(&terminal).unwrap(),
+                terminal.status.as_str(),
+                encode_u64(terminal.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(conn);
+
+        drop(store);
+        let migrated_store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let migrated = migrated_store.load_grant_requests().await.unwrap();
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].handle, terminal.handle);
+        assert_eq!(migrated[0].status, terminal.status);
+        let canonical = migrated[0]
+            .validated_generated_access_proposals()
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            guard::gating::verb::generated_access_matcher_shape(&canonical),
+            matcher
+        );
+        assert_ne!(canonical.name, "access-generated-legacy-fixture");
+        let row_count: i64 = Connection::open(path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM grant_requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1);
     }
 
     #[tokio::test]
@@ -5369,7 +5517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_v14_migrates_v13_dispatch_to_indeterminate_idempotently() {
+    async fn current_schema_migrates_v13_dispatch_to_indeterminate_idempotently() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let store = SessionStore::open(path.clone(), 3600).await.unwrap();
@@ -5431,7 +5579,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(first_json, second_json);
-        assert_eq!(version, 14);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
