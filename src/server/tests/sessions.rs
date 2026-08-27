@@ -4285,7 +4285,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
             ),
         },
     );
-    let registry = crate::session::SessionRegistry::from_parts(
+    let registry = crate::session::SessionRegistry::from_typed_parts(
         grants,
         Vec::new(),
         vec![crate::session::StoredSessionInteraction::from_typed_parts(

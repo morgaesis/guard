@@ -2852,7 +2852,7 @@ mod line_limit_tests {
             .scope
             .access_grants[0]
             .remaining_uses = None;
-        let malformed = crate::session::SessionRegistry::from_parts(
+        let malformed = crate::session::SessionRegistry::from_typed_parts(
             grants,
             registry.history_snapshot(),
             registry.stored_interactions_snapshot(),
@@ -2886,7 +2886,7 @@ mod line_limit_tests {
             .scope
             .access_grants
             .push(grant.scope.access_grants[0].clone());
-        let malformed = crate::session::SessionRegistry::from_parts(
+        let malformed = crate::session::SessionRegistry::from_typed_parts(
             grants,
             registry.history_snapshot(),
             registry.stored_interactions_snapshot(),

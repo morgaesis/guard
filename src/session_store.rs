@@ -925,8 +925,12 @@ impl SessionStore {
             }
         }
 
-        let mut registry =
-            SessionRegistry::from_parts(grants, history, interactions, history_retention_secs);
+        let mut registry = SessionRegistry::from_typed_parts(
+            grants,
+            history,
+            interactions,
+            history_retention_secs,
+        );
         registry.purge_expired();
         let generation = Self::read_registry_generation(&tx)?;
         for (token, allow, deny) in &active_exact_updates {
@@ -7060,7 +7064,7 @@ mod tests {
         let store = SessionStore::open(path.clone(), 1)
             .await
             .expect("open store");
-        let registry = SessionRegistry::from_parts(
+        let registry = SessionRegistry::from_typed_parts(
             HashMap::new(),
             Vec::new(),
             vec![StoredSessionInteraction::from_typed_parts(
@@ -7962,7 +7966,7 @@ mod tests {
                 owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(4242)),
             },
         );
-        let registry = SessionRegistry::from_parts(
+        let registry = SessionRegistry::from_typed_parts(
             grants,
             vec![HistoricalGrant {
                 token: "old".into(),
@@ -8285,7 +8289,8 @@ mod tests {
             auto_amend: true,
             owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
         };
-        let registry = SessionRegistry::from_parts(grants, vec![historical], Vec::new(), 3600);
+        let registry =
+            SessionRegistry::from_typed_parts(grants, vec![historical], Vec::new(), 3600);
         store.persist_registry(&registry).await.unwrap();
 
         let value = ["q", "7"].concat();

@@ -574,6 +574,15 @@ impl CredentialReference {
         Self::from_store_name(name.clone()).or_else(|| Self::from_api_identity(name))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn from_compatibility_name(name: impl Into<String>) -> Option<Self> {
+        let name = name.into();
+        if redact_output_text(&name) != name {
+            return None;
+        }
+        Self::from_persisted_name(name)
+    }
+
     pub fn as_reference_name(&self) -> &str {
         &self.0
     }
@@ -630,8 +639,9 @@ pub struct SessionInteraction {
     /// source compatibility and keeps the existing JSON key. The daemon treats
     /// it as a presentation field only: internal session storage retains nominal
     /// [`CredentialReference`] values and populates these strings when a report
-    /// is projected. Directly constructed strings never become stored daemon
-    /// credential metadata. Resolved credential values are never retained.
+    /// is projected. Compatibility entry points validate and convert canonical
+    /// reference names before storage; malformed and credential-shaped strings
+    /// are discarded. Resolved credential values are never retained.
     #[serde(default, alias = "secret_refs", skip_serializing_if = "Vec::is_empty")]
     pub exposed_secret_refs: Vec<String>,
     /// Versioned admission explanation for this interaction.
@@ -718,7 +728,23 @@ pub(crate) struct StoredSessionInteraction {
     credential_references: Vec<CredentialReference>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn take_compatibility_credential_references(
+    interaction: &mut SessionInteraction,
+) -> Vec<CredentialReference> {
+    std::mem::take(&mut interaction.exposed_secret_refs)
+        .into_iter()
+        .filter_map(CredentialReference::from_compatibility_name)
+        .collect()
+}
+
 impl StoredSessionInteraction {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn from_compatibility_parts(token: String, mut interaction: SessionInteraction) -> Self {
+        let credential_references = take_compatibility_credential_references(&mut interaction);
+        Self::from_typed_parts(token, interaction, credential_references)
+    }
+
     pub(crate) fn from_typed_parts(
         token: String,
         mut interaction: SessionInteraction,
@@ -783,7 +809,26 @@ impl SessionRegistry {
         self
     }
 
-    pub(crate) fn from_parts(
+    /// Reconstruct a registry from the public compatibility representation.
+    /// Credential-reference strings cross into daemon storage only after they
+    /// have been validated and converted to their nominal internal type.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn from_parts(
+        grants: HashMap<String, SessionGrant>,
+        history: Vec<HistoricalGrant>,
+        interactions: Vec<(String, SessionInteraction)>,
+        history_retention_secs: u64,
+    ) -> Self {
+        let interactions = interactions
+            .into_iter()
+            .map(|(token, interaction)| {
+                StoredSessionInteraction::from_compatibility_parts(token, interaction)
+            })
+            .collect();
+        Self::from_typed_parts(grants, history, interactions, history_retention_secs)
+    }
+
+    pub(crate) fn from_typed_parts(
         grants: HashMap<String, SessionGrant>,
         history: Vec<HistoricalGrant>,
         interactions: Vec<StoredSessionInteraction>,
@@ -811,7 +856,7 @@ impl SessionRegistry {
         self.history.clone()
     }
 
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn interactions_snapshot(&self) -> Vec<(String, SessionInteraction)> {
         self.interactions
             .iter()
@@ -1322,13 +1367,18 @@ impl SessionRegistry {
             .collect()
     }
 
-    #[cfg(test)]
+    /// Record an interaction supplied through the public compatibility model.
+    /// Reference strings are validated and converted before storage; daemon
+    /// execution paths supply already typed references through the private
+    /// entry point below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_interaction(&mut self, token: &str, mut interaction: SessionInteraction) {
-        // This public compatibility entry point does not trust presentation
-        // strings as credential provenance. Daemon execution paths use the
-        // typed method below.
-        interaction.exposed_secret_refs.clear();
-        self.record_interaction_with_credential_references(token, interaction, Vec::new());
+        let credential_references = take_compatibility_credential_references(&mut interaction);
+        self.record_interaction_with_credential_references(
+            token,
+            interaction,
+            credential_references,
+        );
     }
 
     pub(crate) fn record_interaction_with_credential_references(
@@ -2096,16 +2146,41 @@ mod tests {
         );
 
         let mut manually_untrusted = interaction.clone();
-        manually_untrusted.exposed_secret_refs = vec!["looks-valid".to_string()];
+        manually_untrusted.exposed_secret_refs = vec![
+            "service/token".to_string(),
+            "../invalid".to_string(),
+            fixture_bearer_jwt(),
+            FIXTURE_PASSWORD_FLAG.to_string(),
+        ];
         assert_eq!(
             serde_json::to_value(&manually_untrusted).unwrap()["exposed_secret_refs"][0],
-            "looks-valid"
+            "service/token"
         );
         let mut registry = SessionRegistry::new();
         registry.record_interaction("compatibility-token", manually_untrusted);
-        assert!(registry.show("compatibility-token", 1).unwrap().recent[0]
-            .exposed_secret_refs
-            .is_empty());
+        assert_eq!(
+            registry.show("compatibility-token", 1).unwrap().recent[0].exposed_secret_refs,
+            vec!["service/token"]
+        );
+
+        let mut reconstructed_interaction = interaction.clone();
+        reconstructed_interaction.exposed_secret_refs = vec![
+            "api-endpoint:prod:upstream".to_string(),
+            "../invalid".to_string(),
+            fixture_bearer_jwt(),
+        ];
+        let reconstructed = SessionRegistry::from_parts(
+            HashMap::new(),
+            Vec::new(),
+            vec![("reconstructed-token".to_string(), reconstructed_interaction)],
+            3_600,
+        );
+        assert_eq!(
+            reconstructed.interactions_snapshot()[0]
+                .1
+                .exposed_secret_refs,
+            vec!["api-endpoint:prod:upstream"]
+        );
 
         let object = encoded.as_object_mut().unwrap();
         let references = object.remove("exposed_secret_refs").unwrap();
@@ -2807,7 +2882,7 @@ mod tests {
             },
         );
         let trace_value = ["q", "7"].concat();
-        let registry = SessionRegistry::from_parts(
+        let registry = SessionRegistry::from_typed_parts(
             grants,
             Vec::new(),
             vec![StoredSessionInteraction::from_typed_parts(
