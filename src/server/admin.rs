@@ -2579,7 +2579,7 @@ async fn approve_access_request_owned(
                 .unwrap_or_else(|| format!("agent:{requester}"));
             if !staged.grant(
                 token.clone(),
-                SessionGrant::additive_access_overlay(requester.clone(), label, expiry),
+                SessionGrant::policy_only_access_overlay(requester.clone(), label, expiry),
             ) {
                 return AccessDecisionResult {
                     request: handle.to_string(),

@@ -6418,7 +6418,7 @@ mod tests {
 
         let token = "snapshot-race".to_string();
         let mut before = SessionRegistry::new();
-        let mut snapshot_grant = SessionGrant::additive_access_overlay(
+        let mut snapshot_grant = SessionGrant::policy_only_access_overlay(
             guard::principal::PrincipalKey::from_uid(1001),
             "snapshot race".to_string(),
             guard::env::now_unix().saturating_add(3_600),

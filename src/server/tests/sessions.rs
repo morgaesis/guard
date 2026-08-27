@@ -893,7 +893,7 @@ verbs:
         )
         .unwrap(),
     ));
-    let mut overlay = SessionGrant::additive_access_overlay(
+    let mut overlay = SessionGrant::policy_only_access_overlay(
         PrincipalKey::from_uid(1001),
         "access overlay".to_string(),
         guard::env::now_unix().saturating_add(60),

@@ -243,7 +243,7 @@ impl SessionGrant {
     /// after durable operator review. The session is policy-only. Command
     /// execution detaches an implicitly selected overlay when it contributes
     /// no selected session verb, leaving the caller's baseline policy intact.
-    pub(crate) fn additive_access_overlay(
+    pub(crate) fn policy_only_access_overlay(
         owner: PrincipalKey,
         label: String,
         expires_at: u64,
@@ -2111,8 +2111,8 @@ mod tests {
     }
 
     #[test]
-    fn additive_access_overlay_grants_no_untyped_command_authority() {
-        let mut grant = SessionGrant::additive_access_overlay(
+    fn policy_only_access_overlay_grants_no_untyped_command_authority() {
+        let mut grant = SessionGrant::policy_only_access_overlay(
             PrincipalKey::from_uid(1000),
             "access overlay".to_string(),
             now_unix().saturating_add(60),
@@ -2144,7 +2144,7 @@ mod tests {
     #[test]
     fn registry_boundaries_normalize_access_managed_posture() {
         let malformed_access_grant = || {
-            let mut grant = SessionGrant::additive_access_overlay(
+            let mut grant = SessionGrant::policy_only_access_overlay(
                 PrincipalKey::from_uid(1000),
                 "compatibility fields".to_string(),
                 now_unix().saturating_add(60),
@@ -2209,7 +2209,7 @@ mod tests {
             SessionEvaluatorPosture::PolicyOnly
         );
 
-        let access_grant = SessionGrant::additive_access_overlay(
+        let access_grant = SessionGrant::policy_only_access_overlay(
             PrincipalKey::from_uid(1000),
             "compatibility fields".to_string(),
             now_unix().saturating_add(60),
