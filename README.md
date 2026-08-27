@@ -52,6 +52,10 @@ guard run rm -rf /tmp/example
 The daemon reads its mode, policy, and credentials at startup. Client-side
 environment changes do not alter daemon policy.
 
+The packaged execution-capable systemd services share the host `/tmp` namespace
+with brokered children, so their temporary files remain visible to the caller
+subject to normal file permissions.
+
 | Mode | Intended use |
 |---|---|
 | `readonly` | Investigation without state changes |

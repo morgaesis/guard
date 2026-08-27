@@ -59,6 +59,13 @@ other input files. File-driven tools remain denied by the default evaluator
 posture unless a matching verb or short-lived grant authorizes the requested
 region.
 
+The execution identity must be able to traverse the working-directory path and
+read every required project file. Tool-native configuration discovery still
+starts from that directory, including files such as `ansible.cfg`. The packaged
+systemd units use `ProtectSystem=strict`, so an approved child cannot modify
+protected host paths unless the deployment adds an explicit writable carve-out
+or routes the operation through a remote or loopback service.
+
 On Unix, the transparent read-grant pipeline can temporarily add an ACL when the
 daemon account cannot read one named caller file. Credential-shaped paths,
 multi-hardlink files, symlink swaps, and traversal outside the file owner's home

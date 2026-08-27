@@ -14,6 +14,20 @@ fn safe_allow_accepts_fixed_ssh_diagnostic() {
     assert!(reason.is_some(), "fixed ssh diagnostic should be allowed");
 }
 
+#[test]
+fn safe_allow_accepts_vetted_option_before_remote_command() {
+    let (cfg, _buf) = make_test_config();
+    let reason = deterministic_safe_allow_reason(
+        &cfg,
+        "ssh",
+        &args(&["host01", "-o", "ConnectTimeout=5", "id"]),
+    );
+    assert!(
+        reason.is_some(),
+        "vetted option should stay in the SSH option zone"
+    );
+}
+
 fn ssh_request(mode: Option<SshHostKeyMode>, argv: &[&str]) -> ExecuteRequest {
     ExecuteRequest {
         binary: "ssh".to_string(),
@@ -139,6 +153,8 @@ fn ssh_options_allow_list_permits_only_vetted_options() {
         &["-o", "ConnectTimeout=5", "host01", "id"][..],
         &["-o", "BatchMode=yes", "host01", "id"][..],
         &["-oConnectTimeout=5", "host01", "id"][..],
+        &["--", "host01", "id"][..],
+        &["host01", "--", "id"][..],
         // Host-key handling injected by the --hostkey mode must not
         // knock the diagnostic off the fast path.
         &[
@@ -149,6 +165,10 @@ fn ssh_options_allow_list_permits_only_vetted_options() {
             "host01",
             "id",
         ][..],
+        // OpenSSH accepts vetted options between the destination and remote
+        // command, so this form shares the same fast path as pre-destination
+        // options.
+        &["host01", "-o", "ConnectTimeout=5", "-oBatchMode=yes", "id"][..],
     ] {
         assert!(
             ssh_options_all_readonly_safe(&args(ok)),
@@ -220,6 +240,33 @@ fn ssh_options_reject_dangerous_option_between_host_and_command() {
         "-o",
         "ProxyCommand=nc x 22"
     ])));
+}
+
+#[test]
+fn safe_allow_rejects_post_command_dash_arguments() {
+    let (cfg, _buf) = make_test_config();
+    for command in [&["host01", "id", "-u"][..], &["host01", "id", "--foo"][..]] {
+        assert!(
+            deterministic_safe_allow_reason(&cfg, "ssh", &args(command)).is_none(),
+            "post-command argument must be part of the remote command: {command:?}"
+        );
+    }
+}
+
+#[test]
+fn ssh_option_terminator_preserves_remote_command_boundary() {
+    let (cfg, _buf) = make_test_config();
+    assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args(&["--", "host01", "id"])).is_some());
+    assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args(&["host01", "--", "id"])).is_some());
+
+    // After the terminator, a dash-prefixed token is the remote command, not
+    // a local option. It cannot match the fixed read-only command allow-list.
+    assert!(deterministic_safe_allow_reason(
+        &cfg,
+        "ssh",
+        &args(&["host01", "--", "-remote-tool", "--flag"])
+    )
+    .is_none());
 }
 
 #[test]

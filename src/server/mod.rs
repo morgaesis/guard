@@ -19,7 +19,8 @@ use guard::gating::approval::ApprovalRegistry;
 use guard::gating::provisional::ProvisionalRegistry;
 use guard::gating::read_grant::GrantReadRegistry;
 use guard::gating::ssh_readonly::{
-    command_tokens, is_fixed_readonly_diagnostic, ssh_options_all_readonly_safe,
+    command_tokens, is_fixed_readonly_diagnostic, ssh_argument_boundaries,
+    ssh_options_all_readonly_safe,
 };
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
@@ -311,9 +312,9 @@ struct ServerState {
     saved_grants: Arc<RwLock<SavedGrantCatalog>>,
     /// Durable requests to amend a live or saved grant.
     grant_requests: Arc<RwLock<std::collections::BTreeMap<String, GrantRequest>>>,
-    /// Serializes terminal transitions so memory and durable state observe one
-    /// winner for approve, deny, and withdraw races.
-    grant_request_transition_gate: Arc<Mutex<()>>,
+    /// Serializes session-bound hold publication and grant-request terminal
+    /// transitions so revocation has one authority winner in this daemon.
+    authority_transition_gate: Arc<Mutex<()>>,
     /// Optional API proxies hosted alongside the gate socket. When set,
     /// the daemon terminates brokered clients' TLS, gates each API operation
     /// against the operator policy, and re-originates to the upstream with the
@@ -373,7 +374,7 @@ impl ServerState {
             verb_previews: Arc::new(RwLock::new(admin::VerbPreviewCache::default())),
             saved_grants: Arc::new(RwLock::new(SavedGrantCatalog::empty())),
             grant_requests: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
-            grant_request_transition_gate: Arc::new(Mutex::new(())),
+            authority_transition_gate: Arc::new(Mutex::new(())),
             protocol_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
             api_coverage: None,
             read_grants: Arc::new(RwLock::new(GrantReadRegistry::new())),
@@ -942,18 +943,33 @@ fn deterministic_credential_deny_reason(binary: &str, args: &[String]) -> Option
         );
     }
 
-    if lower.contains("/etc/default/guard")
-        || lower.contains("/var/lib/guard/.ssh/")
-        || lower.contains("/var/lib/guard/.kube/config")
-        || lower.contains("/.ssh/id_")
-        || lower.contains("~/.ssh/id_")
-        || lower.contains("/.kube/config")
-        || lower.contains("~/.kube/config")
-        || lower.contains("/.aws/credentials")
-        || lower.contains("~/.aws/credentials")
-        || lower.contains("/.env")
-        || tokens.iter().any(|token| token == ".env")
-    {
+    let references_credential_material = |text: &str, text_tokens: &[String]| {
+        text.contains("/etc/default/guard")
+            || text.contains("/var/lib/guard/.ssh/")
+            || text.contains("/var/lib/guard/.kube/config")
+            || text.contains("/.ssh/id_")
+            || text.contains("~/.ssh/id_")
+            || text.contains("/.kube/config")
+            || text.contains("~/.kube/config")
+            || text.contains("/.aws/credentials")
+            || text.contains("~/.aws/credentials")
+            || text.contains("/.env")
+            || text_tokens.iter().any(|token| token == ".env")
+    };
+    if references_credential_material(&lower, &tokens) {
+        if binary.eq_ignore_ascii_case("ssh") {
+            let boundaries = ssh_argument_boundaries(args);
+            if let Some(command_start) = boundaries.command_start {
+                let remote = args[command_start..].join(" ").to_ascii_lowercase();
+                let remote_tokens = command_tokens(&remote);
+                if references_credential_material(&remote, &remote_tokens) {
+                    return Some(
+                        "credential preflight denied: SSH remote command references credential material on the remote host"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         return Some(
             "credential preflight denied: command references credential material".to_string(),
         );

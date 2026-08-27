@@ -12,15 +12,18 @@ use crate::server::learning::{
 };
 use crate::server::transport::{claim_session_maintenance, session_maintenance_once};
 use crate::server::wire::ExecOutcome;
-use crate::server::wire::{AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest};
+use crate::server::wire::{
+    AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest, APPROVAL_ARMED_REASON,
+};
 use crate::session::{
     session_reference, AccessUseGrant, IssuedGrantScope, SessionAmendment, SessionDecisionSource,
     SessionExactRule, SessionExecStatus, SessionGrant, SessionInteraction,
 };
 use crate::session_store::SessionStore;
 use guard::evaluate::{EvalConfig, Evaluator};
+use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 use guard::gating::verb::VerbCatalog;
-use guard::gating::GateMode;
+use guard::gating::{GateMode, Reversibility};
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -2726,6 +2729,83 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
     };
     assert!(items[0].success);
     let target = items[0].target.clone().unwrap();
+    let (session_token, session_fingerprint, session_revision) = {
+        let sessions = cfg.state.sessions.read().await;
+        let token = sessions
+            .access_token_for_principal(&PrincipalKey::from_uid(1001))
+            .expect("approved access session");
+        (
+            token.clone(),
+            super::super::execute::audit_session_fingerprint(Some(&token)),
+            sessions.effective_revision_key(&token).unwrap(),
+        )
+    };
+    let held = |handle: &str| Approval {
+        handle: handle.to_string(),
+        snapshot: ApprovalSnapshot {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            secret_keys: Default::default(),
+            session_fingerprint: Some(session_fingerprint.clone()),
+            session_revision: Some(session_revision.clone()),
+            secret_entitlements: Some(Vec::new()),
+            secret_file_keys: Default::default(),
+            verb_name: None,
+            verb_params: Default::default(),
+            catalog_version: None,
+            verb_digest: None,
+            verb_composition_digest: None,
+            exec_timeout_secs: None,
+            access_verbs: Vec::new(),
+            access_requests: Vec::new(),
+            principal: Some(PrincipalKey::from_uid(1001)),
+            secret_binding: None,
+        },
+        reason: "fixture hold".to_string(),
+        risk: Some(5),
+        reversibility: Some(Reversibility::Irreversible),
+        decision_trace: None,
+        created_unix: guard::env::now_unix(),
+        ttl_secs: 3_600,
+        status: ApprovalStatus::Pending,
+        decided_unix: None,
+        decided_reason: None,
+        result_exit: None,
+        result_stdout: None,
+        result_stderr: None,
+        notes: Vec::new(),
+    };
+    let pending_hold = held("pending-revoked-session-hold");
+    let mut armed_hold = held("armed-revoked-session-hold");
+    let durable_only_hold = held("durable-only-revoked-session-hold");
+    armed_hold.decided_unix = Some(guard::env::now_unix());
+    armed_hold.decided_reason = Some(APPROVAL_ARMED_REASON.to_string());
+    {
+        let mut approvals = cfg.state.approvals.write().await;
+        approvals.enqueue(pending_hold.clone());
+        approvals.enqueue(armed_hold.clone());
+    }
+    let store = cfg.state.session_store.as_ref().unwrap();
+    store.save_approval(pending_hold.clone()).await.unwrap();
+    store.save_approval(armed_hold.clone()).await.unwrap();
+    // This row deliberately bypasses the daemon's in-memory projection. The
+    // revoke transaction must discover it from durable state itself.
+    store
+        .save_approval(durable_only_hold.clone())
+        .await
+        .unwrap();
+    let pending_notify = cfg
+        .state
+        .approvals
+        .write()
+        .await
+        .notifier_or_create(&pending_hold.handle)
+        .unwrap();
+    let notified = pending_notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
 
     let AdminResponse::AccessItem { item: extension } = handle_admin_request_for_test(
         &cfg,
@@ -2743,6 +2823,42 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
         handle_admin_request_for_test(&cfg, &daemon, AdminRequest::AccessRevoke { target },).await,
         AdminResponse::AccessDecisions { .. }
     ));
+    tokio::time::timeout(std::time::Duration::from_secs(1), &mut notified)
+        .await
+        .expect("revocation wakes pending hold waiter");
+    for handle in [
+        &pending_hold.handle,
+        &armed_hold.handle,
+        &durable_only_hold.handle,
+    ] {
+        assert_eq!(
+            cfg.state.approvals.read().await.get(handle).unwrap().status,
+            ApprovalStatus::Denied
+        );
+    }
+    let durable_approvals = store.load_approvals().await.unwrap();
+    for handle in [
+        &pending_hold.handle,
+        &armed_hold.handle,
+        &durable_only_hold.handle,
+    ] {
+        let durable = durable_approvals
+            .iter()
+            .find(|approval| &approval.handle == handle)
+            .unwrap();
+        assert_eq!(durable.status, ApprovalStatus::Denied);
+        assert_eq!(
+            durable.decided_reason.as_deref(),
+            Some("originating access session was revoked")
+        );
+    }
+    let error = store
+        .save_approval(held("late-revoked-session-hold"))
+        .await
+        .expect_err("revoked authority cannot publish a new hold");
+    assert!(error
+        .to_string()
+        .contains("approval session authority is no longer live"));
     assert_eq!(
         cfg.state.grant_requests.read().await[&extension.reference].status,
         crate::grant_profile::GrantRequestStatus::Withdrawn
@@ -2782,6 +2898,7 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
         .await
         .access_token_for_principal(&PrincipalKey::from_uid(1001))
         .is_none());
+    assert!(!cfg.state.sessions.read().await.has(&session_token));
 }
 
 #[tokio::test]
@@ -4356,9 +4473,14 @@ fn session_auto_amend_refuses_credential_shaped_argv() {
         Some(1)
     )
     .is_err());
+    let database_password = (0..24)
+        .map(|index| char::from(b'a' + ((index * 7 + 3) % 26) as u8))
+        .collect::<String>();
     assert!(deny_session_auto_amend_candidate(
         "psql",
-        &["postgres://app:SyntheticDbPass1@db.internal/prod".into()],
+        &[format!(
+            "postgres://app:{database_password}@db.internal/prod"
+        )],
         Some(9)
     )
     .is_err());

@@ -77,6 +77,14 @@ verbs:
 skip the consequence gate or hard invariants. Untrusted verbs keep the evaluator
 as a backstop.
 
+Parameters use `token` semantics by default and cannot contain whitespace.
+Use `value_type: single_argv` with a required `max_length` only for a narrow,
+bounded value that must retain ordinary spaces inside one argv element, such as
+an exact query or selector. `single_argv` values remain unsplit and reject
+control characters and shell operators. Automatically promoted verbs use this
+form only when their finite observed values contain whitespace, with the bound
+derived from those values.
+
 `hold: true` routes every matching operation to operator approval after policy
 admission, including operations declared `reversible`. Use it for reads whose
 scope or sensitivity requires review, such as bulk account enumeration. The
@@ -193,8 +201,10 @@ admission bound prevents catalog persistence.
 
 `guard access request` synthesizes typed coverage when no existing verb matches
 the normalized intent. Proposed verbs cannot be baseline or trusted, use a
-shell or interpreter binary, or accept patterns with whitespace and shell
-metacharacters. Approval promotes only the reviewed matcher to trusted
+shell or interpreter binary, or accept unbounded whitespace or shell-control
+patterns. A bounded `single_argv` parameter may carry an exact finite value
+with ordinary spaces inside one argv element. Approval promotes only the
+reviewed matcher to trusted
 session-scoped coverage. The durable request stores the proposal and restores
 it from SQLite while its access session is active. Guard derives consequence
 locally, so unknown or mutating generated shapes remain irreversible holds. The

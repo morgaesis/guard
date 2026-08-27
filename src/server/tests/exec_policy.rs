@@ -767,6 +767,30 @@ fn credential_preflight_denies_private_key_path() {
 }
 
 #[test]
+fn credential_preflight_identifies_remote_ssh_credential_paths() {
+    let remote = vec![
+        "outer-host".to_string(),
+        "ssh".to_string(),
+        "inner-host".to_string(),
+        "cat".to_string(),
+        "/home/operator/.ssh/id_ed25519".to_string(),
+    ];
+    let reason = deterministic_credential_deny_reason("ssh", &remote)
+        .expect("remote private key read remains denied");
+    assert!(reason.contains("on the remote host"), "got: {reason}");
+
+    let local = vec![
+        "-i".to_string(),
+        "/home/operator/.ssh/id_ed25519".to_string(),
+        "outer-host".to_string(),
+        "uptime".to_string(),
+    ];
+    let reason = deterministic_credential_deny_reason("ssh", &local)
+        .expect("local identity file remains denied");
+    assert!(!reason.contains("on the remote host"), "got: {reason}");
+}
+
+#[test]
 fn credential_preflight_allows_basic_kubectl_inspection() {
     let args = vec!["get".to_string(), "namespaces".to_string()];
     assert!(deterministic_credential_deny_reason("kubectl", &args).is_none());
@@ -3244,10 +3268,27 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
     match result.exec {
         ExecOutcome::Failed { reason, started } => {
             assert!(!started);
-            assert!(reason.contains("outside shim directory"), "got: {reason}");
+            assert!(
+                reason.contains("underlying executable 'missing-tool' is unavailable"),
+                "got: {reason}"
+            );
+            assert!(reason.contains("non-shim directory"), "got: {reason}");
         }
         other => panic!("expected pre-start exec failure, got {:?}", other),
     }
+
+    cfg.config.preflight = true;
+    let mut req = basic_request("missing-tool", Vec::new());
+    req.session_token = Some(format!("shim-recursion-{}", std::process::id()));
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    assert!(!result.policy_allowed());
+    assert!(
+        result
+            .policy_reason()
+            .contains("underlying executable 'missing-tool' is unavailable"),
+        "got: {}",
+        result.policy_reason()
+    );
 }
 
 #[cfg(unix)]
@@ -3303,7 +3344,11 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
     match result.exec {
         ExecOutcome::Failed { reason, started } => {
             assert!(!started);
-            assert!(reason.contains("outside shim directory"), "got: {reason}");
+            assert!(
+                reason.contains("underlying executable 'allowed-tool' is unavailable"),
+                "got: {reason}"
+            );
+            assert!(reason.contains("non-shim directory"), "got: {reason}");
         }
         other => panic!("expected pre-start exec failure, got {:?}", other),
     }

@@ -1761,15 +1761,7 @@ impl SessionRegistry {
 
     pub fn effective_revision_for_fingerprint(&self, fingerprint: &str) -> Option<String> {
         self.grants.keys().find_map(|token| {
-            let digest = sha2::Sha256::digest(token.as_bytes());
-            let candidate = format!(
-                "sha256:{}",
-                digest[..16]
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            (candidate == fingerprint)
+            (session_token_fingerprint(token) == fingerprint)
                 .then(|| self.effective_revision_key(token))
                 .flatten()
         })
@@ -2035,6 +2027,19 @@ pub fn session_reference(token: &str) -> String {
     format!(
         "session:{}",
         digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+/// Stable correlation identifier for a session without exposing bearer bytes.
+/// Every durable and in-memory authority join uses this single projection.
+pub(crate) fn session_token_fingerprint(token: &str) -> String {
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    format!(
+        "sha256:{}",
+        digest[..16]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
@@ -2987,11 +2992,15 @@ mod tests {
         // Simulate rows persisted before storage-time sanitization existed:
         // from_parts loads them verbatim, the inspection boundary must still
         // redact every command-derived field.
+        let database_password = (0..24)
+            .map(|index| char::from(b'a' + ((index * 11 + 5) % 26) as u8))
+            .collect::<String>();
+        let database_allow = format!("psql postgres://app:{database_password}@db/x*");
         let mut grants = HashMap::new();
         grants.insert(
             "tok".to_string(),
             SessionGrant {
-                allow: vec!["psql postgres://app:SyntheticDbPass1@db/x*".to_string()],
+                allow: vec![database_allow],
                 deny: vec![],
                 allow_exact: vec![SessionExactRule::new(
                     "kubectl",
@@ -3056,7 +3065,7 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("SyntheticSignature123"), "got: {json}");
         assert!(!json.contains("SyntheticHunter2Value"), "got: {json}");
-        assert!(!json.contains("SyntheticDbPass1"), "got: {json}");
+        assert!(!json.contains(&database_password), "got: {json}");
         assert!(json.contains("[REDACTED]"), "got: {json}");
         assert!(!json.contains(&trace_value));
         let active = report.active.unwrap();

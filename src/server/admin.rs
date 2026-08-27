@@ -1517,6 +1517,11 @@ pub(super) fn session_token_for_approval_snapshot(
     })
 }
 
+fn approval_has_live_command_session_binding(approval: &Approval) -> bool {
+    approval.snapshot.session_fingerprint.is_some()
+        && !super::gate_runtime::is_api_proxy_sentinel(&approval.snapshot.binary)
+}
+
 fn access_use_policy(uses: Option<(Option<u64>, Option<u64>)>) -> &'static str {
     match uses {
         Some((Some(_), _)) => "bounded",
@@ -1635,13 +1640,6 @@ async fn access_item_for_approval(
     debug_assert!(audience.can_view_principal(&approval.snapshot.principal));
     let projected_expired =
         approval.status == ApprovalStatus::Pending && now_unix() >= approval.deadline_unix();
-    let projected_state = if projected_expired {
-        "expired"
-    } else if approval_is_armed(approval) {
-        "armed"
-    } else {
-        approval.status.as_str()
-    };
     let requester = approval
         .snapshot
         .principal
@@ -1654,9 +1652,9 @@ async fn access_item_for_approval(
         .iter()
         .cloned()
         .collect::<Vec<_>>();
-    let session = if let Some(principal) = approval.snapshot.principal.as_ref() {
+    let session = if approval_has_live_command_session_binding(approval) {
         let sessions = server.state.sessions.read().await;
-        access_token_for_principal_ci(&sessions, principal).and_then(|token| {
+        session_token_for_approval_snapshot(&sessions, &approval.snapshot).and_then(|token| {
             sessions
                 .list()
                 .into_iter()
@@ -1664,6 +1662,18 @@ async fn access_item_for_approval(
         })
     } else {
         None
+    };
+    let projected_revoked = approval.status == ApprovalStatus::Pending
+        && approval_has_live_command_session_binding(approval)
+        && session.is_none();
+    let projected_state = if projected_revoked {
+        "revoked"
+    } else if projected_expired {
+        "expired"
+    } else if approval_is_armed(approval) {
+        "armed"
+    } else {
+        approval.status.as_str()
     };
     let target = session
         .as_ref()
@@ -1686,6 +1696,7 @@ async fn access_item_for_approval(
         .or_else(|| Some(approval.deadline_unix()));
     let awaiting_decision = approval.status == ApprovalStatus::Pending
         && !projected_expired
+        && !projected_revoked
         && !approval_is_armed(approval);
     AccessItem {
         reference: approval.handle.clone(),
@@ -1716,7 +1727,11 @@ async fn access_item_for_approval(
         },
         intent: Some(redact_output_text(&approval.reason)),
         capabilities: capabilities_for(server, &scope).await,
-        decided_reason: approval.decided_reason.as_deref().map(redact_output_text),
+        decided_reason: if projected_revoked {
+            Some("originating access session was revoked".to_string())
+        } else {
+            approval.decided_reason.as_deref().map(redact_output_text)
+        },
     }
 }
 
@@ -1991,7 +2006,7 @@ pub(super) async fn submit_access_request(
 
     prune_grant_requests(server).await;
     {
-        let _transition = server.state.grant_request_transition_gate.lock().await;
+        let _transition = server.state.authority_transition_gate.lock().await;
         if let Some(token) = session_token.as_deref() {
             let sessions = server.state.sessions.read().await;
             let snapshot = access_target_snapshot(&sessions, token)?;
@@ -2047,7 +2062,7 @@ pub(super) async fn submit_access_request(
     let evaluator_scope = requester.to_string();
     let (reduced, proposed_verbs) =
         reduce_access_intent(server, caller, &evaluator_scope, &intent, observed_argv).await?;
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     if let Some(token) = session_token.as_deref() {
         let sessions = server.state.sessions.read().await;
         let snapshot = access_target_snapshot(&sessions, token)?;
@@ -2333,7 +2348,7 @@ async fn approve_access_request_owned(
     uses: Option<u64>,
     audience: &AccessAudience,
 ) -> AccessDecisionResult {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let Some(pending) = server
         .state
         .grant_requests
@@ -2777,7 +2792,7 @@ async fn revoke_access_target_owned(
     caller: &CallerIdentity,
     target: &str,
 ) -> AdminResponse {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let mut generation_retry = false;
     loop {
         let baseline_sessions = server.state.sessions.read().await.clone();
@@ -2828,37 +2843,65 @@ async fn revoke_access_target_owned(
                 (pending, withdrawn)
             })
             .collect::<Vec<_>>();
-        if let Some(store) = &server.state.session_store {
-            if let Err(error) = store
+        let revoked_at = now_unix();
+        let session_fingerprint = audit_session_fingerprint(Some(&token));
+        let approval_denials = if let Some(store) = &server.state.session_store {
+            match store
                 .commit_access_revoke(
                     token.clone(),
-                    expected_revision,
+                    expected_revision.clone(),
                     staged.clone(),
                     withdrawals.clone(),
                 )
                 .await
             {
-                match reload_sessions_after_registry_conflict(
-                    server,
-                    &error,
-                    generation_retry,
-                    "access revoke",
-                    baseline_sessions.revision(),
-                )
-                .await
-                {
-                    Ok(true) => {
-                        generation_retry = true;
-                        continue;
+                Ok(denied) => denied,
+                Err(error) => {
+                    match reload_sessions_after_registry_conflict(
+                        server,
+                        &error,
+                        generation_retry,
+                        "access revoke",
+                        baseline_sessions.revision(),
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            generation_retry = true;
+                            continue;
+                        }
+                        Err(message) => return AdminResponse::Error { message },
+                        Ok(false) => {}
                     }
-                    Err(message) => return AdminResponse::Error { message },
-                    Ok(false) => {}
+                    return AdminResponse::Error {
+                        message: format!("failed to persist access revoke: {error}"),
+                    };
                 }
-                return AdminResponse::Error {
-                    message: format!("failed to persist access revoke: {error}"),
-                };
             }
-        }
+        } else {
+            server
+                .state
+                .approvals
+                .read()
+                .await
+                .list()
+                .into_iter()
+                .filter(|approval| {
+                    approval.status == ApprovalStatus::Pending
+                        && approval.snapshot.session_fingerprint.as_deref()
+                            == Some(session_fingerprint.as_str())
+                        && approval.snapshot.session_revision.as_deref()
+                            == expected_revision.as_deref()
+                })
+                .map(|mut denied| {
+                    denied.status = ApprovalStatus::Denied;
+                    denied.decided_unix = Some(revoked_at);
+                    denied.decided_reason =
+                        Some("originating access session was revoked".to_string());
+                    denied
+                })
+                .collect::<Vec<_>>()
+        };
         {
             let mut live_sessions = server.state.sessions.write().await;
             if live_sessions.revision() != baseline_sessions.revision() {
@@ -2878,10 +2921,28 @@ async fn revoke_access_target_owned(
                 }
             }
         }
+        {
+            let mut live_approvals = server.state.approvals.write().await;
+            for denied in &approval_denials {
+                live_approvals.install_persisted(denied.clone(), true);
+            }
+        }
         #[cfg(test)]
         server.state.session_publication_events.add_permits(1);
         for (_, withdrawn) in &withdrawals {
             emit_grant_request_event(server, withdrawn, "grant_request_withdrawn");
+        }
+        for denied in &approval_denials {
+            server.emit_event(NotifyEvent {
+                event: "decision_made",
+                at_unix: revoked_at,
+                handle: Some(denied.handle.clone()),
+                session_fingerprint: denied.snapshot.session_fingerprint.clone(),
+                requester_principal: denied.snapshot.principal.as_ref().map(ToString::to_string),
+                reason: denied.decided_reason.clone(),
+                status: Some("denied".to_string()),
+                behavior: None,
+            });
         }
         server.emit_audit_ungated(
             AuditEvent::new(AuditKind::SessionRevoke)
@@ -2912,7 +2973,7 @@ async fn approve_held_access(
     uses: Option<u64>,
     audience: &AccessAudience,
 ) -> AccessDecisionResult {
-    let transition = server.state.grant_request_transition_gate.lock().await;
+    let transition = server.state.authority_transition_gate.lock().await;
     let Some(approval) = server.state.approvals.read().await.get(handle).cloned() else {
         return AccessDecisionResult {
             request: handle.to_string(),
@@ -2925,6 +2986,44 @@ async fn approve_held_access(
             consequence: String::new(),
         };
     };
+    let originating_session_active = if approval.status == ApprovalStatus::Pending
+        && approval_has_live_command_session_binding(&approval)
+    {
+        let sessions = server.state.sessions.read().await;
+        session_token_for_approval_snapshot(&sessions, &approval.snapshot).is_some()
+    } else {
+        true
+    };
+    if !originating_session_active {
+        let requester = approval
+            .snapshot
+            .principal
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unknown".to_string());
+        return match terminalize_revoked_session_approval(server, approval).await {
+            Ok(()) => AccessDecisionResult {
+                request: handle.to_string(),
+                success: false,
+                state: "revoked".to_string(),
+                target: Some(format!("agent:{requester}")),
+                remaining_uses: None,
+                use_policy: "unavailable".to_string(),
+                message: "originating access session expired or was revoked".to_string(),
+                consequence: String::new(),
+            },
+            Err(message) => AccessDecisionResult {
+                request: handle.to_string(),
+                success: false,
+                state: "error".to_string(),
+                target: Some(format!("agent:{requester}")),
+                remaining_uses: None,
+                use_policy: "unavailable".to_string(),
+                message,
+                consequence: String::new(),
+            },
+        };
+    }
     if approval_is_armed(&approval) {
         let item = access_item_for_approval(server, &approval, audience).await;
         return AccessDecisionResult {
@@ -3068,16 +3167,24 @@ async fn approve_held_access(
         match session_token_for_approval_snapshot(&sessions, &approval.snapshot) {
             Some(token) => Some(token),
             None => {
+                let terminalized =
+                    terminalize_revoked_session_approval(server, approval.clone()).await;
                 return AccessDecisionResult {
                     request: handle.to_string(),
                     success: false,
-                    state: "revoked".to_string(),
+                    state: if terminalized.is_ok() {
+                        "revoked".to_string()
+                    } else {
+                        "error".to_string()
+                    },
                     target: Some(format!("agent:{requester}")),
                     remaining_uses: None,
                     use_policy: "unavailable".to_string(),
-                    message: "originating access session expired or was revoked".to_string(),
+                    message: terminalized.err().unwrap_or_else(|| {
+                        "originating access session expired or was revoked".to_string()
+                    }),
                     consequence: String::new(),
-                }
+                };
             }
         }
     };
@@ -4175,7 +4282,7 @@ async fn dispatch_admin_request(
                 granted_at: 0, // SessionRegistry::grant fills the current time
                 owner: session_owner,
             };
-            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let _transition = server.state.authority_transition_gate.lock().await;
             let baseline = server.state.sessions.read().await.clone();
             let mut staged = baseline.clone();
             staged.purge_expired();
@@ -4220,7 +4327,7 @@ async fn dispatch_admin_request(
         } => handle_session_appeal(server, caller, token, binary, args).await,
         #[cfg(test)]
         AdminRequest::SessionRevoke { token } => {
-            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let _transition = server.state.authority_transition_gate.lock().await;
             let baseline = server.state.sessions.read().await.clone();
             let mut staged = baseline.clone();
             let removed = staged.revoke(&token);
@@ -5595,7 +5702,7 @@ async fn dispatch_admin_request(
                     && grant.auto_approve_requests
                     && grant.contains_delta(&request.delta)
             });
-            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let _transition = server.state.authority_transition_gate.lock().await;
             {
                 let mut requests = server.state.grant_requests.write().await;
                 if requests.len() >= MAX_GRANT_REQUESTS {
@@ -5753,7 +5860,7 @@ async fn dispatch_admin_request(
             session_token,
         } => {
             prune_grant_requests(server).await;
-            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let _transition = server.state.authority_transition_gate.lock().await;
             let current = server
                 .state
                 .grant_requests
@@ -5994,7 +6101,7 @@ async fn dispatch_admin_request(
             ));
             preview.state.grant_requests =
                 std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new()));
-            preview.state.grant_request_transition_gate =
+            preview.state.authority_transition_gate =
                 std::sync::Arc::new(tokio::sync::Mutex::new(()));
             preview.state.provisional = std::sync::Arc::new(tokio::sync::RwLock::new(
                 guard::gating::provisional::ProvisionalRegistry::new(),
@@ -6108,7 +6215,7 @@ async fn preflight_synthesized_verb(
     ));
     preview.state.grant_requests =
         std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new()));
-    preview.state.grant_request_transition_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    preview.state.authority_transition_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     preview.state.provisional = std::sync::Arc::new(tokio::sync::RwLock::new(
         guard::gating::provisional::ProvisionalRegistry::new(),
     ));
@@ -6608,7 +6715,7 @@ async fn decide_grant_request_owned(
     approve: bool,
     reason: &str,
 ) -> AdminResponse {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let request = server
         .state
         .grant_requests
@@ -6855,7 +6962,7 @@ async fn validate_grant_request_for_approval(
 }
 
 pub(super) async fn prune_grant_requests(server: &ServerContext) {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let now = now_unix();
     let active_requests = server
         .state
@@ -7311,6 +7418,17 @@ async fn commit_terminal_approval(
     Ok(())
 }
 
+async fn terminalize_revoked_session_approval(
+    server: &ServerContext,
+    expected: Approval,
+) -> Result<(), String> {
+    let mut denied = expected.clone();
+    denied.status = ApprovalStatus::Denied;
+    denied.decided_unix = Some(now_unix());
+    denied.decided_reason = Some("originating access session was revoked".to_string());
+    commit_terminal_approval(server, expected, denied).await
+}
+
 /// Why a verb-originated hold no longer binds to what the operator reviewed.
 /// `CatalogChanged` applies only to rows written before per-verb digests
 /// existed, where the whole-catalog version is the only available binding.
@@ -7359,6 +7477,22 @@ async fn arm_held_command(
     approval: Approval,
 ) -> AdminResponse {
     let handle = approval.handle.clone();
+    if approval.status == ApprovalStatus::Pending
+        && approval_has_live_command_session_binding(&approval)
+    {
+        let active = {
+            let sessions = server.state.sessions.read().await;
+            session_token_for_approval_snapshot(&sessions, &approval.snapshot).is_some()
+        };
+        if !active {
+            return match terminalize_revoked_session_approval(server, approval).await {
+                Ok(()) => AdminResponse::Error {
+                    message: "originating access session expired or was revoked".to_string(),
+                },
+                Err(message) => AdminResponse::Error { message },
+            };
+        }
+    }
     if approval_is_armed(&approval) {
         return AdminResponse::Error {
             message: format!("held command {handle} is already armed for requester resume"),
@@ -7741,7 +7875,7 @@ async fn handle_approve(
     caller: &CallerIdentity,
     handle: &str,
 ) -> AdminResponse {
-    let transition = server.state.grant_request_transition_gate.lock().await;
+    let transition = server.state.authority_transition_gate.lock().await;
     let Some(approval) = server.state.approvals.read().await.get(handle).cloned() else {
         return AdminResponse::Error {
             message: format!("no approval with handle '{handle}'"),
@@ -7863,7 +7997,7 @@ pub(super) async fn handle_approval_note(
             message: "note text must not be empty".to_string(),
         };
     }
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let (is_operator, caller_key) = caller_scope(server, caller);
     let author = {
         let reg = server.state.approvals.read().await;
@@ -7950,7 +8084,7 @@ async fn handle_deny(
     handle: &str,
     reason: &str,
 ) -> AdminResponse {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let _transition = server.state.authority_transition_gate.lock().await;
     let now = now_unix();
     let mut registry = server.state.approvals.write().await;
     let Some(expected) = registry.get(handle).cloned() else {
