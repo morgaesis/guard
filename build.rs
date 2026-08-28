@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const WINDOWS_STACK_RESERVE_BYTES: u64 = 8 * 1024 * 1024;
+
 fn git_stdout(args: &[&str]) -> Option<String> {
     let output = Command::new("git").args(args).output().ok()?;
     let text = String::from_utf8(output.stdout).ok()?;
@@ -42,6 +44,23 @@ fn track_git_files() {
     }
 }
 
+/// Give the Guard process the same practical main-thread headroom on Windows
+/// that it receives from common Unix defaults. The generated Clap parser and
+/// async dispatch use deeper frames in unoptimized builds; the PE default can
+/// otherwise exhaust the stack before argument handling begins.
+fn configure_windows_stack_reserve() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    let argument = match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+        Ok("msvc") => format!("/STACK:{WINDOWS_STACK_RESERVE_BYTES}"),
+        Ok("gnu") => format!("-Wl,--stack,{WINDOWS_STACK_RESERVE_BYTES}"),
+        _ => return,
+    };
+    println!("cargo:rustc-link-arg-bin=guard={argument}");
+}
+
 fn main() {
     let commit =
         git_stdout(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
@@ -55,4 +74,5 @@ fn main() {
     }
 
     track_git_files();
+    configure_windows_stack_reserve();
 }
