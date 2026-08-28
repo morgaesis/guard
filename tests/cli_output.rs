@@ -1,17 +1,18 @@
-//! CLI output lifecycle regression tests.
+//! End-to-end CLI output lifecycle tests using anonymous pipes.
 
 use std::process::{Command, Stdio};
 
 const GUARD_BIN: &str = env!("CARGO_BIN_EXE_guard");
 
 fn command_with_closed_stdout(arguments: &[&str]) -> std::process::Output {
-    let mut child = Command::new(GUARD_BIN)
+    let (reader, writer) = std::io::pipe().expect("create stdout pipe");
+    drop(reader);
+    let child = Command::new(GUARD_BIN)
         .args(arguments)
-        .stdout(Stdio::piped())
+        .stdout(writer)
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn guard");
-    drop(child.stdout.take());
     child.wait_with_output().expect("wait for guard")
 }
 
