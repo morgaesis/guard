@@ -949,6 +949,15 @@ impl VerbCatalog {
             }
             None => None,
         };
+        validate_known_file_arguments(verb, &binary, &args, "rendered command")?;
+        if let Some((revert_binary, revert_args)) = &revert {
+            validate_known_file_arguments(
+                verb,
+                revert_binary,
+                revert_args,
+                "rendered revert command",
+            )?;
+        }
         if verb.name.starts_with("access-generated-")
             && (command_contains_sensitive_literals(&binary, &args)
                 || revert.as_ref().is_some_and(|(revert_binary, revert_args)| {
@@ -1060,6 +1069,16 @@ impl VerbCatalog {
             if verb.args.is_empty() && !verb.coverage.is_empty() {
                 rendered.binary = binary.to_string();
                 rendered.args = args.to_vec();
+            }
+            if validate_known_file_arguments(
+                verb,
+                &rendered.binary,
+                &rendered.args,
+                "matched command",
+            )
+            .is_err()
+            {
+                continue;
             }
 
             if verb.coverage.is_empty() {
@@ -1173,6 +1192,19 @@ impl VerbCatalog {
             tracing::warn!("catalog append committed with a durability warning: {error}");
         }
         Ok(())
+    }
+
+    /// Persist one explicitly operator-authored verb without admitting a
+    /// runtime-reserved or automatically promoted identity through the file
+    /// import boundary.
+    pub fn append_operator_verb(&mut self, verb: &Verb) -> Result<()> {
+        if reserved_verb_name(&verb.name) || verb.auto_promoted || verb.promotion_stamp.is_some() {
+            bail!(
+                "generated or reserved verb '{}' cannot be added as an operator-authored verb",
+                verb.name
+            );
+        }
+        self.append_verb(verb)
     }
 
     /// Replace one operator-authored file verb only when its live definition
@@ -2367,34 +2399,37 @@ fn validate_absolute_file_template(
                 names[0]
             )
         })?;
-        let pattern = compile_anchored(spec.pattern_text()).with_context(|| {
+        if let Some(values) = enumerate_pattern_literals(spec.pattern_text()) {
+            if values.iter().all(|value| path_is_absolute(value)) {
+                return Ok(());
+            }
+            bail!(
+                "verb '{}' {command_label} file parameter '{}' enumerates a relative path",
+                verb.name,
+                names[0]
+            );
+        }
+        if spec
+            .default
+            .as_deref()
+            .is_some_and(|value| !path_is_absolute(value))
+        {
+            bail!(
+                "verb '{}' {command_label} file parameter '{}' has a relative default",
+                verb.name,
+                names[0]
+            );
+        }
+        // Regex-language inclusion cannot be proven with representative
+        // samples. `render` checks every concrete value, and raw matching uses
+        // the same rendered-command check before granting coverage.
+        compile_anchored(spec.pattern_text()).with_context(|| {
             format!(
                 "verb '{}' {command_label} file parameter '{}' has an invalid pattern",
                 verb.name, names[0]
             )
         })?;
-        let relative_canaries = [
-            "inventory",
-            "inventory/production",
-            "manifest.yaml",
-            "./manifest.yaml",
-            "../manifest.yaml",
-        ];
-        let absolute_canaries = [
-            "/srv/guard/manifest.yaml",
-            "/srv/guard/manifests/manifest.yaml",
-            r"C:\guard\manifest.yaml",
-            r"\\server\share\manifest.yaml",
-        ];
-        if !relative_canaries
-            .iter()
-            .any(|value| pattern.is_match(value))
-            && absolute_canaries
-                .iter()
-                .any(|value| pattern.is_match(value))
-        {
-            return Ok(());
-        }
+        return Ok(());
     }
     bail!(
         "verb '{}' {command_label} file argument {position} must be an absolute path, got {:?}",
@@ -4759,10 +4794,53 @@ verbs:
     consequence: irreversible
 "#,
         )
-        .unwrap_err();
+        .expect("dynamic file patterns are checked after rendering");
+        let error = relative_parameter
+            .render(
+                "apply-selected-manifest",
+                &params(&[("path", "manifests/app.yaml")]),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("must be an absolute path"));
         assert!(relative_parameter
+            .match_command_all("kubectl", &args_vec(&["apply", "-f", "manifests/app.yaml"]),)
+            .is_empty());
+
+        let exact_kubeconfig = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-with-kubeconfig
+    binary: kubectl
+    args: ["--kubeconfig", "{kubeconfig}", "get", "pods"]
+    params:
+      kubeconfig: { pattern: "^/etc/guard/kubeconfig$" }
+    consequence: reversible
+"#,
+        )
+        .expect("one exact absolute kubeconfig is a valid file parameter");
+        let rendered = exact_kubeconfig
+            .render(
+                "inspect-with-kubeconfig",
+                &params(&[("kubeconfig", "/etc/guard/kubeconfig")]),
+            )
+            .unwrap();
+        assert_eq!(rendered.args[1], "/etc/guard/kubeconfig");
+
+        let mixed_exact_paths = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-with-mixed-kubeconfig
+    binary: kubectl
+    args: ["--kubeconfig", "{kubeconfig}", "get", "pods"]
+    params:
+      kubeconfig: { pattern: "^(/etc/guard/kubeconfig|kubeconfig)$" }
+    consequence: reversible
+"#,
+        )
+        .unwrap_err();
+        assert!(mixed_exact_paths
             .to_string()
-            .contains("must be an absolute path"));
+            .contains("enumerates a relative path"));
 
         let relative_coverage = VerbCatalog::from_yaml(
             r#"
