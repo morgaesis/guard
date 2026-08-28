@@ -13,7 +13,22 @@ guard verb run restart-service --param unit=nginx
 ```
 
 [`examples/verbs.yaml`](../examples/verbs.yaml) contains command-template and
-coverage-cell examples.
+coverage-cell examples. A catalog may declare `platform: unix` or
+`platform: windows`; Guard rejects a catalog for a different platform during
+linting and startup.
+
+On file-backed deployments, operators add one catalog entry from a YAML file
+containing exactly one verb definition:
+
+```bash
+guard verb add --file inspect-service.yaml
+```
+
+The daemon validates the candidate and the complete catalog before atomically
+appending it. The command fails without changing the catalog when the name
+already exists or the definition is invalid. Generated and reserved verb
+identities are not accepted through this operator-authored boundary. Adding a
+verb requires operator authentication.
 
 Operators replace one catalog entry from a YAML file containing exactly one
 verb definition:
@@ -132,11 +147,20 @@ A non-matching cell has no decision. The check cell above allows its bounded
 region and does not deny apply mode, SSH inspection, or any other command. Those
 areas follow their own matching cells or evaluator path.
 
-Known file operands in command and rollback templates must be absolute. Ansible
-inventory coverage likewise accepts only absolute paths or explicit inline host
-lists. If an explicit-inventory Ansible process reports that no inventory was
-parsed, or that every supplied source was unusable, Guard converts exit 0 to a
-failure and emits a diagnostic.
+Recognized local-file operands in command and rollback templates must be
+absolute. The bounded grammar covers documented option values and attached
+short forms, including `key=path` and `label@path` payloads. It preserves
+Ansible's non-file forms: inventories may be comma-terminated inline host
+lists, extra variables may be inline values, and vault IDs may use `prompt`.
+Referenced variable files, vault clients, module-path entries, credentials, and
+configuration files must be absolute under the daemon host's path semantics.
+Kubernetes file and kustomization sources are local absolute paths or standard
+input, not caller-selected URLs. Executable selectors such as Helm post-renderers
+must be fixed absolute paths. Transport passthroughs are fixed literals in exact
+templates, never caller-selected generic coverage. Ambiguous command grammars
+that cannot be modeled safely do not receive file-path coverage. If an explicit-inventory
+Ansible process reports that no inventory was parsed, or that every supplied
+source was unusable, Guard converts exit 0 to a failure and emits a diagnostic.
 
 Environment sources are `plain`, `secret`, and `secret-file`. A constraint may
 name exact `values` or a fully anchored `pattern`. A cell with no environment

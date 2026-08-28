@@ -1,4 +1,4 @@
-# Verb catalog: the operator-authored, typed interface agents call via
+# Unix verb catalog: the operator-authored, typed interface agents call via
 # `guard verb`, instead of raw shell. Load with:
 #
 #   guard server start --gate consequence --socket /run/guard/guard.sock \
@@ -28,6 +28,7 @@
 # coverage cells. A cell that does not match has no effect. Use
 # `baseline: false` for a capability that only a session `--verb` activates.
 
+platform: unix
 verbs:
   # Baseline Ansible policy. Check mode is preauthorized for at most two
   # explicitly limited hosts. Apply mode always reaches the evaluator unless

@@ -426,6 +426,11 @@ pub enum AdminRequest {
     VerbShow {
         name: String,
     },
+    /// Add one operator-authored verb definition. Operator-only because this
+    /// mutates the durable catalog.
+    VerbAdd {
+        verb: Box<guard::gating::verb::Verb>,
+    },
     VerbDelete {
         name: String,
     },

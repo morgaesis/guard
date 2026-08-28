@@ -5041,6 +5041,37 @@ async fn dispatch_admin_request(
                 },
             }
         }
+        AdminRequest::VerbAdd { verb } => {
+            let candidate = verb.clone();
+            let result = server
+                .mutate_verb_catalog("operator verb catalog append", move |catalog| {
+                    catalog.append_operator_verb(&candidate)
+                })
+                .await;
+            match result {
+                Ok(persisted_verb) => {
+                    let definition_digest =
+                        format!("sha256:{}", persisted_verb.definition_digest());
+                    server.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::VerbCreated)
+                            .caller(caller)
+                            .field("name", &persisted_verb.name)
+                            .field("definition_digest", &definition_digest)
+                            .field("consequence", persisted_verb.consequence.as_str())
+                            .field("trusted", persisted_verb.trusted)
+                            .field("source", "operator_file"),
+                    );
+                    AdminResponse::VerbCreated {
+                        verb: persisted_verb,
+                        persisted: true,
+                        preview_digest: None,
+                    }
+                }
+                Err(error) => AdminResponse::Error {
+                    message: format!("verb add rejected: {error}"),
+                },
+            }
+        }
         AdminRequest::VerbDelete { name } => {
             let delete_name = name.clone();
             match server

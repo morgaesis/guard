@@ -1455,6 +1455,43 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
             }
         }
+        VerbCommands::Add { file, socket, json } => {
+            let yaml = std::fs::read_to_string(&file)
+                .with_context(|| format!("failed to read verb file {}", file.display()))?;
+            let verb: guard::gating::verb::Verb =
+                serde_yaml_ng::from_str(&yaml).with_context(|| {
+                    format!("failed to parse {} as one verb definition", file.display())
+                })?;
+            let (client, source) = gate_client(socket, json)?;
+            let response = client
+                .send_admin(server::AdminRequest::VerbAdd {
+                    verb: Box::new(verb),
+                })
+                .await
+                .map_err(|error| describe_connect_failure(error, &client, source))?;
+            match response {
+                server::AdminResponse::VerbCreated {
+                    verb,
+                    persisted: true,
+                    preview_digest: None,
+                } => {
+                    let digest = verb.definition_digest();
+                    if json {
+                        print_json(&serde_json::json!({
+                            "schema_version": JSON_SCHEMA_VERSION,
+                            "type": "verb_added",
+                            "digest": digest,
+                            "verb": verb,
+                        }))
+                    } else {
+                        cli_println!("Added verb '{}' ({}).", verb.name, digest);
+                        Ok(())
+                    }
+                }
+                server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+                other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+            }
+        }
         VerbCommands::Delete { name, socket } => {
             let (client, source) = gate_client(socket, false)?;
             match client

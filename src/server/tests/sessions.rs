@@ -313,6 +313,236 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
     );
 }
 
+fn native_absolute_kubeconfig_path() -> &'static str {
+    if cfg!(windows) {
+        r"C:\guard\kubeconfig"
+    } else {
+        "/etc/guard/kubeconfig"
+    }
+}
+
+fn synthesized_kubeconfig_arguments(_request: &str) -> serde_json::Value {
+    let kubeconfig = native_absolute_kubeconfig_path();
+    serde_json::json!({
+        "name": "inspect-pods-with-kubeconfig",
+        "description": "Inspect pods through one fixed kubeconfig",
+        "binary": "kubectl",
+        "args": ["--kubeconfig", "{kubeconfig}", "get", "pods"],
+        "params": {
+            "kubeconfig": {
+                "pattern": format!("^{}$", regex::escape(kubeconfig)),
+                "required": true
+            }
+        },
+        "consequence": "reversible",
+        "trusted": false,
+        "evidence": "The command reads pods through one exact local credential file."
+    })
+}
+
+fn configure_synthesis_evaluator(server: &mut crate::server::ServerContext, url: String) {
+    server.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn access_request_synthesis_accepts_an_absolute_kubeconfig_parameter() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        synthesized_kubeconfig_arguments,
+    ));
+
+    let (mut server, _) = make_test_config();
+    server.config.daemon_uid = 777;
+    server.config.daemon_principal = PrincipalKey::from_uid(777);
+    server.config.gate = GateMode::Consequence;
+    configure_synthesis_evaluator(&mut server, url);
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let operator = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
+        &server,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect pods through the fixed kubeconfig".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected synthesized access request")
+    };
+    let proposed = guard::gating::verb::parse_normalized_generated_access_verb(
+        server.state.grant_requests.read().await[&item.reference]
+            .proposed_verbs
+            .first()
+            .expect("request carries generated coverage"),
+    )
+    .unwrap();
+    assert_eq!(
+        proposed.args,
+        ["--kubeconfig", "{kubeconfig}", "get", "pods"]
+    );
+
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
+        &server,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![item.reference],
+            uses: None,
+            wait_secs: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected synthesized access approval")
+    };
+    assert!(items[0].success, "approval failed: {:?}", items[0]);
+    let catalog = server.state.verbs.read().await;
+    assert_eq!(
+        catalog
+            .match_command_all(
+                "kubectl",
+                &[
+                    "--kubeconfig".to_string(),
+                    native_absolute_kubeconfig_path().to_string(),
+                    "get".to_string(),
+                    "pods".to_string(),
+                ],
+            )
+            .len(),
+        1
+    );
+    assert!(catalog
+        .match_command_all(
+            "kubectl",
+            &[
+                "--kubeconfig".to_string(),
+                "relative/kubeconfig".to_string(),
+                "get".to_string(),
+                "pods".to_string(),
+            ],
+        )
+        .is_empty());
+}
+
+#[tokio::test]
+async fn access_extension_synthesis_accepts_an_absolute_kubeconfig_parameter() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        synthesized_kubeconfig_arguments,
+    ));
+
+    let (mut server, _) = make_test_config();
+    server.config.daemon_uid = 777;
+    server.config.daemon_principal = PrincipalKey::from_uid(777);
+    server.config.gate = GateMode::Consequence;
+    configure_synthesis_evaluator(&mut server, url);
+    let mut grant = granted_session_owned(1001, Vec::new(), Vec::new());
+    grant.scope.access_managed = true;
+    grant.scope.label = Some("agent:1001".to_string());
+    assert!(server
+        .state
+        .sessions
+        .write()
+        .await
+        .grant("existing-access-session".to_string(), grant));
+
+    let response = handle_admin_request_for_test(
+        &server,
+        &CallerIdentity::UnixAdmin { uid: 777 },
+        AdminRequest::AccessExtend {
+            target: "agent:1001".to_string(),
+            intent: "Inspect pods through the fixed kubeconfig".to_string(),
+            uses: Some(2),
+        },
+    )
+    .await;
+    let AdminResponse::AccessDecisions { items, .. } = response else {
+        panic!("expected synthesized access extension, got {response:?}")
+    };
+    assert!(items[0].success, "extension failed: {:?}", items[0]);
+    assert_eq!(items[0].remaining_uses, Some(2));
+    assert_eq!(
+        server
+            .state
+            .verbs
+            .read()
+            .await
+            .match_command_all(
+                "kubectl",
+                &[
+                    "--kubeconfig".to_string(),
+                    native_absolute_kubeconfig_path().to_string(),
+                    "get".to_string(),
+                    "pods".to_string(),
+                ],
+            )
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn denial_generated_access_preserves_an_absolute_kubeconfig_operand() {
+    let (mut server, _) = make_test_config();
+    server.config.daemon_uid = 777;
+    server.config.daemon_principal = PrincipalKey::from_uid(777);
+    server.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
+    let directory = tempfile::tempdir().unwrap();
+    server.state.session_store = Some(
+        SessionStore::open(directory.path().join("state.db"), 3_600)
+            .await
+            .unwrap(),
+    );
+    let mut request = request_with_session(
+        "kubectl",
+        vec![
+            "--kubeconfig".to_string(),
+            native_absolute_kubeconfig_path().to_string(),
+            "get".to_string(),
+            "pods".to_string(),
+        ],
+        "unused".to_string(),
+    );
+    request.session_token = None;
+
+    let response = execute_command(request, &server, &CallerIdentity::Unix { uid: 1001 })
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    let handle = response
+        .handle
+        .as_deref()
+        .expect("denial creates a typed access request");
+    let proposed = guard::gating::verb::parse_normalized_generated_access_verb(
+        server.state.grant_requests.read().await[handle]
+            .proposed_verbs
+            .first()
+            .expect("denial preserves generated coverage"),
+    )
+    .unwrap();
+    assert_eq!(
+        proposed.args,
+        [
+            "--kubeconfig",
+            native_absolute_kubeconfig_path(),
+            "get",
+            "pods"
+        ]
+    );
+}
+
 fn synthesis_arguments_with_description(description: &str) -> serde_json::Value {
     serde_json::json!({
         "name": "check-compiler",

@@ -692,6 +692,17 @@ enum VerbCommands {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
+    /// Add one operator-authored verb from a YAML file.
+    Add {
+        /// YAML file containing exactly one verb definition.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit a machine-readable addition result.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
     /// Delete one operator-authored verb.
     Delete {
         name: String,

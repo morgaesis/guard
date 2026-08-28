@@ -1953,6 +1953,134 @@ async fn verb_amend_replaces_the_expected_definition_and_preserves_the_catalog()
 }
 
 #[tokio::test]
+async fn verb_add_persists_one_operator_definition_and_rejects_bad_writes_atomically() {
+    let (mut cfg, _buf) = make_test_config();
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    let (_dir, path, catalog) = amend_test_catalog();
+    let mut added = catalog.get("inspect-fixture").unwrap().clone();
+    added.name = "inspect-added-fixture".to_string();
+    added.description = "Inspect one added fixture".to_string();
+    added.coverage =
+        serde_yaml_ng::from_str("- name: blocked\n  action: deny\n  required_args: [blocked]\n")
+            .unwrap();
+    let requested_digest = added.definition_digest();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+    let operator = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAdd {
+            verb: Box::new(added.clone()),
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated {
+        verb,
+        persisted,
+        preview_digest,
+    } = response
+    else {
+        panic!("expected successful add, got {response:?}")
+    };
+    assert_ne!(verb.definition_digest(), requested_digest);
+    let persisted_digest = verb.definition_digest();
+    let persisted_audit_digest = format!("sha256:{persisted_digest}");
+    let requested_audit_digest = format!("sha256:{requested_digest}");
+    assert!(verb.coverage[0].sticky);
+    assert!(persisted);
+    assert!(preview_digest.is_none());
+    let reloaded = VerbCatalog::load(&path).unwrap();
+    let persisted_verb = reloaded.get("inspect-added-fixture").unwrap();
+    assert_eq!(persisted_verb.description, "Inspect one added fixture");
+    assert_eq!(persisted_verb.definition_digest(), persisted_digest);
+    assert!(persisted_verb.coverage[0].sticky);
+    assert!(reloaded.get("untouched").is_some());
+    let records = guard::audit::tail_records(&audit_directory.path().join("audit.jsonl"), 10)
+        .expect("read durable verb audit");
+    let created = records
+        .iter()
+        .find(|record| record["kind"] == "VERB_CREATED")
+        .expect("verb creation is audited");
+    assert_eq!(
+        created["caller"], "admin_uid=777",
+        "durable audit must bind the authenticated operator identity"
+    );
+    let recorded_digest = created["fields"].as_array().and_then(|fields| {
+        fields.iter().find_map(|field| {
+            (field.get(0).and_then(serde_json::Value::as_str) == Some("definition_digest"))
+                .then(|| field.get(1).and_then(serde_json::Value::as_str))
+                .flatten()
+        })
+    });
+    assert!(
+        guard::redact::redact_output_text(&persisted_audit_digest) == persisted_audit_digest,
+        "algorithm-qualified digest survives the audit redaction classifier"
+    );
+    assert!(
+        guard::redact::redact_registered_exact_secrets(&persisted_audit_digest)
+            == persisted_audit_digest,
+        "algorithm-qualified digest is not registered as exact secret material"
+    );
+    assert_eq!(
+        recorded_digest,
+        Some(persisted_audit_digest.as_str()),
+        "durable audit must bind the canonical persisted definition"
+    );
+    assert_ne!(recorded_digest, Some(requested_audit_digest.as_str()));
+    let committed = std::fs::read(&path).unwrap();
+
+    let duplicate = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAdd {
+            verb: Box::new(added.clone()),
+        },
+    )
+    .await;
+    assert!(matches!(
+        duplicate,
+        AdminResponse::Error { message } if message.contains("already exists")
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), committed);
+
+    let mut invalid = added;
+    invalid.name = "invalid-added-fixture".to_string();
+    invalid.params.get_mut("target").unwrap().pattern = "[a-z]+".to_string();
+    let rejected = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAdd {
+            verb: Box::new(invalid),
+        },
+    )
+    .await;
+    assert!(matches!(rejected, AdminResponse::Error { .. }));
+    assert_eq!(std::fs::read(&path).unwrap(), committed);
+
+    let mut generated = verb.clone();
+    generated.name = "generated-added-fixture".to_string();
+    generated.evidence = Some("model-authored evidence".to_string());
+    let rejected = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAdd {
+            verb: Box::new(generated),
+        },
+    )
+    .await;
+    assert!(matches!(
+        rejected,
+        AdminResponse::Error { message } if message.contains("operator-authored")
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), committed);
+    assert!(AdminRequest::VerbAdd {
+        verb: Box::new(verb),
+    }
+    .requires_admin_token());
+}
+
+#[tokio::test]
 async fn verb_amend_rejects_a_stale_digest_without_writing() {
     let (mut cfg, _buf) = make_test_config();
     let (_dir, path, catalog) = amend_test_catalog();
@@ -2412,7 +2540,7 @@ async fn rejected_direct_create_leaves_a_pending_hold_and_catalog_unchanged() {
     let AdminResponse::Error { message } = response else {
         panic!("expected relative-file rejection, got {response:?}");
     };
-    assert!(message.contains("must be an absolute path"), "{message}");
+    assert!(message.contains("must be one absolute path"), "{message}");
     assert_eq!(cfg.state.verbs.read().await.version(), original_version);
     assert!(cfg.state.verbs.read().await.get("apply-fixture").is_none());
     assert_eq!(

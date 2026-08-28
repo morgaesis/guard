@@ -141,6 +141,7 @@ impl Client {
             AdminRequest::ApprovalWithdraw { .. } => "approval_withdraw",
             AdminRequest::VerbList => "verb_list",
             AdminRequest::VerbShow { .. } => "verb_show",
+            AdminRequest::VerbAdd { .. } => "verb_add",
             AdminRequest::VerbDelete { .. } => "verb_delete",
             AdminRequest::VerbCreate { .. } => "verb_create",
             AdminRequest::VerbCreateFromPreview { .. } => "verb_create_from_preview",
