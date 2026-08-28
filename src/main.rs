@@ -13,7 +13,47 @@ mod cli_output {
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+    struct OutputState {
+        closed: AtomicBool,
+    }
+
+    impl OutputState {
+        const fn new() -> Self {
+            Self {
+                closed: AtomicBool::new(false),
+            }
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+
+        fn normalize_write(
+            &self,
+            result: io::Result<usize>,
+            attempted: usize,
+        ) -> io::Result<usize> {
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    self.closed.store(true, Ordering::Relaxed);
+                    Ok(attempted)
+                }
+                result => result,
+            }
+        }
+
+        fn normalize_flush(&self, result: io::Result<()>) -> io::Result<()> {
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    self.closed.store(true, Ordering::Relaxed);
+                    Ok(())
+                }
+                result => result,
+            }
+        }
+    }
+
+    static STDOUT_STATE: OutputState = OutputState::new();
 
     pub(super) struct Stdout;
 
@@ -23,31 +63,17 @@ mod cli_output {
 
     impl Write for Stdout {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            if STDOUT_CLOSED.load(Ordering::Relaxed) {
+            if STDOUT_STATE.is_closed() {
                 return Ok(buffer.len());
             }
-
-            match io::stdout().lock().write(buffer) {
-                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                    STDOUT_CLOSED.store(true, Ordering::Relaxed);
-                    Ok(buffer.len())
-                }
-                result => result,
-            }
+            STDOUT_STATE.normalize_write(io::stdout().lock().write(buffer), buffer.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            if STDOUT_CLOSED.load(Ordering::Relaxed) {
+            if STDOUT_STATE.is_closed() {
                 return Ok(());
             }
-
-            match io::stdout().lock().flush() {
-                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                    STDOUT_CLOSED.store(true, Ordering::Relaxed);
-                    Ok(())
-                }
-                result => result,
-            }
+            STDOUT_STATE.normalize_flush(io::stdout().lock().flush())
         }
     }
 
@@ -64,17 +90,59 @@ mod cli_output {
             panic!("failed writing to stdout: {error}");
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn broken_pipe_closes_output_without_losing_the_attempted_length() {
+            let state = OutputState::new();
+            let result = state.normalize_write(
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture consumer closed",
+                )),
+                12,
+            );
+            assert_eq!(result.unwrap(), 12);
+            assert!(state.is_closed());
+            assert!(state
+                .normalize_flush(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture consumer closed",
+                )))
+                .is_ok());
+        }
+
+        #[test]
+        fn non_pipe_output_failures_remain_errors() {
+            let state = OutputState::new();
+            let error = state
+                .normalize_write(
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "fixture output denied",
+                    )),
+                    12,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(!state.is_closed());
+        }
+    }
 }
 
-// Shadow only the infallible standard stdout macros in this binary crate. The
-// explicit writer paths continue to return `io::Result` to their callers.
-macro_rules! print {
+// Explicit names keep this boundary visible at every call site and prevent
+// macro expansion in the process entrypoint from changing standard behavior.
+// Writer paths that need to propagate failures continue to return `io::Result`.
+macro_rules! cli_print {
     ($($argument:tt)*) => {{
         crate::cli_output::write_stdout(format_args!($($argument)*), false)
     }};
 }
 
-macro_rules! println {
+macro_rules! cli_println {
     () => {{
         crate::cli_output::write_stdout(format_args!(""), true)
     }};
@@ -1546,7 +1614,7 @@ async fn run_main() -> Result<()> {
     // that `guard --version` stays concise and does not require parsing
     // subcommands.
     if top_level_version_requested(&args) {
-        println!(
+        cli_println!(
             "guard v{} ({})",
             env!("CARGO_PKG_VERSION"),
             env!("GUARD_GIT_COMMIT")
@@ -1754,7 +1822,7 @@ fn print_nested_help(path: &[&str], bin_name: &str) -> Result<()> {
     }
     command = command.bin_name(bin_name);
     command.write_help(&mut cli_output::stdout())?;
-    println!();
+    cli_println!();
     Ok(())
 }
 
@@ -1894,7 +1962,7 @@ fn help_tree_entries(
 
 fn print_help_tree() {
     let color = color_enabled_for_stdout();
-    println!("{}", paint("guard command tree", AnsiColor::Bold, color));
+    cli_println!("{}", paint("guard command tree", AnsiColor::Bold, color));
     let mut entries = Vec::new();
     help_tree_entries(&MainArgs::command(), &[], &mut entries);
     for (path, display, about) in &entries {
@@ -1905,13 +1973,13 @@ fn print_help_tree() {
             display.clone()
         };
         if about.is_empty() {
-            println!("{indent}{name}");
+            cli_println!("{indent}{name}");
         } else {
-            println!("{indent}{name}  {about}");
+            cli_println!("{indent}{name}  {about}");
         }
     }
-    println!();
-    println!("Each summary states its own authority where one is required; commands without one are available to allowed local callers.");
+    cli_println!();
+    cli_println!("Each summary states its own authority where one is required; commands without one are available to allowed local callers.");
 }
 #[cfg(test)]
 mod tests;

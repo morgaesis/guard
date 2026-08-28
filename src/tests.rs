@@ -1278,6 +1278,19 @@ fn top_level_help_still_triggers_clap_display_help() {
     }
 }
 
+#[test]
+fn missing_nested_subcommand_remains_invalid_usage() {
+    let error = match MainArgs::try_parse_from(["guard", "verb"]) {
+        Err(error) => error,
+        Ok(_) => panic!("a bare verb command must require a subcommand"),
+    };
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    assert_eq!(error.exit_code(), 2);
+}
+
 /// `guard help run` should show the subcommand help via clap. Note:
 /// because `Run` disables its own help flag, `guard run --help` would
 /// forward `--help` to the child instead - users get run help via

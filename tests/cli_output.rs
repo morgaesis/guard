@@ -2,12 +2,10 @@
 
 use std::process::{Command, Stdio};
 
-fn guard_binary() -> std::ffi::OsString {
-    std::env::var_os("CARGO_BIN_EXE_guard").expect("Cargo did not expose the guard binary")
-}
+const GUARD_BIN: &str = env!("CARGO_BIN_EXE_guard");
 
 fn command_with_closed_stdout(arguments: &[&str]) -> std::process::Output {
-    let mut child = Command::new(guard_binary())
+    let mut child = Command::new(GUARD_BIN)
         .args(arguments)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -49,7 +47,7 @@ fn clap_help_survives_a_closed_stdout_consumer() {
 
 #[test]
 fn missing_subcommand_remains_invalid_usage() {
-    let output = Command::new(guard_binary())
+    let output = Command::new(GUARD_BIN)
         .arg("verb")
         .output()
         .expect("run guard with a missing verb subcommand");
