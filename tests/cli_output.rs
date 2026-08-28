@@ -1,6 +1,9 @@
 //! End-to-end CLI output lifecycle tests using anonymous pipes.
 
-use std::process::{Command, Stdio};
+use std::{
+    path::Path,
+    process::{Command, Stdio},
+};
 
 const GUARD_BIN: &str = env!("CARGO_BIN_EXE_guard");
 
@@ -54,5 +57,10 @@ fn missing_subcommand_remains_invalid_usage() {
         .expect("run guard with a missing verb subcommand");
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage: guard verb"));
+    let executable = Path::new(GUARD_BIN)
+        .file_name()
+        .expect("guard binary has a file name")
+        .to_string_lossy();
+    let usage = format!("Usage: {executable} verb");
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&usage));
 }
