@@ -33,6 +33,8 @@ Each archive expands beneath its release-and-target directory. Linux archives
 include the binary, systemd units, operator wrapper, hardening examples, and
 generic verb examples. The Windows archive includes `guard.exe`, the PowerShell
 installer and tests, an inner binary digest manifest, and the same examples.
+Every archive includes the platform-marked examples. Guard rejects one at lint
+or startup when its declared platform does not match the binary.
 Installation uses files from the expanded archive rather than a source checkout.
 The packaged execution-capable systemd services share the host `/tmp` namespace
 with brokered children, so their temporary files remain visible to the caller

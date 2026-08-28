@@ -5054,6 +5054,7 @@ async fn dispatch_admin_request(
                         format!("sha256:{}", persisted_verb.definition_digest());
                     server.emit_audit_ungated(
                         AuditEvent::new(AuditKind::VerbCreated)
+                            .caller(caller)
                             .field("name", &persisted_verb.name)
                             .field("definition_digest", &definition_digest)
                             .field("consequence", persisted_verb.consequence.as_str())

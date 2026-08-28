@@ -8,10 +8,10 @@
 //! (which drives the consequence gate) and, for recoverable verbs, a
 //! structured rollback template.
 //!
-//! The catalog is the "slow clock": it is a file only an operator-owned
-//! deployment path controls; agents cannot add or change verbs at runtime. A trusted verb may
-//! skip the LLM evaluator entirely (a deterministic allow path, like a static
-//! policy allow), since its shape is already operator-reviewed.
+//! The catalog is the "slow clock": only operator-owned deployment paths and
+//! authenticated operator RPCs can change it. A trusted verb may skip the LLM
+//! evaluator entirely (a deterministic allow path, like a static policy allow),
+//! since its shape is already operator-reviewed.
 
 use super::coverage::reversibility_rank;
 use super::Reversibility;
@@ -548,8 +548,44 @@ impl Verb {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CatalogPlatform {
+    Unix,
+    Windows,
+}
+
+impl CatalogPlatform {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unix => "unix",
+            Self::Windows => "windows",
+        }
+    }
+
+    fn is_current(self) -> bool {
+        match self {
+            Self::Unix => cfg!(unix),
+            Self::Windows => cfg!(windows),
+        }
+    }
+}
+
+fn validate_catalog_platform(platform: Option<CatalogPlatform>) -> Result<()> {
+    if let Some(platform) = platform.filter(|platform| !platform.is_current()) {
+        bail!(
+            "verb catalog targets platform '{}', but this Guard binary targets '{}'",
+            platform.as_str(),
+            std::env::consts::FAMILY
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CatalogFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    platform: Option<CatalogPlatform>,
     #[serde(default)]
     verbs: Vec<Verb>,
 }
@@ -699,6 +735,7 @@ impl VerbCatalog {
     fn from_yaml_with_repair(text: &str) -> Result<(Self, Option<String>)> {
         let file: CatalogFile =
             serde_yaml_ng::from_str(text).context("failed to parse verb catalog")?;
+        validate_catalog_platform(file.platform)?;
         let mut verbs = BTreeMap::new();
         let mut repaired = false;
         for verb in file.verbs {
@@ -1482,6 +1519,7 @@ impl VerbCatalog {
 
     fn refresh_version(&mut self) -> Result<()> {
         let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
             verbs: self.verbs.values().cloned().collect(),
         })
         .context("failed to fingerprint verb catalog")?;
@@ -1572,6 +1610,26 @@ fn lint_catalog_yaml(text: &str) -> VerbCatalogLintReport {
         });
         return report;
     };
+    let platform_key = serde_yaml_ng::Value::String("platform".to_string());
+    if let Some(value) = mapping.get(&platform_key) {
+        let platform = match serde_yaml_ng::from_value::<CatalogPlatform>(value.clone()) {
+            Ok(platform) => platform,
+            Err(error) => {
+                report.findings.push(VerbCatalogFinding {
+                    verb: "<catalog>".to_string(),
+                    message: format!("invalid catalog platform: {error}"),
+                });
+                return report;
+            }
+        };
+        if let Err(error) = validate_catalog_platform(Some(platform)) {
+            report.findings.push(VerbCatalogFinding {
+                verb: "<catalog>".to_string(),
+                message: error.to_string(),
+            });
+            return report;
+        }
+    }
     let key = serde_yaml_ng::Value::String("verbs".to_string());
     let values = match mapping.get(&key) {
         None => Vec::new(),
@@ -2417,8 +2475,6 @@ fn path_is_absolute(value: &str) -> bool {
 enum KnownFileArgument {
     AbsolutePath,
     AbsolutePathList,
-    AbsolutePathOrHttps,
-    AbsolutePathOrProgram,
     AbsolutePathOrStdin,
     KubectlFilename,
     KeyEqualsPath,
@@ -2433,12 +2489,9 @@ impl KnownFileArgument {
         match self {
             Self::AbsolutePath => path_is_absolute(value),
             Self::AbsolutePathList => absolute_path_list(value),
-            Self::AbsolutePathOrHttps => path_is_absolute(value) || strict_https_url(value),
-            Self::AbsolutePathOrProgram => path_is_absolute(value) || bare_program_name(value),
             Self::AbsolutePathOrStdin => value == "-" || path_is_absolute(value),
             Self::KubectlFilename => {
-                !value.contains(',')
-                    && (value == "-" || path_is_absolute(value) || strict_https_url(value))
+                !value.contains(',') && (value == "-" || path_is_absolute(value))
             }
             Self::KeyEqualsPath => key_equals_path_payload(value).is_some_and(path_is_absolute),
             Self::HelmSetFile => helm_set_file_payload(value).is_some_and(path_is_absolute),
@@ -2457,11 +2510,9 @@ impl KnownFileArgument {
         match self {
             Self::AbsolutePath => "an absolute path",
             Self::AbsolutePathList => "a list containing only absolute paths",
-            Self::AbsolutePathOrHttps => "an absolute path or HTTPS URL",
-            Self::AbsolutePathOrProgram => "an absolute path or bare executable name",
             Self::AbsolutePathOrStdin => "an absolute path or '-' for standard input",
             Self::KubectlFilename => {
-                "one absolute path, '-' for standard input, or HTTPS URL; repeat the option for multiple sources"
+                "one absolute path or '-' for standard input; repeat the option for multiple sources"
             }
             Self::KeyEqualsPath => "an absolute path, optionally prefixed with key=",
             Self::HelmSetFile => "one key=absolute-path pair; repeat the option for multiple files",
@@ -2499,25 +2550,6 @@ impl KnownFileArgument {
 
 fn absolute_path_list(value: &str) -> bool {
     !value.is_empty() && std::env::split_paths(value).all(|path| path.is_absolute())
-}
-
-fn bare_program_name(value: &str) -> bool {
-    !matches!(value, "" | "." | "..")
-        && value.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
-        })
-}
-
-fn strict_https_url(value: &str) -> bool {
-    let Some(authority_and_path) = value.strip_prefix("https://") else {
-        return false;
-    };
-    let authority = authority_and_path.split('/').next().unwrap_or_default();
-    !authority.is_empty()
-        && !authority.contains('@')
-        && value
-            .chars()
-            .all(|character| !character.is_control() && !character.is_whitespace())
 }
 
 fn key_equals_path_payload(value: &str) -> Option<&str> {
@@ -2670,7 +2702,6 @@ fn validate_known_file_arguments(
     let binary = binary_match_key(binary);
     const ABSOLUTE: KnownFileArgument = KnownFileArgument::AbsolutePath;
     const ABSOLUTE_LIST: KnownFileArgument = KnownFileArgument::AbsolutePathList;
-    const PROGRAM: KnownFileArgument = KnownFileArgument::AbsolutePathOrProgram;
     const PATH_OR_STDIN: KnownFileArgument = KnownFileArgument::AbsolutePathOrStdin;
     const KUBECTL_FILE: KnownFileArgument = KnownFileArgument::KubectlFilename;
     const KEY_PATH: KnownFileArgument = KnownFileArgument::KeyEqualsPath;
@@ -2731,7 +2762,7 @@ fn validate_known_file_arguments(
             ("--key-file", ABSOLUTE),
             ("--keyring", ABSOLUTE),
             ("--set-file", HELM_SET_FILE),
-            ("--post-renderer", PROGRAM),
+            ("--post-renderer", ABSOLUTE),
             ("--output-dir", ABSOLUTE),
             ("--destination", ABSOLUTE),
             ("--untardir", ABSOLUTE),
@@ -3220,7 +3251,7 @@ fn validate_known_positional_file_arguments(
                 "kustomize" => {
                     let directory = args.get(index + 1).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "verb '{}' {command_label} kubectl kustomize requires an absolute directory or HTTPS URL",
+                            "verb '{}' {command_label} kubectl kustomize requires an absolute directory",
                             verb.name
                         )
                     })?;
@@ -3229,7 +3260,7 @@ fn validate_known_positional_file_arguments(
                         directory,
                         command_label,
                         "kubectl kustomize directory",
-                        KnownFileArgument::AbsolutePathOrHttps,
+                        KnownFileArgument::AbsolutePath,
                     )?;
                 }
                 "cp" => validate_kubectl_cp_operands(verb, args, index, command_label)?,
@@ -5186,6 +5217,7 @@ verbs:
         assert!(!serialized.contains(&value));
         let digest = canonical.definition_digest();
         let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
             verbs: vec![canonical],
         })
         .unwrap();
@@ -5203,7 +5235,11 @@ verbs:
         verb.source_prose = Some(contaminated.clone());
         verb.evidence = Some(contaminated.clone());
         verb.promotion_stamp = Some("regime-safe".to_string());
-        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![verb],
+        })
+        .unwrap();
         let directory = crate::learned_rules::authority_tempdir();
         let path = directory.path().join("verbs.yaml");
         crate::learned_rules::write_authority_file(&path, yaml).unwrap();
@@ -5267,7 +5303,11 @@ verbs:
         let value = ["q", "7"].concat();
         let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
         verb.source_prose = Some(format!("password={value}"));
-        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![verb],
+        })
+        .unwrap();
         let directory = crate::learned_rules::authority_tempdir();
         let path = directory.path().join("verbs.yaml");
         crate::learned_rules::write_authority_file(&path, &yaml).unwrap();
@@ -5385,7 +5425,11 @@ verbs:
         assert!(generated_authority_contains_sensitive_literal(&verb));
         assert!(VerbCatalog::for_admission_preview(&verb).is_err());
 
-        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![verb],
+        })
+        .unwrap();
         let directory = crate::learned_rules::authority_tempdir();
         let path = directory.path().join("verbs.yaml");
         crate::learned_rules::write_authority_file(&path, &yaml).unwrap();
@@ -5400,7 +5444,11 @@ verbs:
         verb.promotion_stamp = Some(format!("password={value}"));
         assert!(canonicalize_generated_authority_envelope(verb.clone()).is_err());
 
-        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![verb],
+        })
+        .unwrap();
         assert!(VerbCatalog::from_yaml(&yaml).is_err());
 
         let unknown_nested = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n    future_metadata: true\n";
@@ -5790,6 +5838,31 @@ verbs:
         assert!(dynamic_post_renderer
             .to_string()
             .contains("operator-fixed literal"));
+        let path_resolved_post_renderer = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: render-with-path-filter
+    binary: helm
+    args: ["template", "fixture", "repo/chart", "--post-renderer=renderer"]
+    consequence: reversible
+"#,
+        )
+        .unwrap_err();
+        assert!(path_resolved_post_renderer
+            .to_string()
+            .contains("must be an absolute path"));
+
+        let remote_manifest = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-remote-manifest
+    binary: kubectl
+    args: ["apply", "--filename=https://example.invalid/manifest.yaml"]
+    consequence: irreversible
+"#,
+        )
+        .unwrap_err();
+        assert!(remote_manifest.to_string().contains("absolute path"));
 
         let exact_kubeconfig = VerbCatalog::from_yaml(
             r#"
@@ -5987,11 +6060,15 @@ verbs:
                 .match_command_all("kubectl", &args_vec(&["apply", relative_manifest]),)
                 .is_empty());
         }
-        for remote_manifest in ["-f=-", "--filename=https://example.invalid/manifest.yaml"] {
-            assert!(!generic_kubectl_coverage
-                .match_command_all("kubectl", &args_vec(&["apply", remote_manifest]),)
-                .is_empty());
-        }
+        assert!(!generic_kubectl_coverage
+            .match_command_all("kubectl", &args_vec(&["apply", "-f=-"]),)
+            .is_empty());
+        assert!(generic_kubectl_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["apply", "--filename=https://example.invalid/manifest.yaml"]),
+            )
+            .is_empty());
         let generic_kubectl_patch_coverage = VerbCatalog::from_yaml(
             r#"
 verbs:
@@ -6103,7 +6180,7 @@ verbs:
                 &args_vec(&["kustomize", "/srv/automation/overlays/production"]),
             )
             .is_empty());
-        assert!(!generic_kubectl_kustomize_coverage
+        assert!(generic_kubectl_kustomize_coverage
             .match_command_all(
                 "kubectl",
                 &args_vec(&["kustomize", "https://example.invalid/overlays/production",]),
@@ -6799,6 +6876,27 @@ verbs:
     }
 
     #[test]
+    fn catalog_platform_is_enforced_by_production_loading() {
+        let incompatible = if cfg!(windows) { "unix" } else { "windows" };
+        let incompatible_catalog = format!(
+            "platform: {incompatible}\nverbs:\n  - name: inspect\n    binary: true\n    consequence: reversible\n"
+        );
+        let error = VerbCatalog::from_yaml(&incompatible_catalog).unwrap_err();
+        assert!(error.to_string().contains("verb catalog targets platform"));
+        let lint = VerbCatalog::lint_yaml(&incompatible_catalog);
+        assert_eq!(lint.findings.len(), 1);
+        assert!(lint.findings[0]
+            .message
+            .contains("verb catalog targets platform"));
+
+        let compatible = if cfg!(windows) { "windows" } else { "unix" };
+        VerbCatalog::from_yaml(&format!(
+            "platform: {compatible}\nverbs:\n  - name: inspect\n    binary: true\n    consequence: reversible\n"
+        ))
+        .expect("catalog for the running platform loads");
+    }
+
+    #[test]
     fn example_verb_catalogs_parse_and_validate() {
         // Guards against example/doc drift: every shipped examples/verbs*.yaml
         // must actually load (anchored patterns, declared placeholders, no
@@ -6816,11 +6914,15 @@ verbs:
                     .as_mapping()
                     .and_then(|mapping| mapping.get("platform"))
                     .and_then(serde_yaml_ng::Value::as_str);
-                if platform == Some("unix") && cfg!(windows) {
-                    continue;
+                match VerbCatalog::from_yaml(&yaml) {
+                    Ok(_) => {}
+                    Err(error)
+                        if platform.is_some_and(|platform| {
+                            (platform == "unix" && cfg!(windows))
+                                || (platform == "windows" && cfg!(unix))
+                        }) && error.to_string().contains("verb catalog targets platform") => {}
+                    Err(error) => panic!("{} failed to load: {error}", path.display()),
                 }
-                VerbCatalog::from_yaml(&yaml)
-                    .unwrap_or_else(|e| panic!("{} failed to load: {e}", path.display()));
                 checked += 1;
             }
         }
@@ -7502,7 +7604,11 @@ verbs:
         ];
         validate_auto_promoted_verb_safety(&verb, &evidence).unwrap();
 
-        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![verb],
+        })
+        .unwrap();
         assert!(yaml.contains("value_type: single_argv"));
         assert!(yaml.contains("max_length:"));
         let catalog = VerbCatalog::from_yaml(&yaml).unwrap();

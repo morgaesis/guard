@@ -2002,6 +2002,10 @@ async fn verb_add_persists_one_operator_definition_and_rejects_bad_writes_atomic
         .iter()
         .find(|record| record["kind"] == "VERB_CREATED")
         .expect("verb creation is audited");
+    assert_eq!(
+        created["caller"], "admin_uid=777",
+        "durable audit must bind the authenticated operator identity"
+    );
     let recorded_digest = created["fields"].as_array().and_then(|fields| {
         fields.iter().find_map(|field| {
             (field.get(0).and_then(serde_json::Value::as_str) == Some("definition_digest"))
@@ -2536,7 +2540,7 @@ async fn rejected_direct_create_leaves_a_pending_hold_and_catalog_unchanged() {
     let AdminResponse::Error { message } = response else {
         panic!("expected relative-file rejection, got {response:?}");
     };
-    assert!(message.contains("must be an absolute path"), "{message}");
+    assert!(message.contains("must be one absolute path"), "{message}");
     assert_eq!(cfg.state.verbs.read().await.version(), original_version);
     assert!(cfg.state.verbs.read().await.get("apply-fixture").is_none());
     assert_eq!(
