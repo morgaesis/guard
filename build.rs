@@ -42,6 +42,24 @@ fn track_git_files() {
     }
 }
 
+/// Reserve enough main-thread stack for the generated CLI parser on Windows.
+///
+/// MSVC's 1 MiB executable default is smaller than Guard's debug command model
+/// requires. An explicit reserve keeps development, test, and release binaries
+/// on the same supported stack contract.
+fn configure_windows_stack() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    let argument = if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        "/STACK:4194304"
+    } else {
+        "-Wl,--stack,4194304"
+    };
+    println!("cargo:rustc-link-arg-bin=guard={argument}");
+}
+
 fn main() {
     let commit =
         git_stdout(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
@@ -55,4 +73,5 @@ fn main() {
     }
 
     track_git_files();
+    configure_windows_stack();
 }
