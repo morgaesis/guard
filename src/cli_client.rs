@@ -267,7 +267,7 @@ fn print_containment_failure(response: &server::ExecuteResponse, streamed: bool)
     let color = color_enabled_for_stderr();
     if !streamed {
         if let Some(stdout) = &response.stdout {
-            print!("{stdout}");
+            cli_print!("{stdout}");
         }
         if let Some(stderr) = &response.stderr {
             eprint!("{stderr}");
@@ -511,8 +511,8 @@ pub(crate) async fn run_exec(
                     streamed_output = true;
                     match stream {
                         server::OutputStream::Stdout => {
-                            print!("{}", data);
-                            let _ = std::io::stdout().flush();
+                            cli_print!("{}", data);
+                            let _ = crate::cli_output::stdout().flush();
                         }
                         server::OutputStream::Stderr => {
                             eprint!("{}", data);
@@ -546,7 +546,7 @@ pub(crate) async fn run_exec(
             let color = color_enabled_for_stderr();
             if !streamed_output {
                 if let Some(stdout) = &resp.stdout {
-                    print!("{}", stdout);
+                    cli_print!("{}", stdout);
                 }
                 if let Some(stderr) = &resp.stderr {
                     eprint!("{}", stderr);
@@ -570,7 +570,7 @@ pub(crate) async fn run_exec(
         }
         Some(server::GateStatus::DryRun) => {
             let color = color_enabled_for_stdout();
-            println!(
+            cli_println!(
                 "{} {}",
                 paint("[DRY-RUN]", AnsiColor::Cyan, color),
                 resp.reason
@@ -589,7 +589,7 @@ pub(crate) async fn run_exec(
         );
         if !streamed_output {
             if let Some(stdout) = &resp.stdout {
-                print!("{}", stdout);
+                cli_print!("{}", stdout);
             }
             if let Some(stderr) = &resp.stderr {
                 eprint!("{}", stderr);
@@ -733,11 +733,11 @@ pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> R
                 }));
             }
             if items.is_empty() {
-                println!("(no provisional executions)");
+                cli_println!("(no provisional executions)");
             }
             let color = color_enabled_for_stdout();
             for p in &items {
-                println!("{}", provisional_human_line(p, color));
+                cli_println!("{}", provisional_human_line(p, color));
             }
             Ok(())
         }
@@ -774,7 +774,7 @@ pub(crate) async fn handle_provisional_show(
                     "item": item,
                 }));
             }
-            println!("{}", provisional_detail_human(&item));
+            cli_println!("{}", provisional_detail_human(&item));
             Ok(())
         }
         server::AdminResponse::Error { message } => {
@@ -846,7 +846,7 @@ pub(crate) fn provisional_detail_human(item: &server::ProvisionalSummary) -> Str
 }
 
 fn render_approval(item: &server::ApprovalSummary, include_transcript: bool) {
-    println!(
+    cli_println!(
         "[{}] handle={} cmd={:?} deadline={} reason={:?}",
         item.status,
         item.handle,
@@ -856,9 +856,9 @@ fn render_approval(item: &server::ApprovalSummary, include_transcript: bool) {
     );
     if include_transcript {
         if let Some(stdout) = item.stdout.as_deref() {
-            print!("{stdout}");
+            cli_print!("{stdout}");
             if item.stdout_truncated {
-                println!("[guard stdout transcript truncated]");
+                cli_println!("[guard stdout transcript truncated]");
             }
         }
         if let Some(stderr) = item.stderr.as_deref() {
@@ -868,7 +868,7 @@ fn render_approval(item: &server::ApprovalSummary, include_transcript: bool) {
             }
         }
         if let Some(exit_code) = item.exit_code {
-            println!("exit_code={exit_code}");
+            cli_println!("exit_code={exit_code}");
         }
     }
 }
@@ -1018,7 +1018,7 @@ pub(crate) async fn handle_approval(command: ApprovalCommands) -> Result<()> {
                 }));
             }
             if items.is_empty() {
-                println!("(no held commands)");
+                cli_println!("(no held commands)");
             }
             for item in &items {
                 render_approval(item, false);
@@ -1044,7 +1044,7 @@ pub(crate) async fn handle_approval(command: ApprovalCommands) -> Result<()> {
                     "message": message,
                 }));
             }
-            println!("{message}");
+            cli_println!("{message}");
             Ok(())
         }
         server::AdminResponse::Error { message } => anyhow::bail!(message),
@@ -1131,8 +1131,8 @@ pub(crate) async fn handle_resume(
                 ))?;
             } else {
                 if let Some(stdout) = stdout.as_deref() {
-                    print!("{stdout}");
-                    std::io::stdout().flush()?;
+                    cli_print!("{stdout}");
+                    crate::cli_output::stdout().flush()?;
                 }
                 if let Some(stderr) = stderr.as_deref() {
                     eprint!("{stderr}");
@@ -1185,7 +1185,7 @@ pub(crate) async fn handle_audit_verify(socket: Option<String>, json: bool) -> R
             }
             let color = color_enabled_for_stdout();
             if verification.intact {
-                println!(
+                cli_println!(
                     "{}: {} record(s) verified ({})",
                     paint("audit chain intact", AnsiColor::Green, color),
                     verification.records,
@@ -1193,7 +1193,7 @@ pub(crate) async fn handle_audit_verify(socket: Option<String>, json: bool) -> R
                 );
                 Ok(())
             } else {
-                println!(
+                cli_println!(
                     "{} at seq {}: {}",
                     paint("audit chain BROKEN", AnsiColor::Red, color),
                     verification
@@ -1202,9 +1202,10 @@ pub(crate) async fn handle_audit_verify(socket: Option<String>, json: bool) -> R
                         .unwrap_or_else(|| "?".to_string()),
                     verification.detail.as_deref().unwrap_or("unknown anomaly")
                 );
-                println!(
+                cli_println!(
                     "{} record(s) verified before the break ({})",
-                    verification.records, path
+                    verification.records,
+                    path
                 );
                 std::process::exit(1);
             }
@@ -1240,11 +1241,11 @@ pub(crate) async fn handle_audit_tail(
                 return print_json(&audit_tail_json_response(&path, &items));
             }
             if items.is_empty() {
-                println!("(no audit records)");
+                cli_println!("(no audit records)");
             }
             for item in &items {
                 match serde_json::from_value::<guard::audit::AuditRecord>(item.clone()) {
-                    Ok(record) => println!(
+                    Ok(record) => cli_println!(
                         "seq={} {} [AUDIT] {}{}",
                         record.seq,
                         format_timestamp(record.ts),
@@ -1258,7 +1259,7 @@ pub(crate) async fn handle_audit_tail(
                     // The server returns metadata for an unparseable line and
                     // omits its raw bytes so a malformed tail cannot disclose
                     // historical detail.
-                    Err(_) => println!("(unparseable audit record; detail omitted)"),
+                    Err(_) => cli_println!("(unparseable audit record; detail omitted)"),
                 }
             }
             Ok(())
@@ -1305,7 +1306,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             }
             if !report.repairs.is_empty() {
                 for repair in &report.repairs {
-                    println!("verb '{}': {}", repair.verb, repair.changes.join(", "));
+                    cli_println!("verb '{}': {}", repair.verb, repair.changes.join(", "));
                 }
                 if !fix {
                     eprintln!(
@@ -1319,13 +1320,13 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 eprintln!("warning: catalog repair committed with a durability warning: {warning}");
             }
             if report.fixed {
-                println!(
+                cli_println!(
                     "repaired {} verb(s) in {}",
                     report.repairs.len(),
                     path.display()
                 );
             } else {
-                println!("valid: {} verb(s) in {}", report.verb_count, path.display());
+                cli_println!("valid: {} verb(s) in {}", report.verb_count, path.display());
             }
             Ok(())
         }
@@ -1345,10 +1346,10 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                         }));
                     }
                     if items.is_empty() {
-                        println!("(no verbs; start the daemon with --verbs <catalog.yaml>)");
+                        cli_println!("(no verbs; start the daemon with --verbs <catalog.yaml>)");
                     }
                     for v in &items {
-                        println!(
+                        cli_println!(
                             "{} [{}]{}{}{}{}{} - {}",
                             v.name,
                             v.consequence,
@@ -1364,13 +1365,13 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                             v.description
                         );
                         for (p, pattern) in &v.params {
-                            println!("    --param {}=<{}>", p, pattern);
+                            cli_println!("    --param {}=<{}>", p, pattern);
                         }
                         if let Some(plan) = &v.credential_plan {
-                            println!("    credential_plan: {}", plan);
+                            cli_println!("    credential_plan: {}", plan);
                         }
                         for cell in &v.coverage {
-                            println!(
+                            cli_println!(
                                 "    coverage {}: {:?} required={:?} forbidden={:?} options={:?} target={:?} inventory={:?} namespace={:?} fanout={:?} override_marker={:?}",
                                 cell.name,
                                 cell.action,
@@ -1385,7 +1386,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                             );
                         }
                         if let Some(evidence) = &v.evidence {
-                            println!("    evidence: {}", evidence);
+                            cli_println!("    evidence: {}", evidence);
                         }
                     }
                     Ok(())
@@ -1400,7 +1401,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                         }));
                     }
                     if items.is_empty() {
-                        println!("(no verbs; start the daemon with --verbs <catalog.yaml>)");
+                        cli_println!("(no verbs; start the daemon with --verbs <catalog.yaml>)");
                     }
                     for verb in &items {
                         print_verb_menu_item(verb);
@@ -1437,7 +1438,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                     if json {
                         print_json(&verb)
                     } else {
-                        println!("{}", serde_json::to_string_pretty(&verb)?);
+                        cli_println!("{}", serde_json::to_string_pretty(&verb)?);
                         Ok(())
                     }
                 }
@@ -1462,7 +1463,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 .map_err(|error| describe_connect_failure(error, &client, source))?
             {
                 server::AdminResponse::Ok => {
-                    println!("ok");
+                    cli_println!("ok");
                     Ok(())
                 }
                 server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
@@ -1524,9 +1525,11 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                             "verb": verb,
                         }))
                     } else {
-                        println!(
+                        cli_println!(
                             "Amended verb '{}' ({} -> {}).",
-                            verb.name, previous_digest, digest
+                            verb.name,
+                            previous_digest,
+                            digest
                         );
                         Ok(())
                     }
@@ -1583,8 +1586,8 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                             streamed = true;
                             match stream {
                                 server::OutputStream::Stdout => {
-                                    print!("{}", data);
-                                    let _ = std::io::stdout().flush();
+                                    cli_print!("{}", data);
+                                    let _ = crate::cli_output::stdout().flush();
                                 }
                                 server::OutputStream::Stderr => {
                                     eprint!("{}", data);
@@ -1688,12 +1691,12 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 return Ok(());
             };
             let short = digest.get(..12).unwrap_or(&digest).to_string();
-            println!();
-            println!(
+            cli_println!();
+            cli_println!(
                 "candidate: {}...",
                 paint(&short, AnsiColor::Bold, color_enabled_for_stdout())
             );
-            println!("  install: guard verb create --from-preview {short}");
+            cli_println!("  install: guard verb create --from-preview {short}");
             if yes || !access_review_is_interactive() {
                 return Ok(());
             }
@@ -1706,7 +1709,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 .map_err(|e| describe_connect_failure(e, &client, source))?;
             match response {
                 server::AdminResponse::VerbCreated { verb, .. } => {
-                    println!(
+                    cli_println!(
                         "Created verb '{}' and added it to the catalog (candidate {short}).",
                         verb.name
                     );
@@ -1732,7 +1735,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                             }));
                         }
                         if items.is_empty() {
-                            println!("(no generated API verb coverage)");
+                            cli_println!("(no generated API verb coverage)");
                         }
                         for item in items {
                             let session = item
@@ -1741,7 +1744,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                                 .map(|value| value.chars().take(12).collect::<String>())
                                 .unwrap_or_else(|| "global".to_string());
                             let regime = item.regime.chars().take(12).collect::<String>();
-                            println!(
+                            cli_println!(
                                 "endpoint={} session={} {} {} {}/{} namespace={} decision={} provenance={:?} regime={} active={} expires={}",
                                 item.endpoint,
                                 session,
@@ -1780,7 +1783,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                                 "removed": removed,
                             }))
                         } else {
-                            println!("Cleared {removed} generated API coverage bucket(s).");
+                            cli_println!("Cleared {removed} generated API coverage bucket(s).");
                             Ok(())
                         }
                     }
@@ -1812,20 +1815,20 @@ fn verb_create_rejection(message: &str) -> Option<&str> {
 
 fn print_verb_create_human(verb: &guard::gating::verb::Verb, persisted: bool) {
     if persisted {
-        println!("Created verb '{}' and added it to the catalog:", verb.name);
+        cli_println!("Created verb '{}' and added it to the catalog:", verb.name);
     } else {
-        println!(
+        cli_println!(
             "Preview of verb '{}' (NOT written). Install exactly this candidate with --from-preview; every created verb is non-trusted and re-validated by the safety gate.",
             verb.name
         );
     }
     if let Some(ev) = &verb.evidence {
-        println!("  evidence: {}", ev);
+        cli_println!("  evidence: {}", ev);
     }
-    println!();
+    cli_println!();
     match serde_yaml_ng::to_string(verb) {
-        Ok(y) => print!("{}", y),
-        Err(_) => println!("{:#?}", verb),
+        Ok(y) => cli_print!("{}", y),
+        Err(_) => cli_println!("{:#?}", verb),
     }
 }
 
@@ -2065,13 +2068,13 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
         server::AdminResponse::AccessItems { items } => {
             if items.is_empty() {
                 if filtered {
-                    println!("(no matching access requests or sessions)");
+                    cli_println!("(no matching access requests or sessions)");
                 } else {
-                    println!("(no access requests or sessions)");
+                    cli_println!("(no access requests or sessions)");
                 }
             }
             for item in items {
-                println!(
+                cli_println!(
                     "{} kind={} consequence={} requester={} target={} scope={} expiry={} uses={} state={} next={}",
                     item.reference,
                     item.kind,
@@ -2099,7 +2102,7 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             }
         }
         server::AdminResponse::AccessItem { item } => {
-            println!("{}", access_item_human(&item, raw_matcher));
+            cli_println!("{}", access_item_human(&item, raw_matcher));
         }
         server::AdminResponse::AccessDecisions { items, .. } => {
             print_access_decision_lines(&items);
@@ -2140,7 +2143,7 @@ fn verb_menu_human_lines(item: &server::VerbMenuItem) -> Vec<String> {
 
 fn print_verb_menu_item(item: &server::VerbMenuItem) {
     for line in verb_menu_human_lines(item) {
-        println!("{line}");
+        cli_println!("{line}");
     }
 }
 
@@ -2185,21 +2188,21 @@ fn render_access_status(
     provisionals: &[server::ProvisionalSummary],
     requests: &[crate::grant_profile::GrantRequest],
 ) {
-    println!("access session status");
+    cli_println!("access session status");
     if let Some(active) = &report.active {
-        println!(
+        cli_println!(
             "  session: {}",
             active.scope.label.as_deref().unwrap_or("(unlabeled)")
         );
-        println!(
+        cli_println!(
             "  expiry: {}",
             active
                 .expires_at
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_string())
         );
-        println!("  owner: {:?}", active.owner);
-        println!(
+        cli_println!("  owner: {:?}", active.owner);
+        cli_println!(
             "  verbs: {}",
             if active.activated_verbs.is_empty() {
                 "(none)".to_string()
@@ -2208,10 +2211,10 @@ fn render_access_status(
             }
         );
         if let Some(line) = secret_entitlements_line(&active.scope.secret_names, "  ") {
-            println!("{line}");
+            cli_println!("{line}");
         }
     }
-    println!(
+    cli_println!(
         "  activity: total={} allowed={} denied={} completed={} failed={} held={}",
         report.stats.total,
         report.stats.allowed,
@@ -2220,7 +2223,7 @@ fn render_access_status(
         report.stats.exec_failed,
         report.stats.holds,
     );
-    println!(
+    cli_println!(
         "  related: requests={} approvals={} provisionals={} recent={}",
         requests.len(),
         approvals.len(),
@@ -2228,7 +2231,7 @@ fn render_access_status(
         report.recent.len(),
     );
     for interaction in &report.recent {
-        println!(
+        cli_println!(
             "  [{}] allowed={} source={} status={:?} command={:?} reason={:?}",
             interaction.at_unix,
             interaction.allowed,
@@ -2238,20 +2241,20 @@ fn render_access_status(
             interaction.reason,
         );
         for line in decision_trace_human_lines(interaction.decision_trace.as_ref(), "    ") {
-            println!("{line}");
+            cli_println!("{line}");
         }
     }
     for approval in approvals {
         render_approval(approval, true);
         for line in decision_trace_human_lines(approval.decision_trace.as_ref(), "  ") {
-            println!("{line}");
+            cli_println!("{line}");
         }
     }
     for provisional in provisionals {
         let secret_names = secret_entitlements_line(&provisional.secret_names, "")
             .map(|line| format!(" {line}"))
             .unwrap_or_default();
-        println!(
+        cli_println!(
             "[{}] handle={} cmd={:?} deadline={} reason={:?}{}",
             provisional.status,
             provisional.handle,
@@ -2261,7 +2264,7 @@ fn render_access_status(
             secret_names,
         );
         for line in decision_trace_human_lines(provisional.decision_trace.as_ref(), "  ") {
-            println!("{line}");
+            cli_println!("{line}");
         }
     }
 }
@@ -2676,7 +2679,7 @@ fn print_access_decision_lines(items: &[server::AccessDecisionResult]) {
     for item in items {
         // `uses=` keeps its existing shape for parsers: this line is the
         // machine-readable decision record, so the field is always present.
-        println!(
+        cli_println!(
             "{} success={} state={} target={} uses={} consequence={} message={}",
             item.request,
             item.success,
@@ -3322,7 +3325,7 @@ fn render_gated_response(
             let color = color_enabled_for_stderr();
             if !streamed {
                 if let Some(out) = &resp.stdout {
-                    print!("{}", out);
+                    cli_print!("{}", out);
                 }
                 if let Some(err) = &resp.stderr {
                     eprint!("{}", err);
@@ -3346,7 +3349,7 @@ fn render_gated_response(
         }
         Some(server::GateStatus::DryRun) => {
             let color = color_enabled_for_stdout();
-            println!(
+            cli_println!(
                 "{} {}",
                 paint("[DRY-RUN]", AnsiColor::Cyan, color),
                 resp.reason
@@ -3358,7 +3361,7 @@ fn render_gated_response(
             if resp.allowed {
                 if !streamed {
                     if let Some(out) = &resp.stdout {
-                        print!("{}", out);
+                        cli_print!("{}", out);
                     }
                     if let Some(err) = &resp.stderr {
                         eprint!("{}", err);
@@ -3411,9 +3414,9 @@ pub(crate) async fn handle_gate_action(
             stdout,
             stderr,
         } => {
-            println!("{}", message);
+            cli_println!("{}", message);
             if let Some(out) = &stdout {
-                print!("{}", out);
+                cli_print!("{}", out);
             }
             if let Some(err) = &stderr {
                 eprint!("{}", err);
@@ -3731,8 +3734,8 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
 
     // Client info first - useful even when the daemon is unreachable.
     if !json {
-        println!("Client:");
-        println!(
+        cli_println!("Client:");
+        cli_println!(
             "  version        {} ({}, {}{})",
             env!("CARGO_PKG_VERSION"),
             env!("GUARD_GIT_COMMIT"),
@@ -3741,8 +3744,8 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
                 .map(|t| format!(", tag {t}"))
                 .unwrap_or_default()
         );
-        println!("  endpoint       {}", client.endpoint_for_log());
-        println!();
+        cli_println!("  endpoint       {}", client.endpoint_for_log());
+        cli_println!();
     }
 
     // Ping is the public liveness probe. Always permitted to any
@@ -3772,11 +3775,11 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
 
     let (version, uptime, mode, dry_run) = ping;
     if !json {
-        println!("Server:");
-        println!("  version        {}", version);
-        println!("  uptime         {}s", uptime);
-        println!("  mode           {}", mode);
-        println!("  dry_run        {}", dry_run);
+        cli_println!("Server:");
+        cli_println!("  version        {}", version);
+        cli_println!("  uptime         {}s", uptime);
+        cli_println!("  mode           {}", mode);
+        cli_println!("  dry_run        {}", dry_run);
         if version != env!("CARGO_PKG_VERSION") {
             eprintln!(
                 "warning: guard client {} differs from server {}",
@@ -3813,46 +3816,51 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
                 }));
             }
             if let Some(ref s) = status.socket_path {
-                println!("  socket         {}", s);
+                cli_println!("  socket         {}", s);
             }
             if let Some(p) = status.tcp_port {
-                println!("  tcp_port       {}", p);
+                cli_println!("  tcp_port       {}", p);
             }
-            println!("  llm_enabled    {}", status.llm_enabled);
+            cli_println!("  llm_enabled    {}", status.llm_enabled);
             if status.llm_enabled {
-                println!("  llm_models     {:?}", status.llm_model_chain);
+                cli_println!("  llm_models     {:?}", status.llm_model_chain);
             }
-            println!("  static_policy  {}", status.static_policy);
-            println!("  preflight      {}", status.preflight);
-            println!("  redact         {}", status.redact);
+            cli_println!("  static_policy  {}", status.static_policy);
+            cli_println!("  preflight      {}", status.preflight);
+            cli_println!("  redact         {}", status.redact);
             if !status.secret_backend.is_empty() {
-                println!("  secret_backend {}", status.secret_backend);
+                cli_println!("  secret_backend {}", status.secret_backend);
             }
-            println!(
+            cli_println!(
                 "  cache          enabled={} size={}",
-                status.cache_enabled, status.cache_size
+                status.cache_enabled,
+                status.cache_size
             );
-            println!(
+            cli_println!(
                 "  learning       enabled={} candidates={}",
-                status.learning_enabled, status.learned_rule_count
+                status.learning_enabled,
+                status.learned_rule_count
             );
-            println!(
+            cli_println!(
                 "  learn_deny     enabled={} shapes={}",
-                status.deny_learning_enabled, status.deny_shape_count
+                status.deny_learning_enabled,
+                status.deny_shape_count
             );
-            println!(
+            cli_println!(
                 "  learn_allow    enabled={} observations={}",
-                status.allow_promotion_enabled, status.allow_promotion_observation_count
+                status.allow_promotion_enabled,
+                status.allow_promotion_observation_count
             );
-            println!("  verb_catalog  {}", status.verb_catalog_hash);
+            cli_println!("  verb_catalog  {}", status.verb_catalog_hash);
             if let Some(changed) = status.verb_catalog_changed_unix {
-                println!("  verb_changed  {}", format_timestamp(changed));
+                cli_println!("  verb_changed  {}", format_timestamp(changed));
             }
-            println!(
+            cli_println!(
                 "  queues         approvals={} provisionals={}",
-                status.pending_approvals, status.pending_provisionals
+                status.pending_approvals,
+                status.pending_provisionals
             );
-            println!(
+            cli_println!(
                 "  command_load   handlers={}/{} rejected={} evaluators={}/{} rate_limited={} circuit_rejected={} errors={}",
                 status.command_admission.handler_admitted,
                 status.command_admission.handler_attempted,
@@ -3863,11 +3871,11 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
                 status.command_admission.evaluator_circuit_rejections,
                 status.command_admission.evaluator_errors,
             );
-            println!("  sessions       {}", status.session_count);
-            println!("  daemon_uid     {}", status.daemon_uid);
-            println!("  exec_identity  {}", status.exec_identity);
+            cli_println!("  sessions       {}", status.session_count);
+            cli_println!("  daemon_uid     {}", status.daemon_uid);
+            cli_println!("  exec_identity  {}", status.exec_identity);
             if let Some(ref path) = status.state_db_path {
-                println!("  state_db       {}", path);
+                cli_println!("  state_db       {}", path);
             }
             Ok(())
         }
@@ -3895,8 +3903,8 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
                 }));
             }
             // Expected when the caller lacks operator authority. Hide the rest.
-            println!();
-            println!("(full server config requires operator authority)");
+            cli_println!();
+            cli_println!("(full server config requires operator authority)");
             Ok(())
         }
         Ok(other) => {
@@ -3928,16 +3936,16 @@ pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
                     "admin_token_configured": config.admin_token.is_some(),
                 }));
             }
-            println!("socket: {:?}", config.server_socket.unwrap_or_default());
-            println!(
+            cli_println!("socket: {:?}", config.server_socket.unwrap_or_default());
+            cli_println!(
                 "port: {:?}",
                 config
                     .server_tcp_port
                     .map(|p| p.to_string())
                     .unwrap_or_default()
             );
-            println!("user: {:?}", config.default_user.unwrap_or_default());
-            println!(
+            cli_println!("user: {:?}", config.default_user.unwrap_or_default());
+            cli_println!(
                 "token: {}",
                 if config.auth_token.is_some() {
                     "***"
@@ -3945,7 +3953,7 @@ pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
                     "(none)"
                 }
             );
-            println!(
+            cli_println!(
                 "admin_token: {}",
                 if config.admin_token.is_some() {
                     "***"
@@ -3960,37 +3968,37 @@ pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
             config.server_socket = Some(socket.clone());
             config.server_tcp_port = None;
             config.save()?;
-            println!("Server socket set to {}", socket);
+            cli_println!("Server socket set to {}", socket);
         }
         ConfigCommands::SetPort { port } => {
             let mut config = load_client_config(false)?;
             config.server_tcp_port = Some(port);
             config.server_socket = None;
             config.save()?;
-            println!("Server port set");
+            cli_println!("Server port set");
         }
         ConfigCommands::SetToken => {
             let mut config = load_client_config(false)?;
             config.auth_token = Some(read_secret_input("Execution token: ")?);
             config.save()?;
-            println!("Token set");
+            cli_println!("Token set");
         }
         ConfigCommands::SetAdminToken => {
             let mut config = load_client_config(false)?;
             config.admin_token = Some(read_secret_input("Admin token: ")?);
             config.save()?;
-            println!("Admin token set");
+            cli_println!("Admin token set");
         }
         ConfigCommands::SetUser { user } => {
             let mut config = load_client_config(false)?;
             config.default_user = Some(user);
             config.save()?;
-            println!("Default user set");
+            cli_println!("Default user set");
         }
         ConfigCommands::Clear => {
             let config = client_config::ClientConfig::default();
             config.save()?;
-            println!("Configuration cleared");
+            cli_println!("Configuration cleared");
         }
     }
     Ok(())

@@ -1,6 +1,156 @@
 //! guard - evaluator-gated command execution for AI agents
 //!
 
+/// Fallible stdout boundary for the CLI process.
+///
+/// Rust's standard `print!` and `println!` macros panic when a downstream pipe
+/// closes. A CLI consumer such as `head` closing stdout is not a Guard failure,
+/// and it must not interrupt an already-admitted command lifecycle. Once the
+/// process observes `EPIPE`, later stdout writes become no-ops while normal
+/// command completion and exit-status handling continue.
+mod cli_output {
+    use std::fmt;
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct OutputState {
+        closed: AtomicBool,
+    }
+
+    impl OutputState {
+        const fn new() -> Self {
+            Self {
+                closed: AtomicBool::new(false),
+            }
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+
+        fn normalize_write(
+            &self,
+            result: io::Result<usize>,
+            attempted: usize,
+        ) -> io::Result<usize> {
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    self.closed.store(true, Ordering::Relaxed);
+                    Ok(attempted)
+                }
+                result => result,
+            }
+        }
+
+        fn normalize_flush(&self, result: io::Result<()>) -> io::Result<()> {
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    self.closed.store(true, Ordering::Relaxed);
+                    Ok(())
+                }
+                result => result,
+            }
+        }
+    }
+
+    static STDOUT_STATE: OutputState = OutputState::new();
+
+    pub(super) struct Stdout;
+
+    pub(super) fn stdout() -> Stdout {
+        Stdout
+    }
+
+    impl Write for Stdout {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if STDOUT_STATE.is_closed() {
+                return Ok(buffer.len());
+            }
+            STDOUT_STATE.normalize_write(io::stdout().lock().write(buffer), buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if STDOUT_STATE.is_closed() {
+                return Ok(());
+            }
+            STDOUT_STATE.normalize_flush(io::stdout().lock().flush())
+        }
+    }
+
+    pub(super) fn write_stdout(arguments: fmt::Arguments<'_>, newline: bool) {
+        let mut writer = stdout();
+        let result = writer.write_fmt(arguments).and_then(|()| {
+            if newline {
+                writer.write_all(b"\n")
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = result {
+            panic!("failed writing to stdout: {error}");
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn broken_pipe_closes_output_without_losing_the_attempted_length() {
+            let state = OutputState::new();
+            let result = state.normalize_write(
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture consumer closed",
+                )),
+                12,
+            );
+            assert_eq!(result.unwrap(), 12);
+            assert!(state.is_closed());
+            assert!(state
+                .normalize_flush(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture consumer closed",
+                )))
+                .is_ok());
+        }
+
+        #[test]
+        fn non_pipe_output_failures_remain_errors() {
+            let state = OutputState::new();
+            let error = state
+                .normalize_write(
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "fixture output denied",
+                    )),
+                    12,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(!state.is_closed());
+        }
+    }
+}
+
+// Explicit names keep this boundary visible at every call site and prevent
+// macro expansion in the process entrypoint from changing standard behavior.
+// Writer paths that need to propagate failures continue to return `io::Result`.
+macro_rules! cli_print {
+    ($($argument:tt)*) => {{
+        crate::cli_output::write_stdout(format_args!($($argument)*), false)
+    }};
+}
+
+macro_rules! cli_println {
+    () => {{
+        crate::cli_output::write_stdout(format_args!(""), true)
+    }};
+    ($($argument:tt)*) => {{
+        crate::cli_output::write_stdout(format_args!($($argument)*), true)
+    }};
+}
+
 mod cli_client;
 mod cli_secrets;
 mod cli_server;
@@ -61,10 +211,9 @@ fn parse_unbounded_secs(value: &str) -> Result<u64, String> {
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    serde_json::to_writer_pretty(&mut lock, value)?;
-    writeln!(lock)?;
+    let mut stdout = cli_output::stdout();
+    serde_json::to_writer_pretty(&mut stdout, value)?;
+    writeln!(stdout)?;
     Ok(())
 }
 
@@ -1465,7 +1614,7 @@ async fn run_main() -> Result<()> {
     // that `guard --version` stays concise and does not require parsing
     // subcommands.
     if top_level_version_requested(&args) {
-        println!(
+        cli_println!(
             "guard v{} ({})",
             env!("CARGO_PKG_VERSION"),
             env!("GUARD_GIT_COMMIT")
@@ -1616,16 +1765,20 @@ async fn run_main() -> Result<()> {
         }
         Ok(MainArgs::Completions { shell }) => {
             let mut command = MainArgs::command();
-            clap_complete::generate(shell, &mut command, "guard", &mut std::io::stdout());
+            clap_complete::generate(shell, &mut command, "guard", &mut cli_output::stdout());
             Ok(())
         }
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
-                || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
                 || e.kind() == clap::error::ErrorKind::DisplayVersion =>
         {
-            // Let clap render help/version to stdout and exit 0.
-            e.exit();
+            write!(cli_output::stdout(), "{e}")?;
+            Ok(())
+        }
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            let exit_code = e.exit_code();
+            eprint!("{e}");
+            std::process::exit(exit_code);
         }
         Err(e) => {
             log_cli_usage_error(&args, &e);
@@ -1668,8 +1821,8 @@ fn print_nested_help(path: &[&str], bin_name: &str) -> Result<()> {
         })?;
     }
     command = command.bin_name(bin_name);
-    command.print_help()?;
-    println!();
+    command.write_help(&mut cli_output::stdout())?;
+    cli_println!();
     Ok(())
 }
 
@@ -1809,7 +1962,7 @@ fn help_tree_entries(
 
 fn print_help_tree() {
     let color = color_enabled_for_stdout();
-    println!("{}", paint("guard command tree", AnsiColor::Bold, color));
+    cli_println!("{}", paint("guard command tree", AnsiColor::Bold, color));
     let mut entries = Vec::new();
     help_tree_entries(&MainArgs::command(), &[], &mut entries);
     for (path, display, about) in &entries {
@@ -1820,13 +1973,13 @@ fn print_help_tree() {
             display.clone()
         };
         if about.is_empty() {
-            println!("{indent}{name}");
+            cli_println!("{indent}{name}");
         } else {
-            println!("{indent}{name}  {about}");
+            cli_println!("{indent}{name}  {about}");
         }
     }
-    println!();
-    println!("Each summary states its own authority where one is required; commands without one are available to allowed local callers.");
+    cli_println!();
+    cli_println!("Each summary states its own authority where one is required; commands without one are available to allowed local callers.");
 }
 #[cfg(test)]
 mod tests;
