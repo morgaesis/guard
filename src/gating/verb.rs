@@ -2496,9 +2496,7 @@ impl KnownFileArgument {
             Self::KeyEqualsPath => key_equals_path_payload(value).is_some_and(path_is_absolute),
             Self::HelmSetFile => helm_set_file_payload(value).is_some_and(path_is_absolute),
             Self::AnsibleInventory => path_is_absolute(value) || value.ends_with(','),
-            Self::AnsibleExtraVars => value
-                .strip_prefix('@')
-                .is_none_or(|path| path_is_absolute(path)),
+            Self::AnsibleExtraVars => value.strip_prefix('@').is_none_or(path_is_absolute),
             Self::AnsibleVaultId => {
                 let source = value.rsplit_once('@').map_or(value, |(_, source)| source);
                 source == "prompt" || path_is_absolute(source)
