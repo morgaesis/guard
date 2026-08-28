@@ -141,8 +141,6 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
-    let mut attached_access_overlay = false;
-
     // Local access authority is selected by the kernel-authenticated principal.
     // Replace only an unknown or expired supplied handle; a known handle stays
     // attached so the owner check below rejects cross-principal use.
@@ -184,10 +182,12 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         verb_guidance: None,
     };
 
+    // Classify the final attached token after local-principal selection, so
+    // daemon-selected and client-supplied access authority share one path.
     // Session authority is owner-bound before any catalog lookup. A replayed
     // bearer therefore cannot reveal foreign session verbs, match precedence,
     // or approval guidance through the pre-validation resolution path.
-    if let Some(token) = request.session_token.as_deref() {
+    let attached_access_overlay = if let Some(token) = request.session_token.as_deref() {
         let (refusal, access_managed) = {
             let sessions = server.state.sessions.read().await;
             match sessions.owner_for(token) {
@@ -226,8 +226,10 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                 .await;
             return ExecuteResult::denied(reason);
         }
-        attached_access_overlay = access_managed;
-    }
+        access_managed
+    } else {
+        false
+    };
 
     if let Err(result) = canonicalize_request_cwd(&mut phase, &mut request).await {
         return *result;
