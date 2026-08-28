@@ -58,18 +58,21 @@ jobs:
             exit 1
           fi
           release_job=$(sed -n '/^  release:/,$p' .github/workflows/publish-release.yml)
-          checkout_line=$(printf '%s\n' "$release_job" | grep -n -m1 'uses: actions/checkout@' | cut -d: -f1)
-          create_line=$(printf '%s\n' "$release_job" | grep -n -m1 'name: Create Release' | cut -d: -f1)
+          checkout_match=$(grep -n -m1 'uses: actions/checkout@' <<< "$release_job")
+          create_match=$(grep -n -m1 'name: Create Release' <<< "$release_job")
+          checkout_line=${checkout_match%%:*}
+          create_line=${create_match%%:*}
           test -n "$checkout_line"
           test -n "$create_line"
           test "$checkout_line" -lt "$create_line"
-          printf '%s\n' "$release_job" | grep -A3 -m1 'uses: actions/checkout@' | grep -q 'persist-credentials: false'
-          printf '%s\n' "$release_job" | grep -A4 -m1 'uses: actions/checkout@' | grep -q 'fetch-depth: 0'
+          checkout_block=$(grep -A4 -m1 'uses: actions/checkout@' <<< "$release_job")
+          grep -q 'persist-credentials: false' <<< "$checkout_block"
+          grep -q 'fetch-depth: 0' <<< "$checkout_block"
           release_validation=$(cat .github/workflows/release.yml)
-          printf '%s\n' "$release_validation" | grep -q '^  actions: read$'
-          printf '%s\n' "$release_validation" | grep -q 'timeout 1800s gh run watch'
+          grep -q '^  actions: read$' <<< "$release_validation"
+          grep -q 'timeout 1800s gh run watch' <<< "$release_validation"
           publish_validation=$(sed -n '/^  validate:/,/^  release:/p' .github/workflows/publish-release.yml)
-          printf '%s\n' "$publish_validation" | grep -q 'actions: read'
+          grep -q 'actions: read' <<< "$publish_validation"
           mkdir /tmp/guard-release-test/verify
           cp /tmp/guard-release-test/a/*.tar.gz /tmp/guard-release-test/b/*.tar.gz /tmp/guard-release-test/verify/
           cp /tmp/guard-release-test/c/*.cdx.json /tmp/guard-release-test/verify/

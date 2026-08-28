@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const WINDOWS_STACK_RESERVE_BYTES: u64 = 8 * 1024 * 1024;
+const WINDOWS_STACK_RESERVE_BYTES: u64 = 4 * 1024 * 1024;
 
 fn git_stdout(args: &[&str]) -> Option<String> {
     let output = Command::new("git").args(args).output().ok()?;
