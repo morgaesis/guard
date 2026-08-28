@@ -5049,16 +5049,16 @@ async fn dispatch_admin_request(
                 })
                 .await;
             match result {
-                Ok(()) => {
+                Ok(persisted_verb) => {
                     server.emit_audit_ungated(
                         AuditEvent::new(AuditKind::VerbCreated)
-                            .field("name", &verb.name)
-                            .field("consequence", verb.consequence.as_str())
-                            .field("trusted", verb.trusted)
+                            .field("name", &persisted_verb.name)
+                            .field("consequence", persisted_verb.consequence.as_str())
+                            .field("trusted", persisted_verb.trusted)
                             .field("source", "operator_file"),
                     );
                     AdminResponse::VerbCreated {
-                        verb: *verb,
+                        verb: persisted_verb,
                         persisted: true,
                         preview_digest: None,
                     }

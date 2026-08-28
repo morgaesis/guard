@@ -145,11 +145,16 @@ A non-matching cell has no decision. The check cell above allows its bounded
 region and does not deny apply mode, SSH inspection, or any other command. Those
 areas follow their own matching cells or evaluator path.
 
-Known file operands in command and rollback templates must be absolute. Ansible
-inventory coverage likewise accepts only absolute paths or explicit inline host
-lists. If an explicit-inventory Ansible process reports that no inventory was
-parsed, or that every supplied source was unusable, Guard converts exit 0 to a
-failure and emits a diagnostic.
+Recognized local-file operands in command and rollback templates must be
+absolute. The bounded grammar covers documented option values and attached
+short forms, including `key=path` and `label@path` payloads. It preserves
+Ansible's non-file forms: inventories may be comma-terminated inline host
+lists, extra variables may be inline values, and vault IDs may use `prompt`.
+Referenced variable files, vault clients, module-path entries, credentials, and
+configuration files must be absolute. Ambiguous command grammars that cannot
+be modeled safely do not receive file-path coverage. If an explicit-inventory
+Ansible process reports that no inventory was parsed, or that every supplied
+source was unusable, Guard converts exit 0 to a failure and emits a diagnostic.
 
 Environment sources are `plain`, `secret`, and `secret-file`. A constraint may
 name exact `values` or a fully anchored `pattern`. A cell with no environment

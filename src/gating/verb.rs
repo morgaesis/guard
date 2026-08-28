@@ -1149,11 +1149,10 @@ impl VerbCatalog {
     }
 
     /// Validate, then persist, a new verb by appending it to the backing catalog
-    /// file, then reload so the in-memory catalog (and its content version)
-    /// reflect the write. Requires the catalog to be file-backed. Nothing is
-    /// written if validation fails.
+    /// file, then adopt the validated result so the in-memory catalog (and its
+    /// content version) reflect the write. Requires the catalog to be
+    /// file-backed. Nothing is written if validation fails.
     pub fn append_verb(&mut self, verb: &Verb) -> Result<()> {
-        self.reload_if_stale()?;
         let canonical;
         let verb = if is_synthesized_verb(verb) {
             canonical = canonicalize_generated_authority_envelope(verb.clone())?;
@@ -1161,7 +1160,10 @@ impl VerbCatalog {
         } else {
             verb
         };
-        self.validate_candidate(verb)?;
+        // Reject an invalid candidate before reading a stale catalog through
+        // the repairing parser. A failed append must never canonicalize an
+        // externally changed file as a side effect.
+        validate_verb(verb)?;
         let path = self.path.clone().ok_or_else(|| {
             anyhow::anyhow!("verb catalog is not backed by a file; cannot persist a new verb")
         })?;
@@ -1173,6 +1175,10 @@ impl VerbCatalog {
             .context("verb catalog is not UTF-8")?
             .unwrap_or_default()
             .to_string();
+        // Compose against the current snapshot before parsing. Duplicate
+        // detection and canonical repair therefore observe concurrent edits,
+        // support every accepted empty-catalog shape, and remain read-only
+        // until the complete append transaction succeeds.
         let new_content = compose_appended_catalog(&existing, verb)?;
         // Validate the COMBINED catalog in memory BEFORE touching the file, so a
         // bad or duplicate verb can never corrupt the catalog on disk.
@@ -1212,7 +1218,7 @@ impl VerbCatalog {
     /// Persist one explicitly operator-authored verb without admitting a
     /// runtime-reserved or automatically promoted identity through the file
     /// import boundary.
-    pub fn append_operator_verb(&mut self, verb: &Verb) -> Result<()> {
+    pub fn append_operator_verb(&mut self, verb: &Verb) -> Result<Verb> {
         if reserved_verb_name(&verb.name)
             || verb.auto_promoted
             || verb.promotion_stamp.is_some()
@@ -1224,7 +1230,12 @@ impl VerbCatalog {
                 verb.name
             );
         }
-        self.append_verb(verb)
+        let mut normalized = verb.clone();
+        normalize_operator_boundaries(&mut normalized);
+        self.append_verb(&normalized)?;
+        self.get(&normalized.name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("persisted verb '{}' is unavailable", normalized.name))
     }
 
     /// Replace one operator-authored file verb only when its live definition
@@ -1663,6 +1674,17 @@ fn compose_appended_catalog(existing: &str, verb: &Verb) -> Result<String> {
     let is_null_or_absent = matches!(map.get(&key), None | Some(serde_yaml_ng::Value::Null));
     if is_seq {
         if let Some(serde_yaml_ng::Value::Sequence(seq)) = map.get_mut(&key) {
+            if seq.iter().any(|value| {
+                value
+                    .as_mapping()
+                    .and_then(|candidate| {
+                        candidate.get(serde_yaml_ng::Value::String("name".to_string()))
+                    })
+                    .and_then(serde_yaml_ng::Value::as_str)
+                    == Some(verb.name.as_str())
+            }) {
+                bail!("a verb named '{}' already exists in the catalog", verb.name);
+            }
             seq.push(verb_value);
         }
     } else if is_null_or_absent {
@@ -2404,20 +2426,81 @@ fn path_is_absolute(value: &str) -> bool {
 #[derive(Clone, Copy)]
 enum KnownFileArgument {
     AbsolutePath,
+    AbsolutePathList,
+    KeyEqualsPath,
     AnsibleInventory,
+    AnsibleExtraVars,
+    AnsibleVaultId,
 }
 
 impl KnownFileArgument {
     fn accepts(self, value: &str) -> bool {
-        path_is_absolute(value) || matches!(self, Self::AnsibleInventory) && value.ends_with(',')
+        match self {
+            Self::AbsolutePath => path_is_absolute(value),
+            Self::AbsolutePathList => absolute_path_list(value),
+            Self::KeyEqualsPath => key_equals_path_payload(value).is_some_and(path_is_absolute),
+            Self::AnsibleInventory => path_is_absolute(value) || value.ends_with(','),
+            Self::AnsibleExtraVars => value
+                .strip_prefix('@')
+                .is_none_or(|path| path_is_absolute(path)),
+            Self::AnsibleVaultId => {
+                let source = value.rsplit_once('@').map_or(value, |(_, source)| source);
+                source == "prompt" || path_is_absolute(source)
+            }
+        }
     }
 
     fn requirement(self) -> &'static str {
         match self {
             Self::AbsolutePath => "an absolute path",
+            Self::AbsolutePathList => "a list containing only absolute paths",
+            Self::KeyEqualsPath => "an absolute path, optionally prefixed with key=",
             Self::AnsibleInventory => "an absolute path or comma-terminated inline host list",
+            Self::AnsibleExtraVars => "an inline value or an @-prefixed absolute path",
+            Self::AnsibleVaultId => "a prompt source or an absolute vault client path",
         }
     }
+
+    /// Extract the local-path payload from the documented argument grammar.
+    /// `None` means the form is an allowed non-file value, such as an inline
+    /// Ansible variable assignment or a vault prompt.
+    fn path_payload_template(self, value: &str) -> Option<&str> {
+        match self {
+            Self::KeyEqualsPath => key_equals_path_payload(value),
+            Self::AnsibleExtraVars => value.strip_prefix('@'),
+            Self::AnsibleVaultId => {
+                let source = value.rsplit_once('@').map_or(value, |(_, source)| source);
+                (!source.is_empty() && source != "prompt").then_some(source)
+            }
+            _ => Some(value),
+        }
+    }
+}
+
+fn absolute_path_list(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    if path_is_absolute(value)
+        && value
+            .as_bytes()
+            .get(1)
+            .is_some_and(|character| *character == b':')
+        && !value.contains(';')
+    {
+        return true;
+    }
+    // Ansible uses the host path-list separator. Semicolon-delimited lists
+    // unambiguously describe Windows paths; otherwise this is a POSIX list.
+    let separator = value.contains(';').then_some(';').unwrap_or(':');
+    value
+        .split(separator)
+        .all(|path| !path.is_empty() && path_is_absolute(path))
+}
+
+fn key_equals_path_payload(value: &str) -> Option<&str> {
+    let path = value.split_once('=').map_or(value, |(_, payload)| payload);
+    (!path.is_empty()).then_some(path)
 }
 
 fn validate_known_file_template(
@@ -2430,8 +2513,16 @@ fn validate_known_file_template(
     if kind.accepts(template) {
         return Ok(());
     }
-    let names = placeholders(template);
-    if names.len() == 1 && template == format!("{{{}}}", names[0]) {
+    let path_template = kind.path_payload_template(template).ok_or_else(|| {
+        anyhow::anyhow!(
+            "verb '{}' {command_label} file argument {position} must be {}, got {:?}",
+            verb.name,
+            kind.requirement(),
+            template
+        )
+    })?;
+    let names = placeholders(path_template);
+    if names.len() == 1 && path_template == format!("{{{}}}", names[0]) {
         let spec = verb.params.get(&names[0]).ok_or_else(|| {
             anyhow::anyhow!(
                 "verb '{}' {command_label} file argument {position} references undeclared parameter '{}'",
@@ -2489,12 +2580,22 @@ fn validate_known_file_arguments(
 ) -> Result<()> {
     let binary = binary_match_key(binary);
     const ABSOLUTE: KnownFileArgument = KnownFileArgument::AbsolutePath;
+    const ABSOLUTE_LIST: KnownFileArgument = KnownFileArgument::AbsolutePathList;
+    const KEY_PATH: KnownFileArgument = KnownFileArgument::KeyEqualsPath;
     const INVENTORY: KnownFileArgument = KnownFileArgument::AnsibleInventory;
+    const EXTRA_VARS: KnownFileArgument = KnownFileArgument::AnsibleExtraVars;
+    const VAULT_ID: KnownFileArgument = KnownFileArgument::AnsibleVaultId;
     let file_options: &[(&str, KnownFileArgument)] = match binary.as_str() {
         "ansible" | "ansible-playbook" => &[
             ("-i", INVENTORY),
             ("--inventory", INVENTORY),
             ("--inventory-file", INVENTORY),
+            ("-e", EXTRA_VARS),
+            ("--extra-vars", EXTRA_VARS),
+            ("-M", ABSOLUTE_LIST),
+            ("--module-path", ABSOLUTE_LIST),
+            ("--playbook-dir", ABSOLUTE),
+            ("--vault-id", VAULT_ID),
             ("--private-key", ABSOLUTE),
             ("--key-file", ABSOLUTE),
             ("--become-password-file", ABSOLUTE),
@@ -2510,6 +2611,11 @@ fn validate_known_file_arguments(
             ("-k", ABSOLUTE),
             ("--kustomize", ABSOLUTE),
             ("--kubeconfig", ABSOLUTE),
+            ("--kuberc", ABSOLUTE),
+            ("--from-file", KEY_PATH),
+            ("--from-env-file", ABSOLUTE),
+            ("--cert", ABSOLUTE),
+            ("--key", ABSOLUTE),
             ("--patch-file", ABSOLUTE),
             ("--certificate-authority", ABSOLUTE),
             ("--client-certificate", ABSOLUTE),
@@ -2521,6 +2627,13 @@ fn validate_known_file_arguments(
             ("--kubeconfig", ABSOLUTE),
             ("--repository-config", ABSOLUTE),
             ("--registry-config", ABSOLUTE),
+            ("--repository-cache", ABSOLUTE),
+            ("--kube-ca-file", ABSOLUTE),
+            ("--ca-file", ABSOLUTE),
+            ("--cert-file", ABSOLUTE),
+            ("--key-file", ABSOLUTE),
+            ("--keyring", ABSOLUTE),
+            ("--set-file", KEY_PATH),
         ],
         _ => &[],
     };
@@ -2548,9 +2661,13 @@ fn validate_known_file_arguments(
                 .strip_prefix('-')
                 .filter(|value| !value.starts_with('-'))
             {
-                if !cluster.starts_with('i') && cluster.contains('i') {
+                let clustered_value_option = cluster
+                    .strip_prefix('v')
+                    .and_then(|rest| rest.trim_start_matches('v').chars().next())
+                    .is_some_and(|flag| matches!(flag, 'i' | 'e' | 'M'));
+                if clustered_value_option {
                     bail!(
-                        "verb '{}' {command_label} clusters Ansible inventory option '-i' in '{}'; pass '-i' separately",
+                        "verb '{}' {command_label} clusters a protected Ansible value option in '{}'; pass value options separately",
                         verb.name,
                         option
                     );
@@ -2604,6 +2721,8 @@ fn validate_known_file_arguments(
         }
     }
 
+    validate_known_positional_file_arguments(verb, &binary, args, command_label)?;
+
     if binary == "ansible-playbook" {
         const VALUE_OPTIONS: &[&str] = &[
             "-i",
@@ -2619,7 +2738,14 @@ fn validate_known_file_arguments(
             "--start-at-task",
             "--vault-id",
             "--vault-password-file",
+            "--vault-pass-file",
             "--private-key",
+            "--key-file",
+            "--become-password-file",
+            "--become-pass-file",
+            "--connection-password-file",
+            "--conn-pass-file",
+            "--playbook-dir",
             "-u",
             "--user",
             "-f",
@@ -2656,6 +2782,98 @@ fn validate_known_file_arguments(
             )?;
             break;
         }
+    }
+    Ok(())
+}
+
+/// Validate only positional forms whose local-file grammar is explicit in the
+/// relevant CLI documentation. This is deliberately not a complete parser for
+/// kubectl or Helm: ambiguous chart references and arbitrary option grammar
+/// remain outside this bounded file-path check.
+fn validate_known_positional_file_arguments(
+    verb: &Verb,
+    binary: &str,
+    args: &[String],
+    command_label: &str,
+) -> Result<()> {
+    match binary {
+        "kubectl" => {
+            if let Some(index) = args.iter().position(|argument| argument == "kustomize") {
+                let directory = args.get(index + 1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "verb '{}' {command_label} kubectl kustomize requires an absolute directory operand",
+                        verb.name
+                    )
+                })?;
+                validate_known_file_template(
+                    verb,
+                    directory,
+                    command_label,
+                    "kubectl kustomize directory",
+                    KnownFileArgument::AbsolutePath,
+                )?;
+            }
+        }
+        "helm" if verb.args.is_empty() && !verb.coverage.is_empty() => {
+            // Generic coverage accepts only the unambiguous local-operand
+            // forms below. Operator-authored argv templates retain Helm's
+            // broader positional grammar and are reviewed as exact commands.
+            for (index, argument) in args.iter().enumerate() {
+                let operand_index = match argument.as_str() {
+                    "verify" | "package" | "lint" => Some(index + 1),
+                    "build" | "update"
+                        if index > 0
+                            && args
+                                .get(index - 1)
+                                .is_some_and(|previous| previous == "dependency") =>
+                    {
+                        Some(index + 1)
+                    }
+                    _ => None,
+                };
+                let Some(operand_index) = operand_index else {
+                    continue;
+                };
+                let operand = args.get(operand_index).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "verb '{}' {command_label} Helm subcommand '{}' requires an absolute local operand",
+                        verb.name,
+                        argument
+                    )
+                })?;
+                if operand.starts_with('-') {
+                    bail!(
+                        "verb '{}' {command_label} Helm subcommand '{}' must place its local operand immediately after the subcommand",
+                        verb.name,
+                        argument
+                    );
+                }
+                validate_known_file_template(
+                    verb,
+                    operand,
+                    command_label,
+                    &format!("Helm {argument} operand"),
+                    KnownFileArgument::AbsolutePath,
+                )?;
+            }
+
+            // `install`, `upgrade`, and `template` accept both chart
+            // references and local paths. Their full positional grammar is
+            // intentionally not modeled here, but an explicit relative path
+            // is unambiguously caller-local and cannot be preauthorized.
+            if let Some(relative) = args.iter().find(|argument| {
+                matches!(argument.as_str(), "." | "..")
+                    || argument.starts_with("./")
+                    || argument.starts_with("../")
+            }) {
+                bail!(
+                    "verb '{}' {command_label} contains explicit relative Helm path operand {:?}; use an absolute path",
+                    verb.name,
+                    relative
+                );
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -4393,6 +4611,21 @@ verbs:
         // Neither failed append touched the file.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
 
+        let repairable_stale = "verbs:\n  - name: external\n    binary: echo\n    consequence: reversible\n    coverage:\n      - name: blocked\n        action: deny\n";
+        crate::learned_rules::write_authority_file(&path, repairable_stale).unwrap();
+        assert!(cat.append_verb(&mk("bad-stale", Some("[a-z]+"))).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            repairable_stale,
+            "invalid append must not repair a stale catalog"
+        );
+        assert!(cat.append_verb(&mk("external", None)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            repairable_stale,
+            "duplicate append must not repair a stale catalog"
+        );
+
         crate::learned_rules::write_authority_file(&path, "verbs: []\n").unwrap();
         cat.append_verb(&mk("dup", None)).unwrap();
         assert!(VerbCatalog::load(&path).unwrap().get("dup").is_some());
@@ -4941,6 +5174,53 @@ verbs:
             .match_command_all("kubectl", &args_vec(&["apply", "-f", "manifests/app.yaml"]),)
             .is_empty());
 
+        let keyed_file_parameter = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: create-selected-secret
+    binary: kubectl
+    args: ["create", "secret", "generic", "fixture", "--from-file=payload={path}"]
+    params:
+      path: { pattern: "^[A-Za-z0-9._/-]+$" }
+    consequence: irreversible
+"#,
+        )
+        .expect("the key= payload is rechecked after rendering");
+        assert!(keyed_file_parameter
+            .render("create-selected-secret", &params(&[("path", "./payload")]),)
+            .is_err());
+        assert!(keyed_file_parameter
+            .render(
+                "create-selected-secret",
+                &params(&[("path", "/srv/automation/payload")]),
+            )
+            .is_ok());
+
+        let vault_source_parameter = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-vault-source
+    binary: ansible-playbook
+    args: ["--vault-id=production@{source}", "/srv/automation/site.yml", "--check"]
+    params:
+      source: { pattern: "^(prompt|[A-Za-z0-9._/-]+)$" }
+    consequence: reversible
+"#,
+        )
+        .expect("the label@ payload is rechecked after rendering");
+        assert!(vault_source_parameter
+            .render(
+                "check-vault-source",
+                &params(&[("source", "./vault-client")]),
+            )
+            .is_err());
+        assert!(vault_source_parameter
+            .render(
+                "check-vault-source",
+                &params(&[("source", "/srv/automation/vault-client")]),
+            )
+            .is_ok());
+
         let exact_kubeconfig = VerbCatalog::from_yaml(
             r#"
 verbs:
@@ -5016,6 +5296,11 @@ verbs:
             "-vi./inventory",
             "--inventory-f=inventory",
             "--private-k=key",
+            "--module-path=./modules",
+            "-M./modules",
+            "--extra-vars=@./vars.yml",
+            "-ve@./vars.yml",
+            "--vault-id=dev@./vault-client",
         ] {
             assert!(generic_ansible_coverage
                 .match_command_all(
@@ -5043,6 +5328,33 @@ verbs:
                 ]),
             )
             .is_empty());
+        for safe_value in [
+            "--module-path=/srv/automation/modules:/opt/ansible/modules",
+            "-M/srv/automation/modules:/opt/ansible/modules",
+            "--extra-vars=@/srv/automation/vars.yml",
+            "-e@/srv/automation/vars.yml",
+            "--vault-id=dev@/srv/automation/vault-client",
+            "--vault-id=dev@prompt",
+        ] {
+            assert!(!generic_ansible_coverage
+                .match_command_all(
+                    "ansible-playbook",
+                    &args_vec(&[safe_value, "/srv/automation/site.yml", "--check"]),
+                )
+                .is_empty());
+        }
+        for (option, value) in [
+            ("--key-file", "/srv/automation/id_ed25519"),
+            ("--vault-pass-file", "/srv/automation/vault-password"),
+            ("--playbook-dir", "/srv/automation"),
+        ] {
+            assert!(generic_ansible_coverage
+                .match_command_all(
+                    "ansible-playbook",
+                    &args_vec(&[option, value, "relative-site.yml", "--check"]),
+                )
+                .is_empty());
+        }
         assert!(!generic_ansible_coverage
             .match_command_all(
                 "ansible-playbook",
@@ -5101,6 +5413,153 @@ verbs:
                     "deployment/app",
                     "--patch-file=/srv/automation/patch.json",
                 ]),
+            )
+            .is_empty());
+
+        let generic_kubectl_file_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: create-file-backed-resource
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: create
+        action: preauthorized
+        required_args: ["create"]
+"#,
+        )
+        .unwrap();
+        for relative_file in [
+            "--from-file=payload=./payload",
+            "--from-env-file=./vars.env",
+            "--cert=./tls.crt",
+            "--key=./tls.key",
+        ] {
+            assert!(generic_kubectl_file_coverage
+                .match_command_all(
+                    "kubectl",
+                    &args_vec(&["create", "secret", "generic", "fixture", relative_file]),
+                )
+                .is_empty());
+        }
+        assert!(generic_kubectl_file_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&[
+                    "create",
+                    "secret",
+                    "generic",
+                    "fixture",
+                    "--from-file",
+                    "payload=./payload",
+                ]),
+            )
+            .is_empty());
+        for absolute_file in [
+            "--from-file=payload=/srv/automation/payload",
+            "--from-env-file=/srv/automation/vars.env",
+            "--cert=/srv/automation/tls.crt",
+            "--key=/srv/automation/tls.key",
+        ] {
+            assert!(!generic_kubectl_file_coverage
+                .match_command_all(
+                    "kubectl",
+                    &args_vec(&["create", "secret", "generic", "fixture", absolute_file]),
+                )
+                .is_empty());
+        }
+
+        let generic_kubectl_kustomize_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: render-kustomization
+    binary: kubectl
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: render
+        action: preauthorized
+        required_args: ["kustomize"]
+"#,
+        )
+        .unwrap();
+        assert!(generic_kubectl_kustomize_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["kustomize", "./overlays/production"])
+            )
+            .is_empty());
+        assert!(!generic_kubectl_kustomize_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["kustomize", "/srv/automation/overlays/production"]),
+            )
+            .is_empty());
+
+        let generic_helm_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: helm-file-backed-operation
+    binary: helm
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: any
+        action: preauthorized
+"#,
+        )
+        .unwrap();
+        for relative_file in [
+            "--ca-file=./ca.pem",
+            "--cert-file=./client.pem",
+            "--key-file=./client.key",
+            "--keyring=./pubring.gpg",
+            "--set-file=payload=./values.txt",
+        ] {
+            assert!(generic_helm_coverage
+                .match_command_all("helm", &args_vec(&["pull", "repo/chart", relative_file]))
+                .is_empty());
+        }
+        assert!(generic_helm_coverage
+            .match_command_all("helm", &args_vec(&["verify", "./chart-1.0.0.tgz"]),)
+            .is_empty());
+        assert!(generic_helm_coverage
+            .match_command_all("helm", &args_vec(&["install", "fixture", "./chart"]))
+            .is_empty());
+        for absolute_file in [
+            "--ca-file=/srv/automation/ca.pem",
+            "--cert-file=/srv/automation/client.pem",
+            "--key-file=/srv/automation/client.key",
+            "--keyring=/srv/automation/pubring.gpg",
+            "--set-file=payload=/srv/automation/values.txt",
+        ] {
+            assert!(!generic_helm_coverage
+                .match_command_all("helm", &args_vec(&["pull", "repo/chart", absolute_file]))
+                .is_empty());
+        }
+        assert!(!generic_helm_coverage
+            .match_command_all(
+                "helm",
+                &args_vec(&["verify", "/srv/automation/chart-1.0.0.tgz"]),
+            )
+            .is_empty());
+        assert!(!generic_helm_coverage
+            .match_command_all(
+                "helm",
+                &args_vec(&["install", "fixture", "/srv/automation/chart"]),
+            )
+            .is_empty());
+
+        for kuberc in ["--kuberc=preferences.yaml", "--kuberc=./preferences.yaml"] {
+            assert!(generic_kubectl_patch_coverage
+                .match_command_all("kubectl", &args_vec(&["patch", "deployment/app", kuberc]),)
+                .is_empty());
+        }
+        assert!(!generic_kubectl_patch_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["patch", "deployment/app", "--kuberc=/etc/guard/kuberc.yaml",]),
             )
             .is_empty());
         assert!(!generic_kubectl_coverage

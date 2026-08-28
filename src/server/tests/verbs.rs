@@ -1959,6 +1959,10 @@ async fn verb_add_persists_one_operator_definition_and_rejects_bad_writes_atomic
     let mut added = catalog.get("inspect-fixture").unwrap().clone();
     added.name = "inspect-added-fixture".to_string();
     added.description = "Inspect one added fixture".to_string();
+    added.coverage =
+        serde_yaml_ng::from_str("- name: blocked\n  action: deny\n  required_args: [blocked]\n")
+            .unwrap();
+    let requested_digest = added.definition_digest();
     cfg.state.verbs = Arc::new(RwLock::new(catalog));
     let operator = CallerIdentity::UnixAdmin { uid: 777 };
 
@@ -1978,14 +1982,15 @@ async fn verb_add_persists_one_operator_definition_and_rejects_bad_writes_atomic
     else {
         panic!("expected successful add, got {response:?}")
     };
-    assert_eq!(verb.definition_digest(), added.definition_digest());
+    assert_ne!(verb.definition_digest(), requested_digest);
+    assert!(verb.coverage[0].sticky);
     assert!(persisted);
     assert!(preview_digest.is_none());
     let reloaded = VerbCatalog::load(&path).unwrap();
-    assert_eq!(
-        reloaded.get("inspect-added-fixture").unwrap().description,
-        "Inspect one added fixture"
-    );
+    let persisted_verb = reloaded.get("inspect-added-fixture").unwrap();
+    assert_eq!(persisted_verb.description, "Inspect one added fixture");
+    assert_eq!(persisted_verb.definition_digest(), verb.definition_digest());
+    assert!(persisted_verb.coverage[0].sticky);
     assert!(reloaded.get("untouched").is_some());
     let committed = std::fs::read(&path).unwrap();
 
