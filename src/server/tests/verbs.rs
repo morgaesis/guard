@@ -1953,6 +1953,76 @@ async fn verb_amend_replaces_the_expected_definition_and_preserves_the_catalog()
 }
 
 #[tokio::test]
+async fn verb_add_persists_one_operator_definition_and_rejects_bad_writes_atomically() {
+    let (mut cfg, _buf) = make_test_config();
+    let (_dir, path, catalog) = amend_test_catalog();
+    let mut added = catalog.get("inspect-fixture").unwrap().clone();
+    added.name = "inspect-added-fixture".to_string();
+    added.description = "Inspect one added fixture".to_string();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+    let operator = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAdd {
+            verb: Box::new(added.clone()),
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated {
+        verb,
+        persisted,
+        preview_digest,
+    } = response
+    else {
+        panic!("expected successful add, got {response:?}")
+    };
+    assert_eq!(verb.definition_digest(), added.definition_digest());
+    assert!(persisted);
+    assert!(preview_digest.is_none());
+    let reloaded = VerbCatalog::load(&path).unwrap();
+    assert_eq!(
+        reloaded.get("inspect-added-fixture").unwrap().description,
+        "Inspect one added fixture"
+    );
+    assert!(reloaded.get("untouched").is_some());
+    let committed = std::fs::read(&path).unwrap();
+
+    let duplicate = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAdd {
+            verb: Box::new(added.clone()),
+        },
+    )
+    .await;
+    assert!(matches!(
+        duplicate,
+        AdminResponse::Error { message } if message.contains("already exists")
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), committed);
+
+    let mut invalid = added;
+    invalid.name = "invalid-added-fixture".to_string();
+    invalid.params.get_mut("target").unwrap().pattern = "[a-z]+".to_string();
+    let rejected = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAdd {
+            verb: Box::new(invalid),
+        },
+    )
+    .await;
+    assert!(matches!(rejected, AdminResponse::Error { .. }));
+    assert_eq!(std::fs::read(&path).unwrap(), committed);
+    assert!(AdminRequest::VerbAdd {
+        verb: Box::new(verb),
+    }
+    .requires_admin_token());
+}
+
+#[tokio::test]
 async fn verb_amend_rejects_a_stale_digest_without_writing() {
     let (mut cfg, _buf) = make_test_config();
     let (_dir, path, catalog) = amend_test_catalog();

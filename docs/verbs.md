@@ -15,6 +15,19 @@ guard verb run restart-service --param unit=nginx
 [`examples/verbs.yaml`](../examples/verbs.yaml) contains command-template and
 coverage-cell examples.
 
+Operators add one catalog entry from a YAML file containing exactly one verb
+definition:
+
+```bash
+guard verb add --file inspect-service.yaml
+```
+
+The daemon validates the candidate and the complete catalog before atomically
+appending it. The command fails without changing the catalog when the name
+already exists or the definition is invalid. Generated and reserved verb
+identities are not accepted through this operator-authored boundary. Adding a
+verb requires the admin bearer.
+
 Operators replace one catalog entry from a YAML file containing exactly one
 verb definition:
 

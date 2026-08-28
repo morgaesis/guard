@@ -730,7 +730,7 @@ fn access_command_family_parses_bounded_and_batch_forms() {
 }
 
 #[test]
-fn resume_and_verb_amend_parse_their_requester_and_cas_inputs() {
+fn resume_and_verb_catalog_mutations_parse_their_inputs() {
     match MainArgs::try_parse_from([
         "guard",
         "resume",
@@ -780,10 +780,31 @@ fn resume_and_verb_amend_parse_their_requester_and_cas_inputs() {
     }
     assert!(MainArgs::try_parse_from(["guard", "verb", "amend", "inspect-fixture"]).is_err());
 
+    match MainArgs::try_parse_from([
+        "guard",
+        "verb",
+        "add",
+        "--file",
+        "new-verb.yaml",
+        "--socket",
+        "/run/guard.sock",
+        "--json",
+    ]) {
+        Ok(MainArgs::Verb(VerbCommands::Add { file, socket, json })) => {
+            assert_eq!(file, PathBuf::from("new-verb.yaml"));
+            assert_eq!(socket.as_deref(), Some("/run/guard.sock"));
+            assert!(json);
+        }
+        Ok(_) => panic!("unexpected verb add command"),
+        Err(error) => panic!("verb add did not parse: {error}"),
+    }
+    assert!(MainArgs::try_parse_from(["guard", "verb", "add"]).is_err());
+
     let help = match MainArgs::try_parse_from(["guard", "verb", "--help"]) {
         Err(error) => error.to_string(),
         Ok(_) => panic!("verb help unexpectedly parsed"),
     };
+    assert!(help.contains("add"));
     assert!(help.contains("amend"));
 }
 
@@ -881,6 +902,7 @@ fn verb_help_lists_show_and_delete() {
     assert!(rendered.contains("list"));
     assert!(rendered.contains("run"));
     assert!(rendered.contains("show"));
+    assert!(rendered.contains("add"));
     assert!(rendered.contains("delete"));
 }
 
