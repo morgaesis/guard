@@ -5050,9 +5050,12 @@ async fn dispatch_admin_request(
                 .await;
             match result {
                 Ok(persisted_verb) => {
+                    let definition_digest =
+                        format!("sha256:{}", persisted_verb.definition_digest());
                     server.emit_audit_ungated(
                         AuditEvent::new(AuditKind::VerbCreated)
                             .field("name", &persisted_verb.name)
+                            .field("definition_digest", &definition_digest)
                             .field("consequence", persisted_verb.consequence.as_str())
                             .field("trusted", persisted_verb.trusted)
                             .field("source", "operator_file"),

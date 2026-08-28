@@ -5667,9 +5667,12 @@ verbs:
 "#,
         )
         .unwrap_err();
-        assert!(relative_forward
-            .to_string()
-            .contains("must be an absolute path"));
+        assert!(
+            relative_forward
+                .to_string()
+                .contains("must be one absolute path"),
+            "got: {relative_forward}"
+        );
 
         let relative_revert = VerbCatalog::from_yaml(
             r#"
@@ -5704,7 +5707,10 @@ verbs:
                 &params(&[("path", "manifests/app.yaml")]),
             )
             .unwrap_err();
-        assert!(error.to_string().contains("must be an absolute path"));
+        assert!(
+            error.to_string().contains("must be one absolute path"),
+            "got: {error}"
+        );
         assert!(relative_parameter
             .match_command_all("kubectl", &args_vec(&["apply", "-f", "manifests/app.yaml"]),)
             .is_empty());
@@ -5972,7 +5978,11 @@ verbs:
                 .match_command_all("kubectl", &args_vec(&["apply", relative_kustomization]),)
                 .is_empty());
         }
-        for relative_manifest in ["-f=./manifest.yaml", "--filename=./manifest.yaml"] {
+        for relative_manifest in [
+            "-f=./manifest.yaml",
+            "--filename=./manifest.yaml",
+            "-f=/srv/automation/one.yaml,./two.yaml",
+        ] {
             assert!(generic_kubectl_coverage
                 .match_command_all("kubectl", &args_vec(&["apply", relative_manifest]),)
                 .is_empty());
