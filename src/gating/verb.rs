@@ -5658,7 +5658,7 @@ verbs:
 "#,
         )
         .unwrap();
-        let command = args_vec(&["--check", "site.yml"]);
+        let command = args_vec(&["--check", "/srv/automation/site.yml"]);
         let mut plain = BTreeMap::new();
         plain.insert(
             "ANSIBLE_CONFIG".to_string(),
