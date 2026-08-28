@@ -1750,10 +1750,10 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             // listens. Printed after all startup validation so a refused start
             // never claims a listener.
             if let Some(line) = socket_announcement {
-                println!("{line}");
+                cli_println!("{line}");
             }
             if let Some(port) = tcp_port {
-                println!("guard server listening on tcp 127.0.0.1:{}", port);
+                cli_println!("guard server listening on tcp 127.0.0.1:{}", port);
             }
 
             srv.run().await
@@ -1797,8 +1797,8 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         streamed_output = true;
                         match stream {
                             server::OutputStream::Stdout => {
-                                print!("{}", data);
-                                let _ = std::io::stdout().flush();
+                                cli_print!("{}", data);
+                                let _ = crate::cli_output::stdout().flush();
                             }
                             server::OutputStream::Stderr => {
                                 eprint!("{}", data);
@@ -1812,7 +1812,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             if resp.allowed {
                 if !streamed_output {
                     if let Some(stdout) = &resp.stdout {
-                        print!("{}", stdout);
+                        cli_print!("{}", stdout);
                     }
                     if let Some(stderr) = &resp.stderr {
                         eprint!("{}", stderr);
