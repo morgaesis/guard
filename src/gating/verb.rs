@@ -2401,13 +2401,33 @@ fn path_is_absolute(value: &str) -> bool {
             .is_some_and(|bytes| bytes[0] == b':' && matches!(bytes[1], b'/' | b'\\'))
 }
 
-fn validate_absolute_file_template(
+#[derive(Clone, Copy)]
+enum KnownFileArgument {
+    AbsolutePath,
+    AnsibleInventory,
+}
+
+impl KnownFileArgument {
+    fn accepts(self, value: &str) -> bool {
+        path_is_absolute(value) || matches!(self, Self::AnsibleInventory) && value.ends_with(',')
+    }
+
+    fn requirement(self) -> &'static str {
+        match self {
+            Self::AbsolutePath => "an absolute path",
+            Self::AnsibleInventory => "an absolute path or comma-terminated inline host list",
+        }
+    }
+}
+
+fn validate_known_file_template(
     verb: &Verb,
     template: &str,
     command_label: &str,
     position: &str,
+    kind: KnownFileArgument,
 ) -> Result<()> {
-    if path_is_absolute(template) {
+    if kind.accepts(template) {
         return Ok(());
     }
     let names = placeholders(template);
@@ -2420,24 +2440,26 @@ fn validate_absolute_file_template(
             )
         })?;
         if let Some(values) = enumerate_pattern_literals(spec.pattern_text()) {
-            if values.iter().all(|value| path_is_absolute(value)) {
+            if values.iter().all(|value| kind.accepts(value)) {
                 return Ok(());
             }
             bail!(
-                "verb '{}' {command_label} file parameter '{}' enumerates a relative path",
+                "verb '{}' {command_label} file parameter '{}' enumerates a value that is not {}",
                 verb.name,
-                names[0]
+                names[0],
+                kind.requirement()
             );
         }
         if spec
             .default
             .as_deref()
-            .is_some_and(|value| !path_is_absolute(value))
+            .is_some_and(|value| !kind.accepts(value))
         {
             bail!(
-                "verb '{}' {command_label} file parameter '{}' has a relative default",
+                "verb '{}' {command_label} file parameter '{}' has a default that is not {}",
                 verb.name,
-                names[0]
+                names[0],
+                kind.requirement()
             );
         }
         // Regex-language inclusion cannot be proven with representative
@@ -2452,8 +2474,9 @@ fn validate_absolute_file_template(
         return Ok(());
     }
     bail!(
-        "verb '{}' {command_label} file argument {position} must be an absolute path, got {:?}",
+        "verb '{}' {command_label} file argument {position} must be {}, got {:?}",
         verb.name,
+        kind.requirement(),
         template
     )
 }
@@ -2465,47 +2488,103 @@ fn validate_known_file_arguments(
     command_label: &str,
 ) -> Result<()> {
     let binary = binary_match_key(binary);
-    let file_options: &[&str] = match binary.as_str() {
+    const ABSOLUTE: KnownFileArgument = KnownFileArgument::AbsolutePath;
+    const INVENTORY: KnownFileArgument = KnownFileArgument::AnsibleInventory;
+    let file_options: &[(&str, KnownFileArgument)] = match binary.as_str() {
         "ansible" | "ansible-playbook" => &[
-            "-i",
-            "--inventory",
-            "--inventory-file",
-            "--private-key",
-            "--vault-password-file",
+            ("-i", INVENTORY),
+            ("--inventory", INVENTORY),
+            ("--inventory-file", INVENTORY),
+            ("--private-key", ABSOLUTE),
+            ("--key-file", ABSOLUTE),
+            ("--become-password-file", ABSOLUTE),
+            ("--become-pass-file", ABSOLUTE),
+            ("--connection-password-file", ABSOLUTE),
+            ("--conn-pass-file", ABSOLUTE),
+            ("--vault-password-file", ABSOLUTE),
+            ("--vault-pass-file", ABSOLUTE),
         ],
-        "kubectl" => &["-f", "--filename", "-k", "--kustomize", "--kubeconfig"],
+        "kubectl" => &[
+            ("-f", ABSOLUTE),
+            ("--filename", ABSOLUTE),
+            ("-k", ABSOLUTE),
+            ("--kustomize", ABSOLUTE),
+            ("--kubeconfig", ABSOLUTE),
+            ("--patch-file", ABSOLUTE),
+            ("--certificate-authority", ABSOLUTE),
+            ("--client-certificate", ABSOLUTE),
+            ("--client-key", ABSOLUTE),
+        ],
         "helm" => &[
-            "-f",
-            "--values",
-            "--kubeconfig",
-            "--repository-config",
-            "--registry-config",
+            ("-f", ABSOLUTE),
+            ("--values", ABSOLUTE),
+            ("--kubeconfig", ABSOLUTE),
+            ("--repository-config", ABSOLUTE),
+            ("--registry-config", ABSOLUTE),
         ],
         _ => &[],
     };
+
+    if matches!(binary.as_str(), "ansible" | "ansible-playbook") {
+        for argument in args {
+            let option = argument
+                .split_once('=')
+                .map_or(argument.as_str(), |pair| pair.0);
+            if option.starts_with("--")
+                && !file_options.iter().any(|(known, _)| *known == option)
+                && file_options
+                    .iter()
+                    .map(|(known, _)| *known)
+                    .filter(|known| known.starts_with("--"))
+                    .any(|known| known != option && known.starts_with(option))
+            {
+                bail!(
+                    "verb '{}' {command_label} uses abbreviated Ansible file option '{}'; spell the option in full",
+                    verb.name,
+                    option
+                );
+            }
+            if let Some(cluster) = option
+                .strip_prefix('-')
+                .filter(|value| !value.starts_with('-'))
+            {
+                if !cluster.starts_with('i') && cluster.contains('i') {
+                    bail!(
+                        "verb '{}' {command_label} clusters Ansible inventory option '-i' in '{}'; pass '-i' separately",
+                        verb.name,
+                        option
+                    );
+                }
+            }
+        }
+    }
+
     for (index, argument) in args.iter().enumerate() {
-        if file_options.contains(&argument.as_str()) {
+        if let Some((_, kind)) = file_options.iter().find(|(option, _)| *option == argument) {
             let value = args.get(index + 1).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "verb '{}' {command_label} option '{}' requires an absolute file argument",
+                    "verb '{}' {command_label} option '{}' requires {}",
                     verb.name,
-                    argument
+                    argument,
+                    kind.requirement()
                 )
             })?;
-            validate_absolute_file_template(
+            validate_known_file_template(
                 verb,
                 value,
                 command_label,
                 &format!("after {argument}"),
+                *kind,
             )?;
         }
-        for option in file_options {
+        for (option, kind) in file_options {
             if let Some(value) = argument.strip_prefix(&format!("{option}=")) {
-                validate_absolute_file_template(
+                validate_known_file_template(
                     verb,
                     value,
                     command_label,
                     &format!("in {option}=..."),
+                    *kind,
                 )?;
             }
             if option.len() == 2 {
@@ -2513,11 +2592,12 @@ fn validate_known_file_arguments(
                     .strip_prefix(option)
                     .filter(|value| !value.is_empty() && !value.starts_with('='))
                 {
-                    validate_absolute_file_template(
+                    validate_known_file_template(
                         verb,
                         value,
                         command_label,
                         &format!("attached to {option}"),
+                        *kind,
                     )?;
                 }
             }
@@ -2567,7 +2647,13 @@ fn validate_known_file_arguments(
                 skip_value = VALUE_OPTIONS.contains(&argument.as_str());
                 continue;
             }
-            validate_absolute_file_template(verb, argument, command_label, "playbook")?;
+            validate_known_file_template(
+                verb,
+                argument,
+                command_label,
+                "playbook",
+                KnownFileArgument::AbsolutePath,
+            )?;
             break;
         }
     }
@@ -4889,7 +4975,26 @@ verbs:
         .unwrap_err();
         assert!(mixed_exact_paths
             .to_string()
-            .contains("enumerates a relative path"));
+            .contains("enumerates a value that is not an absolute path"));
+
+        let inline_inventory = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-inline-inventory
+    binary: ansible-playbook
+    args: ["-i", "{inventory}", "/srv/automation/site.yml", "--check"]
+    params:
+      inventory: { pattern: "^(localhost,|web.example,)$" }
+    consequence: reversible
+"#,
+        )
+        .expect("Ansible inline inventories are not caller-relative files");
+        assert!(inline_inventory
+            .render(
+                "check-inline-inventory",
+                &params(&[("inventory", "localhost,")]),
+            )
+            .is_ok());
 
         let generic_ansible_coverage = VerbCatalog::from_yaml(
             r#"
@@ -4905,7 +5010,13 @@ verbs:
 "#,
         )
         .unwrap();
-        for relative_inventory in ["-i./inventory", "--inventory-file=inventory"] {
+        for relative_inventory in [
+            "-i./inventory",
+            "--inventory-file=inventory",
+            "-vi./inventory",
+            "--inventory-f=inventory",
+            "--private-k=key",
+        ] {
             assert!(generic_ansible_coverage
                 .match_command_all(
                     "ansible-playbook",
@@ -4913,6 +5024,25 @@ verbs:
                 )
                 .is_empty());
         }
+        for inline_inventory in ["-ilocalhost,", "--inventory=localhost,"] {
+            assert!(!generic_ansible_coverage
+                .match_command_all(
+                    "ansible-playbook",
+                    &args_vec(&[inline_inventory, "/srv/automation/site.yml", "--check"]),
+                )
+                .is_empty());
+        }
+        assert!(!generic_ansible_coverage
+            .match_command_all(
+                "ansible-playbook",
+                &args_vec(&[
+                    "--inventory-file",
+                    "localhost,",
+                    "/srv/automation/site.yml",
+                    "--check",
+                ]),
+            )
+            .is_empty());
         assert!(!generic_ansible_coverage
             .match_command_all(
                 "ansible-playbook",
@@ -4943,6 +5073,36 @@ verbs:
                 .match_command_all("kubectl", &args_vec(&["apply", relative_kustomization]),)
                 .is_empty());
         }
+        let generic_kubectl_patch_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: patch-resource
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: patch
+        action: preauthorized
+        required_args: ["patch"]
+"#,
+        )
+        .unwrap();
+        assert!(generic_kubectl_patch_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["patch", "deployment/app", "--patch-file=patch.json"]),
+            )
+            .is_empty());
+        assert!(!generic_kubectl_patch_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&[
+                    "patch",
+                    "deployment/app",
+                    "--patch-file=/srv/automation/patch.json",
+                ]),
+            )
+            .is_empty());
         assert!(!generic_kubectl_coverage
             .match_command_all(
                 "kubectl",
