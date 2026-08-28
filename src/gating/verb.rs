@@ -622,8 +622,10 @@ pub struct RenderedVerb {
     pub promotion_stamp: Option<String>,
 }
 
-/// An operator-authored catalog of verbs plus a content version used to void
-/// approvals when the catalog changes.
+/// The daemon's effective verb catalog, composed from durable operator-owned
+/// definitions and runtime-only generated coverage. The content version
+/// fingerprints the effective set and voids approvals when either plane
+/// changes.
 #[derive(Debug, Clone, Default)]
 pub struct VerbCatalog {
     verbs: BTreeMap<String, Verb>,
@@ -851,26 +853,8 @@ impl VerbCatalog {
         {
             return Ok(false);
         }
-        let runtime_verbs = self
-            .verbs
-            .values()
-            .filter(|verb| {
-                verb.name.starts_with("grant-") || verb.name.starts_with("access-generated-")
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut reloaded = Self::load(&path)?;
-        for mut verb in runtime_verbs {
-            if verb.name.starts_with("grant-") {
-                reloaded.upsert_saved_grant_verb(verb)?;
-            } else {
-                // Approved generated coverage is trusted only in memory. Demote
-                // it back to its validated proposal form before reinstalling it.
-                verb.trusted = false;
-                reloaded.upsert_access_verb(verb)?;
-            }
-        }
-        *self = reloaded;
+        let durable_catalog = Self::load(&path)?;
+        *self = self.effective_catalog_with_runtime_overlays(durable_catalog)?;
         Ok(true)
     }
 
@@ -879,42 +863,40 @@ impl VerbCatalog {
         let Some(path) = self.path.clone() else {
             return Ok(self.clone());
         };
-        let runtime_verbs = self
-            .verbs
-            .values()
-            .filter(|verb| reserved_verb_name(&verb.name))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut reloaded = Self::load(&path)?;
-        for mut verb in runtime_verbs {
-            if verb.name.starts_with("grant-") {
-                reloaded.upsert_saved_grant_verb(verb)?;
-            } else {
-                verb.trusted = false;
-                reloaded.upsert_access_verb(verb)?;
-            }
-        }
-        Ok(reloaded)
+        let durable_catalog = Self::load(&path)?;
+        self.effective_catalog_with_runtime_overlays(durable_catalog)
     }
 
     #[doc(hidden)]
     pub fn adopt_refreshed_file_authority(&mut self, mut refreshed: Self) -> Result<()> {
         refreshed.verbs.retain(|name, _| !reserved_verb_name(name));
-        for mut verb in self
+        *self = self.effective_catalog_with_runtime_overlays(refreshed)?;
+        Ok(())
+    }
+
+    /// Build the effective daemon catalog from a durable operator document and
+    /// the runtime-only coverage already installed in this process. Keeping
+    /// these authority planes as separate values prevents generated grants from
+    /// entering an operator catalog serialization while preserving them across
+    /// file reloads and mutations.
+    fn effective_catalog_with_runtime_overlays(&self, mut durable_catalog: Self) -> Result<Self> {
+        let runtime_overlays = self
             .verbs
             .values()
             .filter(|verb| reserved_verb_name(&verb.name))
             .cloned()
-        {
+            .collect::<Vec<_>>();
+        for mut verb in runtime_overlays {
             if verb.name.starts_with("grant-") {
-                refreshed.upsert_saved_grant_verb(verb)?;
+                durable_catalog.upsert_saved_grant_verb(verb)?;
             } else {
+                // Approved generated coverage is trusted only in memory. Demote
+                // it to its validated proposal form before reinstalling it.
                 verb.trusted = false;
-                refreshed.upsert_access_verb(verb)?;
+                durable_catalog.upsert_access_verb(verb)?;
             }
         }
-        *self = refreshed;
-        Ok(())
+        Ok(durable_catalog)
     }
 
     /// Render a verb invocation into a concrete, gated command. Each param is
@@ -1219,33 +1201,21 @@ impl VerbCatalog {
         let new_content = compose_appended_catalog(&existing, verb)?;
         // Validate the COMBINED catalog in memory BEFORE touching the file, so a
         // bad or duplicate verb can never corrupt the catalog on disk.
-        let (mut validated, canonical) = Self::from_yaml_with_repair(&new_content)
+        let (durable_catalog, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("appending this verb would make the catalog invalid")?;
-        let durable_content = canonical.as_deref().unwrap_or(&new_content);
-        let runtime_verbs = self
-            .verbs
-            .values()
-            .filter(|verb| reserved_verb_name(&verb.name))
-            .cloned()
-            .collect::<Vec<_>>();
-        for mut runtime_verb in runtime_verbs {
-            if runtime_verb.name.starts_with("grant-") {
-                validated.upsert_saved_grant_verb(runtime_verb)?;
-            } else {
-                runtime_verb.trusted = false;
-                validated.upsert_access_verb(runtime_verb)?;
-            }
-        }
+        let durable_content = canonical.unwrap_or(new_content);
+        let mut effective_catalog =
+            self.effective_catalog_with_runtime_overlays(durable_catalog)?;
         let outcome =
-            write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, durable_content)?;
+            write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, &durable_content)?;
         let (committed, warning) = outcome.into_parts();
         // Adopt the already-validated content rather than re-reading the file: a
         // post-write reload failure would otherwise report an error to the
         // operator even though the write landed, desyncing memory from disk.
-        validated.path = Some(path);
-        validated.mtime = committed.modified();
-        validated.snapshot = Some(committed);
-        *self = validated;
+        effective_catalog.path = Some(path);
+        effective_catalog.mtime = committed.modified();
+        effective_catalog.snapshot = Some(committed);
+        *self = effective_catalog;
         if let Some(error) = warning {
             tracing::warn!("catalog append committed with a durability warning: {error}");
         }
@@ -1278,8 +1248,8 @@ impl VerbCatalog {
     /// Replace one operator-authored file verb only when its live definition
     /// still matches `expected_digest`. Validation and whole-catalog
     /// composition complete before the backing file is atomically replaced.
-    /// The in-memory catalog adopts exactly that validated document after the
-    /// durable replacement succeeds.
+    /// The in-memory catalog adopts that validated document plus its existing
+    /// runtime-only coverage after the durable replacement succeeds.
     pub fn amend_verb_if_digest(
         &mut self,
         name: &str,
@@ -1333,33 +1303,20 @@ impl VerbCatalog {
         }
 
         let new_content = compose_replaced_catalog(&existing, name, replacement)?;
-        let (mut validated, canonical) = Self::from_yaml_with_repair(&new_content)
+        let (durable_catalog, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("amending this verb would make the catalog invalid")?;
-        let durable_content = canonical.as_deref().unwrap_or(&new_content);
-
-        let runtime_verbs = self
-            .verbs
-            .values()
-            .filter(|verb| reserved_verb_name(&verb.name))
-            .cloned()
-            .collect::<Vec<_>>();
-        for mut verb in runtime_verbs {
-            if verb.name.starts_with("grant-") {
-                validated.upsert_saved_grant_verb(verb)?;
-            } else {
-                verb.trusted = false;
-                validated.upsert_access_verb(verb)?;
-            }
-        }
+        let durable_content = canonical.unwrap_or(new_content);
+        let mut effective_catalog =
+            self.effective_catalog_with_runtime_overlays(durable_catalog)?;
         // Every fallible catalog adoption step completes before the durable
         // rewrite. After this point, success requires only the atomic file
         // replacement and assigning the already validated state.
         let outcome = atomic_replace_if_unchanged(&path, &snapshot, durable_content.as_bytes())?;
         let (committed, warning) = outcome.into_parts();
-        validated.path = Some(path.clone());
-        validated.mtime = committed.modified();
-        validated.snapshot = Some(committed);
-        *self = validated;
+        effective_catalog.path = Some(path.clone());
+        effective_catalog.mtime = committed.modified();
+        effective_catalog.snapshot = Some(committed);
+        *self = effective_catalog;
         if let Some(error) = warning {
             tracing::warn!("catalog amendment committed with a durability warning: {error}");
         }
@@ -1484,9 +1441,9 @@ impl VerbCatalog {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown verb: '{}'", name))?;
-        if name.starts_with("grant-") {
+        if reserved_verb_name(name) {
             bail!(
-                "saved-grant coverage cannot be deleted directly; use `guard access revoke <session-or-agent>`"
+                "runtime-generated coverage cannot be deleted directly; use its owning access or grant operation"
             );
         }
         let path = self.path.clone().ok_or_else(|| {
@@ -1501,16 +1458,18 @@ impl VerbCatalog {
             .unwrap_or_default()
             .to_string();
         let new_content = compose_removed_catalog(&existing, name)?;
-        let (validated, canonical) = Self::from_yaml_with_repair(&new_content)
+        let (durable_catalog, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("deleting this verb would make the catalog invalid")?;
-        let durable_content = canonical.as_deref().unwrap_or(&new_content);
+        let durable_content = canonical.unwrap_or(new_content);
+        let mut effective_catalog =
+            self.effective_catalog_with_runtime_overlays(durable_catalog)?;
         let outcome =
-            write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, durable_content)?;
+            write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, &durable_content)?;
         let (committed, warning) = outcome.into_parts();
-        self.verbs = validated.verbs;
-        self.version = validated.version;
-        self.mtime = committed.modified();
-        self.snapshot = Some(committed);
+        effective_catalog.path = Some(path);
+        effective_catalog.mtime = committed.modified();
+        effective_catalog.snapshot = Some(committed);
+        *self = effective_catalog;
         if let Some(error) = warning {
             tracing::warn!("catalog deletion committed with a durability warning: {error}");
         }
@@ -4989,9 +4948,17 @@ verbs:
         cat.append_verb(&verb).unwrap();
         assert!(cat.get("grant-runtime").is_some());
         assert!(cat.get(&runtime_access_name).is_some());
+        let durable_content = std::fs::read_to_string(&path).unwrap();
+        assert!(!durable_content.contains("grant-runtime"));
+        assert!(!durable_content.contains(&runtime_access_name));
 
         // Reload independently: persisted, provenance kept, pinning enforced.
         let reloaded = VerbCatalog::load(&path).unwrap();
+        assert_ne!(cat.version(), reloaded.version());
+        let refreshed = cat.refreshed_copy().unwrap();
+        assert_eq!(cat.version(), refreshed.version());
+        assert!(refreshed.get("grant-runtime").is_some());
+        assert!(refreshed.get(&runtime_access_name).is_some());
         assert!(reloaded.names().contains(&"cmk-list".to_string()));
         assert!(reloaded.names().contains(&"existing".to_string()));
         let got = reloaded.get("cmk-list").unwrap();
@@ -5008,6 +4975,53 @@ verbs:
         assert!(reloaded
             .render("cmk-list", &params(&[("resource", "volumes")]))
             .is_err());
+    }
+
+    #[test]
+    fn catalog_mutations_keep_runtime_overlays_out_of_the_durable_document() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(
+            &path,
+            r#"verbs:
+  - name: editable
+    binary: echo
+    consequence: reversible
+  - name: removable
+    binary: true
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let mut catalog = VerbCatalog::load(&path).unwrap();
+        let mut saved_grant = synth_verb("true", None, false, "grant-runtime");
+        saved_grant.name = "grant-runtime".to_string();
+        catalog.upsert_saved_grant_verb(saved_grant).unwrap();
+        let access = catalog
+            .canonical_generated_access_verb(toolbox_wrapper("^(status)$"))
+            .unwrap();
+        let access_name = access.name.clone();
+        catalog.upsert_access_verb(access).unwrap();
+
+        let original_digest = catalog.verb_definition_digest("editable").unwrap();
+        let mut replacement = catalog.get("editable").unwrap().clone();
+        replacement.description = "Edited operator verb".to_string();
+        catalog
+            .amend_verb_if_digest("editable", &original_digest, &replacement)
+            .unwrap();
+        assert!(catalog.get("grant-runtime").is_some());
+        assert!(catalog.get(&access_name).is_some());
+
+        catalog.delete_verb("removable").unwrap();
+        assert!(catalog.get("grant-runtime").is_some());
+        assert!(catalog.get(&access_name).is_some());
+        assert!(catalog.delete_verb(&access_name).is_err());
+
+        let durable_content = std::fs::read_to_string(&path).unwrap();
+        assert!(!durable_content.contains("grant-runtime"));
+        assert!(!durable_content.contains(&access_name));
+        assert!(durable_content.contains("Edited operator verb"));
+        assert!(!durable_content.contains("removable"));
     }
 
     #[test]
