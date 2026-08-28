@@ -1153,6 +1153,7 @@ impl VerbCatalog {
     /// reflect the write. Requires the catalog to be file-backed. Nothing is
     /// written if validation fails.
     pub fn append_verb(&mut self, verb: &Verb) -> Result<()> {
+        self.reload_if_stale()?;
         let canonical;
         let verb = if is_synthesized_verb(verb) {
             canonical = canonicalize_generated_authority_envelope(verb.clone())?;
@@ -1175,19 +1176,33 @@ impl VerbCatalog {
         let new_content = compose_appended_catalog(&existing, verb)?;
         // Validate the COMBINED catalog in memory BEFORE touching the file, so a
         // bad or duplicate verb can never corrupt the catalog on disk.
-        let (validated, canonical) = Self::from_yaml_with_repair(&new_content)
+        let (mut validated, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("appending this verb would make the catalog invalid")?;
         let durable_content = canonical.as_deref().unwrap_or(&new_content);
+        let runtime_verbs = self
+            .verbs
+            .values()
+            .filter(|verb| reserved_verb_name(&verb.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut runtime_verb in runtime_verbs {
+            if runtime_verb.name.starts_with("grant-") {
+                validated.upsert_saved_grant_verb(runtime_verb)?;
+            } else {
+                runtime_verb.trusted = false;
+                validated.upsert_access_verb(runtime_verb)?;
+            }
+        }
         let outcome =
             write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, durable_content)?;
         let (committed, warning) = outcome.into_parts();
         // Adopt the already-validated content rather than re-reading the file: a
         // post-write reload failure would otherwise report an error to the
         // operator even though the write landed, desyncing memory from disk.
-        self.verbs = validated.verbs;
-        self.version = validated.version;
-        self.mtime = committed.modified();
-        self.snapshot = Some(committed);
+        validated.path = Some(path);
+        validated.mtime = committed.modified();
+        validated.snapshot = Some(committed);
+        *self = validated;
         if let Some(error) = warning {
             tracing::warn!("catalog append committed with a durability warning: {error}");
         }
@@ -1198,7 +1213,12 @@ impl VerbCatalog {
     /// runtime-reserved or automatically promoted identity through the file
     /// import boundary.
     pub fn append_operator_verb(&mut self, verb: &Verb) -> Result<()> {
-        if reserved_verb_name(&verb.name) || verb.auto_promoted || verb.promotion_stamp.is_some() {
+        if reserved_verb_name(&verb.name)
+            || verb.auto_promoted
+            || verb.promotion_stamp.is_some()
+            || verb.source_prose.is_some()
+            || verb.evidence.is_some()
+        {
             bail!(
                 "generated or reserved verb '{}' cannot be added as an operator-authored verb",
                 verb.name
@@ -2449,10 +2469,11 @@ fn validate_known_file_arguments(
         "ansible" | "ansible-playbook" => &[
             "-i",
             "--inventory",
+            "--inventory-file",
             "--private-key",
             "--vault-password-file",
         ],
-        "kubectl" => &["-f", "--filename", "--kubeconfig"],
+        "kubectl" => &["-f", "--filename", "-k", "--kustomize", "--kubeconfig"],
         "helm" => &[
             "-f",
             "--values",
@@ -2487,6 +2508,19 @@ fn validate_known_file_arguments(
                     &format!("in {option}=..."),
                 )?;
             }
+            if option.len() == 2 {
+                if let Some(value) = argument
+                    .strip_prefix(option)
+                    .filter(|value| !value.is_empty() && !value.starts_with('='))
+                {
+                    validate_absolute_file_template(
+                        verb,
+                        value,
+                        command_label,
+                        &format!("attached to {option}"),
+                    )?;
+                }
+            }
         }
     }
 
@@ -2494,6 +2528,7 @@ fn validate_known_file_arguments(
         const VALUE_OPTIONS: &[&str] = &[
             "-i",
             "--inventory",
+            "--inventory-file",
             "-l",
             "--limit",
             "-e",
@@ -4188,7 +4223,17 @@ verbs:
             auto_promoted: false,
             promotion_stamp: None,
         };
+        let mut runtime_saved = synth_verb("true", None, false, "grant-runtime");
+        runtime_saved.name = "grant-runtime".to_string();
+        cat.upsert_saved_grant_verb(runtime_saved).unwrap();
+        let runtime_access = cat
+            .canonical_generated_access_verb(toolbox_wrapper("^(status)$"))
+            .unwrap();
+        let runtime_access_name = runtime_access.name.clone();
+        cat.upsert_access_verb(runtime_access).unwrap();
         cat.append_verb(&verb).unwrap();
+        assert!(cat.get("grant-runtime").is_some());
+        assert!(cat.get(&runtime_access_name).is_some());
 
         // Reload independently: persisted, provenance kept, pinning enforced.
         let reloaded = VerbCatalog::load(&path).unwrap();
@@ -4261,6 +4306,10 @@ verbs:
         assert!(cat.append_verb(&mk("bad", Some("[a-z]+"))).is_err());
         // Neither failed append touched the file.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
+
+        crate::learned_rules::write_authority_file(&path, "verbs: []\n").unwrap();
+        cat.append_verb(&mk("dup", None)).unwrap();
+        assert!(VerbCatalog::load(&path).unwrap().get("dup").is_some());
     }
 
     #[test]
@@ -4841,6 +4890,65 @@ verbs:
         assert!(mixed_exact_paths
             .to_string()
             .contains("enumerates a relative path"));
+
+        let generic_ansible_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-playbook
+    binary: ansible-playbook
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: check
+        action: preauthorized
+        required_args: ["--check"]
+"#,
+        )
+        .unwrap();
+        for relative_inventory in ["-i./inventory", "--inventory-file=inventory"] {
+            assert!(generic_ansible_coverage
+                .match_command_all(
+                    "ansible-playbook",
+                    &args_vec(&[relative_inventory, "/srv/automation/site.yml", "--check",]),
+                )
+                .is_empty());
+        }
+        assert!(!generic_ansible_coverage
+            .match_command_all(
+                "ansible-playbook",
+                &args_vec(&[
+                    "-i/srv/automation/inventory",
+                    "/srv/automation/site.yml",
+                    "--check",
+                ]),
+            )
+            .is_empty());
+
+        let generic_kubectl_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-kustomization
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: apply
+        action: preauthorized
+        required_args: ["apply"]
+"#,
+        )
+        .unwrap();
+        for relative_kustomization in ["-k.", "--kustomize=."] {
+            assert!(generic_kubectl_coverage
+                .match_command_all("kubectl", &args_vec(&["apply", relative_kustomization]),)
+                .is_empty());
+        }
+        assert!(!generic_kubectl_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["apply", "-k/srv/automation/kustomization"]),
+            )
+            .is_empty());
 
         let relative_coverage = VerbCatalog::from_yaml(
             r#"

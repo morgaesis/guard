@@ -2016,6 +2016,23 @@ async fn verb_add_persists_one_operator_definition_and_rejects_bad_writes_atomic
     .await;
     assert!(matches!(rejected, AdminResponse::Error { .. }));
     assert_eq!(std::fs::read(&path).unwrap(), committed);
+
+    let mut generated = verb.clone();
+    generated.name = "generated-added-fixture".to_string();
+    generated.evidence = Some("model-authored evidence".to_string());
+    let rejected = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAdd {
+            verb: Box::new(generated),
+        },
+    )
+    .await;
+    assert!(matches!(
+        rejected,
+        AdminResponse::Error { message } if message.contains("operator-authored")
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), committed);
     assert!(AdminRequest::VerbAdd {
         verb: Box::new(verb),
     }
