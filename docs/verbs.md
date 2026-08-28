@@ -15,8 +15,8 @@ guard verb run restart-service --param unit=nginx
 [`examples/verbs.yaml`](../examples/verbs.yaml) contains command-template and
 coverage-cell examples.
 
-Operators add one catalog entry from a YAML file containing exactly one verb
-definition:
+On file-backed deployments, operators add one catalog entry from a YAML file
+containing exactly one verb definition:
 
 ```bash
 guard verb add --file inspect-service.yaml
@@ -26,7 +26,7 @@ The daemon validates the candidate and the complete catalog before atomically
 appending it. The command fails without changing the catalog when the name
 already exists or the definition is invalid. Generated and reserved verb
 identities are not accepted through this operator-authored boundary. Adding a
-verb requires the admin bearer.
+verb requires operator authentication.
 
 Operators replace one catalog entry from a YAML file containing exactly one
 verb definition:
@@ -151,8 +151,10 @@ short forms, including `key=path` and `label@path` payloads. It preserves
 Ansible's non-file forms: inventories may be comma-terminated inline host
 lists, extra variables may be inline values, and vault IDs may use `prompt`.
 Referenced variable files, vault clients, module-path entries, credentials, and
-configuration files must be absolute. Ambiguous command grammars that cannot
-be modeled safely do not receive file-path coverage. If an explicit-inventory
+configuration files must be absolute under the daemon host's path semantics.
+Executable selectors accept absolute paths or a bare executable name resolved
+from the daemon's controlled `PATH`. Ambiguous command grammars that cannot be
+modeled safely do not receive file-path coverage. If an explicit-inventory
 Ansible process reports that no inventory was parsed, or that every supplied
 source was unusable, Guard converts exit 0 to a failure and emits a diagnostic.
 

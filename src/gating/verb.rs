@@ -2415,19 +2415,17 @@ fn validate_auto_promoted_param_spec(pname: &str, spec: &ParamSpec) -> Result<Ve
 }
 
 fn path_is_absolute(value: &str) -> bool {
-    value.starts_with('/')
-        || value.starts_with("\\\\")
-        || value
-            .as_bytes()
-            .get(1..3)
-            .is_some_and(|bytes| bytes[0] == b':' && matches!(bytes[1], b'/' | b'\\'))
+    Path::new(value).is_absolute()
 }
 
 #[derive(Clone, Copy)]
 enum KnownFileArgument {
     AbsolutePath,
     AbsolutePathList,
+    AbsolutePathOrProgram,
+    AbsolutePathOrStdin,
     KeyEqualsPath,
+    HelmSetFile,
     AnsibleInventory,
     AnsibleExtraVars,
     AnsibleVaultId,
@@ -2438,7 +2436,10 @@ impl KnownFileArgument {
         match self {
             Self::AbsolutePath => path_is_absolute(value),
             Self::AbsolutePathList => absolute_path_list(value),
+            Self::AbsolutePathOrProgram => path_is_absolute(value) || bare_program_name(value),
+            Self::AbsolutePathOrStdin => value == "-" || path_is_absolute(value),
             Self::KeyEqualsPath => key_equals_path_payload(value).is_some_and(path_is_absolute),
+            Self::HelmSetFile => helm_set_file_payload(value).is_some_and(path_is_absolute),
             Self::AnsibleInventory => path_is_absolute(value) || value.ends_with(','),
             Self::AnsibleExtraVars => value
                 .strip_prefix('@')
@@ -2454,7 +2455,10 @@ impl KnownFileArgument {
         match self {
             Self::AbsolutePath => "an absolute path",
             Self::AbsolutePathList => "a list containing only absolute paths",
+            Self::AbsolutePathOrProgram => "an absolute path or bare executable name",
+            Self::AbsolutePathOrStdin => "an absolute path or '-' for standard input",
             Self::KeyEqualsPath => "an absolute path, optionally prefixed with key=",
+            Self::HelmSetFile => "one key=absolute-path pair; repeat the option for multiple files",
             Self::AnsibleInventory => "an absolute path or comma-terminated inline host list",
             Self::AnsibleExtraVars => "an inline value or an @-prefixed absolute path",
             Self::AnsibleVaultId => "a prompt source or an absolute vault client path",
@@ -2467,6 +2471,7 @@ impl KnownFileArgument {
     fn path_payload_template(self, value: &str) -> Option<&str> {
         match self {
             Self::KeyEqualsPath => key_equals_path_payload(value),
+            Self::HelmSetFile => helm_set_file_payload(value),
             Self::AnsibleExtraVars => value.strip_prefix('@'),
             Self::AnsibleVaultId => {
                 let source = value.rsplit_once('@').map_or(value, |(_, source)| source);
@@ -2475,32 +2480,36 @@ impl KnownFileArgument {
             _ => Some(value),
         }
     }
+
+    fn accepts_parameter_value(self, value: &str) -> bool {
+        match self {
+            Self::KeyEqualsPath | Self::HelmSetFile | Self::AnsibleExtraVars => {
+                path_is_absolute(value)
+            }
+            _ => self.accepts(value),
+        }
+    }
 }
 
 fn absolute_path_list(value: &str) -> bool {
-    if value.is_empty() {
-        return false;
-    }
-    if path_is_absolute(value)
-        && value
-            .as_bytes()
-            .get(1)
-            .is_some_and(|character| *character == b':')
-        && !value.contains(';')
-    {
-        return true;
-    }
-    // Ansible uses the host path-list separator. Semicolon-delimited lists
-    // unambiguously describe Windows paths; otherwise this is a POSIX list.
-    let separator = value.contains(';').then_some(';').unwrap_or(':');
-    value
-        .split(separator)
-        .all(|path| !path.is_empty() && path_is_absolute(path))
+    !value.is_empty() && std::env::split_paths(value).all(|path| path.is_absolute())
+}
+
+fn bare_program_name(value: &str) -> bool {
+    !matches!(value, "" | "." | "..")
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
 }
 
 fn key_equals_path_payload(value: &str) -> Option<&str> {
     let path = value.split_once('=').map_or(value, |(_, payload)| payload);
     (!path.is_empty()).then_some(path)
+}
+
+fn helm_set_file_payload(value: &str) -> Option<&str> {
+    let (key, path) = value.split_once('=')?;
+    (!key.is_empty() && !path.is_empty() && !value.contains(',')).then_some(path)
 }
 
 fn validate_known_file_template(
@@ -2531,7 +2540,10 @@ fn validate_known_file_template(
             )
         })?;
         if let Some(values) = enumerate_pattern_literals(spec.pattern_text()) {
-            if values.iter().all(|value| kind.accepts(value)) {
+            if values
+                .iter()
+                .all(|value| kind.accepts_parameter_value(value))
+            {
                 return Ok(());
             }
             bail!(
@@ -2544,7 +2556,7 @@ fn validate_known_file_template(
         if spec
             .default
             .as_deref()
-            .is_some_and(|value| !kind.accepts(value))
+            .is_some_and(|value| !kind.accepts_parameter_value(value))
         {
             bail!(
                 "verb '{}' {command_label} file parameter '{}' has a default that is not {}",
@@ -2581,7 +2593,10 @@ fn validate_known_file_arguments(
     let binary = binary_match_key(binary);
     const ABSOLUTE: KnownFileArgument = KnownFileArgument::AbsolutePath;
     const ABSOLUTE_LIST: KnownFileArgument = KnownFileArgument::AbsolutePathList;
+    const PROGRAM: KnownFileArgument = KnownFileArgument::AbsolutePathOrProgram;
+    const PATH_OR_STDIN: KnownFileArgument = KnownFileArgument::AbsolutePathOrStdin;
     const KEY_PATH: KnownFileArgument = KnownFileArgument::KeyEqualsPath;
+    const HELM_SET_FILE: KnownFileArgument = KnownFileArgument::HelmSetFile;
     const INVENTORY: KnownFileArgument = KnownFileArgument::AnsibleInventory;
     const EXTRA_VARS: KnownFileArgument = KnownFileArgument::AnsibleExtraVars;
     const VAULT_ID: KnownFileArgument = KnownFileArgument::AnsibleVaultId;
@@ -2612,6 +2627,8 @@ fn validate_known_file_arguments(
             ("--kustomize", ABSOLUTE),
             ("--kubeconfig", ABSOLUTE),
             ("--kuberc", ABSOLUTE),
+            ("--cache-dir", ABSOLUTE),
+            ("--profile-output", ABSOLUTE),
             ("--from-file", KEY_PATH),
             ("--from-env-file", ABSOLUTE),
             ("--cert", ABSOLUTE),
@@ -2628,14 +2645,32 @@ fn validate_known_file_arguments(
             ("--repository-config", ABSOLUTE),
             ("--registry-config", ABSOLUTE),
             ("--repository-cache", ABSOLUTE),
+            ("--content-cache", ABSOLUTE),
             ("--kube-ca-file", ABSOLUTE),
             ("--ca-file", ABSOLUTE),
             ("--cert-file", ABSOLUTE),
             ("--key-file", ABSOLUTE),
             ("--keyring", ABSOLUTE),
-            ("--set-file", KEY_PATH),
+            ("--set-file", HELM_SET_FILE),
+            ("--post-renderer", PROGRAM),
+            ("--output-dir", ABSOLUTE),
+            ("--destination", ABSOLUTE),
+            ("--untardir", ABSOLUTE),
+            ("--merge", ABSOLUTE),
+            ("--passphrase-file", PATH_OR_STDIN),
         ],
         _ => &[],
+    };
+
+    // Cobra stops parsing kubectl's local options at `--`; later tokens are
+    // command arguments, including the remote argv accepted by `kubectl exec`.
+    let local_args = if binary == "kubectl" {
+        &args[..args
+            .iter()
+            .position(|argument| argument == "--")
+            .unwrap_or(args.len())]
+    } else {
+        args
     };
 
     if matches!(binary.as_str(), "ansible" | "ansible-playbook") {
@@ -2676,9 +2711,9 @@ fn validate_known_file_arguments(
         }
     }
 
-    for (index, argument) in args.iter().enumerate() {
+    for (index, argument) in local_args.iter().enumerate() {
         if let Some((_, kind)) = file_options.iter().find(|(option, _)| *option == argument) {
-            let value = args.get(index + 1).ok_or_else(|| {
+            let value = local_args.get(index + 1).ok_or_else(|| {
                 anyhow::anyhow!(
                     "verb '{}' {command_label} option '{}' requires {}",
                     verb.name,
@@ -2721,7 +2756,10 @@ fn validate_known_file_arguments(
         }
     }
 
-    validate_known_positional_file_arguments(verb, &binary, args, command_label)?;
+    if binary == "kubectl" {
+        validate_kubectl_profile_output(verb, local_args, command_label)?;
+    }
+    validate_known_positional_file_arguments(verb, &binary, local_args, command_label)?;
 
     if binary == "ansible-playbook" {
         const VALUE_OPTIONS: &[&str] = &[
@@ -2782,6 +2820,51 @@ fn validate_known_file_arguments(
             )?;
             break;
         }
+    }
+    Ok(())
+}
+
+fn validate_kubectl_profile_output(
+    verb: &Verb,
+    args: &[String],
+    command_label: &str,
+) -> Result<()> {
+    let mut selected_profile = None;
+    let mut output_is_explicit = false;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--profile" {
+            let value = args.get(index + 1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "verb '{}' {command_label} option '--profile' requires a profile name",
+                    verb.name
+                )
+            })?;
+            selected_profile = Some(value.as_str());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--profile=") {
+            if value.is_empty() {
+                bail!(
+                    "verb '{}' {command_label} option '--profile' requires a profile name",
+                    verb.name
+                );
+            }
+            selected_profile = Some(value);
+        }
+        if argument == "--profile-output" || argument.starts_with("--profile-output=") {
+            output_is_explicit = true;
+        }
+        index += 1;
+    }
+
+    if selected_profile.is_some_and(|profile| profile != "none") && !output_is_explicit {
+        bail!(
+            "verb '{}' {command_label} enables kubectl profiling without an explicit absolute --profile-output path",
+            verb.name
+        );
     }
     Ok(())
 }
@@ -5121,6 +5204,51 @@ verbs:
     }
 
     #[test]
+    fn file_paths_use_daemon_host_semantics() {
+        #[cfg(unix)]
+        let (native, foreign, native_list, foreign_list) = (
+            "/srv/automation/manifest.yaml",
+            r"C:\caller\manifest.yaml",
+            "/srv/automation/modules:/opt/ansible/modules",
+            r"C:\caller\modules;D:\shared\modules",
+        );
+        #[cfg(windows)]
+        let (native, foreign, native_list, foreign_list) = (
+            r"C:\automation\manifest.yaml",
+            "/srv/automation/manifest.yaml",
+            r"C:\automation\modules;D:\shared\modules",
+            "/srv/automation/modules:/opt/ansible/modules",
+        );
+
+        assert!(path_is_absolute(native));
+        assert!(!path_is_absolute(foreign));
+        assert!(absolute_path_list(native_list));
+        assert!(!absolute_path_list(foreign_list));
+
+        let generic = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-file
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: apply
+        action: preauthorized
+        required_args: ["apply"]
+"#,
+        )
+        .unwrap();
+        assert!(!generic
+            .match_command_all("kubectl", &args_vec(&["apply", "-f", native]))
+            .is_empty());
+        assert!(generic
+            .match_command_all("kubectl", &args_vec(&["apply", "-f", foreign]))
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn file_arguments_require_absolute_paths_only_in_known_file_positions() {
         let relative_forward = VerbCatalog::from_yaml(
             r#"
@@ -5219,6 +5347,31 @@ verbs:
                 "check-vault-source",
                 &params(&[("source", "/srv/automation/vault-client")]),
             )
+            .is_ok());
+
+        let post_renderer_parameter = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: render-with-filter
+    binary: helm
+    args: ["template", "fixture", "repo/chart", "--post-renderer={renderer}"]
+    params:
+      renderer: { pattern: "^[A-Za-z0-9._/-]+$" }
+    consequence: reversible
+"#,
+        )
+        .expect("post-renderer paths are checked after rendering");
+        assert!(post_renderer_parameter
+            .render("render-with-filter", &params(&[("renderer", "./renderer")]),)
+            .is_err());
+        assert!(post_renderer_parameter
+            .render(
+                "render-with-filter",
+                &params(&[("renderer", "/srv/automation/renderer")]),
+            )
+            .is_ok());
+        assert!(post_renderer_parameter
+            .render("render-with-filter", &params(&[("renderer", "renderer")]),)
             .is_ok());
 
         let exact_kubeconfig = VerbCatalog::from_yaml(
@@ -5497,6 +5650,77 @@ verbs:
             )
             .is_empty());
 
+        let generic_kubectl_profile_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: profile-read
+    binary: kubectl
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: get
+        action: preauthorized
+        required_args: ["get"]
+"#,
+        )
+        .unwrap();
+        for unsafe_profile in [
+            args_vec(&["get", "pods", "--profile=cpu"]),
+            args_vec(&[
+                "get",
+                "pods",
+                "--profile=cpu",
+                "--profile-output=./profile.pprof",
+            ]),
+        ] {
+            assert!(generic_kubectl_profile_coverage
+                .match_command_all("kubectl", &unsafe_profile)
+                .is_empty());
+        }
+        assert!(!generic_kubectl_profile_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&[
+                    "get",
+                    "pods",
+                    "--profile=cpu",
+                    "--profile-output=/srv/automation/profile.pprof",
+                ]),
+            )
+            .is_empty());
+        assert!(!generic_kubectl_profile_coverage
+            .match_command_all("kubectl", &args_vec(&["get", "pods", "--profile=none"]),)
+            .is_empty());
+
+        let generic_kubectl_exec_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: exec-helper
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: exec
+        action: preauthorized
+        required_args: ["exec"]
+"#,
+        )
+        .unwrap();
+        assert!(!generic_kubectl_exec_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&[
+                    "exec",
+                    "deploy/tool",
+                    "--",
+                    "helper",
+                    "--from-file=./remote-input",
+                    "kustomize",
+                    "./remote-directory",
+                ]),
+            )
+            .is_empty());
+
         let generic_helm_coverage = VerbCatalog::from_yaml(
             r#"
 verbs:
@@ -5516,6 +5740,9 @@ verbs:
             "--key-file=./client.key",
             "--keyring=./pubring.gpg",
             "--set-file=payload=./values.txt",
+            "--set-file=first=/srv/first,second=./second",
+            "--post-renderer=./renderer",
+            "--output-dir=./rendered",
         ] {
             assert!(generic_helm_coverage
                 .match_command_all("helm", &args_vec(&["pull", "repo/chart", relative_file]))
@@ -5533,6 +5760,9 @@ verbs:
             "--key-file=/srv/automation/client.key",
             "--keyring=/srv/automation/pubring.gpg",
             "--set-file=payload=/srv/automation/values.txt",
+            "--post-renderer=/srv/automation/renderer",
+            "--post-renderer=renderer",
+            "--output-dir=/srv/automation/rendered",
         ] {
             assert!(!generic_helm_coverage
                 .match_command_all("helm", &args_vec(&["pull", "repo/chart", absolute_file]))
@@ -6246,7 +6476,12 @@ verbs:
 
     #[test]
     fn typed_coverage_matches_conjunctive_command_dimensions() {
-        let cat = VerbCatalog::from_yaml(
+        let inventory = if cfg!(windows) {
+            r"C:\guard\inventory\prod"
+        } else {
+            "/srv/guard/inventory/prod"
+        };
+        let catalog = format!(
             r#"
 verbs:
   - name: ansible-check
@@ -6266,7 +6501,7 @@ verbs:
           values: ["web"]
         inventory:
           options: ["-i", "--inventory"]
-          values: ["/srv/guard/inventory/prod"]
+          values: ['{inventory}']
         namespace:
           options: ["--namespace"]
           values: ["prod"]
@@ -6274,15 +6509,15 @@ verbs:
           options: ["--limit"]
           max: 2
 "#,
-        )
-        .unwrap();
+        );
+        let cat = VerbCatalog::from_yaml(&catalog).unwrap();
 
         let matching = args_vec(&[
             "web",
             "-m",
             "ping",
             "-i",
-            "/srv/guard/inventory/prod",
+            inventory,
             "--namespace=prod",
             "--limit",
             "one,two",
@@ -6301,10 +6536,11 @@ verbs:
             .collect::<Vec<_>>();
         assert!(cat.match_command_all("ansible", &without_check).is_empty());
 
+        let inventory_option = format!("--inventory={inventory}");
         let too_many = args_vec(&[
             "web",
             "--module-name=ping",
-            "--inventory=/srv/guard/inventory/prod",
+            &inventory_option,
             "--namespace=prod",
             "--limit=one,two,three",
             "--check",
@@ -6316,7 +6552,7 @@ verbs:
             "-m",
             "ping",
             "-i",
-            "/srv/guard/inventory/prod",
+            inventory,
             "--namespace",
             "prod",
             "--limit=one",
@@ -6333,7 +6569,7 @@ verbs:
             "-m",
             "ping",
             "-i",
-            "/srv/guard/inventory/prod",
+            inventory,
             "--namespace",
             "prod",
             "--limit",
@@ -6385,7 +6621,12 @@ verbs:
 "#,
         )
         .unwrap();
-        let command = args_vec(&["--check", "/srv/automation/site.yml"]);
+        let playbook = if cfg!(windows) {
+            r"C:\automation\site.yml"
+        } else {
+            "/srv/automation/site.yml"
+        };
+        let command = args_vec(&["--check", playbook]);
         let mut plain = BTreeMap::new();
         plain.insert(
             "ANSIBLE_CONFIG".to_string(),
