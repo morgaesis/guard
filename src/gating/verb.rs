@@ -6681,7 +6681,9 @@ mod asynchronous_adoption_tests {
             Some("Inspect an object")
         );
         drop(lease);
-        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        // This proves completion after lease release, not latency. Keep the
+        // deadlock bound generous for filesystem work on loaded runners.
+        receive.recv_timeout(Duration::from_secs(30)).unwrap();
         writer.join().unwrap();
 
         assert!(
