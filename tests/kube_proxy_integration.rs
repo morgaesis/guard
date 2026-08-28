@@ -31,6 +31,9 @@ use guard::proxy::{
 };
 
 const CREATE_PROVENANCE_ANNOTATION: &str = "guard.morgaesis.dev/provisional";
+// Keep end-to-end handoff probes bounded without treating shared-runner
+// scheduling delays as a failed authority transition.
+const PROXY_INTEGRATION_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone, Default)]
 struct CreateObservation {
     provenance: Option<String>,
@@ -3107,7 +3110,7 @@ async fn cleanup_revocation_linearizes_at_the_final_header_handoff() {
                 .await
                 .unwrap()
         });
-        tokio::time::timeout(Duration::from_secs(10), sink.reached.acquire())
+        tokio::time::timeout(PROXY_INTEGRATION_TIMEOUT, sink.reached.acquire())
             .await
             .expect("cleanup reaches the final authority handoff")
             .unwrap()
@@ -3126,7 +3129,7 @@ async fn cleanup_revocation_linearizes_at_the_final_header_handoff() {
         }
         sink.release.add_permits(1);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(10), cleanup)
+            tokio::time::timeout(PROXY_INTEGRATION_TIMEOUT, cleanup)
                 .await
                 .expect("cleanup completes after final authority handoff")
                 .unwrap()

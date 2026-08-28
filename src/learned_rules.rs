@@ -225,9 +225,6 @@ fn is_authority_lock_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<AuthorityLockTimeout>().is_some()
 }
 
-#[cfg(test)]
-const AUTHORITY_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(not(test))]
 const AUTHORITY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTHORITY_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -251,14 +248,18 @@ fn durable_store_coordinator(path: &Path) -> Result<Arc<RwLock<()>>> {
 }
 
 async fn acquire_durable_store_write_permit(path: &Path) -> Result<OwnedRwLockWriteGuard<()>> {
+    acquire_durable_store_write_permit_with_timeout(path, AUTHORITY_LOCK_TIMEOUT).await
+}
+
+async fn acquire_durable_store_write_permit_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<OwnedRwLockWriteGuard<()>> {
     #[cfg(test)]
     signal_durable_store_write_attempt(path);
-    let permit = tokio::time::timeout(
-        AUTHORITY_LOCK_TIMEOUT,
-        durable_store_coordinator(path)?.write_owned(),
-    )
-    .await
-    .map_err(|_| authority_lock_timeout("in-process"))?;
+    let permit = tokio::time::timeout(timeout, durable_store_coordinator(path)?.write_owned())
+        .await
+        .map_err(|_| authority_lock_timeout("in-process"))?;
     Ok(permit)
 }
 
@@ -784,6 +785,14 @@ impl DestinationLock {
     }
 
     fn acquire_with_mode(path: &Path, exclusive: bool) -> Result<Self> {
+        Self::acquire_with_mode_and_timeout(path, exclusive, AUTHORITY_LOCK_TIMEOUT)
+    }
+
+    fn acquire_with_mode_and_timeout(
+        path: &Path,
+        exclusive: bool,
+        timeout: Duration,
+    ) -> Result<Self> {
         #[cfg(test)]
         signal_authority_snapshot_attempt_for_test(path);
         ensure_destination_parent(path)?;
@@ -809,7 +818,7 @@ impl DestinationLock {
             format!("failed to open learning-file lock {}", lock_path.display())
         })?;
         ensure_regular_file(&lock_path)?;
-        lock_file(&file, Instant::now() + AUTHORITY_LOCK_TIMEOUT, exclusive)
+        lock_file(&file, Instant::now() + timeout, exclusive)
             .with_context(|| format!("failed to lock learning destination {}", path.display()))?;
         validate_lock_file(&file, &canonical_lock_path)?;
         let lock = Self {
@@ -4733,9 +4742,17 @@ mod tests {
         let destination = temp.path().join("learned.yaml");
         let first = DestinationLock::acquire(&destination).unwrap();
         let contender = destination.clone();
-        let error = std::thread::spawn(move || DestinationLock::acquire(&contender).err().unwrap())
-            .join()
-            .unwrap();
+        let error = std::thread::spawn(move || {
+            DestinationLock::acquire_with_mode_and_timeout(
+                &contender,
+                true,
+                Duration::from_millis(100),
+            )
+            .err()
+            .unwrap()
+        })
+        .join()
+        .unwrap();
         assert!(is_authority_lock_timeout(&error));
         drop(first);
         DestinationLock::acquire(&destination).unwrap();
@@ -4748,9 +4765,12 @@ mod tests {
         let first = acquire_durable_store_write_permit(&destination)
             .await
             .unwrap();
-        let error = acquire_durable_store_write_permit(&destination)
-            .await
-            .unwrap_err();
+        let error = acquire_durable_store_write_permit_with_timeout(
+            &destination,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
         assert!(is_authority_lock_timeout(&error));
         drop(first);
         let _permit = acquire_durable_store_write_permit(&destination)
