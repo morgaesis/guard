@@ -1093,7 +1093,7 @@ fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
 }
 
 #[tokio::test]
-async fn unmatched_implicit_access_overlay_is_removed_from_verb_resolution() {
+async fn unmatched_access_overlay_is_removed_from_verb_resolution() {
     let (mut cfg, _) = make_test_config();
     cfg.config.gate = GateMode::Consequence;
     cfg.state.verbs = Arc::new(RwLock::new(
@@ -1190,6 +1190,40 @@ verbs:
             .flatten(),
         Some(1),
         "detached access authority must not be consumed"
+    );
+
+    let explicit_response = execute_command(
+        request_with_session(
+            "true",
+            vec!["--check".to_string(), "safe".to_string()],
+            "implicit-access".to_string(),
+        ),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1001 },
+    )
+    .await
+    .into_response();
+    assert_eq!(explicit_response.verb_matches.len(), 1);
+    assert_eq!(
+        explicit_response.verb_matches[0].verb,
+        "narrow-baseline-check"
+    );
+    assert_eq!(
+        explicit_response.verb_matches[0].scope,
+        guard::gating::coverage::VerbMatchScope::Baseline
+    );
+    assert!(!explicit_response
+        .reason
+        .contains("session policy-only mode"));
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .aggregate_access_uses("implicit-access")
+            .flatten(),
+        Some(1),
+        "an explicitly attached but unmatched access overlay must not be consumed"
     );
 }
 
@@ -1329,10 +1363,10 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .await
         .access_token_for_principal(&PrincipalKey::from_uid(1001))
         .unwrap();
-    let explicitly_scoped = execute_command(
+    let explicitly_overlaid = execute_command(
         request_with_session(
             "rustc",
-            vec!["--print".to_string(), "cfg".to_string()],
+            vec!["--print".to_string(), "target-libdir".to_string()],
             access_token.clone(),
         ),
         &cfg,
@@ -1340,10 +1374,18 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     )
     .await
     .into_response();
-    assert!(!explicitly_scoped.allowed);
-    assert!(explicitly_scoped
+    assert!(
+        explicitly_overlaid.allowed,
+        "explicit access authority must not narrow unrelated baseline commands: {}",
+        explicitly_overlaid.reason
+    );
+    assert!(!explicitly_overlaid
         .reason
         .contains("session policy-only mode"));
+    assert_eq!(
+        explicitly_overlaid.reason, unrelated_without_overlay.reason,
+        "explicit and implicit unmatched access overlays must preserve the baseline decision path"
+    );
 
     let remaining_before_access = {
         let sessions = cfg.state.sessions.read().await;
@@ -1351,9 +1393,8 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     };
     assert_eq!(remaining_before_access, Some(1));
 
-    let mut execution =
-        request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
-    execution.session_token = None;
+    let execution =
+        request_with_session("rustc", vec!["--version".to_string()], access_token.clone());
     // Keep the two large execute futures off the test thread's bounded stack.
     // Their simultaneous admission is the behavior under test, not their
     // placement in the generated test future.
@@ -2434,6 +2475,126 @@ async fn sequential_approval_keeps_fresh_sibling_extensions_valid() {
         !pending.contains(&request.handle)
             || request.status == crate::grant_profile::GrantRequestStatus::Approved
     }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_first_approvals_converge_on_one_principal_session() {
+    let (mut cfg, _) = make_test_config();
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: inspect-b\n    description: Inspect system B\n    binary: printf\n    args: [b]\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let mut handles = Vec::new();
+    for intent in ["Inspect system A", "Inspect system B"] {
+        let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
+            &cfg,
+            &worker,
+            AdminRequest::AccessRequest {
+                intent: intent.to_string(),
+            },
+        )
+        .await
+        else {
+            panic!("expected first access request")
+        };
+        handles.push(item.reference);
+    }
+    assert_ne!(handles[0], handles[1]);
+    assert!(cfg
+        .state
+        .grant_requests
+        .read()
+        .await
+        .values()
+        .filter(|request| handles.contains(&request.handle))
+        .all(|request| request.session_token.is_empty()));
+
+    let first = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![handles[0].clone()],
+            uses: Some(2),
+            wait_secs: None,
+        },
+    );
+    let second = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![handles[1].clone()],
+            uses: Some(3),
+            wait_secs: None,
+        },
+    );
+    let (first, second) = tokio::join!(first, second);
+    let approved_items = [first, second]
+        .into_iter()
+        .map(|response| match response {
+            AdminResponse::AccessDecisions { mut items, .. } if items.len() == 1 => items.remove(0),
+            response => panic!("expected one concurrent approval result, got {response:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        approved_items.iter().all(|item| item.success),
+        "both first approvals must succeed: {approved_items:?}"
+    );
+    assert_eq!(approved_items[0].target, approved_items[1].target);
+
+    let live_token = cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .access_token_for_principal(&PrincipalKey::from_uid(1001))
+        .expect("one canonical access session");
+    let durable_requests = store.load_grant_requests().await.unwrap();
+    let approved = durable_requests
+        .iter()
+        .filter(|request| handles.contains(&request.handle))
+        .collect::<Vec<_>>();
+    assert_eq!(approved.len(), 2);
+    assert!(approved.iter().all(|request| {
+        request.status == GrantRequestStatus::Approved && request.session_token == live_token
+    }));
+    assert_eq!(
+        approved
+            .iter()
+            .filter(|request| request.issued_session_revision.is_some())
+            .count(),
+        1,
+        "the second serialized approval must use the sibling revision rebased by the first"
+    );
+
+    let durable_registry = store.load_registry().await.unwrap();
+    assert_eq!(
+        durable_registry.access_token_for_principal(&PrincipalKey::from_uid(1001)),
+        Some(live_token.clone())
+    );
+    assert_eq!(
+        durable_registry
+            .access_grant_uses(&live_token, &handles[0])
+            .and_then(|(_, remaining)| remaining),
+        Some(2)
+    );
+    assert_eq!(
+        durable_registry
+            .access_grant_uses(&live_token, &handles[1])
+            .and_then(|(_, remaining)| remaining),
+        Some(3)
+    );
 }
 
 #[tokio::test]
