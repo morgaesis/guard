@@ -1,9 +1,14 @@
 use crate::server::deterministic_safe_allow_reason;
-use crate::server::wire::{ExecuteRequest, SshHostKeyMode};
+use crate::server::execute::execute_command;
+use crate::server::wire::{CallerIdentity, ExecuteRequest, SshHostKeyMode};
 use guard::gating::ssh_readonly::{
     is_fixed_readonly_diagnostic, ssh_o_directive_readonly_safe, ssh_options_all_readonly_safe,
 };
+use guard::gating::verb::VerbCatalog;
+use guard::principal::PrincipalKey;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use super::{args, make_test_config};
 
@@ -25,6 +30,82 @@ fn safe_allow_accepts_vetted_option_before_remote_command() {
     assert!(
         reason.is_some(),
         "vetted option should stay in the SSH option zone"
+    );
+}
+
+#[tokio::test]
+async fn explicit_access_overlay_leaves_unmatched_fixed_ssh_on_baseline_policy() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.dry_run = true;
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: approved-local-check
+    binary: true
+    args: ["--approved"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+"#,
+        )
+        .unwrap(),
+    ));
+    {
+        let mut sessions = cfg.state.sessions.write().await;
+        assert!(sessions.grant_policy_only_access_overlay(
+            "ssh-access-overlay".to_string(),
+            PrincipalKey::from_uid(1001),
+            "approved local check".to_string(),
+            guard::env::now_unix().saturating_add(60),
+        ));
+        assert_eq!(
+            sessions.apply_delta(
+                "ssh-access-overlay",
+                &crate::grant_profile::GrantRequestDelta {
+                    activated_verbs: vec!["approved-local-check".to_string()],
+                    ..Default::default()
+                },
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            sessions.install_access_grant(
+                "ssh-access-overlay",
+                Some(1),
+                "approved-ssh-regression".to_string(),
+                vec!["approved-local-check".to_string()],
+            ),
+            Some(true)
+        );
+    }
+    let caller = CallerIdentity::Unix { uid: 1001 };
+
+    let baseline = execute_command(ssh_request(None, &["host01", "id"]), &cfg, &caller)
+        .await
+        .into_response();
+    assert!(baseline.allowed, "baseline SSH diagnostic: {baseline:?}");
+
+    let mut explicit_request = ssh_request(None, &["host01", "id"]);
+    explicit_request.session_token = Some("ssh-access-overlay".to_string());
+    let explicit = execute_command(explicit_request, &cfg, &caller)
+        .await
+        .into_response();
+    assert!(
+        explicit.allowed,
+        "an unmatched access overlay must not narrow fixed SSH: {explicit:?}"
+    );
+    assert_eq!(explicit.reason, baseline.reason);
+    assert!(!explicit.reason.contains("session policy-only mode"));
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .aggregate_access_uses("ssh-access-overlay")
+            .flatten(),
+        Some(1),
+        "an unmatched SSH command must not consume approved access authority"
     );
 }
 

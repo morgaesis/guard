@@ -64,7 +64,9 @@ deny is never softened, and readonly and paranoid modes are unchanged.
 Session overlays intentionally expand baseline evaluator or readonly coverage
 inside activated verb regions. This gives a short-lived agent bounded mutation
 authority without changing the global posture. The exact session revision and
-coverage snapshot bind any hold or provisional.
+coverage snapshot bind any hold or provisional. Outside an activated region,
+an access-managed session is inert and the command follows baseline policy,
+regardless of whether the client or daemon attached the internal session token.
 
 ## Execution and credential isolation
 

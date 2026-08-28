@@ -141,10 +141,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
-    let mut session_attachment = request
-        .session_token
-        .as_ref()
-        .map(|_| SessionAttachmentOrigin::ExplicitRequest);
+    let mut attached_access_overlay = false;
 
     // Local access authority is selected by the kernel-authenticated principal.
     // Replace only an unknown or expired supplied handle; a known handle stays
@@ -161,7 +158,6 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                     super::admin::access_token_for_principal_ci(&sessions, &principal)
                 {
                     request.session_token = Some(token);
-                    session_attachment = Some(SessionAttachmentOrigin::ImplicitAccessOverlay);
                 }
             }
         }
@@ -192,27 +188,35 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     // bearer therefore cannot reveal foreign session verbs, match precedence,
     // or approval guidance through the pre-validation resolution path.
     if let Some(token) = request.session_token.as_deref() {
-        let refusal = {
+        let (refusal, access_managed) = {
             let sessions = server.state.sessions.read().await;
             match sessions.owner_for(token) {
-                None => Some(format!(
-                    "unknown session token: '{token}' is revoked, expired, or never existed"
-                )),
-                Some(SessionOwner::Unowned) => {
-                    Some(format!("session '{token}' {SESSION_UNOWNED_REFUSED}"))
-                }
+                None => (
+                    Some(format!(
+                        "unknown session token: '{token}' is revoked, expired, or never existed"
+                    )),
+                    false,
+                ),
+                Some(SessionOwner::Unowned) => (
+                    Some(format!("session '{token}' {SESSION_UNOWNED_REFUSED}")),
+                    false,
+                ),
                 Some(owner) => match authorize_session_use(
                     &owner,
                     caller,
                     server.config.allow_windows_system_operator,
                 ) {
-                    SessionAuthz::Allowed => None,
-                    SessionAuthz::Mismatch => Some(format!(
-                        "{SESSION_PRINCIPAL_MISMATCH}: caller {caller} is not the owner of session '{token}'"
-                    )),
-                    SessionAuthz::Unowned => {
-                        Some(format!("session '{token}' {SESSION_UNOWNED_REFUSED}"))
-                    }
+                    SessionAuthz::Allowed => (None, sessions.is_access_managed(token)),
+                    SessionAuthz::Mismatch => (
+                        Some(format!(
+                            "{SESSION_PRINCIPAL_MISMATCH}: caller {caller} is not the owner of session '{token}'"
+                        )),
+                        false,
+                    ),
+                    SessionAuthz::Unowned => (
+                        Some(format!("session '{token}' {SESSION_UNOWNED_REFUSED}")),
+                        false,
+                    ),
                 },
             }
         };
@@ -222,6 +226,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                 .await;
             return ExecuteResult::denied(reason);
         }
+        attached_access_overlay = access_managed;
     }
 
     if let Err(result) = canonicalize_request_cwd(&mut phase, &mut request).await {
@@ -236,17 +241,14 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     phase.verb_matches = verb_resolution.matches.clone();
     phase.verb_guidance = verb_resolution.guidance.clone();
 
-    // An access overlay is additive only when one of its reviewed session
-    // verbs is selected. Detach an unmatched implicit overlay before policy
+    // Persisted access-managed authority is an additive overlay regardless of
+    // whether the client supplied its token or the daemon selected it for the
+    // authenticated principal. Detach an unmatched overlay before policy
     // validation so unrelated commands follow the caller's baseline policy.
     // Restoring the pre-resolution request also discards session-derived
-    // rendering and revert state. An explicitly requested session remains
-    // attached and policy-only.
-    if matches!(
-        session_attachment,
-        Some(SessionAttachmentOrigin::ImplicitAccessOverlay)
-    ) && selected_session_verbs(&phase).is_empty()
-    {
+    // rendering and revert state. Ordinary explicit sessions remain attached
+    // and policy-only.
+    if attached_access_overlay && selected_session_verbs(&phase).is_empty() {
         request = request_before_verb_resolution;
         request.session_token = None;
         phase.session_token = None;
@@ -523,12 +525,6 @@ struct ExecPhase<'a, W> {
     session_token: Option<String>,
     verb_matches: Vec<VerbMatchInfo>,
     verb_guidance: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionAttachmentOrigin {
-    ExplicitRequest,
-    ImplicitAccessOverlay,
 }
 
 fn decision_trace_for_phase<W: AsyncWrite + Unpin>(

@@ -20,7 +20,7 @@ cargo build --quiet --release
 ## Release archive
 
 ```bash
-GUARD_VERSION=v0.8.4
+GUARD_VERSION=v0.8.5
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
@@ -86,7 +86,7 @@ and pass it explicitly. The installer copies the candidate into its protected
 maintenance tree, verifies that digest, and only then executes the staged copy:
 
 ```powershell
-$archive = Resolve-Path '.\guard-v0.8.4-x86_64-pc-windows-msvc.tar.gz'
+$archive = Resolve-Path '.\guard-v0.8.5-x86_64-pc-windows-msvc.tar.gz'
 $archiveHash = '<digest from the verified release SHA256SUMS>'
 $protectedRoot = 'C:\ProgramData\GuardInstall'
 New-Item -ItemType Directory -Force -Path $protectedRoot | Out-Null
@@ -95,7 +95,7 @@ $protectedArchive = Join-Path $protectedRoot (Split-Path -Leaf $archive)
 Copy-Item -LiteralPath $archive -Destination $protectedArchive
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $protectedArchive).Hash -ne $archiveHash) { throw 'Archive digest mismatch.' }
 & tar.exe -C $protectedRoot -xzf $protectedArchive
-$archiveRoot = 'C:\ProgramData\GuardInstall\guard-v0.8.4-x86_64-pc-windows-msvc'
+$archiveRoot = 'C:\ProgramData\GuardInstall\guard-v0.8.5-x86_64-pc-windows-msvc'
 $binaryHash = ((Get-Content -LiteralPath "$archiveRoot\BINARY-SHA256" -Raw).Trim() -split '\s+')[0]
 & "$archiveRoot\deployment\windows\install-guard.ps1" `
   -Action install `
