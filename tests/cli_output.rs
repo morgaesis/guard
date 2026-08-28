@@ -70,5 +70,11 @@ fn missing_subcommand_remains_invalid_usage() {
         .expect("run guard with a missing verb subcommand");
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage: guard verb"));
+    let binary = guard_binary();
+    let executable_name = binary
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("guard executable name");
+    let expected_usage = format!("Usage: {executable_name} verb");
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&expected_usage));
 }
