@@ -313,7 +313,16 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
     );
 }
 
+fn native_absolute_kubeconfig_path() -> &'static str {
+    if cfg!(windows) {
+        r"C:\guard\kubeconfig"
+    } else {
+        "/etc/guard/kubeconfig"
+    }
+}
+
 fn synthesized_kubeconfig_arguments(_request: &str) -> serde_json::Value {
+    let kubeconfig = native_absolute_kubeconfig_path();
     serde_json::json!({
         "name": "inspect-pods-with-kubeconfig",
         "description": "Inspect pods through one fixed kubeconfig",
@@ -321,7 +330,7 @@ fn synthesized_kubeconfig_arguments(_request: &str) -> serde_json::Value {
         "args": ["--kubeconfig", "{kubeconfig}", "get", "pods"],
         "params": {
             "kubeconfig": {
-                "pattern": "^/etc/guard/kubeconfig$",
+                "pattern": format!("^{}$", regex::escape(kubeconfig)),
                 "required": true
             }
         },
@@ -404,7 +413,7 @@ async fn access_request_synthesis_accepts_an_absolute_kubeconfig_parameter() {
                 "kubectl",
                 &[
                     "--kubeconfig".to_string(),
-                    "/etc/guard/kubeconfig".to_string(),
+                    native_absolute_kubeconfig_path().to_string(),
                     "get".to_string(),
                     "pods".to_string(),
                 ],
@@ -474,7 +483,7 @@ async fn access_extension_synthesis_accepts_an_absolute_kubeconfig_parameter() {
                 "kubectl",
                 &[
                     "--kubeconfig".to_string(),
-                    "/etc/guard/kubeconfig".to_string(),
+                    native_absolute_kubeconfig_path().to_string(),
                     "get".to_string(),
                     "pods".to_string(),
                 ],
@@ -500,7 +509,7 @@ async fn denial_generated_access_preserves_an_absolute_kubeconfig_operand() {
         "kubectl",
         vec![
             "--kubeconfig".to_string(),
-            "/etc/guard/kubeconfig".to_string(),
+            native_absolute_kubeconfig_path().to_string(),
             "get".to_string(),
             "pods".to_string(),
         ],
@@ -525,7 +534,12 @@ async fn denial_generated_access_preserves_an_absolute_kubeconfig_operand() {
     .unwrap();
     assert_eq!(
         proposed.args,
-        ["--kubeconfig", "/etc/guard/kubeconfig", "get", "pods"]
+        [
+            "--kubeconfig",
+            native_absolute_kubeconfig_path(),
+            "get",
+            "pods"
+        ]
     );
 }
 
