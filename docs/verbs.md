@@ -152,9 +152,11 @@ Ansible's non-file forms: inventories may be comma-terminated inline host
 lists, extra variables may be inline values, and vault IDs may use `prompt`.
 Referenced variable files, vault clients, module-path entries, credentials, and
 configuration files must be absolute under the daemon host's path semantics.
-Executable selectors accept absolute paths or a bare executable name resolved
-from the daemon's controlled `PATH`. Ambiguous command grammars that cannot be
-modeled safely do not receive file-path coverage. If an explicit-inventory
+Executable selectors and transport passthroughs are fixed literals in exact
+templates, never caller-selected generic coverage. A fixed executable selector
+may use an absolute path or a bare name resolved from the daemon's controlled
+`PATH`. Ambiguous command grammars that cannot be modeled safely do not receive
+file-path coverage. If an explicit-inventory
 Ansible process reports that no inventory was parsed, or that every supplied
 source was unusable, Guard converts exit 0 to a failure and emits a diagnostic.
 
