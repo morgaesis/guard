@@ -40,7 +40,7 @@ objects. Operator-authored policy and verb catalogs remain the source of hard
 invariants, sticky boundaries, credential plans, and verified revert envelopes.
 
 A coverage cell has an explicit action and axes. It is silent outside those
-axes. This prevents an instruction such as "allow Ansible check mode" from
+axes. This prevents an instruction such as "allow kubectl pod reads" from
 creating complement denies that block unrelated read-only commands.
 
 ## Command flow
@@ -52,26 +52,47 @@ agent -> client or shim -> authenticated daemon -> resolver -> evaluator/gate
 
 The daemon authenticates a Unix uid, Windows SID, or TCP bearer before reading
 request authority. Execute requests use a versioned envelope with an explicit
-feature set. Local requests require the caller's working directory; TCP requests
-declare that they have no caller filesystem context. The daemon validates the
-wire contract, argv, working directory, session, injections, and binary floor
-before semantic evaluation. Raw commands reverse-match all verb cells. The
+feature set. A supplied working directory is canonical caller filesystem
+context. An omitted directory becomes a fixed operating-system root before
+evaluation and persistence. The daemon validates the wire contract, argv,
+working directory, session, injections, and binary floor before semantic
+evaluation. Raw commands reverse-match all verb cells. The
 resolver combines applicable global and session coverage, then routes a miss or
 conflict to the evaluator when policy permits.
 
 The execution snapshot contains canonical argv, working directory, principal,
 session revision, matched coverage, credential and execution plan, consequence,
-and secret-name bindings with salted value hashes. A hold freezes that snapshot.
+the selected fixed-user or caller mode, Unix user and group identity including
+sorted supplementary groups, and secret-name bindings with installation-keyed
+value HMACs. A hold freezes that snapshot.
 Approval cannot adopt later grant, catalog, policy, environment, or secret
 changes.
 
-Approved children receive the caller's canonical working directory but the
-daemon's clean environment, identity, SSH context, and secret bindings. Guard
-does not rewrite command semantics, stage input files, or interpret tool-native
-projects. A coverage cell can require one exact canonical working directory;
-the daemon matches it after canonicalization and revalidates the directory
-immediately before execution. Child stdout and stderr are redacted before
-crossing the daemon boundary.
+Opaque interpreter and command-dispatch binaries cannot enter an authorized
+execution path. The catalog and process boundary share one classifier, so a
+typed verb, hold, or restored row cannot bypass this restriction. Reviewed
+logic runs as a direct executable whose primary artifact is fingerprinted.
+Primary-only executables use a positive registry and closed option grammar.
+Read-only file operands require canonical absolute paths and exact typed
+authority. Dispatchers such as `ip` and path-only mutators such as `rm` and
+`touch` remain outside delayed execution authority because their complete
+secondary authority cannot be pinned through their argv interface.
+
+Approved children receive a daemon-constructed clean environment and execute
+as either the configured fixed child identity or the authenticated Unix caller.
+Caller-scoped scalar secret bindings are available
+only in caller mode; daemon-held upstream credentials remain behind API
+proxies. Fixed mode uses an explicit inert-variable schema and admits kubectl
+only through an immutable kubeconfig matching an active Guard proxy. Fixed mode
+rejects Ansible and Helm because their mutable profile state cannot safely cross
+identities. Caller mode rejects Ansible, Helm, and kubectl because it has no
+immutable typed profile snapshot. Commands start from the fixed operating-system
+root unless a coverage cell binds one exact canonical caller working directory.
+Guard retains authorized caller paths for the child lifetime, and Unix authority
+artifacts must be immutable to the actual child uid. Typed environment bindings
+require an explicit environment capability. Guard does not rewrite command
+semantics, stage input files, or interpret tool-native projects. Child stdout
+and stderr are redacted before crossing the daemon boundary.
 
 ## Resolver order
 
@@ -128,13 +149,27 @@ Classification can only raise the gate.
 
 Command containment assesses the forward command, rollback, confirmation check,
 deadline, and control path together. A viable chain runs autonomously. A chain
-that may sever the authority needed to verify or revert holds.
+that may sever the authority needed to verify or revert holds. Arming captures
+separate process and secret authority for the rollback and confirmation check
+before the forward command starts.
+
+Only commands with a closed delayed-execution grammar can enter a hold or a
+command-shaped containment control. Fixed-identity kubectl commands bind the
+immutable active-proxy profile. Literal non-starting `systemctl` operations,
+direct utilities without secondary authority, and the CTF child contract use
+narrow closed executable grammars. Profile-dependent Ansible and Helm commands,
+and all caller-mode typed profile tools, fail before process creation.
+Unknown executables, SSH, wrappers, interpreters, and implicit program or
+configuration loaders fail before durable command authority is created. The
+frozen versioned plan binds typed or raw provenance, profile, normalized command
+digest, and secondary PATH behavior. Replay must regenerate the same plan.
 
 Holds and provisionals persist in SQLite. Startup re-arms a completed forward
 command after validating its frozen authority, then observes a grace before due
 rollback processing. Interrupted or authority-invalid rows require an operator
 decision. A due command rollback uses the frozen working directory, principal,
-and credential bindings. A due HTTP rollback uses an exact live endpoint,
+credential bindings, executable, environment, search path, and operator
+artifacts. A due HTTP rollback uses an exact live endpoint,
 protocol, canonical target, session, and upstream credential identity match.
 
 ## API flow
@@ -192,11 +227,19 @@ provenance.
 TCP has no peer principal. It uses separate execution and admin bearers and
 refuses consequence gating and per-principal secret injection.
 
-Daemon-held credentials are the bypass-prevention invariant. The agent has no
-usable SSH key, SSH socket, kubeconfig, API token, or direct upstream path.
-Secret values resolve after authorization and remain absent from requests,
-evaluator input, state, audit, and history. Frozen holds bind salted value hashes
-so approval fails if a referenced value changes.
+Fixed-identity and API-proxy deployments use daemon-held credentials as the
+bypass-prevention invariant. The agent has no usable kubeconfig, API token, or
+direct path to a protected upstream. Fixed-mode local commands receive no
+Guard-managed credentials. Operators keep independent credentials inaccessible
+to the child account. `--exec-as-caller` deliberately uses the authenticated caller's
+filesystem and caller-owned scalar credential authority and therefore provides
+a weaker credential boundary. It does not admit Ansible, Helm, or kubectl
+without an immutable typed profile snapshot. Secret values resolve after
+authorization and remain absent from requests, evaluator input, state, audit,
+and history. Frozen
+holds bind value HMACs under an installation key stored outside SQLite, so
+approval fails if a referenced value changes without making a copied database a
+standalone guessing oracle.
 
 ## Persistence and audit
 

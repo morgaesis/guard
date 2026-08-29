@@ -6,9 +6,11 @@ function calling, and two retries. The files in this directory opt into a
 specific deterministic policy, verb catalog, saved grant, API policy, or model
 fallback configuration.
 
-Load a policy with `guard server start --policy examples/<file>.yaml`, or place
-it at `~/.config/guard/policy.yaml` for automatic discovery. Load an env file
-with your service manager or `set -a; source examples/<file>.env; set +a`.
+Load a policy with
+`guard server start --exec-user guard-exec --policy examples/<file>.yaml`, or
+place it at `~/.config/guard/policy.yaml` for automatic discovery. Load an env
+file with your service manager or
+`set -a; source examples/<file>.env; set +a`.
 
 There are two distinct ways to skip an LLM round-trip. A static
 **deny** pattern fast-rejects before the LLM is called. A **verb** is the only
@@ -30,15 +32,14 @@ regex per parameter, single-argv rendering, no shell), which is what makes
 
 - **[verbs-readonly.yaml](verbs-readonly.yaml)** -- Read-only verb catalog for
   inspection commands. Lets deterministic read-only operations (`whoami`,
-  `hostname`, `ls`, `kubectl get`, ...) skip the LLM entirely, via
+  `hostname`, `ls`, and `systemctl status`) skip the LLM entirely, via
   structurally validated typed verbs rather than command patterns. Appropriate
   for latency-critical observability workflows where the set of safe commands
   is small and enumerable. Not the default; load with `--verbs`.
 
 - **[verbs.yaml](verbs.yaml)** / **[verbs-kubectl.yaml](verbs-kubectl.yaml)**
-  -- General verb-catalog examples covering reversible, recoverable
-  (auto-revert), and irreversible (held-for-approval) operations. Start here
-  for `--gate consequence` deployments.
+  -- Read-only verb-catalog examples. Their kubectl verbs require the active
+  Guard proxy and its generated transport-authenticated kubeconfig.
 
 - **[hybrid-policy.yaml](hybrid-policy.yaml)** -- Deny list + LLM fallback.
   A broad denylist fast-rejects known-bad patterns before any LLM call;
@@ -54,7 +55,8 @@ regex per parameter, single-argv rendering, no shell), which is what makes
 
 - **[api-policy.yaml](api-policy.yaml)** -- Kubernetes API proxy policy.
   First-match-wins rules over typed API operations (verb, resource, namespace,
-  subresource) for `guard server start --kube-proxy`: reads allowed with
+  subresource) for
+  `guard server start --exec-user guard-exec --kube-proxy`: reads allowed with
   Secret values redacted, non-production writes allowed behind the auto-revert
   envelope, deletes held for operator approval. Hot-reloaded; the proxy is
   default-deny without it. Load with `--api-policy`.
@@ -64,9 +66,9 @@ regex per parameter, single-argv rendering, no shell), which is what makes
   GitHub and Vercel example protocols (`--api-proxy` with
   `--api-protocol github|vercel`). Same rule shape as the Kubernetes policy;
   a repository/organization (GitHub) or project (Vercel) plays the namespace
-  role. Reads allowed with secret-bearing values redacted, scoped writes
-  allowed, deletes and side-effect-only operations held. Load with
-  `--api-policy`.
+  role. The default listener admits reads with secret-bearing values redacted.
+  A named endpoint with `mode: policy` also admits scoped writes while holding
+  deletes and side-effect-only operations. Load with `--api-policy`.
 
 - **[system-prompt-append-tools.md](system-prompt-append-tools.md)** --
   Evaluator prompt supplement describing an in-house tool's read and mutation

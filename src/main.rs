@@ -231,7 +231,7 @@ use cli_shim::{handle_shim, ShimOptions};
 #[command(
     name = "guard",
     about = "Evaluator-gated command execution for AI agents",
-    after_help = "Access workflow:\n  Agents run ordinary commands and use `guard access request \"<intent>\"` when authority is missing.\n  Operators use `guard access approve <request>...`, optionally with `--once` or `--uses N`; on a terminal it reviews each request first, and `--yes` skips the review.\n  `guard access list` and `show` inspect principal-bound requests, holds, and sessions without bearer tokens.\n  Operators use `guard access revoke <session-or-agent>` to remove active access authority.\n\nUse `guard access --help` for representative examples or `guard help-tree` for the full command map."
+    after_help = "Access workflow:\n  Agents run ordinary commands and use `guard access request \"<intent>\"` when authority is missing.\n  Operators use `guard access approve <request>...`, optionally with `--once` or `--uses N`; on a terminal it reviews each request first, and `--yes` skips the review.\n  `guard access list` and `show` inspect principal-bound requests, holds, and sessions without bearer tokens.\n  Operators use `guard access revoke <session-or-agent>` to remove active access authority.\n\nEndpoint selection:\n  `--socket PATH` may precede any command that accepts a socket override.\n\nUse `guard access --help` for representative examples or `guard help-tree` for the full command map."
 )]
 #[allow(clippy::large_enum_variant)]
 enum MainArgs {
@@ -264,14 +264,17 @@ enum MainArgs {
         /// Explain the selected verb coverage and decision source on stderr.
         #[arg(long, action = ArgAction::SetTrue)]
         explain: bool,
-        /// Inject an environment variable (KEY=VALUE, repeatable)
+        /// Inject an environment variable for an --exec-as-caller daemon
+        /// (KEY=VALUE, repeatable).
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
-        /// Inject a stored secret. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
+        /// Inject a caller-scoped stored secret through an --exec-as-caller
+        /// daemon. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
         /// Repeat the flag or pass a comma-separated list for multiple secrets.
         #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
-        /// Inject a stored secret through a private file path in ENV_VAR.
+        /// Declare a stored secret-file binding. Local process execution fails
+        /// closed because neither identity mode provides an isolated file boundary.
         #[arg(long = "secret-file", value_name = "ENV_VAR=SECRET", value_parser = parse_env_assignment, value_delimiter = ',')]
         secret_file_vars: Vec<(String, String)>,
         /// Rollback command for a recoverable action under consequence gating,
@@ -348,10 +351,12 @@ enum MainArgs {
         /// Custom shim directory
         #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
-        /// Inject an environment variable (KEY=VALUE, repeatable)
+        /// Configure a non-credential tool environment value, or a caller-scoped
+        /// value for an --exec-as-caller daemon (KEY=VALUE, repeatable).
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
-        /// Inject a secret as an env var (ENV_VAR=secret-name). Repeat or comma-separate.
+        /// Configure a caller-scoped secret for an --exec-as-caller daemon
+        /// (ENV_VAR=secret-name). Repeat or comma-separate.
         #[arg(long = "secret", value_name = "ENV_VAR=SECRET[,ENV_VAR=SECRET]", value_parser = parse_env_assignment, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
         /// Apply env/secret config to a specific user (UID or token name)
@@ -361,6 +366,9 @@ enum MainArgs {
     /// Manage client configuration
     #[clap(subcommand)]
     Config(ConfigCommands),
+    /// Inspect or repair persistent state while the daemon is inactive.
+    #[clap(subcommand, name = "state-db")]
+    StateDb(StateDbCommands),
     /// Removed caller-scoped API credential export.
     #[clap(subcommand, hide = true)]
     Api(ApiCommands),
@@ -425,13 +433,13 @@ enum MainArgs {
         command: Option<ProvisionalCommands>,
     },
     /// Confirm a provisional: keep the change and cancel its auto-revert.
-    /// Daemon-UID only.
+    /// Requires operator authority.
     Confirm {
         handle: String,
         #[arg(long)]
         socket: Option<String>,
     },
-    /// Revert a provisional immediately (manual rollback). Daemon-UID only.
+    /// Revert a provisional immediately (manual rollback). Requires operator authority.
     Revert {
         handle: String,
         #[arg(long)]
@@ -728,6 +736,9 @@ enum VerbCommands {
         /// Parameter assignments (key=value), repeatable.
         #[arg(long = "param", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         params: Vec<(String, String)>,
+        /// Positional assignments are captured only to produce a precise usage error.
+        #[arg(value_name = "KEY=VALUE", hide = true)]
+        misplaced_params: Vec<String>,
         /// Auto-revert window in seconds for a recoverable verb.
         #[arg(long = "confirm-within", value_name = "SECONDS")]
         confirm_within: Option<u64>,
@@ -867,6 +878,22 @@ fn access_usage_error(command: &AccessCommands) -> Option<String> {
     Some(format!(
         "--wait accepts exactly one request reference; received {}",
         requests.len()
+    ))
+}
+
+fn verb_usage_error(command: &VerbCommands) -> Option<String> {
+    let VerbCommands::Run {
+        misplaced_params, ..
+    } = command
+    else {
+        return None;
+    };
+    if misplaced_params.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "verb parameters require `--param key=value`; received unexpected positional argument `{}`",
+        misplaced_params[0]
     ))
 }
 
@@ -1131,6 +1158,11 @@ enum ServerCommands {
         #[arg(long = "exec-as-caller", action = ArgAction::SetTrue)]
         exec_as_caller: bool,
 
+        /// Execute approved commands as this dedicated Unix account. The
+        /// account must differ from the daemon identity. Env: GUARD_EXEC_USER.
+        #[arg(long = "exec-user", value_name = "USER")]
+        exec_user: Option<String>,
+
         /// Wall-clock limit for brokered commands in seconds. Zero is unlimited.
         /// Env: GUARD_EXEC_TIMEOUT_SECS.
         #[arg(long = "exec-timeout-secs", value_name = "SECONDS")]
@@ -1177,12 +1209,12 @@ enum ServerCommands {
         #[arg(long = "allow-bin", value_name = "BIN[,BIN]", value_delimiter = ',')]
         allow_bin: Option<Vec<String>>,
 
-        /// Extra environment variables the daemon forwards from its own
-        /// environment to executed children (beyond the built-in platform
-        /// allowlist). The generic way to broker a tool's credential config
-        /// without per-tool code, e.g. `--child-env KUBECONFIG` so brokered
-        /// kubectl/helm read a config the agent cannot see. Repeat or
-        /// comma-separate. Env: GUARD_CHILD_ENV (comma-separated).
+        /// Extra non-credential environment variables the daemon forwards to
+        /// executed children. Fixed-identity mode rejects credential-authority
+        /// values; KUBECONFIG is accepted only when it exactly matches an active
+        /// Guard proxy's generated transport-authenticated config. Repeat or
+        /// comma-separate.
+        /// Env: GUARD_CHILD_ENV (comma-separated).
         #[arg(long = "child-env", value_name = "VAR[,VAR]", value_delimiter = ',')]
         child_env: Option<Vec<String>>,
 
@@ -1224,6 +1256,14 @@ enum ServerCommands {
         #[arg(long = "api-ca-out", value_name = "PATH")]
         api_ca_out: Option<PathBuf>,
 
+        /// Write a protected generic-client JSON config containing the proxy
+        /// URL, generated CA, and generated transport bearer. Guard requires a
+        /// daemon-owned 0640 file in the fixed worker's private group on Unix.
+        /// API proxying is unsupported on Windows. Env:
+        /// GUARD_API_CLIENT_CONFIG_OUT.
+        #[arg(long = "api-client-config-out", value_name = "PATH")]
+        api_client_config_out: Option<PathBuf>,
+
         /// Front the Kubernetes apiserver with a TLS-terminating proxy on ADDR
         /// (e.g. 127.0.0.1:8443). Each API request from a brokered client (helm,
         /// kubectl, terraform, k9s, client libraries) is gated against
@@ -1234,7 +1274,8 @@ enum ServerCommands {
         kube_proxy: Option<String>,
 
         /// The operator's real kubeconfig the proxy uses upstream. The daemon
-        /// holds these credentials; the brokered config it emits carries none.
+        /// holds these credentials; the brokered config carries only a generated
+        /// proxy transport bearer, never the upstream credential.
         /// Env: GUARD_KUBE_PROXY_KUBECONFIG.
         #[arg(long = "kubeconfig", value_name = "PATH")]
         kubeconfig: Option<PathBuf>,
@@ -1250,7 +1291,9 @@ enum ServerCommands {
         api_policy: Option<PathBuf>,
 
         /// Write the agent-facing brokered kubeconfig here at startup. It points
-        /// at the proxy and carries no credential; agents set KUBECONFIG to it.
+        /// at the proxy and carries a generated transport bearer, so Guard
+        /// requires a daemon-owned 0640 file in the fixed worker's private group
+        /// on Unix. API proxying is unsupported on Windows.
         /// Env: GUARD_BROKERED_KUBECONFIG_OUT.
         #[arg(long = "brokered-kubeconfig-out", value_name = "PATH")]
         brokered_kubeconfig_out: Option<PathBuf>,
@@ -1426,15 +1469,18 @@ enum ServerCommands {
         #[arg(long, value_name = "PORT")]
         tcp_port: Option<u16>,
 
-        /// Inject an environment variable (KEY=VALUE, repeatable)
+        /// Inject an environment variable for an --exec-as-caller daemon
+        /// (KEY=VALUE, repeatable).
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
 
-        /// Inject a stored secret. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
+        /// Inject a caller-scoped stored secret through an --exec-as-caller
+        /// daemon. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
         /// Repeat the flag or pass a comma-separated list for multiple secrets.
         #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
-        /// Inject a stored secret through a private file path in ENV_VAR.
+        /// Declare a stored secret-file binding. Local process execution fails
+        /// closed because neither identity mode provides an isolated file boundary.
         #[arg(long = "secret-file", value_name = "ENV_VAR=SECRET", value_parser = parse_env_assignment, value_delimiter = ',')]
         secret_file_vars: Vec<(String, String)>,
 
@@ -1485,6 +1531,44 @@ enum ConfigCommands {
     },
     /// Clear configuration
     Clear,
+}
+
+#[derive(Subcommand)]
+enum StateDbCommands {
+    /// Validate a state database against this binary's schema and authority rules.
+    Check {
+        /// SQLite state database to inspect.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        /// History retention used while simulating daemon startup.
+        #[arg(long = "history-retention", value_name = "SECONDS", default_value_t = session::DEFAULT_HISTORY_RETENTION_SECS)]
+        history_retention: u64,
+        /// Emit a machine-readable compatibility report.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Retire one grant-request row that this binary rejects.
+    RetireRejectedGrantRequest {
+        /// SQLite state database to repair while its daemon is inactive.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        /// Rejected grant-request key reported by `state-db check`.
+        #[arg(value_name = "HANDLE", value_parser = parse_stored_grant_request_handle)]
+        handle: String,
+        /// Emit a machine-readable retirement result.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+}
+
+fn parse_stored_grant_request_handle(value: &str) -> std::result::Result<String, String> {
+    const MAX_STORED_HANDLE_BYTES: usize = 4_096;
+    if value.is_empty() || value.len() > MAX_STORED_HANDLE_BYTES {
+        return Err(format!(
+            "stored grant-request handle must contain 1 to {MAX_STORED_HANDLE_BYTES} bytes"
+        ));
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Subcommand)]
@@ -1540,7 +1624,7 @@ enum SecretCommands {
     },
     /// List stored secret keys.
     List {
-        /// Include daemon-only ownership/origin detail for migration work.
+        /// Include operator-only ownership and origin detail for migration work.
         #[arg(long, action = ArgAction::SetTrue)]
         detailed: bool,
         /// Emit machine-readable secret metadata. Values are never included.
@@ -1616,7 +1700,18 @@ async fn run_main() -> Result<()> {
         )
         .init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut process_args = std::env::args();
+    let executable = process_args.next().unwrap_or_else(|| "guard".to_string());
+    let raw_args: Vec<String> = process_args.collect();
+    let args = match normalize_root_socket_option(&raw_args) {
+        Ok(args) => args,
+        Err(message) => {
+            let error =
+                MainArgs::command().error(clap::error::ErrorKind::ArgumentConflict, message);
+            log_cli_usage_error(&raw_args, &error);
+            error.exit();
+        }
+    };
 
     // Top-level --version / -V sniff. We cannot scan for --help / -h here
     // because `guard run df -h` must pass `-h` through to `df`. clap handles
@@ -1642,7 +1737,7 @@ async fn run_main() -> Result<()> {
         return print_nested_help(&path, bin_name);
     }
 
-    let result = MainArgs::try_parse();
+    let result = MainArgs::try_parse_from(std::iter::once(executable).chain(args.iter().cloned()));
 
     match result {
         Ok(MainArgs::Run {
@@ -1724,7 +1819,15 @@ async fn run_main() -> Result<()> {
             handle_resume(socket, handle, wait, json).await
         }
         Ok(MainArgs::Approval(subcommand)) => handle_approval(subcommand).await,
-        Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
+        Ok(MainArgs::Verb(subcommand)) => {
+            if let Some(message) = verb_usage_error(&subcommand) {
+                let error =
+                    MainArgs::command().error(clap::error::ErrorKind::ArgumentConflict, message);
+                log_cli_usage_error(&args, &error);
+                error.exit();
+            }
+            handle_verb(subcommand).await
+        }
         Ok(MainArgs::Audit(subcommand)) => match subcommand {
             AuditCommands::Verify { socket, json } => handle_audit_verify(socket, json).await,
             AuditCommands::Tail { n, socket, json } => handle_audit_tail(socket, n, json).await,
@@ -1753,6 +1856,7 @@ async fn run_main() -> Result<()> {
             .await
         }
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
+        Ok(MainArgs::StateDb(subcommand)) => handle_state_db(subcommand).await,
         Ok(MainArgs::Api(subcommand)) => handle_api(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Ok(MainArgs::Access(subcommand)) => {
@@ -1799,6 +1903,114 @@ async fn run_main() -> Result<()> {
     }
 }
 
+async fn handle_state_db(command: StateDbCommands) -> Result<()> {
+    match command {
+        StateDbCommands::Check {
+            file,
+            history_retention,
+            json,
+        } => handle_state_db_check(file, history_retention, json).await,
+        StateDbCommands::RetireRejectedGrantRequest { file, handle, json } => {
+            let reason = session_store::SessionStore::retire_rejected_grant_request(
+                file.clone(),
+                handle.clone(),
+            )
+            .await?;
+            let Some(reason) = reason else {
+                anyhow::bail!(
+                    "grant-request row {handle:?} is absent or accepted by this binary; no row was deleted"
+                );
+            };
+            if json {
+                print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "state_db_grant_request_retirement",
+                    "retired": true,
+                    "handle": handle,
+                    "reason": reason,
+                }))?;
+            } else {
+                cli_println!("Retired rejected grant-request row {handle:?} ({reason:?}).");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn handle_state_db_check(file: PathBuf, history_retention: u64, json: bool) -> Result<()> {
+    if history_retention == 0 {
+        let error = MainArgs::command().error(
+            clap::error::ErrorKind::InvalidValue,
+            "--history-retention must be greater than zero",
+        );
+        error.exit();
+    }
+
+    match session_store::SessionStore::compatibility_check(file.clone(), history_retention).await {
+        Ok(report) => {
+            let compatible = report.compatible;
+            if json {
+                print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "state_db_compatibility",
+                    "compatible": compatible,
+                    "simulated_open": report.simulated_open,
+                    "simulated_startup": report.simulated_startup,
+                    "rejected_rows": report.rejected_rows,
+                }))?;
+            } else if compatible {
+                cli_println!("State database is compatible with this Guard binary.");
+            } else {
+                eprintln!("State database is not compatible with this Guard binary.");
+                if !report.simulated_open {
+                    eprintln!("  simulated daemon startup failed");
+                }
+                if let Some(category) = report.simulated_startup.error_category {
+                    eprintln!("  rejected durable startup category: {}", category.as_str());
+                }
+                for row in &report.rejected_rows {
+                    eprintln!(
+                        "  rejected {} row: {:?} ({}, {})",
+                        row.category.as_str(),
+                        row.handle,
+                        row.reason.as_str(),
+                        row.impact.as_str(),
+                    );
+                }
+            }
+            if !compatible {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if json {
+                print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "state_db_compatibility",
+                    "compatible": false,
+                    "simulated_open": false,
+                    "simulated_startup": {
+                        "succeeded": false,
+                        "error_category": "inspection_failed",
+                    },
+                    "rejected_rows": [],
+                    "error": {
+                        "code": "inspection_failed",
+                        "message": format!("{error:#}"),
+                    },
+                }))?;
+            } else {
+                eprintln!(
+                    "State database compatibility inspection failed for {}: {error:#}",
+                    file.display()
+                );
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Returns true if the user asked for `--version` / `-V` at the top level,
 /// before any subcommand. We scan only the very first positional token so
 /// that `guard run foo -V` does not trigger a top-level version print.
@@ -1807,6 +2019,58 @@ fn top_level_version_requested(args: &[String]) -> bool {
         Some(first) => first == "--version" || first == "-V",
         None => false,
     }
+}
+
+/// Preserve the established subcommand-level endpoint options while accepting
+/// a transport selector before the command. The insertion point comes from the
+/// Clap command model, so new socket-aware commands cannot drift from this
+/// compatibility form. Only a leading selector is moved; child argv stays
+/// opaque.
+fn normalize_root_socket_option(args: &[String]) -> Result<Vec<String>, String> {
+    let Some(first) = args.first() else {
+        return Ok(Vec::new());
+    };
+    let (socket_args, consumed) = if first == "--socket" {
+        let Some(value) = args.get(1) else {
+            return Err("--socket requires a value".to_string());
+        };
+        (vec![first.clone(), value.clone()], 2)
+    } else if first.starts_with("--socket=") {
+        (vec![first.clone()], 1)
+    } else {
+        return Ok(args.to_vec());
+    };
+
+    let mut normalized = args[consumed..].to_vec();
+    if matches!(
+        normalized.first().map(String::as_str),
+        Some("--help" | "-h" | "--version" | "-V")
+    ) {
+        return Ok(normalized);
+    }
+    let command = MainArgs::command();
+    let mut current = &command;
+    let mut insertion_index = None;
+    for (index, token) in normalized.iter().enumerate() {
+        if token == "--" {
+            break;
+        }
+        let Some(subcommand) = find_subcommand(current, token) else {
+            break;
+        };
+        current = subcommand;
+        if current
+            .get_arguments()
+            .any(|argument| argument.get_id() == "socket")
+        {
+            insertion_index = Some(index + 1);
+        }
+    }
+    let Some(insertion_index) = insertion_index else {
+        return Ok(args.to_vec());
+    };
+    normalized.splice(insertion_index..insertion_index, socket_args);
+    Ok(normalized)
 }
 
 // The `run`/`exec` commands disable clap's help flag so that

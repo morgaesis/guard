@@ -2,17 +2,17 @@ use crate::server::admin::handle_admin_request_for_test;
 #[cfg(windows)]
 use crate::server::binary_path_candidates;
 #[cfg(unix)]
-use crate::server::execute::exec_after_approval_with_secret_authority;
+use crate::server::execute::apply_exec_identity;
+#[cfg(unix)]
+use crate::server::execute::exec_after_approval_for_test;
 #[cfg(unix)]
 use crate::server::execute::execute_command_streaming;
 use crate::server::execute::{
     audit_command_line, audit_session_fingerprint, evaluation_context_prompt, execute_command,
-    log_audit_policy_for_request, AnsibleInventoryDiagnostics,
+    log_audit_policy_for_request,
 };
 use crate::server::gate_runtime::binary_allowed;
 use crate::server::transport::emit_audit_events;
-#[cfg(unix)]
-use crate::server::wire::GateStatus;
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
 };
@@ -38,8 +38,6 @@ use guard::gating::GateMode;
 use guard::policy::PolicyMode;
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::ffi::OsString;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -50,39 +48,129 @@ use super::capture_async;
 #[cfg(unix)]
 use super::production_audit_buffer;
 use super::{args, make_test_config, paranoid_test_config};
+#[cfg(unix)]
+use super::{
+    create_trusted_artifact_dir, trusted_artifact_tempdir, write_trusted_artifact, EnvRestore,
+    TEST_ENV_LOCK,
+};
+
+fn generated_credential_value() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+fn generated_provider_credential() -> String {
+    format!("{}-{}", "sk", generated_credential_value())
+}
 
 #[cfg(unix)]
-static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 #[test]
-fn ansible_inventory_diagnostics_only_fail_explicit_unusable_inventory() {
-    let args = vec!["-i".to_string(), "/srv/inventory-a".to_string()];
-    assert!(AnsibleInventoryDiagnostics::for_command("other-tool", &args).is_none());
-    assert!(AnsibleInventoryDiagnostics::for_command("ansible", &[]).is_none());
+fn brokered_process_identity_must_be_configured_and_distinct() {
+    let (mut server, _) = make_test_config();
+    let caller = CallerIdentity::Unix { uid: 1001 };
 
-    let mut no_inventory =
-        AnsibleInventoryDiagnostics::for_command("ansible-playbook", &args).unwrap();
-    no_inventory
-        .observe("[WARNING]: No inventory was parsed, only implicit localhost is available\n");
-    assert!(no_inventory.normalizes_success_to_failure(Some(0)));
-    assert!(!no_inventory.normalizes_success_to_failure(Some(2)));
+    server.config.exec_user_id = None;
+    let mut command = tokio::process::Command::new("true");
+    let missing = apply_exec_identity(&mut command, &server, &caller).unwrap_err();
+    assert!(missing.to_string().contains("dedicated --exec-user"));
 
-    let multiple = vec![
-        "--inventory=/srv/inventory-a".to_string(),
-        "--inventory".to_string(),
-        "/srv/inventory-b".to_string(),
-    ];
-    let mut partial = AnsibleInventoryDiagnostics::for_command("ansible", &multiple).unwrap();
-    partial.observe(
-        "[WARNING]: Unable to parse /srv/inventory-a as an inventory source\nPLAY [all]\n",
-    );
-    assert!(!partial.normalizes_success_to_failure(Some(0)));
-    partial.observe("[WARNING]: Unable to parse /srv/inventory-b as an inventory source\n");
-    assert!(partial.normalizes_success_to_failure(Some(0)));
+    server.config.exec_user_id = Some(server.config.daemon_uid);
+    let mut command = tokio::process::Command::new("true");
+    let shared = apply_exec_identity(&mut command, &server, &caller).unwrap_err();
+    assert!(shared.to_string().contains("must differ"));
+}
 
-    let mut unrelated = AnsibleInventoryDiagnostics::for_command("ansible", &args).unwrap();
-    unrelated.observe("Unable to parse /srv/inventory-a as a configuration source\n");
-    assert!(!unrelated.normalizes_success_to_failure(Some(0)));
+#[cfg(unix)]
+#[tokio::test]
+async fn fixed_identity_refuses_all_per_run_environment_delivery() {
+    let (cfg, _) = make_test_config();
+    let caller = CallerIdentity::Unix { uid: 1000 };
+
+    for source in ["plain", "secret", "secret-file"] {
+        let mut request = basic_request("true", Vec::new());
+        match source {
+            "plain" => {
+                request
+                    .env
+                    .insert("FIXTURE_VALUE".into(), generated_credential_value());
+            }
+            "secret" => {
+                request
+                    .secrets
+                    .insert("FIXTURE_VALUE".into(), "fixture/value".into());
+            }
+            "secret-file" => {
+                request
+                    .secret_files
+                    .insert("FIXTURE_FILE".into(), "fixture/value".into());
+            }
+            _ => unreachable!(),
+        }
+        let mut sink = tokio::io::sink();
+        let result = exec_after_approval_for_test(
+            &mut RequestContext {
+                server: &cfg,
+                caller: &caller,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            request,
+            "fixture allow".into(),
+            None,
+        )
+        .await;
+        match result.exec {
+            ExecOutcome::Failed { reason, started } => {
+                assert!(!started);
+                assert!(reason.contains("shared child UID"), "{source}: {reason}");
+            }
+            other => panic!("{source} injection reached fixed-identity execution: {other:?}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fixed_identity_refuses_persistent_tool_credential_authority() {
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let principal = PrincipalKey::from_uid(1000);
+    let (cfg, _) = make_test_config();
+    cfg.state
+        .secrets
+        .set(&principal, "fixture/value", &generated_credential_value())
+        .await
+        .unwrap();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  true:\n    secrets:\n      FIXTURE_VALUE: fixture/value\n",
+    )
+    .unwrap();
+    *cfg.state.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+    let mut sink = tokio::io::sink();
+
+    let result = exec_after_approval_for_test(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &caller,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        basic_request("true", Vec::new()),
+        "fixture allow".into(),
+        None,
+    )
+    .await;
+
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains("shared child UID"), "{reason}");
+        }
+        other => panic!("tool credential reached fixed-identity execution: {other:?}"),
+    }
 }
 
 #[cfg(unix)]
@@ -104,32 +192,6 @@ fn unrestricted_session() -> SessionGrant {
         owner: crate::session::SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(
             1000,
         )),
-    }
-}
-
-#[cfg(unix)]
-struct EnvRestore {
-    key: &'static str,
-    value: Option<OsString>,
-}
-
-#[cfg(unix)]
-impl EnvRestore {
-    fn capture(key: &'static str) -> Self {
-        Self {
-            key,
-            value: std::env::var_os(key),
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        match &self.value {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
     }
 }
 
@@ -197,7 +259,8 @@ async fn cwd_is_included_in_audit_and_evaluation_context() {
     let cwd = std::env::current_dir().unwrap();
     let mut req = basic_request("pwd", Vec::new());
     req.cwd = Some(cwd.clone());
-    req.session_token = Some("session-token-that-must-not-appear".into());
+    let session_token = generated_credential_value();
+    req.session_token = Some(session_token.clone());
 
     let prompt = evaluation_context_prompt(&req, Some("SESSION CONTEXT".to_string()))
         .expect("cwd/session prompt");
@@ -232,20 +295,21 @@ async fn cwd_is_included_in_audit_and_evaluation_context() {
         )),
         "logs={logs}"
     );
-    assert!(!logs.contains("session-token-that-must-not-appear"));
+    assert!(!logs.contains(&session_token));
 }
 
 #[test]
 fn caller_environment_is_sorted_redacted_and_cache_partitioned() {
+    let first_value = generated_provider_credential();
+    let second_value = generated_provider_credential();
     let mut first = basic_request("ansible-playbook", vec!["site.yml".to_string()]);
     first.env.insert(
         "ANSIBLE_CONFIG".to_string(),
         "/srv/automation/ansible.cfg".to_string(),
     );
-    first.env.insert(
-        "DEPLOY_TOKEN".to_string(),
-        "sk-live-first-1234567890".to_string(),
-    );
+    first
+        .env
+        .insert("DEPLOY_TOKEN".to_string(), first_value.clone());
     first.secrets.insert(
         "VAULT_PASSWORD".to_string(),
         "ansible/vault-password".to_string(),
@@ -259,18 +323,17 @@ fn caller_environment_is_sorted_redacted_and_cache_partitioned() {
     assert!(first_prompt.contains("ansible/vault-password"));
     assert!(first_prompt.contains("clusters/dev/kubeconfig"));
     assert!(first_prompt.contains("sha256"));
-    assert!(!first_prompt.contains("sk-live-first-1234567890"));
+    assert!(!first_prompt.contains(&first_value));
     let model_subject = guard::evaluate::redact_for_llm(&first_prompt);
     assert!(model_subject.contains("ansible/vault-password"));
     assert!(model_subject.contains("clusters/dev/kubeconfig"));
 
     let mut second = first.clone();
-    second.env.insert(
-        "DEPLOY_TOKEN".to_string(),
-        "sk-live-second-0987654321".to_string(),
-    );
+    second
+        .env
+        .insert("DEPLOY_TOKEN".to_string(), second_value.clone());
     let second_prompt = evaluation_context_prompt(&second, None).unwrap();
-    assert!(!second_prompt.contains("sk-live-second-0987654321"));
+    assert!(!second_prompt.contains(&second_value));
     assert_ne!(
         first_prompt, second_prompt,
         "different raw values must partition evaluator cache keys even when both redact"
@@ -312,10 +375,12 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
     let _test_lock = TEST_ENV_LOCK.lock().await;
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
-    let token = "opaque-session-token-never-logged";
+    let token = generated_credential_value();
+    let delivered_value = generated_credential_value();
 
     let audit = production_audit_buffer();
-    let (cfg, _) = make_test_config();
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
     cfg.state
         .sessions
         .write()
@@ -323,21 +388,17 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
         .grant(token.to_string(), unrestricted_session());
     cfg.state
         .secrets
-        .set(
-            &principal,
-            "test/secret-exposure-success",
-            "secret-value-never-logged",
-        )
+        .set(&principal, "test/secret-exposure-success", &delivered_value)
         .await
         .unwrap();
     let mut request = basic_request("/bin/true", Vec::new());
-    request.session_token = Some(token.into());
-    request.secret_files.insert(
-        "SERVICE_TOKEN_FILE".into(),
+    request.session_token = Some(token.clone());
+    request.secrets.insert(
+        "SERVICE_TOKEN".into(),
         "test/secret-exposure-success".into(),
     );
     let mut sink = tokio::io::sink();
-    let result = exec_after_approval_with_secret_authority(
+    let result = exec_after_approval_for_test(
         &mut RequestContext {
             server: &cfg,
             caller: &caller,
@@ -366,13 +427,15 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
         "logs={logs}"
     );
     assert!(
-        logs.contains(&audit_session_fingerprint(Some(token))),
+        logs.contains(&audit_session_fingerprint(Some(&token))),
         "logs={logs}"
     );
-    assert!(!logs.contains(token));
-    assert!(!logs.contains("secret-value-never-logged"));
+    assert!(!logs.contains(&token));
+    assert!(!logs.contains(&delivered_value));
 
-    let (cfg, _) = make_test_config();
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
+    let failed_spawn_value = generated_credential_value();
     cfg.state
         .sessions
         .write()
@@ -383,18 +446,18 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
         .set(
             &principal,
             "test/secret-exposure-failed-spawn",
-            "another-secret-value",
+            &failed_spawn_value,
         )
         .await
         .unwrap();
     let mut request = basic_request("guard-command-that-does-not-exist", Vec::new());
-    request.session_token = Some(token.into());
+    request.session_token = Some(token.clone());
     request.secrets.insert(
         "SERVICE_TOKEN".into(),
         "test/secret-exposure-failed-spawn".into(),
     );
     let mut sink = tokio::io::sink();
-    let result = exec_after_approval_with_secret_authority(
+    let result = exec_after_approval_for_test(
         &mut RequestContext {
             server: &cfg,
             caller: &caller,
@@ -420,7 +483,8 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
 async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
-    let (cfg, _) = make_test_config();
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
     cfg.state
         .secrets
         .set(&principal, "broker/token", "never-printed")
@@ -462,7 +526,7 @@ async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
     let mut request = basic_request("true", Vec::new());
     request.session_token = Some("tool-secret-session".to_string());
     let mut sink = tokio::io::sink();
-    let result = exec_after_approval_with_secret_authority(
+    let result = exec_after_approval_for_test(
         &mut RequestContext {
             server: &cfg,
             caller: &caller,
@@ -602,14 +666,19 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
     let _test_lock = TEST_ENV_LOCK.lock().await;
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
-    let (cfg, buf) = make_test_config();
-    cfg.state.sessions.write().await.grant(
-        "streaming-session-token-never-logged".to_string(),
-        unrestricted_session(),
-    );
+    let (mut cfg, buf) = make_test_config();
+    cfg.config.exec_as_caller = true;
+    let session_token = generated_credential_value();
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant(session_token.clone(), unrestricted_session());
+    let primary_value = generated_credential_value();
+    let secondary_value = generated_credential_value();
     for (name, value) in [
-        ("service/primary", "primary-value-never-logged"),
-        ("service/secondary", "secondary-value-never-logged"),
+        ("service/primary", primary_value.as_str()),
+        ("service/secondary", secondary_value.as_str()),
     ] {
         cfg.state
             .secrets
@@ -619,7 +688,7 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
     }
 
     let mut request = basic_request("/bin/false", Vec::new());
-    request.session_token = Some("streaming-session-token-never-logged".into());
+    request.session_token = Some(session_token.clone());
     request
         .secrets
         .insert("PRIMARY_TOKEN".into(), "service/primary".into());
@@ -629,7 +698,7 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
     let mut sink = tokio::io::sink();
     let (result, logs) = capture_async(
         &buf,
-        exec_after_approval_with_secret_authority(
+        exec_after_approval_for_test(
             &mut RequestContext {
                 server: &cfg,
                 caller: &caller,
@@ -659,68 +728,9 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
         "logs={logs}"
     );
     assert_eq!(logs.matches("secret=").count(), 2, "logs={logs}");
-    assert!(!logs.contains("streaming-session-token-never-logged"));
-    assert!(!logs.contains("primary-value-never-logged"));
-    assert!(!logs.contains("secondary-value-never-logged"));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn ansible_unusable_inventory_normalizes_success_for_buffered_and_streaming_execution() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let directory = tempfile::tempdir().unwrap();
-    let executable = directory.path().join("ansible-playbook");
-    std::fs::write(
-        &executable,
-        "#!/bin/sh\nprintf '%s\\n' '[WARNING]: Unable to parse /srv/inventory as an inventory source' >&2\nexit 0\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-    let caller = CallerIdentity::Unix { uid: 1000 };
-    let (cfg, _) = make_test_config();
-    for stream_output in [false, true] {
-        let request = basic_request(
-            executable.to_str().unwrap(),
-            vec![
-                "-i".to_string(),
-                "/srv/inventory".to_string(),
-                "/srv/playbook.yaml".to_string(),
-            ],
-        );
-        let mut stream = Vec::new();
-        let result = exec_after_approval_with_secret_authority(
-            &mut RequestContext {
-                server: &cfg,
-                caller: &caller,
-                depth: 0,
-                stream_output,
-                stream_writer: &mut stream,
-            },
-            request,
-            "test allow".to_string(),
-            None,
-        )
-        .await;
-
-        assert_eq!(result.exit_code(), Some(1));
-        if stream_output {
-            assert!(
-                String::from_utf8_lossy(&stream).contains("treating exit 0 as failure"),
-                "stream={}",
-                String::from_utf8_lossy(&stream)
-            );
-        } else {
-            match result.exec {
-                ExecOutcome::Completed {
-                    stderr: Some(stderr),
-                    ..
-                } => assert!(stderr.contains("treating exit 0 as failure")),
-                other => panic!("unexpected result: {other:?}"),
-            }
-        }
-    }
+    assert!(!logs.contains(&session_token));
+    assert!(!logs.contains(&primary_value));
+    assert!(!logs.contains(&secondary_value));
 }
 
 // ---- ExecuteResult result-shape tests -----------------------------------
@@ -734,14 +744,14 @@ fn binary_exists_on_path_rejects_natural_language_token() {
 
 #[cfg(windows)]
 #[test]
-fn binary_path_candidates_include_windows_pathext() {
+fn binary_path_candidates_add_only_native_windows_executable_suffix() {
     let candidates = binary_path_candidates(std::path::Path::new("C:\\Tools"), "ssh");
-    assert!(candidates.iter().any(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.eq_ignore_ascii_case("ssh.exe"))
-            .unwrap_or(false)
-    }));
+    let file_names = candidates
+        .iter()
+        .filter_map(|path| path.file_name()?.to_str())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    assert_eq!(file_names, ["ssh", "ssh.exe"]);
 }
 
 #[test]
@@ -910,6 +920,7 @@ fn binary_allowlist_matches_bare_name_case_insensitively() {
     assert!(binary_allowed(&allow, "kubectl"));
     assert!(binary_allowed(&allow, "KUBECTL"));
     assert!(binary_allowed(&allow, "kubectl.exe"));
+    assert!(binary_allowed(&allow, "Kubectl.ExE"));
     assert!(binary_allowed(&allow, "git"));
     assert!(!binary_allowed(&allow, "helm"));
 }
@@ -1052,7 +1063,8 @@ async fn injection_refuses_non_local_tcp_caller() {
 
 #[tokio::test]
 async fn missing_requested_secret_denies_before_policy_evaluation() {
-    let (cfg, _) = make_test_config();
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
     let request = ExecuteRequest {
         binary: "echo".to_string(),
         args: vec!["$NONEXISTING_SEC".to_string()],
@@ -1237,9 +1249,9 @@ async fn run_policy_llm_once(
 #[tokio::test]
 async fn evaluator_rationale_cannot_reach_policy_audit_or_stream() {
     let _env_guard = TEST_ENV_LOCK.lock().await;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = trusted_artifact_tempdir();
     let bin_dir = temp.path().join("bin");
-    std::fs::create_dir(&bin_dir).unwrap();
+    create_trusted_artifact_dir(&bin_dir);
     for binary in ["curl", "mysqlsh"] {
         let path = bin_dir.join(binary);
         std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
@@ -1277,7 +1289,7 @@ async fn evaluator_rationale_cannot_reach_policy_audit_or_stream() {
             Evaluator::new(
                 EvalConfig::default()
                     .cache_enabled(false)
-                    .llm_api_key("test-key".to_string())
+                    .llm_api_key(generated_provider_credential())
                     .llm_api_url(url)
                     .llm_retries(0),
             )
@@ -1344,6 +1356,7 @@ fn process_state(pid: i32) -> Option<char> {
 #[tokio::test]
 async fn buffered_exec_timeout_kills_the_process_group_and_is_audited() {
     let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
     cfg.config.exec_timeout_secs = 1;
     let (_audit_dir, audit) = attach_test_audit_log(&mut cfg);
     let caller = CallerIdentity::Unix { uid: 1000 };
@@ -1360,7 +1373,7 @@ async fn buffered_exec_timeout_kills_the_process_group_and_is_audited() {
         ],
     );
     let mut sink = tokio::io::sink();
-    let result = exec_after_approval_with_secret_authority(
+    let result = exec_after_approval_for_test(
         &mut RequestContext {
             server: &cfg,
             caller: &caller,
@@ -1405,11 +1418,12 @@ async fn buffered_exec_timeout_kills_the_process_group_and_is_audited() {
 #[tokio::test]
 async fn streaming_exec_timeout_does_not_reset_on_keepalive() {
     let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
     cfg.config.exec_timeout_secs = 1;
     let caller = CallerIdentity::Unix { uid: 1000 };
     let mut stream = Vec::new();
     let request = basic_request("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
-    let result = exec_after_approval_with_secret_authority(
+    let result = exec_after_approval_for_test(
         &mut RequestContext {
             server: &cfg,
             caller: &caller,
@@ -1439,6 +1453,18 @@ async fn streaming_exec_timeout_does_not_reset_on_keepalive() {
 #[cfg(unix)]
 #[tokio::test]
 async fn verb_exec_timeout_overrides_the_daemon_default() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _environment_guard = TEST_ENV_LOCK.lock().await;
+    let _path_restore = EnvRestore::capture("PATH");
+    let executable_directory = trusted_artifact_tempdir();
+    let executable = executable_directory.path().join("printf");
+    std::fs::write(&executable, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::env::set_var(
+        "PATH",
+        format!("{}:/usr/bin:/bin", executable_directory.path().display()),
+    );
     let (mut cfg, _) = make_test_config();
     cfg.config.gate = GateMode::Consequence;
     cfg.config.exec_timeout_secs = 30;
@@ -1446,8 +1472,7 @@ async fn verb_exec_timeout_overrides_the_daemon_default() {
         r#"
 verbs:
   - name: bounded-sleep
-    binary: sh
-    args: ["-c", "sleep 30"]
+    binary: printf
     consequence: reversible
     trusted: true
     exec_timeout_secs: 1
@@ -1478,15 +1503,15 @@ verbs:
 
 #[cfg(unix)]
 #[tokio::test]
-async fn approved_ansible_evaluate_verbs_bypass_denial_without_filing_another_request() {
+async fn approved_ansible_evaluate_verbs_cannot_bypass_profile_isolation() {
     let _env_guard = TEST_ENV_LOCK.lock().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(run_denying_llm(listener));
 
-    let temp = tempfile::tempdir().unwrap();
+    let temp = trusted_artifact_tempdir();
     let bin_dir = temp.path().join("bin");
-    std::fs::create_dir(&bin_dir).unwrap();
+    create_trusted_artifact_dir(&bin_dir);
     let ansible = bin_dir.join("ansible-playbook");
     std::fs::write(&ansible, "#!/bin/sh\nprintf 'ansible-fixture:%s' \"$*\"\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -1496,43 +1521,33 @@ async fn approved_ansible_evaluate_verbs_bypass_denial_without_filing_another_re
     let _path_restore = EnvRestore::capture("PATH");
     std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
 
+    let authority = trusted_artifact_tempdir();
+    let site = authority.path().join("site.yml");
+    let inventory = authority.path().join("inventory");
+    write_trusted_artifact(&site, "---\n");
+    write_trusted_artifact(&inventory, "localhost\n");
+    let site = site.to_string_lossy().into_owned();
+    let inventory = inventory.to_string_lossy().into_owned();
+    let catalog = format!(
+        "verbs:\n  - name: validate-atlas-playbook\n    binary: ansible-playbook\n    args: [\"--syntax-check\", {}]\n    baseline: false\n    consequence: reversible\n    coverage:\n      - name: syntax-check\n        action: evaluate\n        required_args: [\"--syntax-check\", {}]\n  - name: run-atlas-playbook-check-diff\n    binary: ansible-playbook\n    args: [\"-i\", {}, {}, \"--limit\", \"group-a\", \"--check\", \"--diff\"]\n    baseline: false\n    consequence: reversible\n    coverage:\n      - name: check-diff\n        action: evaluate\n        required_args: [\"--check\", \"--diff\"]\n",
+        serde_json::to_string(&site).unwrap(),
+        serde_json::to_string(&site).unwrap(),
+        serde_json::to_string(&inventory).unwrap(),
+        serde_json::to_string(&site).unwrap(),
+    );
+
     let (mut cfg, _) = make_test_config();
     cfg.config.gate = GateMode::Consequence;
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
         .unwrap(),
     );
-    cfg.state.verbs = Arc::new(RwLock::new(
-        VerbCatalog::from_yaml(
-            r#"
-verbs:
-  - name: validate-atlas-playbook
-    binary: ansible-playbook
-    args: ["--syntax-check", "/srv/automation/site.yml"]
-    baseline: false
-    consequence: reversible
-    coverage:
-      - name: syntax-check
-        action: evaluate
-        required_args: ["--syntax-check", "/srv/automation/site.yml"]
-  - name: run-atlas-playbook-check-diff
-    binary: ansible-playbook
-    args: ["-i", "/srv/automation/inventory", "/srv/automation/site.yml", "--limit", "group-a", "--check", "--diff"]
-    baseline: false
-    consequence: reversible
-    coverage:
-      - name: check-diff
-        action: evaluate
-        required_args: ["--check", "--diff"]
-"#,
-        )
-        .unwrap(),
-    ));
+    cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(&catalog).unwrap()));
 
     let mut grant = unrestricted_session();
     grant.activated_verbs = vec![
@@ -1557,14 +1572,11 @@ verbs:
     drop(sessions);
 
     for args in [
-        vec![
-            "--syntax-check".to_string(),
-            "/srv/automation/site.yml".to_string(),
-        ],
+        vec!["--syntax-check".to_string(), site.clone()],
         vec![
             "-i".to_string(),
-            "/srv/automation/inventory".to_string(),
-            "/srv/automation/site.yml".to_string(),
+            inventory.clone(),
+            site.clone(),
             "--limit".to_string(),
             "group-a".to_string(),
             "--check".to_string(),
@@ -1576,11 +1588,12 @@ verbs:
         let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
             .await
             .into_response();
+        assert!(!response.allowed, "mutable profile executed: {response:?}");
         assert!(
-            response.allowed,
-            "approved Evaluate verb reached the denying evaluator: {response:?}"
+            response.reason.contains("immutable profile snapshots"),
+            "unexpected denial: {response:?}"
         );
-        assert_eq!(response.exit_code, Some(0));
+        assert_eq!(response.exit_code, None);
     }
 
     assert_eq!(
@@ -1666,7 +1679,7 @@ async fn run_gated_allowing_llm(listener: tokio::net::TcpListener) {
 fn install_ansible_playbook_shim(temp: &tempfile::TempDir) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let bin_dir = temp.path().join("bin");
-    std::fs::create_dir(&bin_dir).unwrap();
+    create_trusted_artifact_dir(&bin_dir);
     let shim = bin_dir.join("ansible-playbook");
     std::fs::write(&shim, "#!/bin/sh\nexit 0\n").unwrap();
     let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
@@ -1677,13 +1690,13 @@ fn install_ansible_playbook_shim(temp: &tempfile::TempDir) -> std::path::PathBuf
 
 #[cfg(unix)]
 #[tokio::test]
-async fn safe_mode_llm_allow_on_opaque_carrier_is_clamped_to_hold() {
+async fn safe_mode_llm_allow_on_opaque_carrier_fails_closed_without_typed_authority() {
     let _env_guard = TEST_ENV_LOCK.lock().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(run_gated_allowing_llm(listener));
 
-    let temp = tempfile::tempdir().unwrap();
+    let temp = trusted_artifact_tempdir();
     let bin_dir = install_ansible_playbook_shim(&temp);
     let _path_restore = EnvRestore::capture("PATH");
     std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
@@ -1696,7 +1709,7 @@ async fn safe_mode_llm_allow_on_opaque_carrier_is_clamped_to_hold() {
                 .mode(PolicyMode::Safe)
                 .gate_mode(GateMode::Consequence)
                 .cache_enabled(false)
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -1708,91 +1721,102 @@ async fn safe_mode_llm_allow_on_opaque_carrier_is_clamped_to_hold() {
         .await
         .into_response();
     assert!(
-        response.allowed,
-        "the clamp holds an approved command; it is not a denial: {response:?}"
+        !response.allowed,
+        "raw carrier authority must fail closed: {response:?}"
     );
-    assert_eq!(
-        response.status,
-        Some(GateStatus::Held),
-        "a model-only allow of an opaque carrier must hold, not execute: {response:?}"
-    );
+    assert_eq!(response.status, None);
     assert_eq!(response.exit_code, None, "a held command never executed");
     assert!(
-        response.reason.contains("opaque-carrier floor"),
-        "the hold reason must name the carrier boundary: {}",
+        response
+            .reason
+            .contains("Raw approval cannot bind executable authority"),
+        "the denial must explain why approval is unavailable: {}",
         response.reason
     );
-    assert!(response.handle.is_some());
+    assert!(response.reason.contains("exact working-directory binding"));
+    assert!(response.handle.is_none());
+    assert!(response.approval_options.is_empty());
+    assert!(response.access_requests.is_empty());
+    assert_eq!(response.decision_source, "validation");
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn typed_verb_authorized_opaque_carrier_is_not_clamped() {
+async fn exact_cwd_cannot_bypass_profile_isolation() {
     let _env_guard = TEST_ENV_LOCK.lock().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(run_gated_allowing_llm(listener));
-
-    let temp = tempfile::tempdir().unwrap();
+    let temp = trusted_artifact_tempdir();
     let bin_dir = install_ansible_playbook_shim(&temp);
     let _path_restore = EnvRestore::capture("PATH");
     std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
 
-    let (mut cfg, _) = make_test_config();
-    cfg.config.gate = GateMode::Consequence;
-    cfg.state.evaluator = Arc::new(
-        Evaluator::new(
-            EvalConfig::default()
-                .mode(PolicyMode::Safe)
-                .gate_mode(GateMode::Consequence)
-                .cache_enabled(false)
-                .llm_api_key("test-key".to_string())
-                .llm_api_url(url)
-                .llm_retries(0),
-        )
-        .unwrap(),
-    );
-    cfg.state.verbs = Arc::new(RwLock::new(
-        VerbCatalog::from_yaml(
-            r#"
-verbs:
-  - name: validate-approved-playbook
-    binary: ansible-playbook
-    args: ["--syntax-check", "/srv/automation/site.yml"]
-    consequence: reversible
-    coverage:
-      - name: syntax-check
-        action: evaluate
-        required_args: ["--syntax-check", "/srv/automation/site.yml"]
-"#,
-        )
-        .unwrap(),
-    ));
+    let authority = trusted_artifact_tempdir();
+    let site = authority.path().join("site.yml");
+    write_trusted_artifact(&site, "---\n");
+    let site = site.to_string_lossy().into_owned();
+    let cwd = authority.path().canonicalize().unwrap();
 
-    let request = basic_request(
-        "ansible-playbook",
-        vec![
-            "--syntax-check".to_string(),
-            "/srv/automation/site.yml".to_string(),
-        ],
-    );
-    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
-        .await
-        .into_response();
-    assert!(
-        response.allowed,
-        "typed verb coverage expresses the trust the floor demands: {response:?}"
-    );
-    assert_eq!(
-        response.status, None,
-        "an operator-authored typed verb bypasses the carrier floor: {response:?}"
-    );
-    assert_eq!(response.exit_code, Some(0));
+    for exact_cwd in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(run_gated_allowing_llm(listener));
+        let cwd_clause = if exact_cwd {
+            format!("        cwd: {}\n", serde_json::to_string(&cwd).unwrap())
+        } else {
+            String::new()
+        };
+        let catalog = format!(
+            "verbs:\n  - name: validate-approved-playbook\n    binary: ansible-playbook\n    args: [\"--syntax-check\", {}]\n    consequence: reversible\n    coverage:\n      - name: syntax-check\n        action: evaluate\n{cwd_clause}        required_args: [\"--syntax-check\", {}]\n",
+            serde_json::to_string(&site).unwrap(),
+            serde_json::to_string(&site).unwrap(),
+        );
+
+        let (mut cfg, _) = make_test_config();
+        cfg.config.gate = GateMode::Consequence;
+        cfg.state.evaluator = Arc::new(
+            Evaluator::new(
+                EvalConfig::default()
+                    .mode(PolicyMode::Safe)
+                    .gate_mode(GateMode::Consequence)
+                    .cache_enabled(false)
+                    .llm_api_key(generated_provider_credential())
+                    .llm_api_url(url)
+                    .llm_retries(0),
+            )
+            .unwrap(),
+        );
+        cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(&catalog).unwrap()));
+
+        let mut request = basic_request(
+            "ansible-playbook",
+            vec!["--syntax-check".to_string(), site.clone()],
+        );
+        request.cwd = Some(cwd.clone());
+        let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
+            .await
+            .into_response();
+        if exact_cwd {
+            assert!(
+                !response.allowed,
+                "exact cwd must not make a mutable profile safe: {response:?}"
+            );
+            assert_eq!(response.status, None);
+            assert_eq!(response.exit_code, None);
+            assert!(response.reason.contains("immutable profile snapshots"));
+        } else {
+            assert!(
+                !response.allowed,
+                "unbound cwd authority must fail: {response:?}"
+            );
+            assert!(response.reason.contains("exact working-directory binding"));
+            assert_eq!(response.decision_source, "validation");
+        }
+    }
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn trusted_ceph_style_verb_with_exact_dimensions_never_reaches_evaluator() {
+    let _environment_lock = TEST_ENV_LOCK.lock().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(run_denying_llm(listener));
@@ -1826,7 +1850,7 @@ async fn trusted_ceph_style_verb_with_exact_dimensions_never_reaches_evaluator()
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0)
                 .deny_shapes(Arc::new(RwLock::new(deny_store))),
@@ -1867,10 +1891,10 @@ verbs:
             .await
             .into_response();
         assert!(
-            response.allowed,
-            "exact trusted dimensions fell through to evaluator: {response:?}"
+            !response.allowed,
+            "fixed identity must reject: {response:?}"
         );
-        assert_eq!(response.exit_code, Some(0));
+        assert!(response.reason.contains("shared child UID"));
         assert_eq!(response.verb_matches.len(), 1);
         assert_eq!(
             response.verb_matches[0].action,
@@ -1900,7 +1924,7 @@ async fn repeated_llm_denials_append_count_hint_at_threshold_only() {
     let evaluator = Evaluator::new(
         EvalConfig::default()
             .cache_enabled(false)
-            .llm_api_key("test-key".to_string())
+            .llm_api_key(generated_provider_credential())
             .llm_api_url(url)
             .llm_retries(0)
             .deny_shapes(Arc::new(RwLock::new(deny_store))),
@@ -1928,8 +1952,8 @@ async fn repeated_llm_denials_append_count_hint_at_threshold_only() {
     .await;
     let reason = second.policy_reason();
     assert!(reason.contains("destructive request"));
-    assert!(reason.contains("guard has denied 2 similar echo commands; if this access is needed, use the escalation handle to request a saved-grant or verb amendment"));
-    for forbidden in ["promoted", "learned", "fast path"] {
+    assert!(reason.contains("this denial came from evaluator judgment; no learned deny shape decided this command. Guard has recorded 2 similar echo denials; if this access is needed, use the escalation handle to request a saved-grant or verb amendment"));
+    for forbidden in ["promoted", "fast path"] {
         assert!(
             !reason.to_ascii_lowercase().contains(forbidden),
             "client-facing denial reason exposed {forbidden}: {reason}"
@@ -2032,6 +2056,11 @@ async fn deterministic_safe_allow_uses_no_evaluator_admission() {
     let AdminResponse::Status { status } = status else {
         panic!("expected status response");
     };
+    assert_eq!(
+        status.exec_identity,
+        format!("fixed_uid:{}", cfg.config.exec_user_id.unwrap())
+    );
+    assert_ne!(status.exec_identity, "daemon");
     assert_eq!(status.command_admission.handler_admitted, 1);
     assert_eq!(status.command_admission.evaluator_attempted, 0);
 }
@@ -2467,6 +2496,7 @@ async fn secret_list_is_per_user_namespaced() {
 async fn exec_secret_injection_is_isolated_per_uid() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
+    cfg.config.exec_as_caller = true;
     let key = format!("EXEC_ISO_{}", std::process::id());
 
     // user_a stores THE secret.
@@ -2518,6 +2548,7 @@ async fn exec_secret_injection_is_isolated_per_uid() {
 #[tokio::test]
 async fn extra_child_env_forwards_named_var_to_child() {
     let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
     // The daemon forwards GUARD_CHILD_TEST_PT to children only because it is
     // listed in extra_child_env; the value comes from the daemon's own env.
     std::env::set_var("GUARD_CHILD_TEST_PT", "brokered-value-xyz");
@@ -2525,11 +2556,8 @@ async fn extra_child_env_forwards_named_var_to_child() {
 
     #[cfg(unix)]
     let (bin, args) = (
-        "sh".to_string(),
-        vec![
-            "-c".to_string(),
-            "printf %s \"$GUARD_CHILD_TEST_PT\"".to_string(),
-        ],
+        "printenv".to_string(),
+        vec!["GUARD_CHILD_TEST_PT".to_string()],
     );
     #[cfg(windows)]
     let (bin, args) = (
@@ -2600,10 +2628,10 @@ async fn extra_child_env_forwards_named_var_to_child() {
 async fn local_caller_cwd_is_canonicalized_and_used_for_execution() {
     let _env_guard = TEST_ENV_LOCK.lock().await;
     let (cfg, _) = make_test_config();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = trusted_artifact_tempdir();
     let real = temp.path().join("real");
     let link = temp.path().join("link");
-    std::fs::create_dir(&real).unwrap();
+    create_trusted_artifact_dir(&real);
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let token = format!("cwd-session-{}", std::process::id());
     cfg.state.sessions.write().await.grant(
@@ -2637,14 +2665,63 @@ async fn local_caller_cwd_is_canonicalized_and_used_for_execution() {
     req.cwd = Some(link);
 
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
-    match result.exec {
+    match &result.exec {
         ExecOutcome::Completed { stdout, .. } => {
             assert_eq!(
                 stdout.as_deref().map(str::trim),
                 Some(real.to_str().unwrap())
             );
         }
-        other => panic!("expected cwd-backed execution, got {:?}", other),
+        other => panic!(
+            "expected cwd-backed execution, got {:?}: {}",
+            other,
+            result.policy_reason()
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn omitted_cwd_uses_the_explicit_safe_root() {
+    let (cfg, _) = make_test_config();
+    let token = format!("default-cwd-session-{}", std::process::id());
+    cfg.state.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: vec![SessionExactRule::new("pwd", Vec::new())],
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
+        },
+    );
+
+    let mut request = basic_request("pwd", Vec::new());
+    request.session_token = Some(token);
+    assert!(request.cwd.is_none());
+
+    let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match &result.exec {
+        ExecOutcome::Completed {
+            exit_code: Some(0),
+            stdout,
+            ..
+        } => assert_eq!(stdout.as_deref().map(str::trim), Some("/")),
+        other => panic!(
+            "expected execution from the safe root, got {other:?}: {}",
+            result.policy_reason()
+        ),
     }
 }
 
@@ -2659,7 +2736,7 @@ async fn default_service_execution_does_not_forward_ssh_auth_sock() {
     cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
-            allow: vec!["sh *".into()],
+            allow: vec!["printenv *".into()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
@@ -2678,19 +2755,16 @@ async fn default_service_execution_does_not_forward_ssh_auth_sock() {
         },
     );
 
-    let mut req = basic_request(
-        "sh",
-        vec![
-            "-c".to_string(),
-            "test -z \"${SSH_AUTH_SOCK:-}\" && printf clean".to_string(),
-        ],
-    );
+    let mut req = basic_request("printenv", vec!["SSH_AUTH_SOCK".to_string()]);
     req.session_token = Some(token);
 
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
     match result.exec {
-        ExecOutcome::Completed { stdout, .. } => {
-            assert_eq!(stdout.as_deref(), Some("clean"));
+        ExecOutcome::Completed {
+            exit_code, stdout, ..
+        } => {
+            assert_eq!(exit_code, Some(1));
+            assert_eq!(stdout, None);
         }
         other => panic!("expected child without SSH_AUTH_SOCK, got {:?}", other),
     }
@@ -2742,14 +2816,14 @@ async fn caller_env_cannot_supply_ssh_auth_sock() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn guard_configured_ssh_auth_sock_is_forwarded_to_child() {
+async fn fixed_identity_refuses_guard_configured_ssh_auth_sock() {
     let (cfg, _) = make_test_config();
     let _restore = EnvRestore::capture("SSH_AUTH_SOCK");
     std::env::set_var("SSH_AUTH_SOCK", "/tmp/caller-agent.sock");
     let tools = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         tools.path(),
-        "tools:\n  sh:\n    env:\n      SSH_AUTH_SOCK: /run/guard/broker-agent.sock\n",
+        "tools:\n  printenv:\n    env:\n      SSH_AUTH_SOCK: /run/guard/broker-agent.sock\n",
     )
     .unwrap();
     *cfg.state.tool_registry.write().await =
@@ -2759,7 +2833,7 @@ async fn guard_configured_ssh_auth_sock_is_forwarded_to_child() {
     cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
-            allow: vec!["sh *".into()],
+            allow: vec!["printenv *".into()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
@@ -2778,35 +2852,28 @@ async fn guard_configured_ssh_auth_sock_is_forwarded_to_child() {
         },
     );
 
-    let mut req = basic_request(
-        "sh",
-        vec![
-            "-c".to_string(),
-            "printf '%s' \"$SSH_AUTH_SOCK\"".to_string(),
-        ],
-    );
+    let mut req = basic_request("printenv", vec!["SSH_AUTH_SOCK".to_string()]);
     req.session_token = Some(token);
 
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
-    match result.exec {
-        ExecOutcome::Completed { stdout, .. } => {
-            assert_eq!(stdout.as_deref(), Some("/run/guard/broker-agent.sock"));
-        }
-        other => panic!(
-            "expected broker-owned SSH_AUTH_SOCK in child, got {:?}",
-            other
-        ),
-    }
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Failed {
+            started: false,
+            ref reason,
+        } if reason.contains("credential-authority tool environment")
+    ));
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn caller_env_cannot_override_guard_tool_env() {
-    let (cfg, _) = make_test_config();
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
     let tools = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         tools.path(),
-        "tools:\n  sh:\n    env:\n      BROKER_ENDPOINT: guard-owned\n",
+        "tools:\n  true:\n    env:\n      BROKER_ENDPOINT: guard-owned\n",
     )
     .unwrap();
     *cfg.state.tool_registry.write().await =
@@ -2816,7 +2883,7 @@ async fn caller_env_cannot_override_guard_tool_env() {
     cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
-            allow: vec!["sh *".into()],
+            allow: vec!["true".into()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
@@ -2835,13 +2902,7 @@ async fn caller_env_cannot_override_guard_tool_env() {
         },
     );
 
-    let mut req = basic_request(
-        "sh",
-        vec![
-            "-c".to_string(),
-            "printf '%s' \"$BROKER_ENDPOINT\"".to_string(),
-        ],
-    );
+    let mut req = basic_request("true", vec![]);
     req.session_token = Some(token);
     req.env
         .insert("BROKER_ENDPOINT".to_string(), "caller-owned".to_string());
@@ -2861,11 +2922,12 @@ async fn caller_env_cannot_override_guard_tool_env() {
 #[cfg(unix)]
 #[tokio::test]
 async fn caller_secret_cannot_override_guard_tool_env() {
-    let (cfg, _) = make_test_config();
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
     let tools = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         tools.path(),
-        "tools:\n  sh:\n    env:\n      BROKER_TOKEN: guard-owned\n",
+        "tools:\n  true:\n    env:\n      BROKER_TOKEN: guard-owned\n",
     )
     .unwrap();
     *cfg.state.tool_registry.write().await =
@@ -2884,7 +2946,7 @@ async fn caller_secret_cannot_override_guard_tool_env() {
     cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
-            allow: vec!["sh *".into()],
+            allow: vec!["true".into()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
@@ -2903,13 +2965,7 @@ async fn caller_secret_cannot_override_guard_tool_env() {
         },
     );
 
-    let mut req = basic_request(
-        "sh",
-        vec![
-            "-c".to_string(),
-            "printf '%s' \"$BROKER_TOKEN\"".to_string(),
-        ],
-    );
+    let mut req = basic_request("true", vec![]);
     req.session_token = Some(token);
     req.secrets
         .insert("BROKER_TOKEN".to_string(), "CALLER_TOKEN".to_string());
@@ -2933,6 +2989,7 @@ async fn caller_secret_cannot_override_guard_tool_env() {
 #[tokio::test]
 async fn caller_env_cannot_override_daemon_child_env() {
     let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
     let _restore = EnvRestore::capture("GUARD_CHILD_ENDPOINT");
     std::env::set_var("GUARD_CHILD_ENDPOINT", "daemon-owned");
     cfg.config.extra_child_env = vec!["GUARD_CHILD_ENDPOINT".to_string()];
@@ -2941,7 +2998,7 @@ async fn caller_env_cannot_override_daemon_child_env() {
     cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
-            allow: vec!["sh *".into()],
+            allow: vec!["true".into()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
@@ -2960,13 +3017,7 @@ async fn caller_env_cannot_override_daemon_child_env() {
         },
     );
 
-    let mut req = basic_request(
-        "sh",
-        vec![
-            "-c".to_string(),
-            "printf '%s' \"$GUARD_CHILD_ENDPOINT\"".to_string(),
-        ],
-    );
+    let mut req = basic_request("true", vec![]);
     req.session_token = Some(token);
     req.env.insert(
         "GUARD_CHILD_ENDPOINT".to_string(),
@@ -2990,9 +3041,101 @@ async fn caller_env_cannot_override_daemon_child_env() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn untyped_tool_replay_is_rejected_before_secondary_authority() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
+    let token = format!("kubectl-env-floor-{}", std::process::id());
+    cfg.state.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["kubectl *".into(), "ansible *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
+        },
+    );
+
+    let mut request = basic_request("kubectl", vec!["diff".into(), "-f".into(), "-".into()]);
+    request.session_token = Some(token.clone());
+    request
+        .env
+        .insert("KUBECTL_EXTERNAL_DIFF".into(), "/caller/diff-helper".into());
+
+    let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    assert!(!result.policy_allowed());
+    assert!(
+        result
+            .policy_reason()
+            .contains("requires typed operator authority"),
+        "got: {}",
+        result.policy_reason()
+    );
+
+    let mut request = basic_request("ansible", vec!["all".into(), "--check".into()]);
+    request.session_token = Some(token.clone());
+    request
+        .env
+        .insert("ANSIBLE_STRATEGY".into(), "caller-plugin".into());
+    let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    assert!(!result.policy_allowed());
+    assert!(
+        result
+            .policy_reason()
+            .contains("requires typed operator authority"),
+        "got: {}",
+        result.policy_reason()
+    );
+
+    for args in [
+        vec![
+            "create".into(),
+            "configmap".into(),
+            "fixture".into(),
+            "--from-file=/daemon/private-input".into(),
+        ],
+        vec![
+            "cp".into(),
+            "/daemon/private-input".into(),
+            "pod:/tmp/input".into(),
+        ],
+        vec![
+            "get".into(),
+            "pods".into(),
+            "-o=jsonpath-file=/daemon/private-input".into(),
+        ],
+    ] {
+        let mut request = basic_request("kubectl", args);
+        request.session_token = Some(token.clone());
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        assert!(!result.policy_allowed());
+        assert!(
+            result
+                .policy_reason()
+                .contains("requires typed operator authority"),
+            "got: {}",
+            result.policy_reason()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn redaction_covers_effective_tool_child_and_request_env_values() {
     let (mut cfg, _) = make_test_config();
     cfg.config.redact = true;
+    cfg.config.exec_as_caller = true;
     let short_exact = ['q', '7'].iter().collect::<String>();
     let _restore = EnvRestore::capture("GUARD_CHILD_SECRET");
     std::env::set_var("GUARD_CHILD_SECRET", "daemon-child-secret-value");
@@ -3000,7 +3143,7 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
     let tools = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         tools.path(),
-        format!("tools:\n  sh:\n    env:\n      TOOL_SECRET: {short_exact}\n"),
+        format!("tools:\n  printenv:\n    env:\n      TOOL_SECRET: {short_exact}\n"),
     )
     .unwrap();
     *cfg.state.tool_registry.write().await =
@@ -3010,7 +3153,7 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
     cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
-            allow: vec!["sh *".into()],
+            allow: vec!["printenv *".into()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
@@ -3030,11 +3173,11 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
     );
 
     let mut req = basic_request(
-        "sh",
+        "printenv",
         vec![
-            "-c".to_string(),
-            "printf '%s %s %s' \"$TOOL_SECRET\" \"$GUARD_CHILD_SECRET\" \"$REQUEST_SECRET\""
-                .to_string(),
+            "TOOL_SECRET".to_string(),
+            "GUARD_CHILD_SECRET".to_string(),
+            "REQUEST_SECRET".to_string(),
         ],
     );
     req.session_token = Some(token);
@@ -3064,6 +3207,7 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
 async fn trusted_exact_tool_values_redact_when_heuristic_redaction_is_disabled() {
     let (mut cfg, _) = make_test_config();
     cfg.config.redact = false;
+    cfg.config.exec_as_caller = true;
     let exact = ['¤', '9'].iter().collect::<String>();
     cfg.state
         .secrets
@@ -3073,7 +3217,7 @@ async fn trusted_exact_tool_values_redact_when_heuristic_redaction_is_disabled()
     let tools = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         tools.path(),
-        "tools:\n  sh:\n    secrets:\n      TOOL_EXACT: tool/exact\n",
+        "tools:\n  printenv:\n    secrets:\n      TOOL_EXACT: tool/exact\n",
     )
     .unwrap();
     *cfg.state.tool_registry.write().await =
@@ -3083,7 +3227,7 @@ async fn trusted_exact_tool_values_redact_when_heuristic_redaction_is_disabled()
     cfg.state.sessions.write().await.grant(
         token.to_string(),
         SessionGrant {
-            allow: vec!["sh *".into()],
+            allow: vec!["printenv *".into()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
@@ -3099,10 +3243,7 @@ async fn trusted_exact_tool_values_redact_when_heuristic_redaction_is_disabled()
             owner: crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1000)),
         },
     );
-    let mut request = basic_request(
-        "sh",
-        vec!["-c".to_string(), "printf '%s' \"$TOOL_EXACT\"".to_string()],
-    );
+    let mut request = basic_request("printenv", vec!["TOOL_EXACT".to_string()]);
     request.session_token = Some(token.to_string());
     let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
     let ExecOutcome::Completed { stdout, .. } = result.exec else {
@@ -3113,20 +3254,21 @@ async fn trusted_exact_tool_values_redact_when_heuristic_redaction_is_disabled()
 
 #[cfg(unix)]
 #[tokio::test]
-async fn ansible_discovers_config_from_cwd_without_inherited_ansible_config() {
+async fn ansible_cwd_profile_is_rejected_before_process_start() {
     let _env_guard = TEST_ENV_LOCK.lock().await;
-    let (cfg, _) = make_test_config();
-    let temp = tempfile::tempdir().unwrap();
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    let temp = trusted_artifact_tempdir();
     let bin_dir = temp.path().join("bin");
     let project = temp.path().join("project");
-    std::fs::create_dir(&bin_dir).unwrap();
-    std::fs::create_dir(&project).unwrap();
-    std::fs::write(
-        project.join("ansible.cfg"),
-        "[defaults]\ninventory = inventory\n",
-    )
-    .unwrap();
-    std::fs::write(project.join("inventory"), "all\n").unwrap();
+    create_trusted_artifact_dir(&bin_dir);
+    create_trusted_artifact_dir(&project);
+    let inventory = project.join("inventory");
+    write_trusted_artifact(
+        &project.join("ansible.cfg"),
+        format!("[defaults]\ninventory = {}\n", inventory.display()),
+    );
+    write_trusted_artifact(&inventory, "all\n");
     let ansible = bin_dir.join("ansible");
     std::fs::write(
         &ansible,
@@ -3135,7 +3277,7 @@ async fn ansible_discovers_config_from_cwd_without_inherited_ansible_config() {
          test -z \"${ANSIBLE_CONFIG:-}\" || exit 3\n\
          test -f ansible.cfg || exit 4\n\
          test -f inventory || exit 5\n\
-         grep -q '^inventory *= *inventory$' ansible.cfg || exit 6\n\
+         grep -q '^inventory *= */' ansible.cfg || exit 6\n\
          grep -q '^all$' inventory || exit 7\n\
          printf 'ansible-cwd-ok:%s' \"$(pwd)\"\n",
     )
@@ -3149,49 +3291,32 @@ async fn ansible_discovers_config_from_cwd_without_inherited_ansible_config() {
     let _ansible_config_restore = EnvRestore::capture("ANSIBLE_CONFIG");
     std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
     std::env::set_var("ANSIBLE_CONFIG", "/tmp/caller-ansible.cfg");
-
     let project_cwd = project.canonicalize().unwrap();
-    let token = format!("ansible-cwd-{}", std::process::id());
-    cfg.state.sessions.write().await.grant(
-        token.clone(),
-        SessionGrant {
-            allow: Vec::new(),
-            deny: Vec::new(),
-            allow_exact: vec![SessionExactRule::with_cwd(
-                "ansible",
-                vec!["-m".into(), "ping".into(), "all".into()],
-                project_cwd.clone(),
-            )],
-            deny_exact: Vec::new(),
-            activated_verbs: Vec::new(),
-            override_markers: Vec::new(),
-            scope: Default::default(),
-            expires_at: None,
-            prompt_append: None,
-            generated_notes: Vec::new(),
-            static_only: true,
-            auto_amend: false,
-            granted_at: 0,
-            owner: crate::session::SessionOwner::Principal(
-                guard::principal::PrincipalKey::from_uid(1000),
-            ),
-        },
-    );
+    *cfg.state.verbs.write().await = VerbCatalog::from_yaml(&format!(
+        "verbs:\n  - name: ansible-cwd-ping\n    binary: ansible\n    args: [-m, ping, all]\n    consequence: reversible\n    trusted: true\n    coverage:\n      - name: project-root\n        action: preauthorized\n        cwd: \"{}\"\n",
+        project_cwd.display()
+    ))
+    .unwrap();
 
-    let mut req = basic_request("ansible", vec!["-m".into(), "ping".into(), "all".into()]);
-    req.session_token = Some(token);
+    let mut req = basic_request("", Vec::new());
     req.cwd = Some(project_cwd.clone());
+    req.verb = Some(crate::server::VerbInvocation {
+        name: "ansible-cwd-ping".to_string(),
+        params: Default::default(),
+    });
 
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    assert!(
+        result.policy_allowed(),
+        "cwd-backed Ansible request was denied: {}",
+        result.policy_reason()
+    );
     match result.exec {
-        ExecOutcome::Completed { stdout, .. } => {
-            let expected = format!("ansible-cwd-ok:{}", project_cwd.display());
-            assert_eq!(stdout.as_deref(), Some(expected.as_str()));
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains("immutable profile snapshots"), "{reason}");
         }
-        other => panic!(
-            "expected fake ansible to discover cwd config/inventory without ANSIBLE_CONFIG, got {:?}",
-            other
-        ),
+        other => panic!("mutable Ansible profile reached execution: {other:?}"),
     }
 }
 
@@ -3222,7 +3347,7 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
     let _env_guard = TEST_ENV_LOCK.lock().await;
     let (mut cfg, _) = make_test_config();
     let shim_dir = tempfile::tempdir().unwrap();
-    let shim_path = shim_dir.path().join("missing-tool");
+    let shim_path = shim_dir.path().join("printf");
     std::fs::write(&shim_path, "#!/bin/sh\nexit 99\n").unwrap();
     let mut perms = std::fs::metadata(&shim_path).unwrap().permissions();
     use std::os::unix::fs::PermissionsExt;
@@ -3230,19 +3355,13 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
     std::fs::set_permissions(&shim_path, perms).unwrap();
     cfg.config.shim_dir = Some(shim_dir.path().to_path_buf());
     let _path_restore = EnvRestore::capture("PATH");
-    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
-    let test_path = std::env::join_paths(
-        std::iter::once(shim_dir.path().to_path_buf())
-            .chain(std::env::split_paths(&inherited_path)),
-    )
-    .unwrap();
-    std::env::set_var("PATH", test_path);
+    std::env::set_var("PATH", shim_dir.path());
 
     let token = format!("shim-recursion-{}", std::process::id());
     cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
-            allow: vec!["missing-tool".into()],
+            allow: vec!["printf".into()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
@@ -3261,7 +3380,7 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
         },
     );
 
-    let mut req = basic_request("missing-tool", Vec::new());
+    let mut req = basic_request("printf", Vec::new());
     req.session_token = Some(token);
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
 
@@ -3269,23 +3388,26 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
         ExecOutcome::Failed { reason, started } => {
             assert!(!started);
             assert!(
-                reason.contains("underlying executable 'missing-tool' is unavailable"),
+                reason.contains("underlying executable 'printf' is unavailable"),
                 "got: {reason}"
             );
-            assert!(reason.contains("non-shim directory"), "got: {reason}");
+            assert!(
+                reason.contains("outside Guard's shim directory"),
+                "got: {reason}"
+            );
         }
         other => panic!("expected pre-start exec failure, got {:?}", other),
     }
 
     cfg.config.preflight = true;
-    let mut req = basic_request("missing-tool", Vec::new());
+    let mut req = basic_request("printf", Vec::new());
     req.session_token = Some(format!("shim-recursion-{}", std::process::id()));
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
     assert!(!result.policy_allowed());
     assert!(
         result
             .policy_reason()
-            .contains("underlying executable 'missing-tool' is unavailable"),
+            .contains("underlying executable 'printf' is unavailable"),
         "got: {}",
         result.policy_reason()
     );
@@ -3297,28 +3419,22 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
     let _env_guard = TEST_ENV_LOCK.lock().await;
     let (mut cfg, _) = make_test_config();
     let shim_dir = tempfile::tempdir().unwrap();
-    let shim_path = shim_dir.path().join("allowed-tool");
+    let shim_path = shim_dir.path().join("printf");
     std::fs::write(&shim_path, "#!/bin/sh\nexit 99\n").unwrap();
     let mut perms = std::fs::metadata(&shim_path).unwrap().permissions();
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o755);
     std::fs::set_permissions(&shim_path, perms).unwrap();
     cfg.config.shim_dir = Some(shim_dir.path().to_path_buf());
-    cfg.config.allowed_binaries = Some(vec!["allowed-tool".to_string()]);
+    cfg.config.allowed_binaries = Some(vec!["printf".to_string()]);
     let _path_restore = EnvRestore::capture("PATH");
-    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
-    let test_path = std::env::join_paths(
-        std::iter::once(shim_dir.path().to_path_buf())
-            .chain(std::env::split_paths(&inherited_path)),
-    )
-    .unwrap();
-    std::env::set_var("PATH", test_path);
+    std::env::set_var("PATH", shim_dir.path());
 
     let token = format!("shim-allow-bin-{}", std::process::id());
     cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
-            allow: vec!["allowed-tool".into()],
+            allow: vec!["printf".into()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
@@ -3337,7 +3453,7 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
         },
     );
 
-    let mut req = basic_request("allowed-tool", Vec::new());
+    let mut req = basic_request("printf", Vec::new());
     req.session_token = Some(token);
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
 
@@ -3345,10 +3461,13 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
         ExecOutcome::Failed { reason, started } => {
             assert!(!started);
             assert!(
-                reason.contains("underlying executable 'allowed-tool' is unavailable"),
+                reason.contains("underlying executable 'printf' is unavailable"),
                 "got: {reason}"
             );
-            assert!(reason.contains("non-shim directory"), "got: {reason}");
+            assert!(
+                reason.contains("outside Guard's shim directory"),
+                "got: {reason}"
+            );
         }
         other => panic!("expected pre-start exec failure, got {:?}", other),
     }
@@ -3409,28 +3528,22 @@ fn containment_context_redacts_each_structured_command_before_flattening() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn secret_file_exists_only_for_child_lifetime_and_failure_exit_cleans_it() {
+async fn fixed_identity_refuses_secret_files_without_materializing_a_lease() {
     let (cfg, _) = make_test_config();
     let principal = PrincipalKey::from_uid(1000);
+    let value = generated_credential_value();
     cfg.state
         .secrets
-        .set(&principal, "child-file-secret", "expected-value")
+        .set(&principal, "child-file-secret", &value)
         .await
         .unwrap();
-    let mut request = basic_request(
-        "sh",
-        vec![
-            "-c".to_string(),
-            "test \"$(cat \"$CREDENTIAL_FILE\")\" = expected-value; printf '%s' \"$CREDENTIAL_FILE\"; exit 7"
-                .to_string(),
-        ],
-    );
+    let mut request = basic_request("true", Vec::new());
     request.secret_files.insert(
         "CREDENTIAL_FILE".to_string(),
         "child-file-secret".to_string(),
     );
     let mut sink = tokio::io::sink();
-    let result = exec_after_approval_with_secret_authority(
+    let result = exec_after_approval_for_test(
         &mut RequestContext {
             server: &cfg,
             caller: &CallerIdentity::Unix { uid: 1000 },
@@ -3443,15 +3556,13 @@ async fn secret_file_exists_only_for_child_lifetime_and_failure_exit_cleans_it()
         None,
     )
     .await;
-    let path = match result.exec {
-        ExecOutcome::Completed {
-            exit_code: Some(7),
-            stdout: Some(path),
-            ..
-        } => path,
-        other => panic!("unexpected result: {other:?}"),
-    };
-    assert!(!std::path::Path::new(&path).exists());
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains("shared child UID"), "{reason}");
+        }
+        other => panic!("secret file reached fixed-identity execution: {other:?}"),
+    }
     assert_eq!(
         std::fs::read_dir(cfg.config.secret_file_root.as_ref().unwrap())
             .unwrap()
@@ -3465,9 +3576,10 @@ async fn secret_file_is_strictly_refused_with_exec_as_caller() {
     let (mut cfg, _) = make_test_config();
     cfg.config.exec_as_caller = true;
     let principal = PrincipalKey::from_uid(1000);
+    let value = generated_credential_value();
     cfg.state
         .secrets
-        .set(&principal, "caller-file-secret", "value")
+        .set(&principal, "caller-file-secret", &value)
         .await
         .unwrap();
     let mut request = basic_request("echo", vec!["ok".to_string()]);
@@ -3483,5 +3595,8 @@ async fn secret_file_is_strictly_refused_with_exec_as_caller() {
     )
     .await
     .unwrap_err();
-    assert!(reason.contains("--exec-as-caller"), "got: {reason}");
+    assert!(
+        reason.contains("isolated daemon-to-child credential-file boundary"),
+        "got: {reason}"
+    );
 }

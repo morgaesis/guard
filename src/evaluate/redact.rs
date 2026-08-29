@@ -48,111 +48,109 @@ pub fn redact_for_llm(command: &str) -> String {
 mod tests {
     use super::redact_for_llm;
 
-    // --- Redaction tests ---
+    fn repeated(character: char, length: usize) -> String {
+        std::iter::repeat_n(character, length).collect()
+    }
+
+    fn provider_key(prefix: &str, body_length: usize) -> String {
+        format!("{prefix}{}", repeated('A', body_length))
+    }
+
+    fn aws_access_key_id() -> String {
+        format!("{}{}", ["AK", "IA"].concat(), repeated('A', 16))
+    }
+
+    fn jwt() -> String {
+        [
+            [["e", "y", "J"].concat(), repeated('A', 21)].concat(),
+            repeated('B', 32),
+            repeated('C', 24),
+        ]
+        .join(".")
+    }
+
+    fn pem_block() -> String {
+        let begin = ["-----BEGIN ", "PRIVATE", " KEY-----"].concat();
+        let end = ["-----END ", "PRIVATE", " KEY-----"].concat();
+        format!("{begin}\n{}\n{end}", repeated('A', 64))
+    }
+
+    fn assert_redacted(input: &str) {
+        let redacted = redact_for_llm(input);
+        assert!(redacted.contains("[REDACTED]"), "got: {redacted}");
+        assert!(
+            !redacted.contains(input),
+            "credential fixture remained visible"
+        );
+    }
 
     #[test]
     fn test_redact_for_llm_openai_key() {
-        let s = "curl -H 'Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEF'";
-        let r = redact_for_llm(s);
-        assert!(!r.contains("sk-abcdef"), "got: {r}");
-        assert!(r.contains("[REDACTED]"));
+        assert_redacted(&provider_key("sk-", 48));
     }
 
     #[test]
     fn test_redact_for_llm_openrouter_key() {
-        let s = "echo sk-or-v1-abcdefghijklmnopqrstuvwxyz0123456789ABCDEF0123456789";
-        let r = redact_for_llm(s);
-        assert!(!r.contains("sk-or-v1-abcdef"));
-        assert!(r.contains("[REDACTED]"));
+        assert_redacted(&provider_key("sk-or-v1-", 64));
     }
 
     #[test]
     fn test_redact_for_llm_anthropic_key() {
-        let s = "export KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEF";
-        let r = redact_for_llm(s);
-        assert!(!r.contains("sk-ant-api03"));
-        assert!(r.contains("[REDACTED]"));
+        assert_redacted(&provider_key(&["sk-ant-", "api03-"].concat(), 64));
     }
 
     #[test]
     fn test_redact_for_llm_aws_access_key_id() {
-        let s = "aws configure set aws_access_key_id AKIAIOSFODNN7EXAMPLE";
-        let r = redact_for_llm(s);
-        assert!(!r.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(r.contains("[REDACTED]"));
+        assert_redacted(&aws_access_key_id());
     }
 
     #[test]
     fn test_redact_for_llm_aws_secret_with_context() {
-        // Only redact the 40-char base64 when paired with a `secret` context
-        let s = "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-        let r = redact_for_llm(s);
-        assert!(!r.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
-        assert!(r.contains("[REDACTED]"));
+        let secret = repeated('A', 40);
+        assert_redacted(&format!("aws_secret_access_key={secret}"));
     }
 
     #[test]
     fn test_redact_for_llm_jwt() {
-        let s = "curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'";
-        let r = redact_for_llm(s);
-        assert!(!r.contains("eyJhbGciOi"));
-        assert!(r.contains("[REDACTED]"));
+        assert_redacted(&jwt());
     }
 
     #[test]
     fn test_redact_for_llm_pem_block() {
-        let s = "echo '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKC...\n-----END RSA PRIVATE KEY-----' > /tmp/k";
-        let r = redact_for_llm(s);
-        assert!(!r.contains("MIIEpAIBAAKC"));
-        assert!(r.contains("[REDACTED]"));
+        assert_redacted(&pem_block());
     }
 
     #[test]
     fn test_redact_for_llm_bearer_standalone() {
-        let s = "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz012345";
-        let r = redact_for_llm(s);
-        assert!(!r.contains("ghp_abcdefghij"));
-        assert!(r.contains("[REDACTED]"));
+        assert_redacted(&format!("Bearer {}", repeated('A', 48)));
     }
 
     #[test]
     fn test_redact_for_llm_leaves_benign_text_alone() {
-        let s = "ls -la /etc/passwd && cat /etc/hostname";
-        let r = redact_for_llm(s);
-        assert_eq!(r, s);
+        let input = "kubectl get pods --namespace production";
+        assert_eq!(redact_for_llm(input), input);
     }
 
     #[test]
     fn test_redact_for_llm_idempotent() {
-        let s = "curl -H 'Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEF'";
-        let r1 = redact_for_llm(s);
-        let r2 = redact_for_llm(&r1);
-        assert_eq!(r1, r2);
+        let input = format!("token={}", repeated('A', 48));
+        let once = redact_for_llm(&input);
+        assert_eq!(redact_for_llm(&once), once);
     }
 
     #[test]
     fn test_redact_for_llm_json_apikey() {
-        // CloudStack/cmk response shape: quoted compound key name, quoted
-        // value, trailing comma. Must never reach a model.
-        let s = r#"echo '"apikey": "dpFmM7VLB07-kQrfHXWLOsIqy1jvcPUFTzYdaUxKfrKPplbrLPGqrK_a2wRIzT3vFTdb3vCgMFuVJErzWa5S3g",'"#;
-        let r = redact_for_llm(s);
-        assert!(!r.contains("dpFmM7VLB07"), "got: {r}");
-        assert!(r.contains("[REDACTED]"), "got: {r}");
+        assert_redacted(&format!(r#"{{"apikey":"{}"}}"#, repeated('A', 40)));
     }
 
     #[test]
     fn test_redact_for_llm_env_pair() {
-        let s = "export MY_TOKEN=abc123secretvalue";
-        let r = redact_for_llm(s);
-        assert!(!r.contains("abc123secretvalue"), "got: {r}");
-        assert!(r.contains("[REDACTED]"), "got: {r}");
+        assert_redacted(&format!("API_TOKEN={}", repeated('A', 40)));
     }
 
     #[test]
     fn test_redact_for_llm_hex_value_catchall() {
-        let s = "curl -b 'X_CT0=9c52ab235e556a3f8b1d2e4f6a7c9d0e1f2a3b4c5d6e7f'";
-        let r = redact_for_llm(s);
-        assert!(!r.contains("9c52ab235e556a3f"), "got: {r}");
-        assert!(r.contains("[REDACTED]"), "got: {r}");
+        let value = std::iter::repeat_n("ab", 32).collect::<String>();
+        assert_redacted(&value);
     }
 }

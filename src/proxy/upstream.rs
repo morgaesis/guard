@@ -5,8 +5,8 @@
 //! them and a brokered client that could would reach the apiserver around the
 //! gate. Other protocols build from a base URL plus an optional bearer token.
 //! The daemon holds these upstream credentials. A brokered config carries no
-//! upstream credential, though it may carry a Guard session bearer that the
-//! proxy consumes, so the proxy is the sole path to the upstream.
+//! upstream credential. It carries a generated proxy transport bearer, or a
+//! live Guard session bearer, that the proxy consumes before forwarding.
 
 use std::path::Path;
 
@@ -118,8 +118,14 @@ impl Upstream {
     pub fn from_base_url(base: &str, auth: UpstreamAuth) -> Result<Self> {
         let parsed = reqwest::Url::parse(base).context("parse upstream URL")?;
         match parsed.scheme() {
-            "https" | "http" => {}
+            "https" => {}
             other => bail!("unsupported upstream URL scheme '{other}'"),
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            bail!("upstream URL must not contain user credentials");
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            bail!("upstream URL must not contain a query or fragment");
         }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -194,6 +200,23 @@ impl Upstream {
                 ctx.context.user
             );
         }
+        if cluster.cluster.insecure {
+            bail!(
+                "kubeconfig cluster '{}' disables TLS certificate verification; the proxy requires an authenticated upstream",
+                ctx.context.cluster
+            );
+        }
+        let parsed_server = reqwest::Url::parse(&cluster.cluster.server)
+            .context("parse kubeconfig cluster server URL")?;
+        if parsed_server.scheme() != "https" {
+            bail!("kubeconfig credential-bearing upstream requires HTTPS");
+        }
+        if !parsed_server.username().is_empty() || parsed_server.password().is_some() {
+            bail!("kubeconfig cluster server URL must not contain user credentials");
+        }
+        if parsed_server.query().is_some() || parsed_server.fragment().is_some() {
+            bail!("kubeconfig cluster server URL must not contain a query or fragment");
+        }
 
         let mut builder = reqwest::Client::builder()
             // The proxy is a transparent forwarder: it must not chase redirects
@@ -215,10 +238,6 @@ impl Upstream {
                 builder = builder.add_root_certificate(cert);
             }
         }
-        if cluster.cluster.insecure {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-
         // Resolve exactly one authentication method. A kubeconfig user may carry
         // several (a client cert alongside basic auth, say); the apiserver rejects
         // an identity that presents more than one, so pick a single method by
@@ -277,7 +296,7 @@ impl Upstream {
         }
 
         let client = builder.build().context("build upstream TLS client")?;
-        let base = cluster.cluster.server.trim_end_matches('/').to_string();
+        let base = parsed_server.as_str().trim_end_matches('/').to_string();
         let identity_fingerprint = if let Some(token) = bearer.as_deref() {
             fingerprint_identity(&base, ("bearer", token.as_bytes()))
         } else if selected_client_cert {
@@ -430,8 +449,13 @@ fn read_pem(data_b64: &Option<String>, file: Option<&str>, what: &str) -> Result
 mod tests {
     use super::*;
 
+    fn generated_credential() -> String {
+        format!("{:032x}", rand::random::<u128>())
+    }
+
     #[test]
     fn parses_token_context() {
+        let credential = generated_credential();
         let yaml = r#"
 apiVersion: v1
 kind: Config
@@ -447,65 +471,100 @@ contexts:
 users:
   - name: u1
     user:
-      token: brokered-secret-token
-"#;
+      token: <generated>
+"#
+        .replace("<generated>", &credential);
         // Empty CA data decodes to an empty bundle (no certs added) - fine for the
         // parse-level test; we only assert base/bearer resolution here.
-        let up = Upstream::from_kubeconfig_str(yaml, None).expect("parse");
+        let up = Upstream::from_kubeconfig_str(&yaml, None).expect("parse");
         assert_eq!(up.base(), "https://api.example.test:6443");
-        assert_eq!(up.bearer(), Some("brokered-secret-token"));
+        assert_eq!(up.bearer(), Some(credential.as_str()));
         assert_eq!(up.identity_fingerprint().len(), 64);
-        assert!(!up.identity_fingerprint().contains("brokered-secret-token"));
+        assert!(!up.identity_fingerprint().contains(&credential));
     }
 
     #[test]
     fn identity_fingerprint_changes_when_the_credential_rotates() {
+        let first_credential = generated_credential();
+        let second_credential = generated_credential();
         let first = Upstream::from_base_url(
             "https://api.example.test",
-            UpstreamAuth::Bearer("token-one".to_string()),
+            UpstreamAuth::Bearer(first_credential),
         )
         .unwrap();
         let second = Upstream::from_base_url(
             "https://api.example.test",
-            UpstreamAuth::Bearer("token-two".to_string()),
+            UpstreamAuth::Bearer(second_credential),
         )
         .unwrap();
         assert_ne!(first.identity_fingerprint(), second.identity_fingerprint());
     }
 
     #[test]
+    fn credentialed_upstreams_require_https_and_credential_free_urls() {
+        assert!(Upstream::from_base_url(
+            "http://api.example.test",
+            UpstreamAuth::Bearer(generated_credential()),
+        )
+        .is_err());
+        assert!(
+            Upstream::from_base_url("https://user@api.example.test", UpstreamAuth::None,).is_err()
+        );
+        assert!(Upstream::from_base_url("http://api.example.test", UpstreamAuth::None).is_err());
+    }
+
+    #[test]
+    fn kubeconfig_upstreams_require_https_without_url_userinfo() {
+        for server in [
+            "http://api.example.test:6443",
+            "https://user@api.example.test:6443",
+        ] {
+            let yaml = format!(
+                "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters: [{{name: c, cluster: {{server: {server:?}}}}}]\ncontexts: [{{name: ctx, context: {{cluster: c, user: u}}}}]\nusers: [{{name: u, user: {{token: fixture}}}}]\n"
+            );
+            assert!(
+                Upstream::from_kubeconfig_str(&yaml, None).is_err(),
+                "{server}"
+            );
+        }
+    }
+
+    #[test]
     fn revert_error_excerpt_is_bounded_and_redacts_injected_credentials() {
+        let credential = generated_credential();
         let upstream = Upstream::from_base_url(
             "https://api.example.test",
-            UpstreamAuth::Bearer("operator-secret-token".to_string()),
+            UpstreamAuth::Bearer(credential.clone()),
         )
         .unwrap();
         let body = format!(
-            "upstream reflected Bearer operator-secret-token {}",
+            "upstream reflected Bearer {credential} {}",
             "x".repeat(2000)
         );
         let excerpt = upstream.redact_error_excerpt(body.as_bytes(), 80);
-        assert!(!excerpt.contains("operator-secret-token"));
+        assert!(!excerpt.contains(&credential));
         assert!(excerpt.contains("[REDACTED]"));
         assert!(excerpt.chars().count() <= 81);
     }
 
     #[test]
     fn revert_error_excerpt_drops_a_credential_prefix_at_the_read_boundary() {
+        let credential = generated_credential();
         let upstream = Upstream::from_base_url(
             "https://api.example.test",
-            UpstreamAuth::Bearer("operator-secret-token".to_string()),
+            UpstreamAuth::Bearer(credential.clone()),
         )
         .unwrap();
-        let mut body = vec![b'x'; 4096 - "operator-secr".len()];
-        body.extend_from_slice(b"operator-secr");
+        let prefix = &credential[..credential.len() - 3];
+        let mut body = vec![b'x'; 4096 - prefix.len()];
+        body.extend_from_slice(prefix.as_bytes());
 
         let secrets = upstream.response_secret_values();
         let trimmed = trim_trailing_secret_prefix(&body, &secrets);
         let excerpt = upstream.redact_error_excerpt(&body, 5000);
 
-        assert_eq!(trimmed.len(), 4096 - "operator-secr".len());
-        assert!(!excerpt.contains("operator-secr"));
+        assert_eq!(trimmed.len(), 4096 - prefix.len());
+        assert!(!excerpt.contains(prefix));
     }
 
     #[test]
@@ -534,6 +593,8 @@ users:
         // A user carrying basic-auth *and* a token must present exactly one
         // method upstream: the token wins and the basic-auth fields are dropped,
         // so the apiserver never sees `[token basicAuth]`.
+        let password = generated_credential();
+        let token = generated_credential();
         let yaml = r#"
 apiVersion: v1
 kind: Config
@@ -544,16 +605,19 @@ users:
   - name: u
     user:
       username: admin
-      password: hunter2
-      token: brokered-secret-token
-"#;
-        let up = Upstream::from_kubeconfig_str(yaml, None).expect("parse");
-        assert_eq!(up.bearer(), Some("brokered-secret-token"));
+      password: <password>
+      token: <token>
+"#
+        .replace("<password>", &password)
+        .replace("<token>", &token);
+        let up = Upstream::from_kubeconfig_str(&yaml, None).expect("parse");
+        assert_eq!(up.bearer(), Some(token.as_str()));
         assert_eq!(up.basic_auth(), None, "basic auth must be dropped");
     }
 
     #[test]
     fn basic_auth_without_token_is_used() {
+        let password = generated_credential();
         let yaml = r#"
 apiVersion: v1
 kind: Config
@@ -564,11 +628,12 @@ users:
   - name: u
     user:
       username: admin
-      password: hunter2
-"#;
-        let up = Upstream::from_kubeconfig_str(yaml, None).expect("parse");
+      password: <password>
+"#
+        .replace("<password>", &password);
+        let up = Upstream::from_kubeconfig_str(&yaml, None).expect("parse");
         assert_eq!(up.bearer(), None);
-        assert_eq!(up.basic_auth(), Some(("admin", "hunter2")));
+        assert_eq!(up.basic_auth(), Some(("admin", password.as_str())));
     }
 
     #[test]
@@ -586,6 +651,28 @@ users:
 "#;
         let err = Upstream::from_kubeconfig_str(yaml, None).unwrap_err();
         assert!(err.to_string().contains("exec credential plugin"), "{err}");
+    }
+
+    #[test]
+    fn rejects_disabled_upstream_certificate_verification() {
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+current-context: ctx
+clusters:
+  - name: c
+    cluster:
+      server: https://x:6443
+      insecure-skip-tls-verify: true
+contexts: [{name: ctx, context: {cluster: c, user: u}}]
+users: [{name: u, user: {token: t}}]
+"#;
+        let err = Upstream::from_kubeconfig_str(yaml, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires an authenticated upstream"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -620,16 +707,17 @@ users: [{name: u, user: {token: t}}]
         // must resolve to the token alone: the certificate is not attached and no
         // basic auth is layered on, so the apiserver sees exactly one method.
         let (cert_b64, key_b64) = client_cert_key_b64();
+        let token = generated_credential();
         let yaml = format!(
             "apiVersion: v1\n\
              kind: Config\n\
              current-context: ctx\n\
              clusters: [{{name: c, cluster: {{server: \"https://x:6443\"}}}}]\n\
              contexts: [{{name: ctx, context: {{cluster: c, user: u}}}}]\n\
-             users: [{{name: u, user: {{token: brokered-secret-token, client-certificate-data: {cert_b64}, client-key-data: {key_b64}}}}}]\n"
+             users: [{{name: u, user: {{token: {token}, client-certificate-data: {cert_b64}, client-key-data: {key_b64}}}}}]\n"
         );
         let up = Upstream::from_kubeconfig_str(&yaml, None).expect("parse");
-        assert_eq!(up.bearer(), Some("brokered-secret-token"));
+        assert_eq!(up.bearer(), Some(token.as_str()));
         assert_eq!(up.basic_auth(), None);
     }
 
@@ -639,13 +727,14 @@ users: [{name: u, user: {token: t}}]
         // basic auth resolves to the certificate: basic auth is dropped, not
         // layered on top.
         let (cert_b64, key_b64) = client_cert_key_b64();
+        let password = generated_credential();
         let yaml = format!(
             "apiVersion: v1\n\
              kind: Config\n\
              current-context: ctx\n\
              clusters: [{{name: c, cluster: {{server: \"https://x:6443\"}}}}]\n\
              contexts: [{{name: ctx, context: {{cluster: c, user: u}}}}]\n\
-             users: [{{name: u, user: {{username: admin, password: hunter2, client-certificate-data: {cert_b64}, client-key-data: {key_b64}}}}}]\n"
+             users: [{{name: u, user: {{username: admin, password: {password}, client-certificate-data: {cert_b64}, client-key-data: {key_b64}}}}}]\n"
         );
         let up = Upstream::from_kubeconfig_str(&yaml, None).expect("parse");
         assert_eq!(up.bearer(), None);

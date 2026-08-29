@@ -3,7 +3,8 @@
 //! agent's connection. The CA (base64 PEM) goes into the brokered kubeconfig as
 //! `certificate-authority-data`; the leaf, signed by the CA, is what the proxy
 //! presents. ALPN offers both `h2` and `http/1.1` so client-go (h2) and HTTP/1.1
-//! clients both negotiate.
+//! clients both negotiate. Application-layer proxy or session bearers
+//! authenticate clients before any request reaches the upstream.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -66,6 +67,9 @@ impl ProxyTls {
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());
+        // The loopback listener uses server-authenticated TLS. Every HTTP
+        // request must also present the generated proxy transport bearer or a
+        // live Guard session bearer before routing can reach the upstream.
         let mut server_config = ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .context("rustls protocol versions")?
@@ -123,6 +127,7 @@ mod tests {
         let yaml = super::super::kubeconfig::brokered_kubeconfig(
             "https://127.0.0.1:8443",
             &tls.ca_data_b64(),
+            &format!("transport-{:032x}", rand::random::<u128>()),
         );
         super::super::kubeconfig::validate_brokered_kubeconfig(&yaml).expect("valid brokered cfg");
     }

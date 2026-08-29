@@ -1,5 +1,5 @@
 use crate::grant_profile::EvaluationMode;
-use crate::grant_profile::{GrantRequest, SavedGrant};
+use crate::grant_profile::{GrantRequest, SavedGrant, SavedGrantCatalog};
 use crate::session::{
     session_grant_revision_key, session_token_fingerprint, CredentialReference, HistoricalGrant,
     HistoricalStatus, IssuedGrantScope, SessionDecisionSource, SessionExactRule, SessionExecStatus,
@@ -9,9 +9,11 @@ use anyhow::{Context, Result};
 use guard::gating::approval::{Approval, ApprovalStatus};
 use guard::gating::provisional::{Provisional, ProvisionalStatus, REVERT_BODY_CLEANUP_PREFIX};
 use guard::gating::read_grant::ReadGrant;
-use guard::redact::{redact_output_text, SENSITIVE_ARGV_REPLAY_GUIDANCE};
+use guard::redact::{
+    named_value_contains_sensitive_literals, redact_output_text, SENSITIVE_ARGV_REPLAY_GUIDANCE,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -54,6 +56,142 @@ const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
 const TERMINAL_ACCESS_CANONICALIZATION_KEY: &str = "terminal_access_canonicalization_v1";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A durable-state table containing a row rejected by the candidate binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableStateRowCategory {
+    SessionGrant,
+    SessionHistory,
+    SessionInteraction,
+    SavedGrant,
+    GrantRequest,
+    Provisional,
+    Approval,
+    #[cfg(unix)]
+    ReadGrant,
+}
+
+impl DurableStateRowCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionGrant => "session_grant",
+            Self::SessionHistory => "session_history",
+            Self::SessionInteraction => "session_interaction",
+            Self::SavedGrant => "saved_grant",
+            Self::GrantRequest => "grant_request",
+            Self::Provisional => "provisional",
+            Self::Approval => "approval",
+            #[cfg(unix)]
+            Self::ReadGrant => "read_grant",
+        }
+    }
+}
+
+/// Stable categories for rejected durable-state rows. Reports deliberately
+/// expose only the table, row handle, and category, never serialized state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableStateRowReason {
+    Malformed,
+    IndexMismatch,
+    InvalidAuthority,
+}
+
+/// Operational effect of a rejected row. Some invalid grant requests are
+/// ignored by the running daemon but must be retired before an upgrade can be
+/// declared compatible; other rejected rows prevent startup directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableStateRowImpact {
+    BlocksStartup,
+    RequiresRetirement,
+}
+
+impl DurableStateRowImpact {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BlocksStartup => "blocks_startup",
+            Self::RequiresRetirement => "requires_retirement",
+        }
+    }
+}
+
+impl DurableStateRowReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::IndexMismatch => "index_mismatch",
+            Self::InvalidAuthority => "invalid_authority",
+        }
+    }
+}
+
+/// A durable-state row rejected while simulating startup from a private
+/// snapshot. `handle` is a table key, not serialized row content.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RejectedDurableStateRow {
+    pub handle: String,
+    pub category: DurableStateRowCategory,
+    pub reason: DurableStateRowReason,
+    pub impact: DurableStateRowImpact,
+}
+
+/// The first startup stage that could not accept the snapshot. These values
+/// remain stable for automated deployment preflight checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimulatedStartupErrorCategory {
+    SessionRegistry,
+    SavedGrants,
+    GrantRequests,
+    Provisionals,
+    Approvals,
+    #[cfg(unix)]
+    ReadGrants,
+}
+
+impl SimulatedStartupErrorCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionRegistry => "session_registry",
+            Self::SavedGrants => "saved_grants",
+            Self::GrantRequests => "grant_requests",
+            Self::Provisionals => "provisionals",
+            Self::Approvals => "approvals",
+            #[cfg(unix)]
+            Self::ReadGrants => "read_grants",
+        }
+    }
+}
+
+/// Sanitized outcome of replaying durable startup validation against a private
+/// SQLite snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SimulatedStartupResult {
+    pub succeeded: bool,
+    pub error_category: Option<SimulatedStartupErrorCategory>,
+}
+
+struct SimulatedStartupError {
+    category: SimulatedStartupErrorCategory,
+}
+
+impl SimulatedStartupError {
+    const fn new(category: SimulatedStartupErrorCategory) -> Self {
+        Self { category }
+    }
+}
+
+/// Result of validating a consistent state-database snapshot under the current
+/// schema and durable-startup rules. No serialized row payloads are returned.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionStoreCompatibilityReport {
+    pub compatible: bool,
+    pub simulated_open: bool,
+    pub simulated_startup: SimulatedStartupResult,
+    pub rejected_rows: Vec<RejectedDurableStateRow>,
+}
 
 #[derive(Debug)]
 struct SessionRevisionUpdate {
@@ -192,6 +330,9 @@ pub struct SessionStore {
     /// generation inside the rewrite transaction, extending stale-snapshot
     /// protection across independently opened stores and daemon processes.
     registry_write_gate: std::sync::Arc<tokio::sync::Mutex<RegistryWriteState>>,
+    /// Invalid grant-request rows are retained until an operator retires them.
+    /// Warn once per row within this store lifetime so reloads do not flood logs.
+    warned_invalid_grant_requests: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
     #[cfg(test)]
     fail_next_write: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -316,6 +457,685 @@ impl SessionStore {
         })
         .await
         .context("daemon session store open task failed")?
+    }
+
+    /// Inspect a consistent SQLite snapshot without writing to the source
+    /// database. The snapshot follows the daemon's registry open and durable
+    /// startup validation path, but never exposes serialized state payloads.
+    pub async fn compatibility_check(
+        path: PathBuf,
+        history_retention_secs: u64,
+    ) -> Result<SessionStoreCompatibilityReport> {
+        tokio::task::spawn_blocking(move || {
+            Self::compatibility_check_sync(&path, history_retention_secs)
+        })
+        .await
+        .context("session-store compatibility check task failed")?
+    }
+
+    /// Retire one durable grant-request row only when the current binary
+    /// rejects it. The daemon lease makes this an offline maintenance action.
+    pub async fn retire_rejected_grant_request(
+        path: PathBuf,
+        handle: String,
+    ) -> Result<Option<DurableStateRowReason>> {
+        tokio::task::spawn_blocking(move || {
+            let path = Self::normalize_daemon_database_path(&path)?;
+            Self::ensure_single_link_database(&path)?;
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("inspect state database {}", path.display()))?;
+            if !metadata.file_type().is_file() {
+                anyhow::bail!("state database {} is not a regular file", path.display());
+            }
+            let _daemon_lease = Self::acquire_daemon_lease_sync(&path)?;
+            Self::ensure_single_link_database(&path)?;
+
+            let mut conn = open_state_connection(&path)
+                .with_context(|| format!("open state database {}", path.display()))?;
+            conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+            enforce_private_state_files(&path)?;
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            ensure_supported_schema_version(version, SCHEMA_VERSION)?;
+            if version != SCHEMA_VERSION {
+                anyhow::bail!(
+                    "state database schema {} requires daemon migration to schema {} before offline retirement",
+                    version,
+                    SCHEMA_VERSION
+                );
+            }
+            Self::validate_current_schema_tables(&conn)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let inspected = {
+                let mut statement = tx.prepare(
+                    "SELECT rowid, status, created_unix, json
+                     FROM grant_requests WHERE handle = ?1",
+                )?;
+                let mut rows = statement.query(params![&handle])?;
+                rows.next()?
+                    .map(|row| {
+                        let row_id = row.get::<_, i64>(0)?;
+                        let reason = grant_request_rejection_reason(&handle, row, 1, 2, 3);
+                        Ok::<_, rusqlite::Error>((row_id, reason))
+                    })
+                    .transpose()?
+            };
+            let Some((row_id, reason)) = inspected else {
+                return Ok(None);
+            };
+            let Some(reason) = reason else {
+                return Ok(None);
+            };
+            let deleted = tx.execute(
+                "DELETE FROM grant_requests WHERE rowid = ?1 AND handle = ?2",
+                params![row_id, &handle],
+            )?;
+            if deleted != 1 {
+                anyhow::bail!("rejected grant-request row changed during retirement");
+            }
+            tx.commit()?;
+            Ok(Some(reason))
+        })
+        .await
+        .context("retire rejected grant-request task failed")?
+    }
+
+    fn compatibility_check_sync(
+        path: &Path,
+        history_retention_secs: u64,
+    ) -> Result<SessionStoreCompatibilityReport> {
+        let snapshot_dir = private_snapshot_dir()?;
+        let snapshot_path = snapshot_dir.path().join("state.db");
+        let source = open_state_connection_read_only(path)
+            .with_context(|| format!("open state database {} read-only", path.display()))?;
+        source.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        source
+            .execute("VACUUM INTO ?1", params![snapshot_path.to_string_lossy()])
+            .context("create consistent state database snapshot")?;
+        drop(source);
+
+        let (simulated_open, loader_error_category) =
+            match Self::open_sync(snapshot_path.clone(), history_retention_secs, None) {
+                Ok(store) => (
+                    true,
+                    Self::simulate_durable_startup(store)
+                        .err()
+                        .map(|error| error.category),
+                ),
+                Err(_) => (false, None),
+            };
+        let snapshot = open_state_connection_read_only(&snapshot_path)
+            .context("open compatibility snapshot read-only")?;
+        let mut rejected_rows = Self::rejected_session_registry_rows(&snapshot)?;
+        rejected_rows.extend(Self::rejected_saved_grant_rows(&snapshot)?);
+        rejected_rows.extend(Self::rejected_grant_request_rows(&snapshot)?);
+        rejected_rows.extend(Self::rejected_provisional_rows(&snapshot)?);
+        rejected_rows.extend(Self::rejected_approval_rows(&snapshot)?);
+        #[cfg(unix)]
+        rejected_rows.extend(Self::rejected_read_grant_rows(&snapshot)?);
+        rejected_rows.sort_by(|left, right| {
+            (left.category.as_str(), left.handle.as_str())
+                .cmp(&(right.category.as_str(), right.handle.as_str()))
+        });
+
+        let rejected_row_category = if rejected_rows.iter().any(|row| {
+            matches!(
+                row.category,
+                DurableStateRowCategory::SessionGrant
+                    | DurableStateRowCategory::SessionHistory
+                    | DurableStateRowCategory::SessionInteraction
+            )
+        }) {
+            Some(SimulatedStartupErrorCategory::SessionRegistry)
+        } else if rejected_rows.iter().any(|row| {
+            row.category == DurableStateRowCategory::GrantRequest
+                && row.impact == DurableStateRowImpact::BlocksStartup
+        }) {
+            Some(SimulatedStartupErrorCategory::GrantRequests)
+        } else if rejected_rows
+            .iter()
+            .any(|row| row.category == DurableStateRowCategory::SavedGrant)
+        {
+            Some(SimulatedStartupErrorCategory::SavedGrants)
+        } else if rejected_rows
+            .iter()
+            .any(|row| row.category == DurableStateRowCategory::Provisional)
+        {
+            Some(SimulatedStartupErrorCategory::Provisionals)
+        } else if rejected_rows
+            .iter()
+            .any(|row| row.category == DurableStateRowCategory::Approval)
+        {
+            Some(SimulatedStartupErrorCategory::Approvals)
+        } else {
+            #[cfg(unix)]
+            {
+                if rejected_rows
+                    .iter()
+                    .any(|row| row.category == DurableStateRowCategory::ReadGrant)
+                {
+                    Some(SimulatedStartupErrorCategory::ReadGrants)
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        };
+        let error_category = rejected_row_category.or(loader_error_category).or_else(|| {
+            (!simulated_open).then_some(SimulatedStartupErrorCategory::SessionRegistry)
+        });
+        let simulated_startup = SimulatedStartupResult {
+            succeeded: error_category.is_none(),
+            error_category,
+        };
+        Ok(SessionStoreCompatibilityReport {
+            compatible: simulated_startup.succeeded && rejected_rows.is_empty(),
+            simulated_open,
+            simulated_startup,
+            rejected_rows,
+        })
+    }
+
+    /// Exercise the same durable loaders used by daemon startup against the
+    /// private compatibility snapshot. The stage is retained without exposing
+    /// the loader's row payload or diagnostic text.
+    fn simulate_durable_startup(store: Self) -> std::result::Result<(), SimulatedStartupError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                SimulatedStartupError::new(SimulatedStartupErrorCategory::SessionRegistry)
+            })?;
+        runtime.block_on(async move {
+            store.load_registry().await.map_err(|_| {
+                SimulatedStartupError::new(SimulatedStartupErrorCategory::SessionRegistry)
+            })?;
+            let grants = store.load_saved_grants().await.map_err(|_| {
+                SimulatedStartupError::new(SimulatedStartupErrorCategory::SavedGrants)
+            })?;
+            store.load_saved_grant_tombstones().await.map_err(|_| {
+                SimulatedStartupError::new(SimulatedStartupErrorCategory::SavedGrants)
+            })?;
+            SavedGrantCatalog::empty()
+                .overlay_rows(grants)
+                .map_err(|_| {
+                    SimulatedStartupError::new(SimulatedStartupErrorCategory::SavedGrants)
+                })?;
+            store.load_grant_requests().await.map_err(|_| {
+                SimulatedStartupError::new(SimulatedStartupErrorCategory::GrantRequests)
+            })?;
+            store.load_provisionals().await.map_err(|_| {
+                SimulatedStartupError::new(SimulatedStartupErrorCategory::Provisionals)
+            })?;
+            store.load_approvals().await.map_err(|_| {
+                SimulatedStartupError::new(SimulatedStartupErrorCategory::Approvals)
+            })?;
+            #[cfg(unix)]
+            store.load_read_grants().await.map_err(|_| {
+                SimulatedStartupError::new(SimulatedStartupErrorCategory::ReadGrants)
+            })?;
+            Ok(())
+        })
+    }
+
+    fn rejected_session_registry_rows(conn: &Connection) -> Result<Vec<RejectedDurableStateRow>> {
+        let mut rejected = Vec::new();
+        let mut grants = conn.prepare(
+            "SELECT rowid, token, allow_json, deny_json, allow_exact_json, deny_exact_json,
+                    activated_verbs_json, override_markers_json, scope_json, expires_at,
+                    prompt_append, generated_notes_json, granted_at, static_only, auto_amend,
+                    owner_json
+             FROM session_grants ORDER BY rowid",
+        )?;
+        let mut rows = grants.query([])?;
+        while let Some(row) = rows.next()? {
+            let row_id = row.get::<_, i64>(0)?;
+            let malformed = row.get::<_, String>(1).is_err()
+                || row
+                    .get::<_, String>(2)
+                    .and_then(|value| decode_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(3)
+                    .and_then(|value| decode_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(4)
+                    .and_then(|value| decode_exact_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(5)
+                    .and_then(|value| decode_exact_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(6)
+                    .and_then(|value| decode_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(7)
+                    .and_then(|value| decode_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(8)
+                    .and_then(|value| decode_scope(&value))
+                    .is_err()
+                || row
+                    .get::<_, Option<i64>>(9)
+                    .and_then(decode_optional_u64)
+                    .is_err()
+                || row.get::<_, Option<String>>(10).is_err()
+                || row
+                    .get::<_, String>(11)
+                    .and_then(|value| decode_vec(&value))
+                    .is_err()
+                || row.get::<_, i64>(12).and_then(decode_u64).is_err()
+                || row.get::<_, i64>(13).and_then(decode_bool).is_err()
+                || row.get::<_, i64>(14).and_then(decode_bool).is_err()
+                || row
+                    .get::<_, String>(15)
+                    .and_then(|value| decode_owner(&value))
+                    .is_err();
+            if malformed {
+                rejected.push(RejectedDurableStateRow {
+                    handle: row_id.to_string(),
+                    category: DurableStateRowCategory::SessionGrant,
+                    reason: DurableStateRowReason::Malformed,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                });
+            }
+        }
+        drop(rows);
+        drop(grants);
+
+        let mut history = conn.prepare(
+            "SELECT id, token, allow_json, deny_json, allow_exact_json, deny_exact_json,
+                    activated_verbs_json, override_markers_json, scope_json, granted_at,
+                    expires_at, ended_at, status, prompt_append, generated_notes_json,
+                    static_only, auto_amend, owner_json
+             FROM session_history ORDER BY id",
+        )?;
+        let mut rows = history.query([])?;
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, i64>(0)?;
+            let malformed = row.get::<_, String>(1).is_err()
+                || row
+                    .get::<_, String>(2)
+                    .and_then(|value| decode_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(3)
+                    .and_then(|value| decode_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(4)
+                    .and_then(|value| decode_exact_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(5)
+                    .and_then(|value| decode_exact_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(6)
+                    .and_then(|value| decode_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(7)
+                    .and_then(|value| decode_vec(&value))
+                    .is_err()
+                || row
+                    .get::<_, String>(8)
+                    .and_then(|value| decode_scope(&value))
+                    .is_err()
+                || row.get::<_, i64>(9).and_then(decode_u64).is_err()
+                || row
+                    .get::<_, Option<i64>>(10)
+                    .and_then(decode_optional_u64)
+                    .is_err()
+                || row.get::<_, i64>(11).and_then(decode_u64).is_err()
+                || row
+                    .get::<_, String>(12)
+                    .and_then(|value| decode_historical_status(&value))
+                    .is_err()
+                || row.get::<_, Option<String>>(13).is_err()
+                || row
+                    .get::<_, String>(14)
+                    .and_then(|value| decode_vec(&value))
+                    .is_err()
+                || row.get::<_, i64>(15).and_then(decode_bool).is_err()
+                || row.get::<_, i64>(16).and_then(decode_bool).is_err()
+                || row
+                    .get::<_, String>(17)
+                    .and_then(|value| decode_owner(&value))
+                    .is_err();
+            if malformed {
+                rejected.push(RejectedDurableStateRow {
+                    handle: id.to_string(),
+                    category: DurableStateRowCategory::SessionHistory,
+                    reason: DurableStateRowReason::Malformed,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                });
+            }
+        }
+        drop(rows);
+        drop(history);
+
+        let mut interactions = conn.prepare(
+            "SELECT id, token, at_unix, command, allowed, source, reason, risk,
+                    exec_status, exit_code, secret_refs_json, decision_trace_json
+             FROM session_interactions ORDER BY id",
+        )?;
+        let mut rows = interactions.query([])?;
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, i64>(0)?;
+            let malformed = row.get::<_, String>(1).is_err()
+                || row.get::<_, i64>(2).and_then(decode_u64).is_err()
+                || row.get::<_, String>(3).is_err()
+                || row.get::<_, i64>(4).is_err()
+                || row
+                    .get::<_, String>(5)
+                    .and_then(|value| decode_decision_source(&value))
+                    .is_err()
+                || row.get::<_, String>(6).is_err()
+                || row.get::<_, Option<u8>>(7).is_err()
+                || row
+                    .get::<_, String>(8)
+                    .and_then(|value| decode_exec_status(&value))
+                    .is_err()
+                || row.get::<_, Option<i32>>(9).is_err()
+                || row
+                    .get::<_, String>(10)
+                    .and_then(|value| decode_credential_references(&value))
+                    .is_err()
+                || row
+                    .get::<_, Option<String>>(11)
+                    .and_then(|value| {
+                        value
+                            .map(|json| {
+                                serde_json::from_str::<guard::gating::DecisionTrace>(&json).map_err(
+                                    |error| {
+                                        rusqlite::Error::FromSqlConversionFailure(
+                                            11,
+                                            rusqlite::types::Type::Text,
+                                            Box::new(error),
+                                        )
+                                    },
+                                )
+                            })
+                            .transpose()
+                    })
+                    .is_err();
+            if malformed {
+                rejected.push(RejectedDurableStateRow {
+                    handle: id.to_string(),
+                    category: DurableStateRowCategory::SessionInteraction,
+                    reason: DurableStateRowReason::Malformed,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                });
+            }
+        }
+        Ok(rejected)
+    }
+
+    fn rejected_saved_grant_rows(conn: &Connection) -> Result<Vec<RejectedDurableStateRow>> {
+        let mut statement =
+            conn.prepare("SELECT rowid, name, updated_unix, json FROM saved_grants ORDER BY name")?;
+        let mut rows = statement.query([])?;
+        let mut rejected = Vec::new();
+        let mut grants = Vec::new();
+        while let Some(row) = rows.next()? {
+            let row_id = row.get::<_, i64>(0)?;
+            let name = match row.get::<_, String>(1) {
+                Ok(name) => name,
+                Err(_) => {
+                    rejected.push(RejectedDurableStateRow {
+                        handle: row_id.to_string(),
+                        category: DurableStateRowCategory::SavedGrant,
+                        reason: DurableStateRowReason::Malformed,
+                        impact: DurableStateRowImpact::BlocksStartup,
+                    });
+                    continue;
+                }
+            };
+            let reason = match durable_indexed_json_fields(row, 2, 3) {
+                Err(reason) => Some(reason),
+                Ok((updated_unix, json)) => match serde_json::from_str::<SavedGrant>(&json) {
+                    Err(_) => Some(DurableStateRowReason::Malformed),
+                    Ok(grant) => match decode_u64(updated_unix) {
+                        Err(_) => Some(DurableStateRowReason::IndexMismatch),
+                        Ok(updated_unix)
+                            if grant.name != name || grant.updated_unix != updated_unix =>
+                        {
+                            Some(DurableStateRowReason::IndexMismatch)
+                        }
+                        Ok(_) if grant.validate_canonical().is_err() => {
+                            Some(DurableStateRowReason::InvalidAuthority)
+                        }
+                        Ok(_) => {
+                            grants.push(grant);
+                            None
+                        }
+                    },
+                },
+            };
+            if let Some(reason) = reason {
+                rejected.push(RejectedDurableStateRow {
+                    handle: name,
+                    category: DurableStateRowCategory::SavedGrant,
+                    reason,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                });
+            }
+        }
+        if rejected.is_empty() && SavedGrantCatalog::empty().overlay_rows(grants).is_err() {
+            // `overlay_rows` validates the same canonical shape as startup;
+            // individual rows have already been classified above.
+            anyhow::bail!("validate durable saved-grant startup catalog");
+        }
+        Ok(rejected)
+    }
+
+    fn rejected_grant_request_rows(conn: &Connection) -> Result<Vec<RejectedDurableStateRow>> {
+        let mut statement = conn.prepare(
+            "SELECT rowid, handle, status, created_unix, json
+             FROM grant_requests ORDER BY handle",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut rejected = Vec::new();
+        while let Some(row) = rows.next()? {
+            let row_id = row.get::<_, i64>(0)?;
+            let handle = match row.get::<_, String>(1) {
+                Ok(handle) => handle,
+                Err(_) => {
+                    rejected.push(RejectedDurableStateRow {
+                        handle: row_id.to_string(),
+                        category: DurableStateRowCategory::GrantRequest,
+                        reason: DurableStateRowReason::Malformed,
+                        impact: DurableStateRowImpact::BlocksStartup,
+                    });
+                    continue;
+                }
+            };
+            let reason = grant_request_rejection_reason(&handle, row, 2, 3, 4);
+            if let Some(reason) = reason {
+                let impact = if reason == DurableStateRowReason::InvalidAuthority {
+                    DurableStateRowImpact::RequiresRetirement
+                } else {
+                    DurableStateRowImpact::BlocksStartup
+                };
+                rejected.push(RejectedDurableStateRow {
+                    handle,
+                    category: DurableStateRowCategory::GrantRequest,
+                    reason,
+                    impact,
+                });
+            }
+        }
+        Ok(rejected)
+    }
+
+    fn rejected_provisional_rows(conn: &Connection) -> Result<Vec<RejectedDurableStateRow>> {
+        let mut statement = conn.prepare(
+            "SELECT rowid, handle, status, created_unix, json
+             FROM gating_provisional ORDER BY handle",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut rejected = Vec::new();
+        while let Some(row) = rows.next()? {
+            let row_id = row.get::<_, i64>(0)?;
+            let handle = match row.get::<_, String>(1) {
+                Ok(handle) => handle,
+                Err(_) => {
+                    rejected.push(RejectedDurableStateRow {
+                        handle: row_id.to_string(),
+                        category: DurableStateRowCategory::Provisional,
+                        reason: DurableStateRowReason::Malformed,
+                        impact: DurableStateRowImpact::BlocksStartup,
+                    });
+                    continue;
+                }
+            };
+            let reason = match durable_status_timestamp_json_fields(row, 2, 3, 4) {
+                Err(reason) => Some(reason),
+                Ok((status, created_unix, json)) => {
+                    match serde_json::from_str::<Provisional>(&json) {
+                        Err(_) => Some(DurableStateRowReason::Malformed),
+                        Ok(provisional) => match decode_u64(created_unix) {
+                            Err(_) => Some(DurableStateRowReason::IndexMismatch),
+                            Ok(created_unix)
+                                if provisional.handle != handle
+                                    || provisional.status.as_str() != status
+                                    || provisional.created_unix != created_unix =>
+                            {
+                                Some(DurableStateRowReason::IndexMismatch)
+                            }
+                            Ok(_) => {
+                                let mut provisional = provisional;
+                                repair_legacy_create_revert(&mut provisional);
+                                validate_persisted_provisional(&provisional)
+                                    .err()
+                                    .map(|_| DurableStateRowReason::InvalidAuthority)
+                            }
+                        },
+                    }
+                }
+            };
+            if let Some(reason) = reason {
+                rejected.push(RejectedDurableStateRow {
+                    handle,
+                    category: DurableStateRowCategory::Provisional,
+                    reason,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                });
+            }
+        }
+        Ok(rejected)
+    }
+
+    fn rejected_approval_rows(conn: &Connection) -> Result<Vec<RejectedDurableStateRow>> {
+        let mut statement = conn.prepare(
+            "SELECT rowid, handle, status, created_unix, json
+             FROM gating_approval ORDER BY handle",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut rejected = Vec::new();
+        while let Some(row) = rows.next()? {
+            let row_id = row.get::<_, i64>(0)?;
+            let handle = match row.get::<_, String>(1) {
+                Ok(handle) => handle,
+                Err(_) => {
+                    rejected.push(RejectedDurableStateRow {
+                        handle: row_id.to_string(),
+                        category: DurableStateRowCategory::Approval,
+                        reason: DurableStateRowReason::Malformed,
+                        impact: DurableStateRowImpact::BlocksStartup,
+                    });
+                    continue;
+                }
+            };
+            let reason = match durable_status_timestamp_json_fields(row, 2, 3, 4) {
+                Err(reason) => Some(reason),
+                Ok((status, created_unix, json)) => match serde_json::from_str::<Approval>(&json) {
+                    Err(_) => Some(DurableStateRowReason::Malformed),
+                    Ok(approval) => match decode_u64(created_unix) {
+                        Err(_) => Some(DurableStateRowReason::IndexMismatch),
+                        Ok(created_unix)
+                            if approval.handle != handle
+                                || approval.status.as_str() != status
+                                || approval.created_unix != created_unix =>
+                        {
+                            Some(DurableStateRowReason::IndexMismatch)
+                        }
+                        Ok(_) => validate_persisted_approval(&approval)
+                            .err()
+                            .map(|_| DurableStateRowReason::InvalidAuthority),
+                    },
+                },
+            };
+            if let Some(reason) = reason {
+                rejected.push(RejectedDurableStateRow {
+                    handle,
+                    category: DurableStateRowCategory::Approval,
+                    reason,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                });
+            }
+        }
+        Ok(rejected)
+    }
+
+    #[cfg(unix)]
+    fn rejected_read_grant_rows(conn: &Connection) -> Result<Vec<RejectedDurableStateRow>> {
+        let mut statement = conn.prepare(
+            "SELECT rowid, target_path, status, expires_unix, json
+             FROM read_grants ORDER BY target_path",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut rejected = Vec::new();
+        while let Some(row) = rows.next()? {
+            let row_id = row.get::<_, i64>(0)?;
+            let target_path = match row.get::<_, String>(1) {
+                Ok(target_path) => target_path,
+                Err(_) => {
+                    rejected.push(RejectedDurableStateRow {
+                        handle: row_id.to_string(),
+                        category: DurableStateRowCategory::ReadGrant,
+                        reason: DurableStateRowReason::Malformed,
+                        impact: DurableStateRowImpact::BlocksStartup,
+                    });
+                    continue;
+                }
+            };
+            let reason = match durable_status_timestamp_json_fields(row, 2, 3, 4) {
+                Err(reason) => Some(reason),
+                Ok((status, expires_unix, json)) => {
+                    match serde_json::from_str::<ReadGrant>(&json) {
+                        Err(_) => Some(DurableStateRowReason::Malformed),
+                        Ok(grant) => match decode_u64(expires_unix) {
+                            Err(_) => Some(DurableStateRowReason::IndexMismatch),
+                            Ok(expires_unix)
+                                if grant.target_path != target_path
+                                    || grant.status.as_str() != status
+                                    || grant.expires_unix != expires_unix =>
+                            {
+                                Some(DurableStateRowReason::IndexMismatch)
+                            }
+                            Ok(_) => None,
+                        },
+                    }
+                }
+            };
+            if let Some(reason) = reason {
+                rejected.push(RejectedDurableStateRow {
+                    handle: target_path,
+                    category: DurableStateRowCategory::ReadGrant,
+                    reason,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                });
+            }
+        }
+        Ok(rejected)
     }
 
     fn normalize_daemon_database_path(path: &Path) -> Result<PathBuf> {
@@ -632,6 +1452,9 @@ impl SessionStore {
                 database_generation: generation,
                 last_written_revision: registry.revision(),
             })),
+            warned_invalid_grant_requests: std::sync::Arc::new(std::sync::Mutex::new(
+                BTreeSet::new(),
+            )),
             #[cfg(test)]
             fail_next_write: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -686,7 +1509,7 @@ impl SessionStore {
                     .canonical_access_key()
                     .context("rebase pending access request key")?;
             }
-            validate_persisted_access_request(&request)?;
+            validate_durable_grant_request(&handle, &request)?;
             conn.execute(
                 "UPDATE grant_requests SET json = ?1 WHERE handle = ?2",
                 params![
@@ -1546,16 +2369,10 @@ impl SessionStore {
                 let request = serde_json::from_str::<GrantRequest>(&json).with_context(|| {
                     format!("decode durable grant request {handle} with status {status}")
                 })?;
-                if validate_access_authority {
-                    if let Err(error) = validate_persisted_access_request(&request) {
-                        tracing::warn!(
-                            %handle,
-                            %error,
-                            "skipping durable grant request that fails current validation; \
-                             the row is never honored and can be cleared with guard access"
-                        );
-                        continue;
-                    }
+                if validate_access_authority
+                    && validate_durable_grant_request(&handle, &request).is_err()
+                {
+                    continue;
                 }
                 if request.handle != handle
                     || request.status.as_str() != status
@@ -1787,7 +2604,7 @@ impl SessionStore {
         }
         let path = self.path.clone();
         let request = sanitize_grant_request(request);
-        validate_persisted_access_request(&request)?;
+        validate_durable_grant_request(&request.handle, &request)?;
         tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
@@ -1819,8 +2636,8 @@ impl SessionStore {
         let path = self.path.clone();
         let pending = sanitize_grant_request(pending);
         let terminal = sanitize_grant_request(terminal);
-        validate_persisted_access_request(&pending)?;
-        validate_persisted_access_request(&terminal)?;
+        validate_durable_grant_request(&pending.handle, &pending)?;
+        validate_durable_grant_request(&terminal.handle, &terminal)?;
         tokio::task::spawn_blocking(move || {
             Self::compare_and_swap_grant_request_sync(&path, &pending, &terminal)
         })
@@ -1865,7 +2682,7 @@ impl SessionStore {
             .context("durable pending grant request is missing")?;
         let durable: GrantRequest =
             serde_json::from_str(&durable_json).context("decode durable pending grant request")?;
-        validate_persisted_access_request(&durable)?;
+        validate_durable_grant_request(&pending.handle, &durable)?;
         if durable != *pending {
             anyhow::bail!("durable grant request already has a terminal outcome");
         }
@@ -1892,14 +2709,14 @@ impl SessionStore {
             let json = conn
                 .query_row(
                     "SELECT json FROM grant_requests WHERE handle = ?1",
-                    params![handle],
+                    params![&handle],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
             json.map(|json| {
                 let request =
                     serde_json::from_str::<GrantRequest>(&json).context("decode grant request")?;
-                validate_persisted_access_request(&request)?;
+                validate_durable_grant_request(&handle, &request)?;
                 Ok(request)
             })
             .transpose()
@@ -1943,11 +2760,11 @@ impl SessionStore {
                 )
             })
             .collect::<Vec<_>>();
-        validate_persisted_access_request(&pending)?;
-        validate_persisted_access_request(&approved)?;
+        validate_durable_grant_request(&pending.handle, &pending)?;
+        validate_durable_grant_request(&approved.handle, &approved)?;
         for (previous, next) in &rebased_pending {
-            validate_persisted_access_request(previous)?;
-            validate_persisted_access_request(next)?;
+            validate_durable_grant_request(&previous.handle, previous)?;
+            validate_durable_grant_request(&next.handle, next)?;
         }
         let path = self.path.clone();
         let retention = self.history_retention_secs;
@@ -2011,7 +2828,7 @@ impl SessionStore {
             .context("durable pending grant request is missing")?;
         let durable: GrantRequest =
             serde_json::from_str(&durable_json).context("decode durable pending grant request")?;
-        validate_persisted_access_request(&durable)?;
+        validate_durable_grant_request(&pending.handle, &durable)?;
         if durable != *pending {
             anyhow::bail!("durable grant request changed after approval began");
         }
@@ -2118,8 +2935,8 @@ impl SessionStore {
             })
             .collect::<Vec<_>>();
         for (previous, next) in &withdrawals {
-            validate_persisted_access_request(previous)?;
-            validate_persisted_access_request(next)?;
+            validate_durable_grant_request(&previous.handle, previous)?;
+            validate_durable_grant_request(&next.handle, next)?;
         }
         let session_fingerprint = session_token_fingerprint(&token);
         let path = self.path.clone();
@@ -2210,7 +3027,7 @@ impl SessionStore {
                     .context("durable pending access request is missing")?;
                 let durable: GrantRequest = serde_json::from_str(&durable_json)
                     .context("decode durable pending access request")?;
-                validate_persisted_access_request(&durable)?;
+                validate_durable_grant_request(&pending.handle, &durable)?;
                 if durable != *pending {
                     anyhow::bail!("durable access request changed before revoke");
                 }
@@ -2256,6 +3073,7 @@ impl SessionStore {
 
     pub async fn load_grant_requests(&self) -> Result<Vec<GrantRequest>> {
         let path = self.path.clone();
+        let warned_invalid_grant_requests = self.warned_invalid_grant_requests.clone();
         tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
@@ -2275,13 +3093,20 @@ impl SessionStore {
                 let request = serde_json::from_str::<GrantRequest>(&json).with_context(|| {
                     format!("decode durable grant request {handle} with status {status}")
                 })?;
-                if let Err(error) = validate_persisted_access_request(&request) {
-                    tracing::warn!(
-                        %handle,
-                        %error,
-                        "skipping durable grant request that fails current validation; \
-                         the row is never honored and can be cleared with guard access"
-                    );
+                if let Err(error) = validate_durable_grant_request(&handle, &request) {
+                    let first_warning = warned_invalid_grant_requests
+                        .lock()
+                        .expect("invalid grant-request warning set lock")
+                        .insert(handle.clone());
+                    if first_warning {
+                        tracing::warn!(
+                            %handle,
+                            %error,
+                            "ignoring durable grant request that fails current validation; \
+                             the row remains stored and is not honored until an operator retires it \
+                             with `guard access deny <handle>`"
+                        );
+                    }
                     continue;
                 }
                 let created_unix = decode_u64(created_unix)?;
@@ -2330,10 +3155,59 @@ impl SessionStore {
         .context("delete grant requests task failed")?
     }
 
+    /// Atomically retire one durable access-request row only when it no longer
+    /// passes current validation. Missing and valid rows are left untouched.
+    pub async fn retire_invalid_grant_request(&self, handle: String) -> Result<bool> {
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
+        }
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let json = tx
+                .query_row(
+                    "SELECT json FROM grant_requests WHERE handle = ?1",
+                    params![&handle],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(json) = json else {
+                return Ok(false);
+            };
+            let request = serde_json::from_str::<GrantRequest>(&json)
+                .context("decode durable grant request before retirement")?;
+            if validate_durable_grant_request(&handle, &request).is_ok() {
+                return Ok(false);
+            }
+            tx.execute(
+                "DELETE FROM grant_requests WHERE handle = ?1",
+                params![&handle],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+        .context("retire invalid grant request task failed")?
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_write_for_test(&self) {
         self.fail_next_write
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn warned_invalid_grant_request_handles_for_test(&self) -> BTreeSet<String> {
+        self.warned_invalid_grant_requests
+            .lock()
+            .expect("invalid grant-request warning set lock")
+            .clone()
     }
 
     #[cfg(test)]
@@ -3196,9 +4070,87 @@ fn validate_persisted_access_request(request: &GrantRequest) -> Result<()> {
     Ok(())
 }
 
+fn durable_indexed_json_fields(
+    row: &rusqlite::Row<'_>,
+    timestamp_index: usize,
+    json_index: usize,
+) -> std::result::Result<(i64, String), DurableStateRowReason> {
+    let timestamp = row
+        .get::<_, i64>(timestamp_index)
+        .map_err(|_| DurableStateRowReason::Malformed)?;
+    let json = row
+        .get::<_, String>(json_index)
+        .map_err(|_| DurableStateRowReason::Malformed)?;
+    Ok((timestamp, json))
+}
+
+fn durable_status_timestamp_json_fields(
+    row: &rusqlite::Row<'_>,
+    status_index: usize,
+    timestamp_index: usize,
+    json_index: usize,
+) -> std::result::Result<(String, i64, String), DurableStateRowReason> {
+    let status = row
+        .get::<_, String>(status_index)
+        .map_err(|_| DurableStateRowReason::Malformed)?;
+    let (timestamp, json) = durable_indexed_json_fields(row, timestamp_index, json_index)?;
+    Ok((status, timestamp, json))
+}
+
+fn grant_request_rejection_reason(
+    handle: &str,
+    row: &rusqlite::Row<'_>,
+    status_index: usize,
+    created_unix_index: usize,
+    json_index: usize,
+) -> Option<DurableStateRowReason> {
+    let (status, created_unix, json) = match durable_status_timestamp_json_fields(
+        row,
+        status_index,
+        created_unix_index,
+        json_index,
+    ) {
+        Ok(fields) => fields,
+        Err(reason) => return Some(reason),
+    };
+    match serde_json::from_str::<GrantRequest>(&json) {
+        Err(_) => Some(DurableStateRowReason::Malformed),
+        Ok(request) if validate_durable_grant_request(handle, &request).is_err() => {
+            Some(DurableStateRowReason::InvalidAuthority)
+        }
+        Ok(request) => match decode_u64(created_unix) {
+            Ok(created_unix)
+                if request.handle == handle
+                    && request.status.as_str() == status
+                    && request.created_unix == created_unix =>
+            {
+                None
+            }
+            _ => Some(DurableStateRowReason::IndexMismatch),
+        },
+    }
+}
+
+fn validate_durable_grant_request(handle: &str, request: &GrantRequest) -> Result<()> {
+    validate_persisted_access_request(request)
+        .with_context(|| format!("validate durable grant-request row {handle}"))
+}
+
 fn validate_persisted_approval(approval: &Approval) -> Result<()> {
-    if !approval.snapshot.env.is_empty() {
-        anyhow::bail!("approval snapshots cannot persist plain environment values");
+    if !approval.snapshot.env.is_empty() && !approval.snapshot.has_typed_environment_authority() {
+        anyhow::bail!(
+            "approval snapshots require typed verb authority for plain environment values"
+        );
+    }
+    if approval
+        .snapshot
+        .env
+        .iter()
+        .any(|(name, value)| named_value_contains_sensitive_literals(name, value))
+    {
+        anyhow::bail!(
+            "approval snapshots cannot persist credential-shaped plain environment values"
+        );
     }
     if approval.snapshot.contains_sensitive_literals() {
         anyhow::bail!("{SENSITIVE_ARGV_REPLAY_GUIDANCE}");
@@ -3666,22 +4618,34 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                 continue;
             };
             let prose_changed = approval.sanitize_explanatory_text();
-            let plain_environment = !approval.snapshot.env.is_empty();
+            let unauthorized_plain_environment = !approval.snapshot.env.is_empty()
+                && !approval.snapshot.has_typed_environment_authority();
+            let sensitive_plain_environment = approval
+                .snapshot
+                .env
+                .iter()
+                .any(|(name, value)| named_value_contains_sensitive_literals(name, value));
             let sensitive_snapshot = approval.snapshot.contains_sensitive_literals();
             let persisted_verb_params = !approval.snapshot.verb_params.is_empty();
             let exact_contamination = serialized_contains_registered_exact_literals(&approval)?;
             if !prose_changed
-                && !plain_environment
+                && !unauthorized_plain_environment
+                && !sensitive_plain_environment
                 && !sensitive_snapshot
                 && !persisted_verb_params
                 && !exact_contamination
             {
                 continue;
             }
-            approval.snapshot.env.clear();
+            if unauthorized_plain_environment || sensitive_plain_environment {
+                approval.snapshot.env.clear();
+            }
             approval.snapshot.verb_params.clear();
             approval.snapshot.scrub_sensitive_literals();
-            if (plain_environment || sensitive_snapshot || exact_contamination)
+            if (unauthorized_plain_environment
+                || sensitive_plain_environment
+                || sensitive_snapshot
+                || exact_contamination)
                 && matches!(
                     approval.status,
                     ApprovalStatus::Pending | ApprovalStatus::Approving
@@ -3689,7 +4653,10 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
             {
                 approval.status = ApprovalStatus::ExecFailed;
                 approval.decided_unix = Some(guard::env::now_unix());
-                approval.decided_reason = Some(if sensitive_snapshot || exact_contamination {
+                approval.decided_reason = Some(if sensitive_plain_environment {
+                    "credential-shaped plain environment values were removed from persisted approval state; use named secret references"
+                        .to_string()
+                } else if sensitive_snapshot || exact_contamination {
                     SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string()
                 } else {
                     "plain environment values were removed from persisted approval state"
@@ -4087,6 +5054,31 @@ fn open_state_connection(path: &Path) -> rusqlite::Result<Connection> {
 #[cfg(not(unix))]
 fn open_state_connection(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open(path)
+}
+
+#[cfg(unix)]
+fn open_state_connection_read_only(path: &Path) -> rusqlite::Result<Connection> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    Connection::open_with_flags(path, flags)
+}
+
+#[cfg(not(unix))]
+fn open_state_connection_read_only(path: &Path) -> rusqlite::Result<Connection> {
+    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+}
+
+fn private_snapshot_dir() -> Result<tempfile::TempDir> {
+    let directory = tempfile::tempdir().context("create compatibility snapshot directory")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .context("protect compatibility snapshot directory")?;
+    #[cfg(windows)]
+    guard::learned_rules::protect_current_user_directory(directory.path())
+        .context("protect compatibility snapshot directory")?;
+    Ok(directory)
 }
 
 #[cfg(windows)]
@@ -4491,11 +5483,14 @@ mod tests {
                 catalog_version: None,
                 verb_digest: None,
                 verb_composition_digest: None,
+                verb_environment_authority: false,
+                verb_local_file_authority: false,
                 exec_timeout_secs: None,
                 access_verbs: Vec::new(),
                 access_requests: Vec::new(),
                 principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
                 secret_binding: None,
+                process_authority: None,
             },
             reason: "fixture approval".to_string(),
             risk: Some(7),
@@ -4525,8 +5520,10 @@ mod tests {
             secret_file_keys: std::collections::BTreeMap::new(),
             revert_binary: "fixture-revert".to_string(),
             revert_args: Vec::new(),
+            revert_authorization: None,
             confirm_check_binary: None,
             confirm_check_args: Vec::new(),
+            confirm_check_authorization: None,
             control_path: Some("fixture".to_string()),
             session_fingerprint: None,
             session_revision: None,
@@ -4590,8 +5587,8 @@ mod tests {
         let mut verb = Verb {
             name: "access-generated-fixture".to_string(),
             description: "fixture coverage".to_string(),
-            binary: "fixturectl".to_string(),
-            args: vec!["status".to_string(), "resource/example".to_string()],
+            binary: "printf".to_string(),
+            args: vec!["status %s".to_string(), "resource/example".to_string()],
             baseline: false,
             coverage: Vec::new(),
             credential_plan: None,
@@ -4624,6 +5621,200 @@ mod tests {
         request.proposed_verbs = vec![serde_json::to_value(verb).unwrap()];
         request.request_key = request.canonical_access_key().unwrap();
         request
+    }
+
+    fn invalid_access_request() -> GrantRequest {
+        GrantRequest::new_access_with_uses(
+            guard::principal::PrincipalKey::from_uid(1001),
+            None,
+            "agent:fixture".to_string(),
+            crate::grant_profile::GrantRequestDelta::default(),
+            "invalid access fixture".to_string(),
+            Some(1),
+        )
+        .unwrap()
+    }
+
+    fn insert_durable_timestamp_rows(
+        connection: &Connection,
+        suffix: &str,
+        timestamp: rusqlite::types::Value,
+    ) -> (Vec<(DurableStateRowCategory, String)>, String) {
+        let payload_marker = format!("durable-row-payload-{suffix}");
+        let mut rows = Vec::new();
+
+        connection
+            .execute(
+                "INSERT INTO session_grants
+                 (token, allow_json, deny_json, scope_json, granted_at)
+                 VALUES (?1, '[]', '[]', '{}', ?2)",
+                params![format!("{payload_marker}-grant"), timestamp.clone()],
+            )
+            .unwrap();
+        rows.push((
+            DurableStateRowCategory::SessionGrant,
+            connection.last_insert_rowid().to_string(),
+        ));
+
+        connection
+            .execute(
+                "INSERT INTO session_history
+                 (token, allow_json, deny_json, granted_at, ended_at, status)
+                 VALUES (?1, '[]', '[]', 1, ?2, 'revoked')",
+                params![format!("{payload_marker}-history"), timestamp.clone()],
+            )
+            .unwrap();
+        rows.push((
+            DurableStateRowCategory::SessionHistory,
+            connection.last_insert_rowid().to_string(),
+        ));
+
+        connection
+            .execute(
+                "INSERT INTO session_interactions
+                 (token, at_unix, command, allowed, source, reason, exec_status)
+                 VALUES (?1, ?2, 'true', 1, 'llm', 'fixture', 'completed')",
+                params![format!("{payload_marker}-interaction"), timestamp.clone()],
+            )
+            .unwrap();
+        rows.push((
+            DurableStateRowCategory::SessionInteraction,
+            connection.last_insert_rowid().to_string(),
+        ));
+
+        let saved_name = format!("saved-{suffix}");
+        let mut saved_grant = SavedGrantCatalog::from_yaml(&format!(
+            "grants:\n  - name: {saved_name}\n    activated_verbs: [inspect]\n"
+        ))
+        .unwrap()
+        .get(&saved_name)
+        .unwrap()
+        .clone();
+        saved_grant.description = payload_marker.clone();
+        saved_grant.updated_unix = 1;
+        connection
+            .execute(
+                "INSERT INTO saved_grants (name, json, updated_unix) VALUES (?1, ?2, ?3)",
+                params![
+                    &saved_name,
+                    serde_json::to_string(&saved_grant).unwrap(),
+                    timestamp.clone()
+                ],
+            )
+            .unwrap();
+        rows.push((DurableStateRowCategory::SavedGrant, saved_name));
+
+        let request = GrantRequest::new(
+            format!("request-session-{suffix}"),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some("fixture request".to_string()),
+                ..Default::default()
+            },
+            payload_marker.clone(),
+        )
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &request.handle,
+                    serde_json::to_string(&request).unwrap(),
+                    request.status.as_str(),
+                    timestamp.clone()
+                ],
+            )
+            .unwrap();
+        rows.push((DurableStateRowCategory::GrantRequest, request.handle));
+
+        let provisional_handle = format!("provisional-{suffix}");
+        let mut provisional = provisional_row(&provisional_handle, ProvisionalStatus::Armed);
+        provisional.reason = payload_marker.clone();
+        connection
+            .execute(
+                "INSERT INTO gating_provisional (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &provisional.handle,
+                    serde_json::to_string(&provisional).unwrap(),
+                    provisional.status.as_str(),
+                    timestamp.clone()
+                ],
+            )
+            .unwrap();
+        rows.push((DurableStateRowCategory::Provisional, provisional.handle));
+
+        let approval_handle = format!("approval-{suffix}");
+        let mut approval = pending_approval(&approval_handle);
+        approval.reason = payload_marker.clone();
+        connection
+            .execute(
+                "INSERT INTO gating_approval (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &approval.handle,
+                    serde_json::to_string(&approval).unwrap(),
+                    approval.status.as_str(),
+                    timestamp.clone()
+                ],
+            )
+            .unwrap();
+        rows.push((DurableStateRowCategory::Approval, approval.handle));
+
+        #[cfg(unix)]
+        {
+            let target_path = format!("/fixture/read-{suffix}");
+            let read_grant = ReadGrant {
+                handle: format!("read-{suffix}"),
+                principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
+                granting_session: None,
+                target_path: target_path.clone(),
+                grantee_uid: 1001,
+                entries: Vec::new(),
+                reason: payload_marker.clone(),
+                created_unix: 1,
+                expires_unix: 2,
+                status: guard::gating::read_grant::ReadGrantStatus::Active,
+                revert_detail: None,
+            };
+            connection
+                .execute(
+                    "INSERT INTO read_grants (target_path, json, status, expires_unix)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        &read_grant.target_path,
+                        serde_json::to_string(&read_grant).unwrap(),
+                        read_grant.status.as_str(),
+                        timestamp
+                    ],
+                )
+                .unwrap();
+            rows.push((DurableStateRowCategory::ReadGrant, target_path));
+        }
+
+        (rows, payload_marker)
+    }
+
+    fn assert_rejected_timestamp_rows(
+        report: &SessionStoreCompatibilityReport,
+        expected: &[(DurableStateRowCategory, String)],
+        reason_for: impl Fn(DurableStateRowCategory) -> DurableStateRowReason,
+    ) {
+        assert_eq!(report.rejected_rows.len(), expected.len());
+        for (category, handle) in expected {
+            let expected_row = RejectedDurableStateRow {
+                handle: handle.clone(),
+                category: *category,
+                reason: reason_for(*category),
+                impact: DurableStateRowImpact::BlocksStartup,
+            };
+            assert!(
+                report.rejected_rows.contains(&expected_row),
+                "missing rejected row {expected_row:?} from {:?}",
+                report.rejected_rows
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -4838,7 +6029,7 @@ mod tests {
         legacy.baseline = true;
         legacy.trusted = true;
         legacy.revert = Some(guard::gating::verb::VerbCommand {
-            binary: "fixturectl".to_string(),
+            binary: "printf".to_string(),
             args: vec!["undo".to_string()],
         });
         legacy.consequence = match legacy.consequence {
@@ -4915,7 +6106,7 @@ mod tests {
             verb.baseline = true;
             verb.trusted = true;
             verb.revert = Some(guard::gating::verb::VerbCommand {
-                binary: "fixturectl".to_string(),
+                binary: "printf".to_string(),
                 args: vec!["undo".to_string()],
             });
             request.proposed_verbs = vec![serde_json::to_value(verb).unwrap()];
@@ -5142,7 +6333,7 @@ mod tests {
 
         let verbs = [
             generated(
-                "fixturectl",
+                "printf",
                 &["{option}", "{operand}"],
                 BTreeMap::from([
                     ("option".to_string(), parameter("^--[a-z]{8}$", true)),
@@ -5150,19 +6341,11 @@ mod tests {
                 ]),
             ),
             generated(
-                "fixturectl",
+                "printf",
                 &["{argument}"],
                 BTreeMap::from([(
                     "argument".to_string(),
                     parameter("^--[a-z]{8}=[a-z0-9]{2}$", true),
-                )]),
-            ),
-            generated(
-                "mysql",
-                &["{argument}"],
-                BTreeMap::from([(
-                    "argument".to_string(),
-                    parameter("^-[a-z][a-z0-9]{2}$", true),
                 )]),
             ),
         ];
@@ -5199,20 +6382,14 @@ mod tests {
                     ("option".to_string(), "--password".to_string()),
                     ("operand".to_string(), value.clone()),
                 ]),
-                "fixturectl",
+                "printf",
                 vec!["--password".to_string(), value.clone()],
             ),
             (
                 1,
                 BTreeMap::from([("argument".to_string(), format!("--password={value}"))]),
-                "fixturectl",
+                "printf",
                 vec![format!("--password={value}")],
-            ),
-            (
-                2,
-                BTreeMap::from([("argument".to_string(), format!("-p{value}"))]),
-                "mysql",
-                vec![format!("-p{value}")],
             ),
         ] {
             assert!(catalog.render(&verbs[index].name, &params).is_err());
@@ -5230,6 +6407,7 @@ mod tests {
         verb.coverage = vec![VerbCoverageCell {
             name: "exact".to_string(),
             action: CoverageAction::Evaluate,
+            command_path: Vec::new(),
             required_args: Vec::new(),
             forbidden_args: Vec::new(),
             min_args: Some(2),
@@ -5386,8 +6564,10 @@ mod tests {
                 secret_file_keys: BTreeMap::new(),
                 revert_binary: "true".to_string(),
                 revert_args: Vec::new(),
+                revert_authorization: None,
                 confirm_check_binary: None,
                 confirm_check_args: Vec::new(),
+                confirm_check_authorization: None,
                 control_path: Some("local".to_string()),
                 session_fingerprint: Some("sha256:test".to_string()),
                 session_revision: Some("revision".to_string()),
@@ -5623,6 +6803,648 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retire_invalid_grant_request_is_atomic_and_scoped() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        let invalid = invalid_access_request();
+        let valid = GrantRequest::new(
+            "valid-session".to_string(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some("valid request".to_string()),
+                ..Default::default()
+            },
+            "valid request".to_string(),
+        )
+        .unwrap();
+        store.save_grant_request(valid.clone()).await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &invalid.handle,
+                    serde_json::to_string(&invalid).unwrap(),
+                    invalid.status.as_str(),
+                    encode_u64(invalid.created_unix).unwrap(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(store
+            .retire_invalid_grant_request(invalid.handle.clone())
+            .await
+            .unwrap());
+        assert!(!store
+            .retire_invalid_grant_request(invalid.handle.clone())
+            .await
+            .unwrap());
+        assert!(!store
+            .retire_invalid_grant_request(valid.handle.clone())
+            .await
+            .unwrap());
+        assert_eq!(store.load_grant_requests().await.unwrap(), vec![valid]);
+    }
+
+    #[tokio::test]
+    async fn offline_retirement_requires_the_daemon_lease_and_current_rejection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        let invalid = invalid_access_request();
+        let valid = GrantRequest::new(
+            "valid-session".to_string(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some("valid request".to_string()),
+                ..Default::default()
+            },
+            "valid request".to_string(),
+        )
+        .unwrap();
+        store.save_grant_request(valid.clone()).await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &invalid.handle,
+                    serde_json::to_string(&invalid).unwrap(),
+                    invalid.status.as_str(),
+                    encode_u64(invalid.created_unix).unwrap(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let daemon_lease = store.acquire_daemon_lease().await.unwrap();
+        let error =
+            SessionStore::retire_rejected_grant_request(path.clone(), invalid.handle.clone())
+                .await
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("already has an active daemon"));
+        let connection = Connection::open(&path).unwrap();
+        let retained: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM grant_requests WHERE handle = ?1",
+                params![&invalid.handle],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 1);
+        drop(connection);
+        drop(daemon_lease);
+
+        assert_eq!(
+            SessionStore::retire_rejected_grant_request(path.clone(), invalid.handle.clone())
+                .await
+                .unwrap(),
+            Some(DurableStateRowReason::InvalidAuthority)
+        );
+        assert_eq!(
+            SessionStore::retire_rejected_grant_request(path.clone(), valid.handle.clone())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.load_grant_requests().await.unwrap(),
+            vec![valid.clone()]
+        );
+
+        let malformed_handle = "legacy-invalid-row";
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+                params![malformed_handle, "not-json", "pending", 1_i64],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            SessionStore::retire_rejected_grant_request(
+                path.clone(),
+                malformed_handle.to_string(),
+            )
+            .await
+            .unwrap(),
+            Some(DurableStateRowReason::Malformed)
+        );
+        assert_eq!(store.load_grant_requests().await.unwrap(), vec![valid]);
+    }
+
+    #[tokio::test]
+    async fn offline_retirement_deletes_malformed_and_index_mismatch_rows_by_exact_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        let malformed = GrantRequest::new(
+            "malformed-storage-session".to_string(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some("malformed storage fixture".to_string()),
+                ..Default::default()
+            },
+            "malformed storage fixture".to_string(),
+        )
+        .unwrap();
+        let index_mismatch = GrantRequest::new(
+            "negative-timestamp-session".to_string(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some("negative timestamp fixture".to_string()),
+                ..Default::default()
+            },
+            "negative timestamp fixture".to_string(),
+        )
+        .unwrap();
+        store.save_grant_request(malformed.clone()).await.unwrap();
+        store
+            .save_grant_request(index_mismatch.clone())
+            .await
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE grant_requests SET created_unix = ?1 WHERE handle = ?2",
+                params![rusqlite::types::Value::Blob(vec![0xff]), &malformed.handle],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE grant_requests SET created_unix = -1 WHERE handle = ?1",
+                params![&index_mismatch.handle],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            SessionStore::retire_rejected_grant_request(path.clone(), malformed.handle.clone(),)
+                .await
+                .unwrap(),
+            Some(DurableStateRowReason::Malformed)
+        );
+        let connection = Connection::open(&path).unwrap();
+        let remaining_index_mismatch: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM grant_requests WHERE handle = ?1",
+                params![&index_mismatch.handle],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_index_mismatch, 1);
+        drop(connection);
+
+        assert_eq!(
+            SessionStore::retire_rejected_grant_request(
+                path.clone(),
+                index_mismatch.handle.clone(),
+            )
+            .await
+            .unwrap(),
+            Some(DurableStateRowReason::IndexMismatch)
+        );
+        let remaining: i64 = Connection::open(path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM grant_requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn offline_retirement_requires_the_current_complete_schema() {
+        let temporary = tempfile::tempdir().unwrap();
+        let future_path = temporary.path().join("future.db");
+        let future_store = SessionStore::open(future_path.clone(), 3_600)
+            .await
+            .unwrap();
+        drop(future_store);
+        let connection = Connection::open(&future_path).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+        let error = SessionStore::retire_rejected_grant_request(
+            future_path,
+            "legacy-invalid-row".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("newer than supported"));
+
+        let incomplete_path = temporary.path().join("incomplete.db");
+        let incomplete_store = SessionStore::open(incomplete_path.clone(), 3_600)
+            .await
+            .unwrap();
+        drop(incomplete_store);
+        let connection = Connection::open(&incomplete_path).unwrap();
+        connection.execute("DROP TABLE grant_requests", []).unwrap();
+        drop(connection);
+        let error = SessionStore::retire_rejected_grant_request(
+            incomplete_path,
+            "legacy-invalid-row".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("missing required table grant_requests"));
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_request_warning_is_deduplicated_per_store() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        let invalid = invalid_access_request();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &invalid.handle,
+                    serde_json::to_string(&invalid).unwrap(),
+                    invalid.status.as_str(),
+                    encode_u64(invalid.created_unix).unwrap(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(store.load_grant_requests().await.unwrap().is_empty());
+        assert!(store.load_grant_requests().await.unwrap().is_empty());
+        assert_eq!(
+            store.warned_invalid_grant_request_handles_for_test(),
+            BTreeSet::from([invalid.handle.clone()])
+        );
+
+        let reopened = SessionStore::open(path, 3_600).await.unwrap();
+        assert!(reopened.load_grant_requests().await.unwrap().is_empty());
+        assert_eq!(
+            reopened.warned_invalid_grant_request_handles_for_test(),
+            BTreeSet::from([invalid.handle])
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_check_reports_rejected_rows_without_payloads() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        let mut request = generated_access_request();
+        request.request_key = "inconsistent-fixture-key".to_string();
+        request.justification = "stored-payload-must-not-escape".to_string();
+        let handle = request.handle.clone();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    handle,
+                    serde_json::to_string(&request).unwrap(),
+                    request.status.as_str(),
+                    encode_u64(request.created_unix).unwrap()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let report = SessionStore::compatibility_check(path.clone(), 3_600)
+            .await
+            .unwrap();
+        assert!(report.simulated_open);
+        assert!(report.simulated_startup.succeeded);
+        assert!(!report.compatible);
+        assert_eq!(
+            report.rejected_rows,
+            vec![RejectedDurableStateRow {
+                handle: request.handle.clone(),
+                category: DurableStateRowCategory::GrantRequest,
+                reason: DurableStateRowReason::InvalidAuthority,
+                impact: DurableStateRowImpact::RequiresRetirement,
+            }]
+        );
+        assert!(store.load_grant_requests().await.unwrap().is_empty());
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains("stored-payload-must-not-escape"));
+        let stored: String = Connection::open(path)
+            .unwrap()
+            .query_row("SELECT json FROM grant_requests", [], |row| row.get(0))
+            .unwrap();
+        assert!(stored.contains("stored-payload-must-not-escape"));
+    }
+
+    #[tokio::test]
+    async fn compatibility_check_classifies_invalid_storage_types_in_every_durable_category() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        let (expected, payload_marker) = insert_durable_timestamp_rows(
+            &connection,
+            "invalid-storage",
+            rusqlite::types::Value::Blob(vec![0xff]),
+        );
+        drop(connection);
+
+        let report = SessionStore::compatibility_check(path, 3_600)
+            .await
+            .unwrap();
+        assert!(!report.compatible);
+        assert_rejected_timestamp_rows(&report, &expected, |_| DurableStateRowReason::Malformed);
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains(&payload_marker));
+    }
+
+    #[tokio::test]
+    async fn compatibility_check_classifies_negative_timestamps_in_every_durable_category() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        let (expected, payload_marker) = insert_durable_timestamp_rows(
+            &connection,
+            "negative-timestamp",
+            rusqlite::types::Value::Integer(-1),
+        );
+        drop(connection);
+
+        let report = SessionStore::compatibility_check(path, 3_600)
+            .await
+            .unwrap();
+        assert!(!report.compatible);
+        assert_rejected_timestamp_rows(&report, &expected, |category| match category {
+            DurableStateRowCategory::SessionGrant
+            | DurableStateRowCategory::SessionHistory
+            | DurableStateRowCategory::SessionInteraction => DurableStateRowReason::Malformed,
+            DurableStateRowCategory::SavedGrant
+            | DurableStateRowCategory::GrantRequest
+            | DurableStateRowCategory::Provisional
+            | DurableStateRowCategory::Approval => DurableStateRowReason::IndexMismatch,
+            #[cfg(unix)]
+            DurableStateRowCategory::ReadGrant => DurableStateRowReason::IndexMismatch,
+        });
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains(&payload_marker));
+    }
+
+    #[tokio::test]
+    async fn compatibility_check_reports_malformed_rows_after_failed_simulation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        let handle = "malformed-grant-request";
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![handle, "{", "pending", 1_i64],
+            )
+            .unwrap();
+        drop(connection);
+        drop(store);
+
+        let report = SessionStore::compatibility_check(path.clone(), 3_600)
+            .await
+            .unwrap();
+        assert!(!report.simulated_open);
+        assert!(!report.simulated_startup.succeeded);
+        assert_eq!(
+            report.simulated_startup.error_category,
+            Some(SimulatedStartupErrorCategory::GrantRequests)
+        );
+        assert_eq!(
+            report.rejected_rows,
+            vec![RejectedDurableStateRow {
+                handle: handle.to_string(),
+                category: DurableStateRowCategory::GrantRequest,
+                reason: DurableStateRowReason::Malformed,
+                impact: DurableStateRowImpact::BlocksStartup,
+            }]
+        );
+        let error = format!("{:#}", SessionStore::open(path, 3_600).await.unwrap_err());
+        assert!(error.contains(handle), "{error}");
+    }
+
+    #[tokio::test]
+    async fn compatibility_check_reports_malformed_session_registry_row_ids() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let session_token = format!("session-fixture-{:032x}", rand::random::<u128>());
+        connection
+            .execute(
+                "INSERT INTO session_grants
+                 (token, allow_json, deny_json, scope_json, granted_at)
+                 VALUES (?1, ?2, '[]', '{}', 1)",
+                params![session_token, "{"],
+            )
+            .unwrap();
+        let grant_row_id = connection.last_insert_rowid().to_string();
+        connection
+            .execute(
+                "INSERT INTO session_history
+                 (token, allow_json, deny_json, granted_at, ended_at, status)
+                 VALUES (?1, '[]', '[]', 1, 2, ?2)",
+                params!["history-fixture", "unknown-history-status"],
+            )
+            .unwrap();
+        let history_id = connection.last_insert_rowid().to_string();
+        connection
+            .execute(
+                "INSERT INTO session_interactions
+                 (token, at_unix, command, allowed, source, reason, exec_status)
+                 VALUES (?1, 1, 'true', 0, ?2, 'fixture', 'completed')",
+                params!["interaction-fixture", "unknown-decision-source"],
+            )
+            .unwrap();
+        let interaction_id = connection.last_insert_rowid().to_string();
+        drop(connection);
+        drop(store);
+
+        let report = SessionStore::compatibility_check(path, 3_600)
+            .await
+            .unwrap();
+
+        assert!(!report.compatible);
+        assert!(!report.simulated_open);
+        assert!(!report.simulated_startup.succeeded);
+        assert_eq!(
+            report.simulated_startup.error_category,
+            Some(SimulatedStartupErrorCategory::SessionRegistry)
+        );
+        assert_eq!(
+            report.rejected_rows,
+            vec![
+                RejectedDurableStateRow {
+                    handle: grant_row_id,
+                    category: DurableStateRowCategory::SessionGrant,
+                    reason: DurableStateRowReason::Malformed,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                },
+                RejectedDurableStateRow {
+                    handle: history_id,
+                    category: DurableStateRowCategory::SessionHistory,
+                    reason: DurableStateRowReason::Malformed,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                },
+                RejectedDurableStateRow {
+                    handle: interaction_id,
+                    category: DurableStateRowCategory::SessionInteraction,
+                    reason: DurableStateRowReason::Malformed,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                },
+            ]
+        );
+        let report_json = serde_json::to_string(&report).unwrap();
+        assert!(!report_json.contains(&session_token));
+        assert!(!report_json.contains("unknown-history-status"));
+        assert!(!report_json.contains("unknown-decision-source"));
+    }
+
+    #[tokio::test]
+    async fn compatibility_check_reports_malformed_provisionals_and_approvals_without_payloads() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO gating_provisional (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "malformed-provisional",
+                    "{\"secret\":\"must-not-escape\"",
+                    "armed",
+                    1_i64
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO gating_approval (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "malformed-approval",
+                    "{\"secret\":\"must-not-escape\"",
+                    "pending",
+                    1_i64
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        drop(store);
+
+        let report = SessionStore::compatibility_check(path, 3_600)
+            .await
+            .unwrap();
+        assert!(!report.compatible);
+        assert!(!report.simulated_startup.succeeded);
+        assert_eq!(
+            report.simulated_startup.error_category,
+            Some(SimulatedStartupErrorCategory::Provisionals)
+        );
+        assert_eq!(
+            report.rejected_rows,
+            vec![
+                RejectedDurableStateRow {
+                    handle: "malformed-approval".to_string(),
+                    category: DurableStateRowCategory::Approval,
+                    reason: DurableStateRowReason::Malformed,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                },
+                RejectedDurableStateRow {
+                    handle: "malformed-provisional".to_string(),
+                    category: DurableStateRowCategory::Provisional,
+                    reason: DurableStateRowReason::Malformed,
+                    impact: DurableStateRowImpact::BlocksStartup,
+                },
+            ]
+        );
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains("must-not-escape"));
+    }
+
+    #[tokio::test]
+    async fn compatibility_check_snapshots_live_wal_state_consistently() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        let mut request = generated_access_request();
+        request.request_key = "inconsistent-fixture-key".to_string();
+        let handle = request.handle.clone();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    handle,
+                    serde_json::to_string(&request).unwrap(),
+                    request.status.as_str(),
+                    encode_u64(request.created_unix).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO gating_approval (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["malformed-wal-approval", "{", "pending", 1_i64],
+            )
+            .unwrap();
+
+        let before_commit = SessionStore::compatibility_check(path.clone(), 3_600)
+            .await
+            .unwrap();
+        assert!(before_commit.simulated_open);
+        assert!(before_commit.compatible);
+        assert!(before_commit.rejected_rows.is_empty());
+
+        connection.execute_batch("COMMIT").unwrap();
+        let after_commit = SessionStore::compatibility_check(path, 3_600)
+            .await
+            .unwrap();
+        assert!(!after_commit.compatible);
+        assert_eq!(
+            after_commit.simulated_startup.error_category,
+            Some(SimulatedStartupErrorCategory::Approvals)
+        );
+        assert!(after_commit
+            .rejected_rows
+            .contains(&RejectedDurableStateRow {
+                handle: request.handle,
+                category: DurableStateRowCategory::GrantRequest,
+                reason: DurableStateRowReason::InvalidAuthority,
+                impact: DurableStateRowImpact::RequiresRetirement,
+            }));
+        assert!(after_commit
+            .rejected_rows
+            .contains(&RejectedDurableStateRow {
+                handle: "malformed-wal-approval".to_string(),
+                category: DurableStateRowCategory::Approval,
+                reason: DurableStateRowReason::Malformed,
+                impact: DurableStateRowImpact::BlocksStartup,
+            }));
+        drop(store);
+    }
+
+    #[tokio::test]
     async fn grant_request_index_mismatch_fails_closed() {
         let request = GrantRequest::new(
             "fixture-session".to_string(),
@@ -5654,6 +7476,7 @@ mod tests {
         ];
 
         for (handle, status, created_unix) in cases {
+            let expected_handle = handle.clone();
             let tmp = tempfile::tempdir().unwrap();
             let path = tmp.path().join("state.db");
             let store = SessionStore::open(path.clone(), 3600).await.unwrap();
@@ -5668,6 +7491,7 @@ mod tests {
 
             let error = format!("{:#}", store.load_grant_requests().await.unwrap_err());
             assert!(error.contains("index disagrees"), "{error}");
+            assert!(error.contains(&expected_handle), "{error}");
         }
     }
 
@@ -5875,8 +7699,10 @@ mod tests {
             secret_file_keys: BTreeMap::new(),
             revert_binary: "fixture-revert".to_string(),
             revert_args: Vec::new(),
+            revert_authorization: None,
             confirm_check_binary: None,
             confirm_check_args: Vec::new(),
+            confirm_check_authorization: None,
             control_path: Some("fixture".to_string()),
             session_fingerprint: None,
             session_revision: None,
@@ -6054,8 +7880,10 @@ mod tests {
         assert!(!stored.contains(&fixture_bearer_jwt()));
         assert!(stored.contains("[REDACTED]"));
 
-        request.justification = format!("tool {}", FIXTURE_PASSWORD_FLAG);
-        request.delta.prompt_append = Some(format!("legacy {}", FIXTURE_PASSWORD_FLAG));
+        let legacy_justification_credential = fixture_password_flag();
+        let legacy_prompt_credential = fixture_password_flag();
+        request.justification = format!("tool {legacy_justification_credential}");
+        request.delta.prompt_append = Some(format!("legacy {legacy_prompt_credential}"));
         let legacy_json = serde_json::to_string(&request).unwrap();
         conn.execute(
             "UPDATE grant_requests SET json = ?1 WHERE handle = ?2",
@@ -6068,13 +7896,15 @@ mod tests {
         let migrated = SessionStore::open(path.clone(), 3600).await.unwrap();
         let migrated_json =
             serde_json::to_string(&migrated.load_grant_requests().await.unwrap()).unwrap();
-        assert!(!migrated_json.contains(FIXTURE_PASSWORD_FLAG));
+        assert!(!migrated_json.contains(&legacy_justification_credential));
+        assert!(!migrated_json.contains(&legacy_prompt_credential));
         assert!(migrated_json.contains("[REDACTED]"));
         let migrated_stored: String = Connection::open(path)
             .unwrap()
             .query_row("SELECT json FROM grant_requests", [], |row| row.get(0))
             .unwrap();
-        assert!(!migrated_stored.contains(FIXTURE_PASSWORD_FLAG));
+        assert!(!migrated_stored.contains(&legacy_justification_credential));
+        assert!(!migrated_stored.contains(&legacy_prompt_credential));
     }
 
     #[tokio::test]
@@ -6844,8 +8674,10 @@ mod tests {
             secret_file_keys: BTreeMap::new(),
             revert_binary: "fixture-revert".to_string(),
             revert_args: Vec::new(),
+            revert_authorization: None,
             confirm_check_binary: None,
             confirm_check_args: Vec::new(),
+            confirm_check_authorization: None,
             control_path: Some("fixture".to_string()),
             session_fingerprint: None,
             session_revision: None,
@@ -7069,16 +8901,18 @@ mod tests {
         assert_eq!(loaded.show(&token, 10).unwrap().stats.total, 1);
     }
 
-    // Synthetic test-fixture credential shapes (never real secrets).
     fn fixture_bearer_jwt() -> String {
         [
-            "eyJhbGciOiJSUzI1NiJ9",
-            "eyJzdWIiOiJndWFyZC10ZXN0LWZpeHR1cmUifQ",
-            "c3ludGhldGljLXNpZ25hdHVyZS1ub3QtYS1jcmVkZW50aWFs",
+            [["e", "y", "J"].concat(), "A".repeat(21)].concat(),
+            "B".repeat(32),
+            "C".repeat(48),
         ]
         .join(".")
     }
-    const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
+
+    fn fixture_password_flag() -> String {
+        format!("--password={:032x}", rand::random::<u128>())
+    }
 
     #[test]
     fn credential_reference_decoder_discards_noncanonical_legacy_entries() {
@@ -7095,6 +8929,8 @@ mod tests {
     async fn v5_migration_sanitizes_persisted_credentials_and_bumps_version() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("state.db");
+        let bearer = fixture_bearer_jwt();
+        let password_flag = fixture_password_flag();
         {
             // Seed a database exactly one schema version back, holding
             // credential material the way a pre-v6 daemon persisted it.
@@ -7110,11 +8946,11 @@ mod tests {
                 params![
                     serde_json::to_string(&vec![SessionExactRule::new(
                         "kubectl",
-                        vec![format!("--token={}", fixture_bearer_jwt()), "get".to_string()],
+                        vec![format!("--token={bearer}"), "get".to_string()],
                     )])
                     .unwrap(),
-                    format!("session context {FIXTURE_PASSWORD_FLAG}"),
-                    serde_json::to_string(&vec![format!("note {FIXTURE_PASSWORD_FLAG}")]).unwrap(),
+                    format!("session context {password_flag}"),
+                    serde_json::to_string(&vec![format!("note {password_flag}")]).unwrap(),
                 ],
             )
             .expect("seed grant");
@@ -7124,8 +8960,8 @@ mod tests {
                  VALUES ('tok', ?1, ?2, 1, 'llm', ?3, 1, 'completed')",
                 params![
                     encode_u64(guard::env::now_unix()).unwrap(),
-                    format!("kubectl --token={} get pods", fixture_bearer_jwt()),
-                    format!("allowed with {FIXTURE_PASSWORD_FLAG}"),
+                    format!("kubectl --token={bearer} get pods"),
+                    format!("allowed with {password_flag}"),
                 ],
             )
             .expect("seed interaction");
@@ -7152,12 +8988,12 @@ mod tests {
             )
             .unwrap();
         assert!(
-            !command.contains("SyntheticSignature123"),
+            !command.contains(&bearer),
             "bearer token survived migration: {command}"
         );
         assert!(command.contains("[REDACTED]"), "marker missing: {command}");
         assert!(command.contains("kubectl"), "utility lost: {command}");
-        assert!(!reason.contains("SyntheticHunter2Value"), "got: {reason}");
+        assert!(!reason.contains(&password_flag), "got: {reason}");
         assert!(reason.contains("[REDACTED]"), "got: {reason}");
         let (prompt, notes, allow_exact): (String, String, String) = conn
             .query_row(
@@ -7166,11 +9002,11 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert!(!prompt.contains("SyntheticHunter2Value"), "got: {prompt}");
+        assert!(!prompt.contains(&password_flag), "got: {prompt}");
         assert!(prompt.contains("[REDACTED]"), "got: {prompt}");
-        assert!(!notes.contains("SyntheticHunter2Value"), "got: {notes}");
+        assert!(!notes.contains(&password_flag), "got: {notes}");
         assert!(
-            !allow_exact.contains("SyntheticSignature123"),
+            !allow_exact.contains(&bearer),
             "exact rule survived migration: {allow_exact}"
         );
         let rules: Vec<SessionExactRule> = serde_json::from_str(&allow_exact).unwrap();
@@ -7183,7 +9019,7 @@ mod tests {
             .expect("reopen migrated store");
         let registry = store.load_registry().await.expect("load registry");
         let prompt = registry.prompt_append_for("tok").expect("prompt");
-        assert!(!prompt.contains("SyntheticHunter2Value"));
+        assert!(!prompt.contains(&password_flag));
     }
 
     #[tokio::test]
@@ -7416,11 +9252,14 @@ mod tests {
                 catalog_version: None,
                 verb_digest: None,
                 verb_composition_digest: None,
+                verb_environment_authority: false,
+                verb_local_file_authority: false,
                 exec_timeout_secs: None,
                 access_verbs: Vec::new(),
                 access_requests: Vec::new(),
                 principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
                 secret_binding: None,
+                process_authority: None,
             },
             reason: "fixture approval".to_string(),
             risk: Some(7),
@@ -7573,10 +9412,55 @@ mod tests {
         let path = tmp.path().join("state.db");
         let store = SessionStore::open(path, 3600).await.unwrap();
         let mut approval = pending_approval("ap-plain-env");
+        let fixture_value = format!("fixture-{:032x}", rand::random::<u128>());
         approval
             .snapshot
             .env
-            .insert("FIXTURE_VALUE".to_string(), "synthetic-secret".to_string());
+            .insert("FIXTURE_VALUE".to_string(), fixture_value);
+
+        assert!(store.save_approval(approval).await.is_err());
+        assert!(store.load_approvals().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_store_preserves_typed_verb_environment_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path, 3600).await.unwrap();
+        let mut approval = pending_approval("ap-typed-env");
+        approval
+            .snapshot
+            .env
+            .insert("FORMAT_STYLE".to_string(), "compact".to_string());
+        approval.snapshot.verb_environment_authority = true;
+        approval.snapshot.verb_name = Some("format-output".to_string());
+        approval.snapshot.catalog_version = Some(1);
+
+        store.save_approval(approval).await.unwrap();
+        let loaded = store.load_approvals().await.unwrap();
+        assert_eq!(
+            loaded[0]
+                .snapshot
+                .env
+                .get("FORMAT_STYLE")
+                .map(String::as_str),
+            Some("compact")
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_store_rejects_sensitive_plain_environment_with_typed_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        let mut approval = pending_approval("ap-sensitive-typed-env");
+        let sensitive_name = ["SERVICE", "TOKEN"].join("_");
+        let fixture_value = format!("fixture-{:032x}", rand::random::<u128>());
+        approval.snapshot.env.insert(sensitive_name, fixture_value);
+        approval.snapshot.verb_environment_authority = true;
+        approval.snapshot.verb_name = Some("format-output".to_string());
+        approval.snapshot.catalog_version = Some(1);
 
         assert!(store.save_approval(approval).await.is_err());
         assert!(store.load_approvals().await.unwrap().is_empty());
@@ -8256,6 +10140,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_schema_preserves_typed_verb_environment_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut approval = pending_approval("ap-current-typed-env");
+        approval
+            .snapshot
+            .env
+            .insert("FORMAT_STYLE".to_string(), "compact".to_string());
+        approval.snapshot.verb_environment_authority = true;
+        approval.snapshot.verb_name = Some("format-output".to_string());
+        approval.snapshot.catalog_version = Some(1);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO gating_approval (handle, json, status, created_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                approval.handle,
+                serde_json::to_string(&approval).unwrap(),
+                approval.status.as_str(),
+                encode_u64(approval.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let loaded = store.load_approvals().await.unwrap();
+        assert_eq!(loaded[0].status, ApprovalStatus::Pending);
+        assert_eq!(
+            loaded[0]
+                .snapshot
+                .env
+                .get("FORMAT_STYLE")
+                .map(String::as_str),
+            Some("compact")
+        );
+    }
+
+    #[tokio::test]
     async fn old_session_schema_migrates_typed_verb_scope_columns() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("state.db");
@@ -8460,7 +10383,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
         let store = SessionStore::open(path.clone(), 3600).await.unwrap();
-        let safe_rule = SessionExactRule::new("fixturectl", vec!["status".to_string()]);
+        let safe_rule = SessionExactRule::new("printf", vec!["status".to_string()]);
         let mut registry = SessionRegistry::new();
         registry.grant(
             "safe".to_string(),
@@ -8470,7 +10393,7 @@ mod tests {
             "safe",
             SessionInteraction {
                 at_unix: guard::env::now_unix(),
-                command: "fixturectl status".to_string(),
+                command: "printf status".to_string(),
                 allowed: true,
                 source: SessionDecisionSource::Llm,
                 reason: "safe rationale".to_string(),
@@ -8501,7 +10424,7 @@ mod tests {
             assert!(loaded.has("safe"));
             assert!(matches!(
                 loaded
-                    .check("safe", "fixturectl", &["status".to_string()], None)
+                    .check("safe", "printf", &["status".to_string()], None)
                     .map(|decision| decision.0),
                 Some(crate::session::SessionDecision::Allow)
             ));
@@ -8533,7 +10456,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
         let store = SessionStore::open(path.clone(), 3600).await.unwrap();
-        let safe_rule = SessionExactRule::new("fixturectl", vec!["status".to_string()]);
+        let safe_rule = SessionExactRule::new("printf", vec!["status".to_string()]);
         let mut registry = SessionRegistry::new();
         registry.grant(
             "safe".to_string(),
@@ -8543,7 +10466,7 @@ mod tests {
             "safe",
             SessionInteraction {
                 at_unix: guard::env::now_unix(),
-                command: "fixturectl status".to_string(),
+                command: "printf status".to_string(),
                 allowed: true,
                 source: SessionDecisionSource::Llm,
                 reason: "safe rationale".to_string(),
@@ -8581,7 +10504,7 @@ mod tests {
             let loaded = restarted.load_registry().await.unwrap();
             assert!(matches!(
                 loaded
-                    .check("safe", "fixturectl", &["status".to_string()], None)
+                    .check("safe", "printf", &["status".to_string()], None)
                     .map(|decision| decision.0),
                 Some(crate::session::SessionDecision::Allow)
             ));

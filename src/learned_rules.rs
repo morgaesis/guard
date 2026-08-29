@@ -20,7 +20,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -931,6 +931,38 @@ fn validate_authority_file(file: &File) -> Result<()> {
     validate_windows_authority_handle(file, false)
 }
 
+#[cfg(unix)]
+fn executable_search_file_is_candidate(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_file() && metadata.mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn executable_search_file_is_candidate(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
+#[cfg(unix)]
+fn validate_executable_search_file(file: &File, untrusted_unix_user_id: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if !executable_search_file_is_candidate(&metadata)
+        || untrusted_unix_user_id.is_some_and(|user_id| metadata.uid() == user_id)
+        || metadata.mode() & 0o022 != 0
+    {
+        anyhow::bail!("executable search file ownership or permissions are unsafe")
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_executable_search_file(
+    file: &File,
+    _untrusted_unix_user_id: Option<u32>,
+) -> Result<()> {
+    validate_windows_operator_authority_handle(file, false)
+}
+
 #[cfg(windows)]
 fn windows_authority_mutation_mask(directory: bool) -> u32 {
     use windows_sys::Win32::Storage::FileSystem::{
@@ -956,6 +988,20 @@ fn windows_authority_mutation_mask(directory: bool) -> u32 {
 
 #[cfg(windows)]
 fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()> {
+    validate_windows_authority_handle_with_current_user(file, directory, true)
+}
+
+#[cfg(windows)]
+fn validate_windows_operator_authority_handle(file: &File, directory: bool) -> Result<()> {
+    validate_windows_authority_handle_with_current_user(file, directory, false)
+}
+
+#[cfg(windows)]
+fn validate_windows_authority_handle_with_current_user(
+    file: &File,
+    directory: bool,
+    allow_current_user: bool,
+) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{
@@ -967,7 +1013,24 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID, SECURITY_MAX_SID_SIZE,
         TOKEN_QUERY, TOKEN_USER,
     };
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect the Windows authority object type");
+    }
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        anyhow::bail!("authority object is a Windows reparse point");
+    }
+    let is_directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    if is_directory != directory {
+        anyhow::bail!("authority object type does not match its expected role");
+    }
 
     fn well_known_sid(kind: i32) -> Result<Vec<u8>> {
         let mut sid = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
@@ -1039,18 +1102,18 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         Ok(sid)
     }
 
-    fn owner_rights_sid() -> Result<Vec<u8>> {
-        let value = "S-1-3-4\0".encode_utf16().collect::<Vec<_>>();
+    fn string_sid(value: &str, label: &str) -> Result<Vec<u8>> {
+        let value = format!("{value}\0").encode_utf16().collect::<Vec<_>>();
         let mut allocated: PSID = std::ptr::null_mut();
         if unsafe { ConvertStringSidToSidW(value.as_ptr(), &mut allocated) } == 0 {
             return Err(std::io::Error::last_os_error())
-                .context("failed to construct the Windows Owner Rights SID");
+                .with_context(|| format!("failed to construct the Windows {label} SID"));
         }
         let length = unsafe { windows_sys::Win32::Security::GetLengthSid(allocated) };
         if length == 0 {
             unsafe { LocalFree(allocated) };
             return Err(std::io::Error::last_os_error())
-                .context("failed to measure the Windows Owner Rights SID");
+                .with_context(|| format!("failed to measure the Windows {label} SID"));
         }
         let mut sid = vec![0u8; length as usize];
         let copied = unsafe {
@@ -1059,7 +1122,7 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         unsafe { LocalFree(allocated) };
         if copied == 0 {
             return Err(std::io::Error::last_os_error())
-                .context("failed to copy the Windows Owner Rights SID");
+                .with_context(|| format!("failed to copy the Windows {label} SID"));
         }
         Ok(sid)
     }
@@ -1067,7 +1130,11 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
     let system = well_known_sid(WinLocalSystemSid)?;
     let administrators = well_known_sid(WinBuiltinAdministratorsSid)?;
     let current_user = current_user_sid()?;
-    let owner_rights = owner_rights_sid()?;
+    let owner_rights = string_sid("S-1-3-4", "Owner Rights")?;
+    let trusted_installer = string_sid(
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+        "TrustedInstaller",
+    )?;
     let mut owner: PSID = std::ptr::null_mut();
     let mut dacl = std::ptr::null_mut();
     let mut descriptor = std::ptr::null_mut();
@@ -1090,9 +1157,11 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         anyhow::bail!("authority object has no inspectable owner-only Windows DACL");
     }
 
-    let trusted_owner = unsafe { EqualSid(owner, current_user.as_ptr().cast_mut().cast()) } != 0
+    let trusted_owner = (allow_current_user
+        && unsafe { EqualSid(owner, current_user.as_ptr().cast_mut().cast()) } != 0)
         || unsafe { EqualSid(owner, system.as_ptr().cast_mut().cast()) } != 0
-        || unsafe { EqualSid(owner, administrators.as_ptr().cast_mut().cast()) } != 0;
+        || unsafe { EqualSid(owner, administrators.as_ptr().cast_mut().cast()) } != 0
+        || unsafe { EqualSid(owner, trusted_installer.as_ptr().cast_mut().cast()) } != 0;
     if !trusted_owner {
         unsafe { LocalFree(descriptor) };
         anyhow::bail!("authority object is not owned by a trusted Windows principal");
@@ -1145,9 +1214,11 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
                 anyhow::bail!("authority DACL grants mutation rights to an invalid trustee SID");
             }
             let trusted = unsafe { EqualSid(trustee, owner) } != 0
-                || unsafe { EqualSid(trustee, current_user.as_ptr().cast_mut().cast()) } != 0
+                || (allow_current_user
+                    && unsafe { EqualSid(trustee, current_user.as_ptr().cast_mut().cast()) } != 0)
                 || unsafe { EqualSid(trustee, system.as_ptr().cast_mut().cast()) } != 0
                 || unsafe { EqualSid(trustee, administrators.as_ptr().cast_mut().cast()) } != 0
+                || unsafe { EqualSid(trustee, trusted_installer.as_ptr().cast_mut().cast()) } != 0
                 // Owner Rights represents the already validated object owner.
                 // Accept it only after the owner check above succeeds.
                 || unsafe { EqualSid(trustee, owner_rights.as_ptr().cast_mut().cast()) } != 0;
@@ -1670,6 +1741,17 @@ fn apply_owner_only_windows_dacl_to_handle(file: &File) -> Result<()> {
 }
 
 #[cfg(windows)]
+#[doc(hidden)]
+pub fn protect_current_user_directory(path: &Path) -> Result<()> {
+    let directory = open_parent_directory(path)
+        .with_context(|| format!("cannot open private directory {}", path.display()))?;
+    apply_owner_only_windows_dacl_to_handle(&directory)
+        .with_context(|| format!("cannot protect private directory {}", path.display()))?;
+    validate_windows_authority_handle(&directory, true)
+        .with_context(|| format!("private directory {} is not trusted", path.display()))
+}
+
+#[cfg(windows)]
 fn ensure_windows_owner_group_compatible(destination: &[u8], writer: &[u8]) -> Result<()> {
     use windows_sys::Win32::Security::{
         EqualSid, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner, PSID,
@@ -2067,6 +2149,449 @@ pub(crate) fn load_learning_file_snapshot(path: &Path) -> Result<LearningFileSna
     lock.verify_parent_binding()?;
     recover_learning_file_transaction_locked(lock.destination())?;
     read_learning_file_snapshot_locked(&lock)
+}
+
+/// Pinned filesystem authority held from the final policy recheck for the
+/// child lifetime. Ancestor handles prevent Windows rename/delete races; Unix
+/// ownership and mode checks make every retained path immutable to untrusted
+/// principals while the daemon holds the lease.
+#[derive(Debug)]
+pub struct OperatorAuthorityArtifactLease {
+    _handles: Vec<File>,
+}
+
+#[cfg(unix)]
+fn validate_operator_authority_parent(
+    parent: &File,
+    path: &Path,
+    untrusted_unix_user_id: Option<u32>,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    validate_trusted_parent(parent, path)?;
+    let metadata = parent.metadata()?;
+    if untrusted_unix_user_id.is_some_and(|user_id| user_id == 0 || metadata.uid() == user_id) {
+        anyhow::bail!("authority directory can be mutated by the child identity")
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_operator_authority_parent(
+    parent: &File,
+    path: &Path,
+    _untrusted_unix_user_id: Option<u32>,
+) -> Result<()> {
+    validate_windows_operator_authority_handle(parent, true)?;
+    parent_identity_matches(parent, path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_operator_authority_parent(
+    parent: &File,
+    path: &Path,
+    _untrusted_unix_user_id: Option<u32>,
+) -> Result<()> {
+    validate_trusted_parent(parent, path)
+}
+
+#[cfg(unix)]
+fn validate_operator_authority_file(
+    file: &File,
+    untrusted_unix_user_id: Option<u32>,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    validate_authority_file(file)?;
+    let metadata = file.metadata()?;
+    if untrusted_unix_user_id.is_some_and(|user_id| user_id == 0 || metadata.uid() == user_id) {
+        anyhow::bail!("authority file can be mutated by the child identity")
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_operator_authority_file(
+    file: &File,
+    _untrusted_unix_user_id: Option<u32>,
+) -> Result<()> {
+    validate_windows_operator_authority_handle(file, false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_operator_authority_file(
+    file: &File,
+    _untrusted_unix_user_id: Option<u32>,
+) -> Result<()> {
+    validate_authority_file(file)
+}
+
+fn open_operator_authority_file(path: &Path, untrusted_unix_user_id: Option<u32>) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let handle = options
+        .open(path)
+        .with_context(|| format!("cannot pin operator authority file {}", path.display()))?;
+    validate_operator_authority_file(&handle, untrusted_unix_user_id)
+        .with_context(|| format!("operator authority file {} is not trusted", path.display()))?;
+    verify_open_file_binding(&handle, path).with_context(|| {
+        format!(
+            "operator authority file {} changed while it was pinned",
+            path.display()
+        )
+    })?;
+    Ok(handle)
+}
+
+fn pin_operator_authority_directory_tree(
+    root: &Path,
+    handles: &mut Vec<File>,
+    untrusted_unix_user_id: Option<u32>,
+) -> Result<()> {
+    const MAX_PINNED_AUTHORITY_ENTRIES: usize = 4_096;
+
+    let mut pending = vec![root.to_path_buf()];
+    let mut inspected = 0usize;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).with_context(|| {
+            format!(
+                "cannot enumerate operator authority directory {}",
+                directory.display()
+            )
+        })? {
+            let path = entry?.path();
+            inspected = inspected.saturating_add(1);
+            if inspected > MAX_PINNED_AUTHORITY_ENTRIES {
+                anyhow::bail!(
+                    "operator authority directory exceeds {MAX_PINNED_AUTHORITY_ENTRIES} pinned entries"
+                )
+            }
+            let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+                format!("cannot inspect operator authority child {}", path.display())
+            })?;
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "operator authority directory contains symlink {}",
+                    path.display()
+                )
+            }
+            if metadata.is_dir() {
+                let handle = open_parent_directory(&path).with_context(|| {
+                    format!("cannot pin operator authority directory {}", path.display())
+                })?;
+                validate_operator_authority_parent(&handle, &path, untrusted_unix_user_id)
+                    .with_context(|| {
+                        format!(
+                            "operator authority directory {} is not trusted",
+                            path.display()
+                        )
+                    })?;
+                handles.push(handle);
+                pending.push(path);
+            } else if metadata.is_file() {
+                // Keep every file handle for the lease lifetime. On Windows a
+                // no-share-write handle is the mutation boundary for a child
+                // that otherwise has the daemon token; retaining only parent
+                // directory handles does not prevent in-place file writes.
+                handles.push(open_operator_authority_file(&path, untrusted_unix_user_id)?);
+            } else {
+                anyhow::bail!(
+                    "operator authority directory contains unsupported file type {}",
+                    path.display()
+                )
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pin one executable or credential-bearing operator artifact. Every path
+/// component must be a real directory owned by the daemon user or root and
+/// must deny mutation by group/other principals. The final object may be a
+/// regular file or directory and is opened without following a final symlink.
+pub fn lease_operator_authority_artifact(
+    path: &Path,
+    untrusted_unix_user_id: Option<u32>,
+) -> Result<OperatorAuthorityArtifactLease> {
+    if !path.is_absolute() {
+        anyhow::bail!("operator authority artifact path is not absolute")
+    }
+
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "cannot inspect operator authority artifact {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+        anyhow::bail!("operator authority artifact is a symlink or unsupported file type")
+    }
+
+    #[cfg(unix)]
+    if path.canonicalize().with_context(|| {
+        format!(
+            "cannot canonicalize operator authority artifact {}",
+            path.display()
+        )
+    })? != path
+    {
+        anyhow::bail!("operator authority artifact path is not canonical")
+    }
+
+    let mut handles = Vec::new();
+    let mut ancestors = path.ancestors().skip(1).collect::<Vec<_>>();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        let handle = open_parent_directory(ancestor).with_context(|| {
+            format!(
+                "cannot pin operator authority ancestor {}",
+                ancestor.display()
+            )
+        })?;
+        validate_operator_authority_parent(&handle, ancestor, untrusted_unix_user_id)
+            .with_context(|| {
+                format!(
+                    "operator authority ancestor {} is not trusted",
+                    ancestor.display()
+                )
+            })?;
+        handles.push(handle);
+    }
+
+    if metadata.is_dir() {
+        let handle = open_parent_directory(path).with_context(|| {
+            format!("cannot pin operator authority directory {}", path.display())
+        })?;
+        validate_operator_authority_parent(&handle, path, untrusted_unix_user_id).with_context(
+            || {
+                format!(
+                    "operator authority directory {} is not trusted",
+                    path.display()
+                )
+            },
+        )?;
+        handles.push(handle);
+        pin_operator_authority_directory_tree(path, &mut handles, untrusted_unix_user_id)?;
+    } else {
+        handles.push(open_operator_authority_file(path, untrusted_unix_user_id)?);
+    }
+
+    Ok(OperatorAuthorityArtifactLease { _handles: handles })
+}
+
+fn open_executable_search_file(path: &Path, untrusted_unix_user_id: Option<u32>) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let handle = options
+        .open(path)
+        .with_context(|| format!("cannot pin executable search entry {}", path.display()))?;
+    validate_executable_search_file(&handle, untrusted_unix_user_id)
+        .with_context(|| format!("executable search entry {} is not trusted", path.display()))?;
+    verify_open_file_binding(&handle, path).with_context(|| {
+        format!(
+            "executable search entry {} changed while it was pinned",
+            path.display()
+        )
+    })?;
+    Ok(handle)
+}
+
+#[cfg(unix)]
+fn executable_search_entry_is_link(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn system_executable_directory(path: &Path) -> bool {
+    ["/bin", "/sbin", "/usr/bin", "/usr/sbin"]
+        .into_iter()
+        .filter_map(|directory| Path::new(directory).canonicalize().ok())
+        .any(|directory| path == directory)
+}
+
+#[cfg(windows)]
+fn system_executable_directory(path: &Path) -> bool {
+    std::env::var_os("SystemRoot")
+        .and_then(|root| PathBuf::from(root).canonicalize().ok())
+        .is_some_and(|root| path.starts_with(root))
+}
+
+#[cfg(windows)]
+fn executable_search_entry_is_link(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn retain_executable_search_link_target(
+    path: &Path,
+    handles: &mut Vec<File>,
+    retained_paths: &mut BTreeSet<PathBuf>,
+    untrusted_unix_user_id: Option<u32>,
+) -> Result<()> {
+    let target = path.canonicalize().with_context(|| {
+        format!(
+            "cannot resolve executable search link target {}",
+            path.display()
+        )
+    })?;
+    let metadata = std::fs::metadata(&target)?;
+    if !executable_search_file_is_candidate(&metadata) {
+        return Ok(());
+    }
+    if !system_executable_directory(target.parent().unwrap_or_else(|| Path::new(""))) {
+        let lease = lease_operator_authority_artifact(&target, untrusted_unix_user_id)?;
+        handles.extend(lease._handles);
+        retained_paths.insert(target);
+        return Ok(());
+    }
+    let mut ancestors = target.ancestors().skip(1).collect::<Vec<_>>();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        if retained_paths.insert(ancestor.to_path_buf()) {
+            let handle = open_parent_directory(ancestor).with_context(|| {
+                format!(
+                    "cannot pin executable search target ancestor {}",
+                    ancestor.display()
+                )
+            })?;
+            validate_trusted_parent(&handle, ancestor).with_context(|| {
+                format!(
+                    "executable search target ancestor {} is not trusted",
+                    ancestor.display()
+                )
+            })?;
+            handles.push(handle);
+        }
+    }
+    if retained_paths.insert(target.clone()) {
+        handles.push(open_executable_search_file(
+            &target,
+            untrusted_unix_user_id,
+        )?);
+    }
+    Ok(())
+}
+
+/// Pin one directory used for direct executable lookup. Unlike a configuration
+/// or plugin tree, PATH lookup examines only immediate entries. This lease
+/// validates the directory and retains every immediate executable link target
+/// without traversing unrelated entries or descendants. Direct entries cannot
+/// be replaced beneath the retained directory; the primary executable has its
+/// own exact artifact lease. Link targets and their ancestors remain pinned for
+/// the child lifetime. System-directory executables owned by the originating
+/// Unix caller are rejected because that caller can rewrite them in place.
+pub fn lease_operator_executable_search_directory(
+    path: &Path,
+    untrusted_unix_user_id: Option<u32>,
+) -> Result<OperatorAuthorityArtifactLease> {
+    if !path.is_absolute() {
+        anyhow::bail!("operator executable search directory is not absolute")
+    }
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "cannot inspect operator executable search directory {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("operator executable search directory is not a real directory")
+    }
+
+    let mut handles = Vec::new();
+    let mut retained_paths = BTreeSet::new();
+    let mut components = path.ancestors().collect::<Vec<_>>();
+    components.reverse();
+    for directory in components {
+        let handle = open_parent_directory(directory).with_context(|| {
+            format!(
+                "cannot pin operator executable search directory {}",
+                directory.display()
+            )
+        })?;
+        validate_trusted_parent(&handle, directory).with_context(|| {
+            format!(
+                "operator executable search directory {} is not trusted",
+                directory.display()
+            )
+        })?;
+        handles.push(handle);
+        retained_paths.insert(directory.to_path_buf());
+    }
+
+    const MAX_SEARCH_ENTRIES: usize = 100_000;
+    let system_directory = system_executable_directory(path);
+    for (index, entry) in std::fs::read_dir(path)?.enumerate() {
+        if index >= MAX_SEARCH_ENTRIES {
+            anyhow::bail!(
+                "operator executable search directory exceeds {MAX_SEARCH_ENTRIES} entries"
+            )
+        }
+        let entry = entry?;
+        let entry_path = entry.path();
+        let metadata = std::fs::symlink_metadata(&entry_path)?;
+        if executable_search_entry_is_link(&metadata) {
+            retain_executable_search_link_target(
+                &entry_path,
+                &mut handles,
+                &mut retained_paths,
+                untrusted_unix_user_id,
+            )?;
+        } else if metadata.is_file() {
+            if system_directory {
+                if executable_search_file_is_candidate(&metadata) {
+                    // System directory membership is root-controlled, but an
+                    // entry's owner can still rewrite its contents in place.
+                    // Validate each executable even though retaining thousands
+                    // of system binary handles would exhaust process limits.
+                    drop(open_executable_search_file(
+                        &entry_path,
+                        untrusted_unix_user_id,
+                    )?);
+                }
+            } else {
+                let lease = lease_operator_authority_artifact(&entry_path, untrusted_unix_user_id)?;
+                handles.extend(lease._handles);
+            }
+        } else if !metadata.is_dir() && !metadata.is_file() {
+            anyhow::bail!(
+                "operator executable search directory contains unsupported entry {}",
+                entry_path.display()
+            )
+        }
+    }
+
+    Ok(OperatorAuthorityArtifactLease { _handles: handles })
 }
 
 /// Read one operator-owned authority file without creating writable sibling
@@ -4203,14 +4728,14 @@ fn infer_ssh_service(host: &str, remote_args: &[String]) -> String {
 /// Also used by `gating::deny_shape` so both the allow-candidate and the
 /// auto-deny bucketing key commands to the same "service" the same way.
 pub(crate) fn infer_service_from_binary(binary: &str) -> String {
-    sanitize_name(binary.trim_end_matches(".exe"), "service")
+    sanitize_name(&crate::gating::executable_match_key(binary), "service")
 }
 
 fn infer_shim_name(service: &str, remote_tool: &str) -> String {
     if service == "opnsense-api" {
         return "opnsense-api".to_string();
     }
-    let tool = sanitize_name(remote_tool.trim_end_matches(".exe"), "tool");
+    let tool = sanitize_name(&crate::gating::executable_match_key(remote_tool), "tool");
     sanitize_name(&format!("{service}-{tool}"), "service-shim")
 }
 
@@ -4295,6 +4820,129 @@ pub(crate) fn looks_dangerous_for_learned_allow(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_authority_artifact_lease_rejects_replaceable_paths() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let effective_user = unsafe { libc::geteuid() };
+        let root = std::env::current_dir()
+            .unwrap()
+            .ancestors()
+            .find(|candidate| {
+                let writable = std::fs::metadata(candidate).is_ok_and(|metadata| {
+                    metadata.uid() == effective_user && metadata.mode() & 0o200 != 0
+                });
+                writable
+                    && candidate.ancestors().all(|ancestor| {
+                        open_parent_directory(ancestor)
+                            .and_then(|handle| validate_trusted_parent(&handle, ancestor))
+                            .is_ok()
+                    })
+            })
+            .map(Path::to_path_buf)
+            .expect("a trusted writable test ancestor");
+        let temp = tempfile::Builder::new()
+            .prefix("guard-authority-")
+            .tempdir_in(&root)
+            .unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let artifact = temp.path().join("credential");
+        write_authority_file(&artifact, "credential").unwrap();
+
+        lease_operator_authority_artifact(&artifact, None).unwrap();
+        let file = File::open(&artifact).unwrap();
+        let error = validate_operator_authority_file(&file, Some(effective_user))
+            .expect_err("a child-owned authority file remains mutable after validation");
+        assert!(error.to_string().contains("child identity"));
+        let directory = open_parent_directory(temp.path()).unwrap();
+        let error =
+            validate_operator_authority_parent(&directory, temp.path(), Some(effective_user))
+                .expect_err("a child-owned authority directory permits post-check replacement");
+        assert!(error.to_string().contains("child identity"));
+        let error = lease_operator_authority_artifact(&artifact, Some(effective_user)).unwrap_err();
+        assert!(format!("{error:#}").contains("child identity"));
+
+        std::fs::create_dir(temp.path().join("alias-parent")).unwrap();
+        let noncanonical = temp
+            .path()
+            .join("alias-parent")
+            .join("..")
+            .join("credential");
+        assert!(lease_operator_authority_artifact(&noncanonical, None)
+            .unwrap_err()
+            .to_string()
+            .contains("not canonical"));
+
+        let executable = temp.path().join("helper");
+        write_authority_file(&executable, "helper").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable_file = File::open(&executable).unwrap();
+        assert!(validate_executable_search_file(&executable_file, Some(effective_user)).is_err());
+        validate_executable_search_file(&executable_file, None).unwrap();
+
+        let link = temp.path().join("credential-link");
+        symlink(&artifact, &link).unwrap();
+        assert!(lease_operator_authority_artifact(&link, None)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink"));
+
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(lease_operator_authority_artifact(&artifact, None)
+            .unwrap_err()
+            .to_string()
+            .contains("not trusted"));
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(lease_operator_authority_artifact(&artifact, None)
+            .unwrap_err()
+            .to_string()
+            .contains("ancestor"));
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let tree = temp.path().join("modules");
+        let nested = tree.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let module = nested.join("module.py");
+        write_authority_file(&module, "module").unwrap();
+        lease_operator_authority_artifact(&tree, None).unwrap();
+
+        std::fs::set_permissions(&module, std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(lease_operator_authority_artifact(&tree, None)
+            .unwrap_err()
+            .to_string()
+            .contains("not trusted"));
+        std::fs::set_permissions(&module, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let nested_link = tree.join("module-link");
+        symlink(&module, &nested_link).unwrap();
+        assert!(lease_operator_authority_artifact(&tree, None)
+            .unwrap_err()
+            .to_string()
+            .contains("contains symlink"));
+
+        // Executable PATH lookup is shallow but still validates executable
+        // link targets without traversing unrelated nested directories.
+        std::fs::set_permissions(&module, std::fs::Permissions::from_mode(0o700)).unwrap();
+        lease_operator_executable_search_directory(&tree, None).unwrap();
+        std::fs::set_permissions(&module, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(lease_operator_executable_search_directory(&tree, None)
+            .unwrap_err()
+            .to_string()
+            .contains("not trusted"));
+        std::fs::set_permissions(&module, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            lease_operator_executable_search_directory(&nested_link, None)
+                .unwrap_err()
+                .to_string()
+                .contains("not a real directory")
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -5382,8 +6030,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn windows_authority_validation_reads_every_raw_ace_and_rejects_inherited_mutation() {
+    fn apply_windows_test_dacl(path: &Path, sddl: &str) {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::Security::Authorization::{
@@ -5393,39 +6040,41 @@ mod tests {
             SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
         };
 
-        fn apply_dacl(path: &Path, sddl: &str) {
-            let path = path
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect::<Vec<_>>();
-            let sddl = sddl
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect::<Vec<_>>();
-            let mut descriptor = std::ptr::null_mut();
-            assert_ne!(
-                unsafe {
-                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                        sddl.as_ptr(),
-                        SDDL_REVISION_1,
-                        &mut descriptor,
-                        std::ptr::null_mut(),
-                    )
-                },
-                0
-            );
-            let applied = unsafe {
-                SetFileSecurityW(
-                    path.as_ptr(),
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    descriptor,
+        let path = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let sddl = sddl
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
                 )
-            };
-            unsafe { LocalFree(descriptor) };
-            assert_ne!(applied, 0);
-        }
+            },
+            0
+        );
+        let applied = unsafe {
+            SetFileSecurityW(
+                path.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor,
+            )
+        };
+        unsafe { LocalFree(descriptor) };
+        assert_ne!(applied, 0);
+    }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_authority_validation_reads_every_raw_ace_and_rejects_inherited_mutation() {
         let temp = authority_tempdir();
         let path = temp.path().join("learned.yaml");
         write_authority_file(&path, "version: 1\n").unwrap();
@@ -5435,13 +6084,13 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        apply_dacl(&path, "D:P(A;;FA;;;OW)(A;ID;GR;;;AU)");
+        apply_windows_test_dacl(&path, "D:P(A;;FA;;;OW)(A;ID;GR;;;AU)");
         validate_authority_file(&file).unwrap();
 
-        apply_dacl(&path, "D:P(A;;FA;;;OW)(D;ID;GW;;;AU)");
+        apply_windows_test_dacl(&path, "D:P(A;;FA;;;OW)(D;ID;GW;;;AU)");
         validate_authority_file(&file).unwrap();
 
-        apply_dacl(&path, "D:P(A;;FA;;;OW)(A;ID;GW;;;AU)");
+        apply_windows_test_dacl(&path, "D:P(A;;FA;;;OW)(A;ID;GW;;;AU)");
         let error = validate_authority_file(&file).unwrap_err();
         assert!(error
             .to_string()
@@ -5449,7 +6098,7 @@ mod tests {
 
         let inherited_parent = temp.path().join("inherited");
         std::fs::create_dir(&inherited_parent).unwrap();
-        apply_dacl(
+        apply_windows_test_dacl(
             &inherited_parent,
             "D:P(A;;FA;;;OW)(A;OICI;FA;;;CO)(A;OICI;GR;;;AU)",
         );
@@ -5462,7 +6111,7 @@ mod tests {
             .unwrap();
         validate_authority_file(&read_only_child).unwrap();
 
-        apply_dacl(
+        apply_windows_test_dacl(
             &inherited_parent,
             "D:P(A;;FA;;;OW)(A;OICI;FA;;;CO)(A;OICI;GW;;;AU)",
         );
@@ -5477,6 +6126,41 @@ mod tests {
         assert!(error
             .to_string()
             .contains("grants mutation rights to an untrusted principal"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_operator_artifacts_reject_daemon_owned_files_and_reparse_points() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let temp = authority_tempdir();
+        let artifact = temp.path().join("credential");
+        write_authority_file(&artifact, "credential").unwrap();
+        apply_windows_test_dacl(&artifact, "D:P(A;;FA;;;OW)(A;ID;GR;;;AU)");
+
+        let error = open_operator_authority_file(&artifact, None).unwrap_err();
+        assert!(format!("{error:#}").contains("not owned by a trusted Windows principal"));
+
+        apply_windows_test_dacl(&artifact, "D:P(A;;FA;;;OW)(A;ID;GW;;;AU)");
+        assert!(open_operator_authority_file(&artifact, None).is_err());
+        apply_windows_test_dacl(&artifact, "D:P(A;;FA;;;OW)(A;ID;GR;;;AU)");
+
+        let link = temp.path().join("credential-link");
+        symlink_file(&artifact, &link).unwrap();
+        assert!(lease_operator_authority_artifact(&link, None)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink"));
+        let error = open_operator_authority_file(&link, None).unwrap_err();
+        assert!(format!("{error:#}").contains("reparse point"));
+
+        let directory = temp.path().join("modules");
+        std::fs::create_dir(&directory).unwrap();
+        let directory_link = temp.path().join("modules-link");
+        symlink_dir(&directory, &directory_link).unwrap();
+        let handle = open_parent_directory(&directory_link).unwrap();
+        let error = validate_trusted_parent(&handle, &directory_link).unwrap_err();
+        assert!(format!("{error:#}").contains("reparse point"));
     }
 
     #[cfg(windows)]

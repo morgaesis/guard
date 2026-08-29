@@ -1,6 +1,6 @@
 [package]
 name = "guard"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2021"
 rust-version = "1.95"
 description = "LLM-evaluated command gate for AI agents"
@@ -57,3 +57,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 proptest = "1.11.0"
+
+[workspace]
+exclude = ["fuzz"]

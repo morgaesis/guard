@@ -662,6 +662,11 @@ impl AdminRequest {
         !matches!(
             self,
             Self::Ping
+                // Status performs its own operator check in the handler so a
+                // packaged Windows service can recognize kernel-authenticated
+                // local SYSTEM without a bearer. A valid bearer still elevates
+                // the caller in the transport before dispatch.
+                | Self::Status
                 | Self::SecretSet { .. }
                 | Self::SecretDelete { .. }
                 | Self::SecretExists { .. }
@@ -733,6 +738,8 @@ pub enum AdminResponse {
     Status {
         status: ServerStatus,
     },
+    /// The caller completed the public liveness probe but does not hold the
+    /// operator authority required for the privileged status snapshot.
     Ping {
         version: String,
         uptime_secs: u64,
@@ -2261,6 +2268,7 @@ mod decision_trace_feature_tests {
             ],
             selected: true,
             overridden: false,
+            exact_cwd_authorized: false,
         };
 
         let response = ExecuteResult::denied("fixture denial")

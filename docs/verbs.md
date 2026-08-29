@@ -8,8 +8,8 @@ packaged Windows service loads its administrator-owned catalog once at startup.
 
 ```bash
 guard verb list
-guard verb show restart-service
-guard verb run restart-service --param unit=nginx
+guard verb show scale-deployment
+guard verb run scale-deployment --param name=web --param replicas=2 --param namespace=production
 ```
 
 [`examples/verbs.yaml`](../examples/verbs.yaml) contains command-template and
@@ -34,7 +34,7 @@ Operators replace one catalog entry from a YAML file containing exactly one
 verb definition:
 
 ```bash
-guard verb amend restart-service --file restart-service.yaml
+guard verb amend scale-deployment --file scale-deployment.yaml
 ```
 
 The client reads the live definition first and binds the amendment to its
@@ -114,66 +114,119 @@ caller-requested environment bindings.
 Their actions are `preauthorized`, `evaluate`, or `deny`; preauthorization
 requires a trusted verb.
 
+Use `required_args` for independent exact tokens and complete joined option
+tokens such as `--mode=check`. An option whose value is a separate argv element
+uses an `options` value constraint so the selected value remains bound to that
+specific option regardless of argument order.
+Generic kubectl cells bind the parsed local subcommand with
+`command_path`. Guard compares that path at the tool grammar boundary, before
+matching ordinary argv constraints, so a command name in a resource name or in
+kubectl's remote argv cannot select unrelated coverage. A cell may omit
+`command_path` only for `evaluate` or `deny`, when `required_args` contains
+exactly one recognized local subcommand. Preauthorized cells always declare it.
+
 ```yaml
-  - name: ansible-baseline
-    binary: ansible
+  - name: kubernetes-pod-read
+    binary: kubectl
     consequence: reversible
-    credential_plan: ansible-managed-ssh
     trusted: true
     coverage:
-      - name: bounded-check
+      - name: staging-pods
         action: preauthorized
-        required_args: [--check]
-        inventory:
-          options: [-i, --inventory]
-          values: [/srv/guard/inventory/production]
-        fanout:
-          options: [--limit]
-          max: 2
-        environment:
-          - name: ANSIBLE_CONFIG
-            source: plain
-            values: [ansible.cfg]
-      - name: bounded-apply
-        action: evaluate
-        forbidden_args: [--check]
-        fanout:
-          options: [--limit]
-          max: 1
-        override_marker: operator:ansible-apply
+        command_path: [get]
+        required_args: [pods]
+        namespace:
+          options: [-n, --namespace]
+          values: [staging]
 ```
 
-A non-matching cell has no decision. The check cell above allows its bounded
-region and does not deny apply mode, SSH inspection, or any other command. Those
+A non-matching cell has no decision. The pod-read cell above allows its bounded
+region and does not deny kubectl mutation, SSH inspection, or any other command. Those
 areas follow their own matching cells or evaluator path.
 
 Recognized local-file operands in command and rollback templates must be
-absolute. The bounded grammar covers documented option values and attached
-short forms, including `key=path` and `label@path` payloads. It preserves
-Ansible's non-file forms: inventories may be comma-terminated inline host
-lists, extra variables may be inline values, and vault IDs may use `prompt`.
-Referenced variable files, vault clients, module-path entries, credentials, and
-configuration files must be absolute under the daemon host's path semantics.
-Kubernetes file and kustomization sources are local absolute paths or standard
-input, not caller-selected URLs. Executable selectors such as Helm post-renderers
-must be fixed absolute paths. Transport passthroughs are fixed literals in exact
-templates, never caller-selected generic coverage. Ambiguous command grammars
-that cannot be modeled safely do not receive file-path coverage. If an explicit-inventory
-Ansible process reports that no inventory was parsed, or that every supplied
-source was unusable, Guard converts exit 0 to a failure and emits a diagnostic.
+absolute. The bounded grammar covers documented option values, including
+`key=path` and `label@path` payloads. Kubernetes endpoint, context, user, and
+impersonation selectors are literals or finite operator-enumerated sets. Direct
+credential arguments such as bearer tokens and passwords are not eligible for
+static coverage; fixed-identity kubectl receives only the generated active-proxy
+kubeconfig. Fixed paths identify artifacts in the daemon's
+operator-controlled filesystem trust boundary and must not point into
+caller-writable locations. Guard revalidates these artifacts and an authorized
+working tree at process start, rejects symlinks, reparse points, and unsafe
+ownership or permissions, and retains pinned handles for the child lifetime.
+Directory-valued authority is checked recursively, including every nested
+directory and regular file. Caller-selected local input is available only
+through an exact typed template, is included in the process-lifetime artifact
+set, and cannot enter through evaluator-only or untyped replay authority. The
+daemon resolves the primary executable to a canonical absolute path. Typed
+tools also bind their server-owned executable search directories. System
+executable directories use their package-managed trust boundary. Every direct
+regular file and resolved link target in a custom directory is pinned, including
+files that are not executable when the request starts, so a caller cannot use a
+later content or mode change to introduce a child executable. Guard replaces
+aliases in the child PATH with the canonical retained directories. Kubernetes
+file and kustomization sources are local absolute paths or standard input, not
+caller-selected URLs. File-producing tool
+operations use standard output where supported; static coverage does not grant
+a caller-selected filesystem output path, positional output directory, or local
+copy destination.
+Transport passthroughs are fixed literals in exact templates, never
+caller-selected generic coverage. Unknown kubectl subcommands are treated as
+external plugins and do not receive static coverage. Ambiguous command grammars
+that cannot be modeled safely do not receive file-path coverage.
+
+Kubeconfig paths are literals or finite exact parameter sets because kubeconfigs
+can invoke credential plugins; generic coverage and open-ended path patterns
+cannot select them. Process admission accepts only the complete generated
+kubeconfig matching an active Guard proxy.
 
 Environment sources are `plain`, `secret`, and `secret-file`. A constraint may
 name exact `values` or a fully anchored `pattern`. A cell with no environment
 constraints cannot preauthorize a request that adds caller-controlled bindings;
-that request returns to the evaluator. Automatically promoted cells never
-preauthorize environment bindings.
+that request returns to the evaluator. Kubectl configuration and credential
+paths use typed fixed values. Tool-prefixed environment variables without a
+classification do not receive static coverage. Typed tools also reject
+unclassified injected environment variables, including names without a tool
+prefix. Fixed-identity execution rejects `secret` and `secret-file` delivery
+even when a typed cell classifies the binding; the shared UID is not an
+execution-isolation boundary. It accepts kubectl only with an immutable
+`KUBECONFIG` matching an active Guard proxy and disables kuberc and command
+shadowing. Ansible and Helm are denied in fixed mode because their mutable
+profile state cannot safely cross identities. Caller mode denies all three
+typed profile tools because it has no immutable profile snapshot.
+Automatically promoted cells never preauthorize environment bindings.
 
 `cwd` binds a cell to one existing, absolute canonical directory. Guard
-canonicalizes the caller directory before coverage resolution and revalidates it
-immediately before execution, so a changed directory or symlink retarget cannot
-reuse the cell. This bounds tools that discover configuration, plugins, or input
-files from a project tree. Cwd-dependent opaque carriers do not enter automatic
-verb promotion; an operator-authored typed verb supplies their durable authority.
+canonicalizes the caller directory before coverage resolution, recursively
+validates the tree, and holds its trusted directory handles for the child
+lifetime. This bounds tools that discover configuration, plugins, or input files
+from a project tree. It does not make mutable Ansible, Helm, or caller kubectl
+profiles admissible. A protected typed tool with no explicit `cwd` starts from
+a fixed operating-system directory rather than inheriting the daemon's launch
+directory. Cwd-dependent opaque carriers do not enter automatic verb promotion.
+Only tools with a built-in structured profile can receive typed durable authority.
+Operator-authored catalogs use the same positive executable-profile registry as
+process admission. The primary-only profiles are `cat`, `df`, `echo`, `false`,
+`free`, `hostname`, `id`, `ls`, `printf`, `printenv`, `ps`, `pwd`, `tail`, `true`,
+`uptime`, and `whoami`. Ansible, kubectl, Helm, and `systemctl` have structured
+grammars, but grammar recognition does not bypass identity-mode admission.
+Fixed-identity active-proxy kubectl, literal non-starting `systemctl`, and
+primary-only profiles can execute. Ansible and Helm cannot execute in either
+identity mode, and caller-mode kubectl cannot execute. Shells, language runtimes,
+SSH, Git, generic command-dispatch binaries, and every unknown executable have
+no profile and are rejected. Executable support requires a built-in profile
+that lets Guard fingerprint the complete primary artifact and validate its
+invocation grammar.
+
+A command that may execute after an approval or restart gap also requires a
+built-in delayed-execution grammar and a mode-compatible executable profile.
+Fixed-identity active-proxy kubectl commands, literal non-starting `systemctl`
+operations, and profiled primary-only utilities satisfy that boundary. Ansible,
+Helm, and caller-mode kubectl cannot enter executable durable state. Unknown
+executables, SSH, wrappers, file-testing utilities, and commands that discover
+program or configuration files cannot be held or registered as unattended
+checks or rollbacks. Raw evaluator approval does not supply that authority.
 
 ## Reverse matching
 

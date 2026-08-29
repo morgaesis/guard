@@ -1,8 +1,9 @@
 # Deployment
 
-A durable Guard deployment separates the agent, daemon, credentials, state, and
-operator authority. The daemon listens on a local Unix socket or Windows named
-pipe, and the agent has no direct route or credential for protected upstreams.
+A durable Guard deployment separates the agent, daemon, state, and operator
+authority. Fixed-identity and API-proxy deployments also keep protected upstream
+credentials and routes unavailable to the agent. Caller-identity deployments
+instead use the authenticated caller's filesystem and credential authority.
 
 ## Operating model
 
@@ -18,22 +19,25 @@ This supports autonomous incident response without requiring an operator to be
 available during every session. Notifications can wake or inform an operator,
 but notification delivery does not change a gate decision.
 
-The principal split is mandatory:
+Every deployment preserves these principal boundaries:
 
-- The daemon principal owns SSH keys, SSH agent sockets, kubeconfigs, API tokens,
-  state, and internal saved authority. Operators own deployed binaries and verb
-  catalogs.
+- The daemon principal owns state and internal saved authority. In fixed-identity
+  and API-proxy deployments it also owns any brokered kubeconfig or API token.
+  Operators own deployed binaries and verb catalogs.
 - The agent principal can connect to Guard and receives only non-authoritative
   request and session references. Approved command authority remains in daemon
-  state and is bound automatically to the authenticated requester.
+  state and is bound automatically to the authenticated requester. Under
+  `--exec-as-caller`, an approved child also receives that requester's existing
+  filesystem and caller-owned credential authority.
 - On Unix, the operator principal holds the admin bearer token from the
   root-held token file. The packaged Windows service instead accepts only
   kernel-authenticated local SYSTEM on its named pipe and rejects an admin
   bearer. The daemon's own uid or Windows service SID never grants operator
   authority, so a brokered child cannot approve its own work.
 
-An agent that can read daemon credentials or reach the same upstream directly
-can bypass Guard.
+An agent that can read daemon credentials or reach the same protected upstream
+directly can bypass the fixed-identity credential boundary. `--exec-as-caller`
+does not claim that boundary for caller-owned credentials.
 
 ## Unix service
 
@@ -44,6 +48,8 @@ deployment/systemd/guard.service
 deployment/systemd/guard-exec-as-caller.service
 deployment/systemd/guard.env.example
 deployment/systemd/guard-operator
+deployment/systemd/upgrade-guard
+deployment/systemd/test-upgrade-guard.sh
 deployment/hardening/guard.apparmor.example
 deployment/hardening/seccomp-deny-escape.json
 ```
@@ -61,6 +67,9 @@ world-accessible.
 getent group guard >/dev/null || groupadd --system guard
 getent group guard-clients >/dev/null || groupadd --system guard-clients
 id guard >/dev/null 2>&1 || useradd --system --gid guard --home-dir /var/lib/guard --shell /usr/sbin/nologin guard
+getent group guard-exec >/dev/null || groupadd --system guard-exec
+id guard-exec >/dev/null 2>&1 || useradd --system --create-home --gid guard-exec --home-dir /var/lib/guard-exec --shell /usr/sbin/nologin guard-exec
+install -d -o guard-exec -g guard-exec -m 0700 /var/lib/guard-exec /var/lib/guard-exec/.ssh
 usermod --append --groups guard-clients guard-agent
 install -m 0755 guard /usr/local/bin/guard
 install -o root -g root -m 0755 deployment/systemd/guard-operator /usr/local/sbin/guard-operator
@@ -80,6 +89,19 @@ Replace `guard-agent` with each local agent account that may connect. Edit
 tokens out of unit command lines. `systemctl cat guard.service` shows the exact
 merged hardening and environment configuration.
 
+Keep `guard-exec` as a private group containing only the `guard-exec` worker and
+the `guard` daemon. The standard unit uses that group solely to deliver a
+generated proxy transport bearer through daemon-owned `0640` client files.
+Guard enumerates system account membership before each output and refuses the
+write when any unrelated account belongs to the group.
+
+The packaged `upgrade-guard` installer validates the `guard-exec` account and
+its private home before it interrupts the standard service.
+Provision the account with the setup commands above before upgrading. The
+upgrader rejects SSH material under the shared execution home because one fixed
+UID separates children from daemon state but does not isolate executions from
+each other.
+
 Use `--users` to restrict submitting Unix uids when the socket group is broader
 than the intended agent account. Set `GUARD_ALLOWED_UIDS=1000,1001` in
 `/etc/default/guard` when using the packaged service. The unit keeps `--users`
@@ -91,10 +113,10 @@ wide-access model below relaxes it deliberately.
 ## Wide host access
 
 A deployment whose agents debug and administer the local host through Guard
-gives the daemon deliberately broad reach: the guard account carries
-passwordless sudo for brokered children, holds the fleet SSH identity and tool
-credentials, and exposes the socket to the agent group. Passwordless sudo
-requires a host-local sudoers entry for the guard account and, because the
+gives the broker deliberately broad reach: the guard-exec account carries
+passwordless sudo for fixed-identity local commands, while the daemon holds
+secret-backend and API authority and exposes the socket to the agent group. Passwordless sudo
+requires a host-local sudoers entry for the guard-exec account and, because the
 packaged unit mounts the host filesystem read-only and sets
 `NoNewPrivileges=true`, a service drop-in that removes those restrictions:
 
@@ -117,9 +139,10 @@ Wide access raises the cost of instruction defects, so pair it with:
 
 - a narrow socket group and a `--users` restriction;
 - shipped audit and periodic review of allowed mutations;
-- prompt regression coverage for the deployed mode prompt;
-- prompt supplements or typed verbs for house tools the evaluator cannot
-  otherwise judge;
+- prompt regression coverage for the deployed mode prompt and typed verbs for
+  built-in executable profiles;
+  a new house executable requires a closed profile in Guard before policy or a
+  catalog entry can authorize it;
 - saved grants for recurring apply-class work, so denials stay rare and each
   one is meaningful.
 
@@ -127,8 +150,8 @@ Consequence gating adds holds for the irreversible tail once enabled; keep
 holds exceptional so each one gets real operator attention.
 
 Administrative RPCs authenticate the admin bearer token, never a uid. The
-daemon's own uid grants no operator authority: brokered children inherit that
-uid and must not inherit its command surface. The token reaches the daemon
+daemon's own uid grants no operator authority, independently of the dedicated
+child UID boundary. The token reaches the daemon
 only through stdin at startup (`StandardInput=file:` opens the root-held file
 as root and hands over the descriptor), so it never enters the daemon's
 environment, argv, or any file its children can read.
@@ -157,19 +180,22 @@ sudo guard-operator revert <provisional>
 ```
 
 On a console, `access approve` reviews each request interactively before
-deciding; add `--yes` for unattended runs. `GUARD_ADMIN_TOKEN` in the
-daemon's own environment is supported for development only: a brokered child
-can read the daemon's `/proc/<pid>/environ`, so production daemons must take
-the token from stdin.
+deciding; add `--yes` for unattended runs. `GUARD_ADMIN_TOKEN` in the daemon's
+own environment is supported for development only. Production daemons take the
+token from stdin so it never enters the process environment.
 
 Restrict `sudo` access to `/usr/local/sbin/guard-operator` to human operator
 accounts. Access to the wrapper grants the full daemon-principal command surface.
 Keep credentials out of command arguments.
 
-`--exec-as-caller` is a Unix-only alternative for a root socket daemon. Approved
-children drop to the authenticated caller uid and groups. It is incompatible
-with TCP, API proxying, and secret-file injection. The default broker model keeps
-the daemon identity because it owns the credentials the agent lacks.
+`--exec-user` is the standard Unix broker model. Approved children run as a
+dedicated account that cannot read the daemon database, authority key, audit
+log, or secret storage. `--exec-as-caller` is an alternative for a root socket
+daemon; it drops children to the authenticated caller uid and groups and is
+incompatible with TCP, API proxying, and secret-file injection. Fixed identity
+admits kubectl only through an active Guard proxy and denies Ansible and Helm.
+Caller identity denies all three typed profile tools because it has no immutable
+profile snapshot.
 
 ## Windows service
 
@@ -187,10 +213,16 @@ Run installation and operator decisions from an elevated shell. The installer
 uses a transient Task Scheduler task under SYSTEM, whose authenticated named-pipe
 SID Guard recognizes as a Windows operator. The interactive agent connects
 under its own SID and cannot satisfy this check or read daemon state.
-`--exec-as-caller` is unavailable; approved children run as the service account.
-Service mode requires exactly one named-pipe listener and rejects
-`GUARD_ADMIN_TOKEN` and `--admin-token-stdin`, so a brokered service child
-cannot inherit or recover operator authority.
+Local process execution and API proxying are unavailable on Windows because the
+platform does not provide a distinct worker identity or a race-free,
+client-specific authority handoff. Policy decisions, access administration,
+and inspection remain available. Service mode requires exactly one named-pipe
+listener and rejects
+`GUARD_ADMIN_TOKEN` and `--admin-token-stdin`, so operator authority is bound
+only to the kernel-authenticated SYSTEM pipe identity.
+
+Windows rejects API proxy configuration, including brokered kubeconfig and
+generic API-client output paths.
 
 The installer maps explicit PowerShell actions to the Guard CLI and runs them as
 SYSTEM. Access requests use exact `gr-` plus 32-hex references. Provisionals use
@@ -264,133 +296,120 @@ them with its current operator interface and verify that no active sessions
 remain. Keep the stopped binary and consistent database backup together for
 rollback.
 
-On Unix, the packaged paths use this upgrade sequence:
+On Unix, `/usr/local/sbin/upgrade-guard` performs the tested upgrade and
+rollback transaction. Install this root-owned helper from a verified source
+before its first use. It accepts only the explicit `install` and `rollback`
+actions, authenticates the complete release archive against an externally
+verified SHA256 digest, verifies the exact installed-artifact manifest in
+root-owned staging, and records the selected service unit and state ownership
+with each backup.
 
 ```bash
-release_version=0.8.1
-standard_state="$(systemctl is-active guard.service || true)"
-caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
-case "$standard_state:$caller_state" in
-  active:active) echo 'both packaged Guard services are active' >&2; exit 1 ;;
-  active:*) guard_unit=guard.service ;;
-  *:active) guard_unit=guard-exec-as-caller.service ;;
-  *) echo 'no packaged Guard service is active' >&2; exit 1 ;;
-esac
-sha256sum --check BINARY-SHA256
-expected_binary_hash="$(awk '$2 == "guard" {print $1}' BINARY-SHA256)"
-test "${#expected_binary_hash}" -eq 64
-test ! -f /var/lib/guard/verbs.yaml || ./guard verb lint --file /var/lib/guard/verbs.yaml
-backup_dir="$(mktemp -d "/var/backups/guard-before-v${release_version}-XXXXXXXX")"
-printf 'GUARD_ROLLBACK_BACKUP_DIR=%q\n' "$backup_dir"
-install -d -o root -g root -m 0700 "$backup_dir"
-systemctl stop "$guard_unit"
-test "$(systemctl is-active "$guard_unit" || true)" = inactive
-install -o root -g root -m 0755 /usr/local/bin/guard "$backup_dir/guard"
-for deployed_file in \
-  /usr/local/sbin/guard-operator \
-  /etc/systemd/system/guard.service \
-  /etc/systemd/system/guard-exec-as-caller.service; do
-  backup_name="$(basename "$deployed_file")"
-  if test -f "$deployed_file"; then
-    cp -a "$deployed_file" "$backup_dir/$backup_name"
-  else
-    : > "$backup_dir/$backup_name.absent"
-  fi
-done
-sqlite3 /var/lib/guard/state.db ".backup '$backup_dir/state.db'"
-test -s "$backup_dir/state.db"
-if test -d /etc/guard; then
-  cp -a /etc/guard "$backup_dir/config"
-else
-  : > "$backup_dir/config.absent"
-fi
-if test -d /var/lib/guard/api-proxy-reverts; then
-  cp -a /var/lib/guard/api-proxy-reverts "$backup_dir/api-proxy-reverts"
-fi
-(cd "$backup_dir" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
-(cd "$backup_dir" && sha256sum --check SHA256SUMS)
-install -m 0755 guard /usr/local/bin/guard
-install -o root -g root -m 0755 deployment/systemd/guard-operator /usr/local/sbin/guard-operator
-install -o root -g root -m 0644 deployment/systemd/guard.service /etc/systemd/system/guard.service
-install -o root -g root -m 0644 deployment/systemd/guard-exec-as-caller.service /etc/systemd/system/guard-exec-as-caller.service
-systemctl daemon-reload
-systemctl start "$guard_unit"
-daemon_pid="$(systemctl show "$guard_unit" --property MainPID --value)"
-test "$daemon_pid" -gt 0
-test "$(readlink -f "/proc/$daemon_pid/exe")" = /usr/local/bin/guard
-test "$(sha256sum "/proc/$daemon_pid/exe" | cut -d ' ' -f 1)" = "$expected_binary_hash"
-guard status --json
+sudo install -o root -g root -m 0755 \
+  /path/to/verified-source/deployment/systemd/upgrade-guard \
+  /usr/local/sbin/upgrade-guard
+
+sudo /usr/local/sbin/upgrade-guard install \
+  --release-archive /path/to/guard-release-x86_64-unknown-linux-gnu.tar.gz \
+  --expected-sha256 '<digest from the verified release SHA256SUMS>'
 ```
 
-Rollback stops the service again, verifies the backup manifest, and restores
-the matching binary, database, configuration, and API-revert bodies. Remove the
-database and every WAL, SHM, or rollback-journal sidecar before installing the
-backup so SQLite cannot combine files from different snapshots:
+The command retains a host-wide transaction lock, copies the archive into a
+root-only staging directory, rejects inherited archive-tool options, and
+validates every member name, type, and required release layout before
+extraction. The staged candidate validates the active database with `state-db
+check --json` before the service stops. A root-owned transaction journal then records the active service
+identity before the daemon is stopped. The stopped daemon supplies a coherent
+backup of the installed binary, operator wrapper, upgrade helper, both unit
+files, configuration tree, API-revert tree, service metadata, installation HMAC
+key, SQLite database, and SHA256 manifest. The API-revert tree and HMAC key are
+derived from the recorded state-database parent.
+
+The journal is beneath the root-owned, mode-`0700`
+`/var/lib/guard-upgrade` directory. Recovery validates the journal directory and
+records for type, ownership, and mode before reading them. A failed snapshot
+restarts and verifies the unchanged deployment. A failed restore, replacement,
+daemon start, or verification retains the journal for automatic recovery on the
+next non-dry-run invocation. Replacement files use atomic same-directory
+renames.
+
+The helper reads the selected active unit's effective `ExecStart` setting and
+requires exactly one canonical absolute `--state-db` path and `--socket` path.
+It records both settings with the backup and keeps the adjacent `authority.hmac`
+key and `api-proxy-reverts` tree with the matching SQLite snapshot. Missing,
+repeated, escaped, or malformed settings stop the transaction before the
+service is stopped. After unit replacement or restore, the helper verifies the
+effective database and socket settings plus the daemon-reported status fields;
+an effective drop-in or customized unit cannot silently redirect the deployment.
+
+Run `guard state-db check --file /path/to/state.db` with the candidate binary
+to simulate its schema migrations against a private SQLite snapshot. The
+source database remains unchanged. `--json` reports `compatible`,
+`simulated_open`, and one sanitized `rejected_rows` list. Each row identifies
+its durable category, reason, and whether it blocks startup or requires
+retirement before upgrade; serialized row content and session credentials are
+never returned.
+
+With the daemon stopped, retire one reported grant-request row through the same
+candidate binary:
 
 ```bash
-: "${GUARD_ROLLBACK_BACKUP_DIR:?set it to the value printed by the upgrade sequence}"
-backup_dir="$GUARD_ROLLBACK_BACKUP_DIR"
-standard_state="$(systemctl is-active guard.service || true)"
-caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
-case "$standard_state:$caller_state" in
-  active:active) echo 'both packaged Guard services are active' >&2; exit 1 ;;
-  active:*) guard_unit=guard.service; state_owner=guard; state_group=guard ;;
-  *:active) guard_unit=guard-exec-as-caller.service; state_owner=root; state_group=root ;;
-  *) echo 'no packaged Guard service is active' >&2; exit 1 ;;
-esac
-systemctl stop "$guard_unit"
-test "$(systemctl is-active "$guard_unit" || true)" = inactive
-(cd "$backup_dir" && sha256sum --check SHA256SUMS)
-for database_file in /var/lib/guard/state.db /var/lib/guard/state.db-wal /var/lib/guard/state.db-shm /var/lib/guard/state.db-journal; do
-  test ! -e "$database_file" || rm -- "$database_file"
-done
-install -o root -g root -m 0755 "$backup_dir/guard" /usr/local/bin/guard
-restore_packaged_file() {
-  backup_name="$1"
-  destination="$2"
-  mode="$3"
-  if test -f "$backup_dir/$backup_name.absent"; then
-    rm -f -- "$destination"
-  else
-    install -o root -g root -m "$mode" "$backup_dir/$backup_name" "$destination"
-  fi
-}
-restore_packaged_file guard-operator /usr/local/sbin/guard-operator 0755
-restore_packaged_file guard.service /etc/systemd/system/guard.service 0644
-restore_packaged_file guard-exec-as-caller.service /etc/systemd/system/guard-exec-as-caller.service 0644
-install -o "$state_owner" -g "$state_group" -m 0600 "$backup_dir/state.db" /var/lib/guard/state.db
-rm -rf /etc/guard /var/lib/guard/api-proxy-reverts
-if test ! -f "$backup_dir/config.absent"; then
-  cp -a "$backup_dir/config" /etc/guard
-fi
-if test -d "$backup_dir/api-proxy-reverts"; then
-  cp -a "$backup_dir/api-proxy-reverts" /var/lib/guard/api-proxy-reverts
-  chown -R "$state_owner:$state_group" /var/lib/guard/api-proxy-reverts
-fi
-systemctl daemon-reload
-systemctl start "$guard_unit"
-daemon_pid="$(systemctl show "$guard_unit" --property MainPID --value)"
-test "$daemon_pid" -gt 0
-test "$(readlink -f "/proc/$daemon_pid/exe")" = /usr/local/bin/guard
-test "$(sha256sum "/proc/$daemon_pid/exe" | cut -d ' ' -f 1)" = "$(sha256sum "$backup_dir/guard" | cut -d ' ' -f 1)"
-guard status --json
+guard state-db retire-rejected-grant-request \
+  --file /path/to/state.db '<handle reported by state-db check>'
 ```
+
+The command acquires the daemon lease and deletes the row only when the current
+binary still classifies that exact handle as rejected. Missing and accepted
+rows are unchanged.
+
+Use `--dry-run` with either action to validate its release or backup without
+changing the host.
+
+A failed install, verification, or handled signal restores the verified backup
+and checks the restarted daemon's binary digest, effective `ExecStart`
+`--state-db` and `--socket`, plus server-reported `state_db_path` and
+`socket_path`. The helper requires `jq` for the structured status check. A stop
+failure also recovers a unit that enters the `failed` state. The command prints
+the backup path after a successful install.
+
+```bash
+sudo /usr/local/sbin/upgrade-guard rollback --backup-dir /var/backups/guard-install-<identifier>
+```
+
+Rollback validates that the absolute backup path is under `/var/backups` and
+uses a `guard-` name containing only letters, digits, `.`, `_`, and `-`. It
+creates a safety backup of the pre-rollback deployment, stages the selected
+backup, swaps it into place, and restores the safety backup if a replacement or
+handshake fails. The fault-injection test is
+`deployment/systemd/test-upgrade-guard.sh`.
 
 On Windows, verify the release archive checksum, extract it into an
 Administrators-and-SYSTEM only directory, and rerun `install-guard.ps1` from an
 elevated PowerShell with `-CandidateExe` and the digest from the archive's
 `BINARY-SHA256` file as `-ExpectedSha256`. The installer copies the candidate to
-its protected staging directory, verifies the expected digest, and executes only
-that staged copy. It stops the service and backs up the installed binary,
-catalog, exact service command line, DPAPI-protected service environment,
-complete quiesced SQLite file set, and durable API-revert body files. The
-installer deletes the entire live SQLite set and API-revert snapshot before a
-restore, so files from different snapshots never mix. It verifies file hashes,
-the running process path, exact DACLs, and a `guard status --json` client/server
-version handshake. A failed install restores the prior files, environment,
-service command line, start mode, and running state. A disabled service is
-temporarily set to manual for verification, stopped again, and returned to
-disabled mode.
+protected staging, verifies the expected digest, and executes only that copy.
+Before stopping the service, the staged candidate runs `state-db check --json`
+against the active database and refuses incompatible durable state. The service
+command line must contain exactly one canonical absolute `--state-db` and one
+canonical local `--socket`. Custom values survive install, rollback, recovery,
+status, and ACL validation.
+
+An ACL-protected transaction journal records quiescing, backup, mutation, and
+verification. Every install, rollback, or uninstall invocation recovers an
+interrupted transaction before taking a new action. The stopped service backup
+contains the installed binary, catalog, exact command line, DPAPI-protected
+environment, matching HMAC key, complete SQLite file set, and durable API-revert
+bodies. Replacement files are staged beside their destination for same-volume
+atomic replacement. Restore removes the complete live SQLite and API-revert
+sets before installing one coherent snapshot. The `authority.hmac` file grants
+only the service SID access during normal operation and receives bounded
+administrative access only while backup maintenance is active.
+
+The installer verifies file hashes, the running process path, reported state
+and socket paths, exact DACLs, and a `guard status --json` client/server version
+handshake. A failed install restores the prior files, environment, command
+line, start mode, and running state. A disabled service is temporarily set to
+manual for verification, stopped again, and returned to disabled mode.
 Successful backups remain under `C:\ProgramData\GuardMaintenance\backups` and
 are inaccessible to the service.
 
@@ -402,10 +421,10 @@ Use that exact name for a later verified rollback:
 ```
 
 Rollback validates the metadata, hashes, fixed installation paths, exact service
-executable token, and DPAPI environment backup before stopping the service. It
+executable token, recorded state authority paths, and DPAPI environment backup before stopping the service. It
 creates a safety backup, restores the binary, database, API-revert bodies,
-catalog, exact service command, start mode, and environment, verifies the real
-status/version handshake, and restores the safety backup if verification fails.
+installation HMAC key, catalog, exact service command, start mode, and
+environment, verifies the real status/version handshake, and restores the safety backup if verification fails.
 
 A daemon refuses a database written by a newer binary and fails startup. Never
 start an older binary against the migrated database. Removing the database
@@ -430,18 +449,21 @@ audit purposes.
 
 ## Brokered files and tools
 
-Guard runs approved commands in the caller's canonical working directory while
-retaining the daemon's clean environment, identity, SSH configuration, agent
-socket, and secret bindings. It does not stage or copy project files.
-The execution identity needs traversal and read access to the project tree.
-Tool-native configuration discovery remains rooted in that working directory,
-including discovery of files such as `ansible.cfg`.
+Guard uses a caller working directory only when typed authority binds its
+canonical tree, while selecting either the fixed child identity or the
+authenticated caller, a clean environment, operator-owned tool settings, and
+mode-appropriate secret bindings. Every command without an explicit working
+directory starts from the fixed operating-system root. Guard does not stage or
+copy project files. The execution identity needs
+traversal and read access to an authorized project tree. A working directory
+does not enable mutable tool-profile discovery across an identity boundary.
 
-On Unix, a brokered command that cannot read one named non-secret file can enter
-the transparent read-grant path. The packaged system service grants the daemon
-`CAP_FOWNER` and `CAP_DAC_READ_SEARCH` for its ACL operations, then clears
-ambient and inheritable capabilities before spawning brokered children. The
-child never inherits these capabilities.
+On Unix, a brokered command running with `--exec-as-caller` that cannot read one
+named non-secret file can enter the transparent read-grant path. Fixed-identity
+mode refuses temporary read grants because the shared child UID would let a
+concurrent execution consume another request's ACL. The standard packaged
+service therefore grants only `CAP_SETUID` and `CAP_SETGID` for the fixed
+identity switch and clears both before spawning brokered children.
 
 The read-grant path requires the operating system ACL utilities, including
 `getfacl` and `setfacl`. Install the distribution's `acl` package before
@@ -461,23 +483,42 @@ no file access by itself. Guard separately rejects credential-shaped paths,
 pins the inode, prevents symlink and hardlink retargeting, applies a short TTL,
 and persists cleanup state. Windows does not modify caller file ACLs.
 
-Use `--secret-file ENV=NAME` when a child accepts credential material by path.
-The value remains in a daemon-owned child-lifetime file and is incompatible with
-`--exec-as-caller`.
+Per-run plain environment, secret, and secret-file bindings are unavailable in
+fixed-identity mode because a shared child UID can inspect another process with
+the same credentials. `--exec-as-caller` permits plain environment and scalar
+secret bindings for the authenticated caller, but refuses daemon-created secret
+files.
 
 On Unix, Guard creates private state directories as `0700` and the SQLite
-database and sidecars as `0600`. It rejects symlinked or non-regular database
-paths and unsafe writable parent directories instead of opening them.
+database, sidecars, and installation HMAC key as `0600`. It rejects symlinked or
+non-regular state files and unsafe writable parent directories instead of
+opening them. Keep `authority.hmac` with its matching SQLite backup. Replacing
+either half invalidates frozen command and secret authority.
 
 ## Remote command credentials
 
-Store the only usable remote credentials under the daemon account. For SSH-based
-tools, configure the daemon's SSH config, known-hosts database, and agent socket.
-Do not forward the caller's `SSH_AUTH_SOCK` or trust caller SSH configuration.
+Do not place SSH keys, agent sockets, bearer files, or other durable credentials
+under the fixed child account. A shared child UID is a daemon-state boundary,
+not an execution sandbox, so any approved command under that UID could consume
+child-readable authority. The standard upgrader requires
+`/var/lib/guard-exec/.ssh` to remain empty.
+
+Use the API proxy for daemon-held upstream credentials, or use
+`--exec-as-caller` when caller-owned credentials and filesystem identity are the
+intended boundary. Do not forward one caller's `SSH_AUTH_SOCK` into a shared
+fixed child.
 
 Use `GUARD_CHILD_ENV` for operator-selected daemon environment values such as a
-brokered `KUBECONFIG`. Use per-run or tool-config secret bindings for credential
-values. The agent names an entitlement, not the secret value.
+validated broker-only `KUBECONFIG` with a generated proxy transport bearer.
+Fixed-identity
+mode rejects every environment name outside its small inert-variable schema.
+Kubectl also requires the brokered `KUBECONFIG` and an active Guard proxy. Guard
+disables kuberc and command shadowing. Fixed identity rejects Ansible and Helm
+because their mutable profile state cannot safely cross identities. Caller
+identity rejects Ansible, Helm, and kubectl because it has no immutable typed
+profile snapshot. Caller-specific scalar secrets remain available to admitted
+non-profile commands under `--exec-as-caller`; the agent names an entitlement,
+not the secret value.
 
 Shims are convenience wrappers around `guard run`; they are not security
 boundaries. Put them before real tools in the agent `PATH`, and enforce bypass
@@ -495,8 +536,9 @@ Each endpoint has a unique name, listener, mode, policy, credential reference,
 and output path. Persisted rollback binds that identity and cannot cross to a
 different listener.
 
-Protect proxy ports from other local users. A separately integrated API bearer
-supplies scope, not network client identity. See [API proxy](docs/api-proxy.md).
+Every proxy request authenticates with either the generated transport bearer or
+a live Guard session bearer. Keep the brokered client file inside the fixed
+worker's private group. See [API proxy](docs/api-proxy.md).
 
 ## Access authority internals
 
@@ -540,7 +582,10 @@ out or the session is revoked.
 The daemon needs durable state and continuous supervision while provisionals are
 armed. It re-arms a completed forward command only after validating its frozen
 principal, session, secret selectors, endpoint, and credential identity. The
-sweeper observes a startup grace before processing due rows. An interrupted
+process-start and salted secret bindings captured for each command-shaped
+confirmation check and rollback are also required. A row without those bindings
+cannot execute its persisted command. The sweeper observes a startup grace
+before processing due rows. An interrupted
 rollback, unknown forward outcome, or invalid frozen authority becomes
 `needs_operator_decision` and emits a recovery notification. Monitor `guard
 provisionals`, `guard access list`, and the service audit stream after restart.

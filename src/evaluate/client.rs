@@ -110,9 +110,7 @@ impl Evaluator {
         );
 
         let response = self
-            .http_client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", api_key))
+            .provider_get(&url, api_key)?
             .timeout(Duration::from_secs(5))
             .send()
             .await;
@@ -376,9 +374,8 @@ impl Evaluator {
         tracing::debug!("LLM POST {}: model={}", api_url, model);
 
         let response = self
-            .http_client
-            .post(api_url)
-            .header("Authorization", format!("Bearer {}", api_key))
+            .provider_post(api_url, api_key)
+            .map_err(|e| AttemptError::Transport(e.to_string()))?
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -642,6 +639,10 @@ mod tests {
     use super::{parse_provider_json, MAX_PROVIDER_STRING_BYTES};
     use crate::evaluate::{EvalConfig, EvalResult, Evaluator};
 
+    fn generated_provider_credential() -> String {
+        format!("fixture-{:032x}", rand::random::<u128>())
+    }
+
     #[test]
     fn provider_json_shape_limits_string_and_container_growth() {
         let oversized = serde_json::json!({
@@ -659,7 +660,7 @@ mod tests {
 
     async fn mock_server_evaluator(port: u16, retries: u32, models: Vec<String>) -> Evaluator {
         let mut config = EvalConfig::default()
-            .llm_api_key("test-key".to_string())
+            .llm_api_key(generated_provider_credential())
             .llm_api_url(format!("http://127.0.0.1:{}", port))
             .llm_timeout_secs(5)
             .llm_retries(retries);
@@ -899,21 +900,27 @@ mod tests {
     async fn evaluator_uses_its_explicit_http_proxy() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_url = format!("http://{}", listener.local_addr().unwrap());
-        let mock = tokio::spawn(run_mock(
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mock = tokio::spawn(run_mock_capture(
             listener,
-            vec![(200, tool_call_body("APPROVE"), None)],
+            tool_call_body("APPROVE"),
+            sender,
         ));
         let evaluator = Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
-                .llm_api_url("http://guard-evaluator.invalid/chat".to_string())
+                .llm_api_key(generated_provider_credential())
+                .llm_api_url("https://guard-evaluator.invalid/chat".to_string())
                 .llm_proxy_url(proxy_url)
+                .llm_timeout_secs(1)
                 .llm_retries(0),
         )
         .expect("evaluator with HTTP proxy");
 
         let result = evaluator.evaluate_llm("id", None).await;
-        assert!(result.is_allow(), "got: {result}");
+        assert!(matches!(result, EvalResult::Error(_)), "got: {result}");
+        let request = receiver.await.unwrap();
+        assert!(String::from_utf8_lossy(&request)
+            .starts_with("CONNECT guard-evaluator.invalid:443 HTTP/1.1"));
         mock.await.unwrap();
     }
 

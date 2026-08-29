@@ -181,13 +181,21 @@ boundaries.
 | `GUARD_GPG_RECIPIENT` | none | GPG recipient for the local backend. |
 | `GUARD_SERVER_UID` | daemon principal | Owner namespace for the daemon's backend `LLM_API_KEY`. |
 | `GUARD_CHILD_ENV` | unset | Daemon environment names copied into approved children. |
+| `GUARD_EXEC_USER` | none | Dedicated Unix account required for local process execution unless `GUARD_EXEC_AS_CALLER=true`. |
 | `GUARD_EXEC_AS_CALLER` | `false` | Unix-only identity drop to the authenticated caller. |
 
 The child starts from a clean environment. Built-in safe variables and
 operator-selected `GUARD_CHILD_ENV` values come from the daemon, not the caller.
-`guard run --secret NAME` injects a stored value as an environment variable;
-`--secret-file ENV=NAME` creates a daemon-only child-lifetime file and exposes
-only its path. The file mode is incompatible with `--exec-as-caller`.
+`guard run --secret NAME` injects a caller-scoped stored value only with
+`--exec-as-caller`. Fixed-identity execution rejects all per-run bindings.
+Secret-file bindings remain part of typed policy and frozen hold snapshots, but
+local execution rejects them because neither supported identity mode provides
+an isolated daemon-to-child credential-file boundary.
+
+Fixed-identity daemon or tool environment may carry `KUBECONFIG` only when the
+document exactly matches the generated schema, endpoint, certificate authority,
+and transport bearer of an active Guard Kubernetes proxy. Alternate clusters,
+contexts, users, proxy settings, extensions, and unknown fields fail closed.
 
 Caller-requested `--env`, `--secret`, and `--secret-file` bindings are part of
 the evaluator subject and cache authority. Raw environment values stay out of
@@ -198,29 +206,29 @@ the daemon.
 ### Tool-owned environment
 
 The daemon loads `tools.yaml` from its Guard configuration directory. Each
-binary can receive fixed environment values and named secrets owned by the
-daemon:
+binary can receive fixed environment values and, in caller mode, named scalar
+secrets owned by the daemon:
 
 ```yaml
 tools:
-  ansible-playbook:
+  printf:
     env:
-      HOME: /var/lib/guard
-      ANSIBLE_LOCAL_TEMP: /var/lib/guard/.ansible/tmp
-      PATH: /opt/ansible-tools/bin:/usr/local/bin:/usr/bin:/bin
+      LANG: C.UTF-8
+      TZ: UTC
 ```
 
-This pattern gives `connection: local` tasks a writable home and temporary
-directory while selecting an operator-managed Python environment for modules.
-Create those directories with service-account ownership before starting Guard.
-Pin `ansible_python_interpreter` in the inventory or a typed verb when a
-playbook must use a particular interpreter. Tool values override the built-in
-safe environment, and a request cannot override the same variable.
+Tool values override the built-in safe environment, and a request cannot
+override the same variable. Fixed identity rejects tool-config secret bindings
+and credential-authority environment such as `SSH_AUTH_SOCK`; a validated
+broker-only kubeconfig with generated transport authentication for an active
+Guard proxy is the narrow kubectl exception. Tool configuration cannot enable
+Ansible or Helm. Caller mode also rejects typed Ansible, Helm, and kubectl
+execution.
 
-Tool configuration is binary-wide. Use separate wrapper binary names when two
-verb families require incompatible environments. Per-user entries under
-`users` can override fixed values or secret references, but the authenticated
-principal's secret namespace remains the source.
+Tool configuration is binary-wide. Use separate executable entries when two
+admitted command families require incompatible environments. Per-user entries
+under `users` can override fixed values or scalar secret references in caller
+mode, but the authenticated principal's secret namespace remains the source.
 
 ## API proxy
 
@@ -229,16 +237,20 @@ principal's secret namespace remains the source.
 | `GUARD_API_PROXY` | unset | Single generic loopback proxy listener. |
 | `GUARD_API_ENDPOINTS` | unset | YAML catalog of named concurrent listeners. |
 | `GUARD_API_PROTOCOL` | `kubernetes` | `kubernetes`, `github`, or `vercel`. |
-| `GUARD_API_UPSTREAM` | none | Generic upstream base URL. |
+| `GUARD_API_UPSTREAM` | none | Generic HTTPS upstream base URL without userinfo, query, or fragment. |
 | `GUARD_API_TOKEN_ENV` | none | Daemon environment name containing the upstream bearer. |
 | `GUARD_API_TOKEN_FILE` | none | Daemon-readable upstream bearer file. |
 | `GUARD_API_CA_OUT` | none | Output path for the local proxy CA. |
+| `GUARD_API_CLIENT_CONFIG_OUT` | none | Protected Unix fixed-worker JSON containing the loopback URL, CA, and generated transport bearer. |
 | `GUARD_KUBE_PROXY` | unset | Kubernetes listener shorthand. |
 | `GUARD_KUBE_PROXY_KUBECONFIG` | none | Daemon-owned upstream kubeconfig. |
 | `GUARD_KUBE_CONTEXT` | kubeconfig current context | Upstream Kubernetes context. |
 | `GUARD_API_POLICY` | none | Hot-reloaded API policy; absence is default deny. |
-| `GUARD_BROKERED_KUBECONFIG_OUT` | none | Operator/bootstrap kubeconfig output for a trusted local API client. |
+| `GUARD_BROKERED_KUBECONFIG_OUT` | none | Protected Unix fixed-worker kubeconfig output; requires `--exec-user`. |
 | `GUARD_API_RARITY_ESCALATION` | `0` | Observation threshold for evaluator or hold escalation. |
+
+API proxy configuration is unsupported on Windows because the platform has no
+race-free, client-specific authority handoff.
 
 API evaluator concurrency, rate, burst, error circuit, and cooldown controls use
 the `GUARD_API_JUDGE_*` variables shown by `guard server start --help`.

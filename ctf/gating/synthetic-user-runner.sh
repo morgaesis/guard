@@ -112,14 +112,39 @@ write_missing_result_evidence() {
 }
 
 assert_isolated_container() {
-  local container="$1" mounts
+  local container="$1" mounts capabilities
   [ "$(podman inspect --format '{{.HostConfig.NetworkMode}}' "$container")" = none ]
   [ "$(podman inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container")" = true ]
   [ "$(podman inspect --format '{{.Config.User}}' "$container")" = 1000:1000 ]
   podman inspect --format '{{json .HostConfig.SecurityOpt}}' "$container" | grep -Fq 'no-new-privileges'
   podman inspect --format '{{json .HostConfig.CapDrop}}' "$container" | grep -Fq 'ALL'
+  capabilities="$(podman inspect --format '{{json .HostConfig.CapAdd}}' "$container")"
+  [ "$capabilities" = '["CAP_SETGID","CAP_SETUID"]' ] \
+    || [ "$capabilities" = '["CAP_SETUID","CAP_SETGID"]' ]
   mounts="$(podman inspect --format '{{range .Mounts}}{{printf "%s %s\n" .Type .Destination}}{{end}}' "$container")"
   [ "$mounts" = 'volume /scenario' ]
+}
+
+principal_name_for_uid() {
+  case "$1" in
+    1000) printf '%s\n' guarddaemon ;;
+    1001) printf '%s\n' agent ;;
+    1002) printf '%s\n' other-agent ;;
+    *) return 2 ;;
+  esac
+}
+
+assert_daemon_runtime_boundary() {
+  local container="$1"
+  podman exec --user 0:0 "$container" /bin/sh -c '
+    pids=$(pgrep -u 1000 -x guard)
+    [ "$(printf "%s\n" "$pids" | sed "/^$/d" | wc -l)" -eq 1 ] || exit 1
+    cap_eff=$(awk "/^CapEff:/ { value = tolower(\$2); sub(/^0+/, \"\", value); print value == \"\" ? \"0\" : value }" /proc/$pids/status)
+    [ "$cap_eff" = c0 ]
+    [ "$(stat -c "%a:%G" /scenario/run/guard.sock)" = 660:guard-clients ]
+  '
+  podman exec --user agent "$container" test -S /scenario/run/guard.sock
+  podman exec --user other-agent "$container" test -S /scenario/run/guard.sock
 }
 
 resource_exists() {
@@ -232,7 +257,9 @@ cleanup_scenario() {
   fi
   for type in container volume; do
     while IFS=$'\t' read -r _ manifest_type name manifest_scenario; do
-      [ "$manifest_type" = "$type" ] && [ "$manifest_scenario" = "$scenario" ] || continue
+      if [ "$manifest_type" != "$type" ] || [ "$manifest_scenario" != "$scenario" ]; then
+        continue
+      fi
       if ! cleanup_registered_resource "$manifest_type" "$name" "$manifest_scenario"; then
         cleanup_failed=1
       fi
@@ -296,9 +323,9 @@ self_test() {
   RESULTS_DIR="$test_dir"
   record_host_failure SU-TEST 'phase-gr-test-handle /scenario/private' access 125
   test_evidence="$RESULTS_DIR/SU-TEST.host-failure.md"
-  grep -Fq 'Phase: `phase-[redacted-handle] [redacted-path]`' "$test_evidence"
-  grep -Fq 'Command category: `access`' "$test_evidence"
-  grep -Fq 'Podman exec status: `125`' "$test_evidence"
+  grep -Fq "Phase: \`phase-[redacted-handle] [redacted-path]\`" "$test_evidence"
+  grep -Fq "Command category: \`access\`" "$test_evidence"
+  grep -Fq "Podman exec status: \`125\`" "$test_evidence"
   if grep -Fq 'gr-test-handle' "$test_evidence"; then
     return 1
   fi
@@ -372,8 +399,8 @@ if ! flock -n 9; then
 fi
 
 CATALOG=(SU-01 SU-02 SU-03 SU-04 SU-05 SU-06 SU-07 SU-08 SU-09 SU-10 SU-11
-  SU-12-ssh SU-12-cloudstack SU-12-kubernetes SU-12-helm SU-12-ansible
-  SU-12-host-maintenance SU-12-api SU-13 SU-14 SU-15 SU-16 SU-17 SU-18
+  SU-12-service SU-12-cloudstack SU-12-kubernetes SU-12-helm SU-12-ansible
+  SU-12-workload-maintenance SU-12-api SU-13 SU-14 SU-15 SU-16 SU-17 SU-18
   SU-19 SU-20 SU-21 SU-22)
 if [ "$#" -eq 0 ]; then
   set -- "${CATALOG[@]}"
@@ -435,6 +462,8 @@ printf '%s\n' "runs/$RUN_ID" > "$EVIDENCE_ROOT/latest-run"
   echo "- Status: running"
 } > "$MANIFEST"
 
+# This callback is invoked indirectly by the EXIT trap below.
+# shellcheck disable=SC2317
 cleanup_active() {
   if [ -n "$ACTIVE_SCENARIO" ]; then
     if ! cleanup_scenario "$ACTIVE_SCENARIO"; then
@@ -528,6 +557,9 @@ run_one() {
     --network none \
     --read-only \
     --cap-drop ALL \
+    --cap-add SETUID \
+    --cap-add SETGID \
+    --group-add 2000 \
     --security-opt no-new-privileges \
     --memory "$MEMORY" \
     --memory-swap "$MEMORY" \
@@ -577,9 +609,7 @@ run_one() {
     echo "$scenario: isolated Guard daemon did not become ready" >&2
     return 1
   fi
-  if ! podman exec --user 1000:1000 "$container" chmod 0711 /scenario/run \
-    || ! podman exec --user 1000:1000 "$container" chmod 0666 /scenario/run/guard.sock
-  then
+  if ! assert_daemon_runtime_boundary "$container"; then
     record_host_failure "$scenario" daemon-socket-permissions container-setup 1
     return 1
   fi
@@ -633,10 +663,11 @@ run_one() {
 }
 
 run_phase() {
-  local container="$1" scenario="$2" uid="$3" phase="$4" command_category exec_status
+  local container="$1" scenario="$2" uid="$3" phase="$4" command_category exec_status principal
   command_category="$(command_category_for_phase "$phase")"
+  principal="$(principal_name_for_uid "$uid")"
   if podman exec \
-    --user "$uid:$uid" \
+    --user "$principal" \
     --env HOME="/tmp/synthetic-home-$uid" \
     --env XDG_CONFIG_HOME="/tmp/synthetic-config-$uid" \
     --env XDG_DATA_HOME="/tmp/synthetic-data-$uid" \
@@ -676,9 +707,7 @@ restart_daemon() {
     record_host_failure "$scenario" restart-readiness container-readiness 1
     return 1
   fi
-  if ! podman exec --user 1000:1000 "$container" chmod 0711 /scenario/run \
-    || ! podman exec --user 1000:1000 "$container" chmod 0666 /scenario/run/guard.sock
-  then
+  if ! assert_daemon_runtime_boundary "$container"; then
     record_host_failure "$scenario" restart-socket-permissions container-setup 1
     return 1
   fi

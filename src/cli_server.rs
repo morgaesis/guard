@@ -50,9 +50,9 @@ struct ApiEndpointSpec {
     #[serde(default)]
     ca_out: Option<PathBuf>,
     #[serde(default)]
-    brokered_kubeconfig_out: Option<PathBuf>,
+    client_config_out: Option<PathBuf>,
     #[serde(default)]
-    session_env: Option<String>,
+    brokered_kubeconfig_out: Option<PathBuf>,
     #[serde(default)]
     rarity_escalation: u64,
 }
@@ -63,6 +63,15 @@ enum ApiEndpointMode {
     Policy,
     #[default]
     Readonly,
+}
+
+impl ApiEndpointMode {
+    fn listener_mode(self) -> guard::proxy::ApiListenerMode {
+        match self {
+            Self::Policy => guard::proxy::ApiListenerMode::Policy,
+            Self::Readonly => guard::proxy::ApiListenerMode::Readonly,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -132,12 +141,22 @@ fn validate_windows_service_operator_config(
     }
     if has_admin_token {
         anyhow::bail!(
-            "the packaged Windows service rejects GUARD_ADMIN_TOKEN; brokered children share the service identity and must not inherit an operator bearer"
+            "the packaged Windows service rejects GUARD_ADMIN_TOKEN; local process execution is unavailable and operator actions use the kernel-authenticated SYSTEM named-pipe identity"
         );
     }
     if !has_socket || has_tcp_listener {
         anyhow::bail!(
             "the packaged Windows service requires exactly one named-pipe listener via --socket and does not accept a TCP listener"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_api_proxy(has_api_proxy: bool) -> Result<()> {
+    if has_api_proxy {
+        anyhow::bail!(
+            "Windows rejects API proxy configuration because Guard cannot deliver generated proxy authority through a race-free client-specific filesystem boundary"
         );
     }
     Ok(())
@@ -298,6 +317,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             metrics_addr,
             history_retention,
             exec_as_caller,
+            exec_user,
             exec_timeout_secs,
             system_prompt,
             system_prompt_append,
@@ -314,6 +334,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             api_token_env,
             api_token_file,
             api_ca_out,
+            api_client_config_out,
             kube_proxy,
             kubeconfig,
             kube_context,
@@ -554,9 +575,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     .unwrap_or(false);
             if exec_as_caller {
                 #[cfg(windows)]
-                anyhow::bail!(
-                    "--exec-as-caller is not supported on Windows; the daemon executes approved commands as its own service account"
-                );
+                anyhow::bail!("--exec-as-caller is not supported on Windows");
                 #[cfg(unix)]
                 {
                     let daemon_uid = current_uid();
@@ -571,6 +590,33 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     tracing::info!("Approved commands will execute as the connecting unix uid");
                 }
             }
+            #[cfg(unix)]
+            let exec_user_id = {
+                let configured = exec_user
+                    .or_else(|| guard_env("EXEC_USER"))
+                    .filter(|value| !value.trim().is_empty());
+                if exec_as_caller && configured.is_some() {
+                    anyhow::bail!("--exec-as-caller and --exec-user are mutually exclusive");
+                }
+                let user_id = configured
+                    .as_deref()
+                    .map(|name| {
+                        uzers::get_user_by_name(name)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("--exec-user account '{name}' does not exist")
+                            })
+                            .map(|user| user.uid())
+                    })
+                    .transpose()?;
+                validate_exec_user_id(user_id, current_uid(), exec_as_caller, dry_run)?
+            };
+            #[cfg(not(unix))]
+            let exec_user_id = {
+                if exec_user.is_some() || guard_env("EXEC_USER").is_some() {
+                    anyhow::bail!("--exec-user is not supported on this platform");
+                }
+                None
+            };
             let exec_timeout_secs = exec_timeout_secs
                 .map(Some)
                 .unwrap_or(guard_env_u64("EXEC_TIMEOUT_SECS")?)
@@ -1128,6 +1174,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         .unwrap_or_else(|_| parent.to_path_buf())
                 })
             });
+            let authority_mac_key = server::load_or_create_authority_mac_key(state_dir.as_deref())?;
 
             tracing::info!("Creating server instance...");
             let config = server::ServerConfig {
@@ -1144,9 +1191,11 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 redact_secrets,
                 preflight,
                 exec_as_caller,
+                exec_user_id,
                 exec_timeout_secs,
                 state_db_path,
                 state_dir,
+                authority_mac_key,
                 audit_log_path,
                 ..server::ServerConfig::default()
             };
@@ -1390,6 +1439,9 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             let env_api_token_env = guard_env("API_TOKEN_ENV");
             let env_api_token_file = guard_env("API_TOKEN_FILE").map(PathBuf::from);
             let env_api_ca_out = guard_env("API_CA_OUT").map(PathBuf::from);
+            let env_api_client_config_out = guard_env("API_CLIENT_CONFIG_OUT").map(PathBuf::from);
+            let env_brokered_kubeconfig_out =
+                guard_env("BROKERED_KUBECONFIG_OUT").map(PathBuf::from);
             let env_api_policy = guard_env("API_POLICY").map(PathBuf::from);
             let env_api_rarity_escalation = guard_env("API_RARITY_ESCALATION");
             let api_endpoints_path = api_endpoints.or_else(|| {
@@ -1441,6 +1493,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 || api_token_env.is_some()
                 || api_token_file.is_some()
                 || api_ca_out.is_some()
+                || api_client_config_out.is_some()
                 || kubeconfig.is_some()
                 || kube_context.is_some()
                 || api_policy.is_some()
@@ -1451,8 +1504,19 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 || env_api_token_env.is_some()
                 || env_api_token_file.is_some()
                 || env_api_ca_out.is_some()
+                || env_api_client_config_out.is_some()
+                || env_brokered_kubeconfig_out.is_some()
                 || env_api_policy.is_some()
                 || env_api_rarity_escalation.is_some();
+            #[cfg(windows)]
+            validate_windows_api_proxy(
+                !named_api_endpoints.is_empty()
+                    || api_proxy_flag_set
+                    || kube_proxy_flag_set
+                    || env_api_proxy.is_some()
+                    || env_kube_proxy.is_some()
+                    || api_companion_configured,
+            )?;
             if !named_api_endpoints.is_empty()
                 && (api_proxy_flag_set
                     || kube_proxy_flag_set
@@ -1679,41 +1743,30 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         .with_context(|| format!("write API proxy CA to {}", out.display()))?;
                     tracing::info!("Wrote API proxy CA to {}", out.display());
                 }
-                if let Some(out) = brokered_kubeconfig_out
-                    .or_else(|| guard_env("BROKERED_KUBECONFIG_OUT").map(PathBuf::from))
-                {
+                if let Some(out) = api_client_config_out.or(env_api_client_config_out) {
+                    let config = proxy.brokered_client_config();
+                    guard::proxy::validate_brokered_client_config(&config).map_err(|error| {
+                        anyhow::anyhow!("generated API client config is invalid: {error}")
+                    })?;
+                    write_protected_proxy_client_output(&out, &config, exec_user_id)?;
+                    tracing::info!("Wrote protected API client config to {}", out.display());
+                }
+                if let Some(out) = brokered_kubeconfig_out.or(env_brokered_kubeconfig_out) {
                     if !is_kubernetes {
                         anyhow::bail!(
                             "--brokered-kubeconfig-out is only valid for the Kubernetes API proxy"
                         );
                     }
-                    let session = guard_env("SESSION").filter(|value| !value.is_empty());
-                    let yaml = match session.as_deref() {
-                        Some(token) => {
-                            if session_aliases_upstream(&proxy, token) {
-                                anyhow::bail!(
-                                    "Guard session credential aliases the upstream API credential"
-                                );
-                            }
-                            proxy.brokered_kubeconfig_with_session(token)
-                        }
-                        None => proxy.brokered_kubeconfig(),
-                    };
-                    // Assert that the generated config contains no upstream
-                    // credential and, when requested, only the expected Guard
-                    // session bearer before handing it to an agent.
-                    match session.as_deref() {
-                        Some(token) => {
-                            guard::proxy::validate_brokered_kubeconfig_with_session(&yaml, token)
-                        }
-                        None => guard::proxy::validate_brokered_kubeconfig(&yaml),
-                    }
-                    .map_err(|e| {
+                    let yaml = proxy.brokered_kubeconfig();
+                    // Startup output carries only a generated transport bearer.
+                    // Reusable session authority stays behind principal-bound
+                    // command admission.
+                    guard::proxy::validate_brokered_kubeconfig(&yaml).map_err(|e| {
                         anyhow::anyhow!(
                             "generated brokered kubeconfig contains an invalid credential: {e}"
                         )
                     })?;
-                    write_brokered_kubeconfig_output(&out, &yaml, session.is_some())?;
+                    write_protected_proxy_client_output(&out, &yaml, exec_user_id)?;
                     tracing::info!("Wrote brokered kubeconfig to {}", out.display());
                 }
                 tracing::info!(
@@ -1733,6 +1786,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     api_judge_cache_ttl,
                     api_promotion_store.clone(),
                     api_judge_spend.clone(),
+                    exec_user_id,
                 )
                 .await?;
                 tracing::info!(
@@ -1836,47 +1890,158 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
     }
 }
 
-fn write_brokered_kubeconfig_output(
+fn write_protected_proxy_client_output(
     path: &std::path::Path,
     yaml: &str,
-    contains_session: bool,
+    exec_user_id: Option<u32>,
 ) -> Result<()> {
     #[cfg(unix)]
-    if contains_session {
+    {
         use std::io::Write as _;
+        use std::os::fd::AsRawFd;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-        let existing_mode = match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                anyhow::bail!(
-                    "session-bearing brokered kubeconfig path is not a regular file: {}",
-                    path.display()
-                );
-            }
-            Ok(metadata) => Some(metadata.mode() & 0o777),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        let mut file = std::fs::OpenOptions::new()
+        let child_uid = exec_user_id
+            .context("protected proxy client output requires the fixed --exec-user identity")?;
+        let child = uzers::get_user_by_uid(child_uid)
+            .context("resolve the fixed execution account for protected proxy client output")?;
+        let child_gid = child.primary_group_id();
+        let owner_uid = current_uid();
+        validate_broker_group_membership(child_uid, child_gid, owner_uid)?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let parent_metadata = std::fs::symlink_metadata(parent)
+            .with_context(|| format!("inspect proxy client output parent {}", parent.display()))?;
+        if parent_metadata.file_type().is_symlink()
+            || !parent_metadata.is_dir()
+            || parent_metadata.uid() != owner_uid
+            || parent_metadata.mode() & 0o022 != 0
+        {
+            anyhow::bail!(
+                "protected proxy client output parent must be a daemon-owned directory that is not writable by another account (expected uid {owner_uid}, found uid {}, mode {:o})",
+                parent_metadata.uid(),
+                parent_metadata.mode() & 0o7777,
+            );
+        }
+
+        let existing = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .with_context(|| format!("open brokered kubeconfig {}", path.display()))?;
-        let mode = existing_mode.unwrap_or(0o600) & !0o007;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            .open(path);
+        let (mut file, created) = match existing {
+            Ok(file) => (file, false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path)
+                    .with_context(|| {
+                        format!("create protected proxy client output {}", path.display())
+                    })?;
+                (file, true)
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("open protected proxy client output {}", path.display())
+                })
+            }
+        };
+
+        if created {
+            let metadata = file.metadata()?;
+            if metadata.gid() != child_gid {
+                let result = unsafe {
+                    libc::fchown(
+                        file.as_raw_fd(),
+                        !0 as libc::uid_t,
+                        child_gid as libc::gid_t,
+                    )
+                };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context(
+                            "assign protected proxy client output to the fixed execution account's private group; the daemon must belong to that group",
+                        );
+                }
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+        }
+
+        let metadata = file.metadata()?;
+        let mode = metadata.mode() & 0o777;
+        if !metadata.is_file()
+            || metadata.uid() != owner_uid
+            || metadata.gid() != child_gid
+            || mode != 0o640
+            || metadata.nlink() != 1
+        {
+            anyhow::bail!(
+                "protected proxy client output must be a regular file owned by the daemon, readable only by the fixed execution account's private group (mode 0640)"
+            );
+        }
+        file.set_len(0)?;
         file.write_all(yaml.as_bytes())?;
-        file.flush()?;
+        file.sync_all()?;
         return Ok(());
     }
 
-    #[cfg(not(unix))]
-    let _ = contains_session;
+    #[cfg(windows)]
+    {
+        let _ = (path, yaml, exec_user_id);
+        anyhow::bail!("protected proxy client output is unsupported on Windows")
+    }
 
-    std::fs::write(path, yaml)
-        .with_context(|| format!("write brokered kubeconfig to {}", path.display()))
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, yaml, exec_user_id);
+        anyhow::bail!("protected proxy client output is unsupported on this platform")
+    }
+}
+
+#[cfg(unix)]
+fn validate_broker_group_membership(child_uid: u32, child_gid: u32, daemon_uid: u32) -> Result<()> {
+    let process_can_assign_group = daemon_uid == 0
+        || uzers::group_access_list()
+            .is_ok_and(|groups| groups.iter().any(|group| group.gid() == child_gid));
+    if !process_can_assign_group {
+        anyhow::bail!(
+            "the daemon must belong to the fixed execution account's private group before it can emit protected proxy client output"
+        );
+    }
+
+    let mut child_is_member = false;
+    // SAFETY: Guard performs one system-account enumeration during serialized
+    // startup, before it exposes the proxy listener or starts child processes.
+    // No other Guard path enumerates the libc user database.
+    for user in unsafe { uzers::all_users() } {
+        let belongs_to_group = uzers::get_user_groups(user.name(), user.primary_group_id())
+            .is_some_and(|groups| groups.iter().any(|group| group.gid() == child_gid));
+        if !belongs_to_group {
+            continue;
+        }
+        if user.uid() == child_uid {
+            child_is_member = true;
+        } else if !broker_group_member_is_authorized(user.uid(), child_uid, daemon_uid) {
+            anyhow::bail!(
+                "the fixed execution account's private group contains an additional account; refusing to expose the proxy transport bearer"
+            );
+        }
+    }
+    if !child_is_member {
+        anyhow::bail!(
+            "the fixed execution account is not a member of its protected proxy client group"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn broker_group_member_is_authorized(member_uid: u32, child_uid: u32, daemon_uid: u32) -> bool {
+    member_uid == child_uid || member_uid == daemon_uid
 }
 
 fn validate_api_listener(listen: std::net::SocketAddr, label: &str) -> Result<()> {
@@ -1905,6 +2070,7 @@ async fn build_named_api_proxy(
     cache_ttl: Duration,
     coverage: Option<Arc<RwLock<guard::gating::api_promotion::ApiPromotionStore>>>,
     spend: Arc<server::ApiJudgeSpend>,
+    exec_user_id: Option<u32>,
 ) -> Result<(String, Arc<guard::proxy::ApiProxy>)> {
     if spec.name.is_empty()
         || !spec
@@ -1924,12 +2090,6 @@ async fn build_named_api_proxy(
     if !is_kubernetes && (spec.kubeconfig.is_some() || spec.kube_context.is_some()) {
         anyhow::bail!(
             "non-Kubernetes API endpoint '{}' cannot set kubeconfig or kube_context",
-            spec.name
-        );
-    }
-    if spec.session_env.is_some() && spec.brokered_kubeconfig_out.is_none() {
-        anyhow::bail!(
-            "API endpoint '{}' can set session_env only with brokered_kubeconfig_out",
             spec.name
         );
     }
@@ -2016,10 +2176,7 @@ async fn build_named_api_proxy(
         spec.name.clone(),
         format!("api-endpoint:{}:upstream", spec.name),
     )
-    .with_listener_mode(match spec.mode {
-        ApiEndpointMode::Policy => guard::proxy::ApiListenerMode::Policy,
-        ApiEndpointMode::Readonly => guard::proxy::ApiListenerMode::Readonly,
-    });
+    .with_listener_mode(spec.mode.listener_mode());
     if spec.rarity_escalation > 0 {
         proxy = proxy.with_rarity_escalation(spec.rarity_escalation);
     }
@@ -2069,6 +2226,17 @@ async fn build_named_api_proxy(
         std::fs::write(&path, ca_pem)
             .with_context(|| format!("write CA for API endpoint '{}'", spec.name))?;
     }
+    if let Some(path) = spec.client_config_out {
+        let config = proxy.brokered_client_config();
+        guard::proxy::validate_brokered_client_config(&config).map_err(|error| {
+            anyhow::anyhow!(
+                "client config for API endpoint '{}' is invalid: {error}",
+                spec.name
+            )
+        })?;
+        write_protected_proxy_client_output(&path, &config, exec_user_id)
+            .with_context(|| format!("write client config for API endpoint '{}'", spec.name))?;
+    }
     if let Some(path) = spec.brokered_kubeconfig_out {
         if !is_kubernetes {
             anyhow::bail!(
@@ -2076,52 +2244,69 @@ async fn build_named_api_proxy(
                 spec.name
             );
         }
-        let session = match spec.session_env.as_deref() {
-            Some(variable) => {
-                if !is_valid_env_name(variable) {
-                    anyhow::bail!("API endpoint '{}' has an invalid session_env", spec.name);
-                }
-                Some(std::env::var(variable).with_context(|| {
-                    format!("read session environment for API endpoint '{}'", spec.name)
-                })?)
-            }
-            None => None,
-        };
-        let yaml = match session.as_deref() {
-            Some(token) => {
-                if session_aliases_upstream(&proxy, token) {
-                    anyhow::bail!(
-                        "API endpoint '{}' session credential aliases its upstream credential",
-                        spec.name
-                    );
-                }
-                proxy.brokered_kubeconfig_with_session(token)
-            }
-            None => proxy.brokered_kubeconfig(),
-        };
-        match session.as_deref() {
-            Some(token) => guard::proxy::validate_brokered_kubeconfig_with_session(&yaml, token),
-            None => guard::proxy::validate_brokered_kubeconfig(&yaml),
-        }
-        .map_err(|error| {
+        let yaml = proxy.brokered_kubeconfig();
+        guard::proxy::validate_brokered_kubeconfig(&yaml).map_err(|error| {
             anyhow::anyhow!(
                 "brokered kubeconfig for API endpoint '{}' is invalid: {error}",
                 spec.name
             )
         })?;
-        write_brokered_kubeconfig_output(&path, &yaml, session.is_some()).with_context(|| {
+        write_protected_proxy_client_output(&path, &yaml, exec_user_id).with_context(|| {
             format!("write brokered kubeconfig for API endpoint '{}'", spec.name)
         })?;
     }
     Ok((spec.name, proxy))
 }
 
-fn session_aliases_upstream(proxy: &guard::proxy::ApiProxy, token: &str) -> bool {
-    proxy.upstream().bearer() == Some(token)
-        || proxy
-            .upstream()
-            .basic_auth()
-            .is_some_and(|(username, password)| token == username || token == password)
+#[cfg(unix)]
+fn validate_exec_user_id(
+    exec_user_id: Option<u32>,
+    daemon_uid: u32,
+    exec_as_caller: bool,
+    dry_run: bool,
+) -> anyhow::Result<Option<u32>> {
+    if !dry_run && !exec_as_caller && exec_user_id.is_none() {
+        anyhow::bail!(
+            "Unix process execution requires exactly one identity mode: configure --exec-user or --exec-as-caller"
+        );
+    }
+    if exec_user_id == Some(0) {
+        anyhow::bail!("--exec-user must not resolve to uid 0");
+    }
+    if exec_user_id == Some(daemon_uid) {
+        anyhow::bail!("--exec-user must differ from the daemon account");
+    }
+    Ok(exec_user_id)
+}
+
+#[cfg(all(test, unix))]
+mod exec_identity_tests {
+    use super::validate_exec_user_id;
+
+    #[test]
+    fn dedicated_child_rejects_root_uid_before_server_startup() {
+        let error = validate_exec_user_id(Some(0), 999, false, false)
+            .expect_err("uid 0 must never be accepted as the dedicated child");
+        assert!(error.to_string().contains("must not resolve to uid 0"));
+    }
+
+    #[test]
+    fn dedicated_child_rejects_the_daemon_uid() {
+        assert!(validate_exec_user_id(Some(999), 999, false, false).is_err());
+        assert_eq!(
+            validate_exec_user_id(Some(1001), 999, false, false).unwrap(),
+            Some(1001)
+        );
+    }
+
+    #[test]
+    fn startup_rejects_an_unconfigured_execution_identity() {
+        let error = validate_exec_user_id(None, 999, false, false)
+            .expect_err("a Unix daemon must select an execution identity");
+        assert!(error.to_string().contains("exactly one identity mode"));
+        assert_eq!(validate_exec_user_id(None, 0, true, false).unwrap(), None);
+        assert_eq!(validate_exec_user_id(None, 999, false, true).unwrap(), None);
+    }
 }
 
 #[cfg(test)]
@@ -2176,8 +2361,8 @@ mod api_endpoint_tests {
             kube_context: None,
             policy: None,
             ca_out: None,
+            client_config_out: None,
             brokered_kubeconfig_out: None,
-            session_env: None,
             rarity_escalation: 0,
         }
     }
@@ -2192,6 +2377,19 @@ mod api_endpoint_tests {
                 "{address} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn named_policy_endpoint_selects_mutation_capable_listener_mode() {
+        let file: ApiEndpointFile = serde_yaml_ng::from_str(
+            "endpoints:\n  - name: github-automation\n    listen: 127.0.0.1:9443\n    protocol: github\n    mode: policy\n",
+        )
+        .unwrap();
+        assert_eq!(file.endpoints.len(), 1);
+        assert_eq!(
+            file.endpoints[0].mode.listener_mode(),
+            guard::proxy::ApiListenerMode::Policy
+        );
     }
 
     #[tokio::test]
@@ -2224,6 +2422,7 @@ mod api_endpoint_tests {
             Arc::new(server::ApiJudgeSpend::new(
                 server::ApiJudgeSpendConfig::default(),
             )),
+            None,
         )
         .await
         .unwrap();
@@ -2237,6 +2436,7 @@ mod api_endpoint_tests {
             Arc::new(server::ApiJudgeSpend::new(
                 server::ApiJudgeSpendConfig::default(),
             )),
+            None,
         )
         .await
         .unwrap();
@@ -2244,36 +2444,63 @@ mod api_endpoint_tests {
         assert_eq!(second.0, "second");
         assert_eq!(first.1.protocol_name(), "kubernetes");
         assert_eq!(second.1.protocol_name(), "kubernetes");
-        assert!(session_aliases_upstream(&first.1, "test-only"));
-        assert!(!session_aliases_upstream(&first.1, "guard-session"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn session_brokered_output_preserves_group_access_and_removes_other_access() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-        let temp = tempfile::tempdir().unwrap();
-        let output = temp.path().join("brokered.kubeconfig");
-        std::fs::write(&output, "old").unwrap();
-        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o644)).unwrap();
+    fn broker_group_rejects_every_unrelated_account() {
+        assert!(broker_group_member_is_authorized(20, 20, 30));
+        assert!(broker_group_member_is_authorized(30, 20, 30));
+        assert!(!broker_group_member_is_authorized(40, 20, 30));
+    }
 
-        write_brokered_kubeconfig_output(&output, "new", true).unwrap();
+    #[cfg(unix)]
+    #[test]
+    fn transport_brokered_output_requires_the_fixed_private_group() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = temp.path().join("brokered.kubeconfig");
+        let current_uid = super::current_uid();
+        let child_uid = if current_uid == 0 {
+            uzers::get_user_by_name("nobody").unwrap().uid()
+        } else {
+            current_uid
+        };
+        let child_gid = uzers::get_user_by_uid(child_uid)
+            .unwrap()
+            .primary_group_id();
+
+        write_protected_proxy_client_output(&output, "new", Some(child_uid)).unwrap();
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "new");
-        assert_eq!(
-            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
-            0o640
-        );
+        let metadata = std::fs::metadata(&output).unwrap();
+        assert_eq!(metadata.uid(), current_uid);
+        assert_eq!(metadata.gid(), child_gid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+        assert_eq!(metadata.nlink(), 1);
 
         let link = temp.path().join("linked.kubeconfig");
         symlink(&output, &link).unwrap();
-        assert!(write_brokered_kubeconfig_output(&link, "replacement", true).is_err());
+        assert!(
+            write_protected_proxy_client_output(&link, "replacement", Some(child_uid),).is_err()
+        );
         assert_eq!(std::fs::read_to_string(output).unwrap(), "new");
+
+        let shared_parent = temp.path().join("shared");
+        std::fs::create_dir(&shared_parent).unwrap();
+        std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(write_protected_proxy_client_output(
+            &shared_parent.join("client.json"),
+            "{}",
+            Some(child_uid),
+        )
+        .is_err());
     }
 }
 
 #[cfg(all(test, windows))]
 mod windows_service_operator_tests {
-    use super::validate_windows_service_operator_config;
+    use super::{validate_windows_api_proxy, validate_windows_service_operator_config};
 
     #[test]
     fn packaged_service_requires_one_named_pipe_and_no_bearer() {
@@ -2287,7 +2514,9 @@ mod windows_service_operator_tests {
     }
 
     #[test]
-    fn foreground_windows_server_retains_explicit_bearer_configuration() {
+    fn foreground_windows_server_rejects_api_proxy_authority() {
         assert!(validate_windows_service_operator_config(false, false, true, true, true).is_ok());
+        assert!(validate_windows_api_proxy(false).is_ok());
+        assert!(validate_windows_api_proxy(true).is_err());
     }
 }

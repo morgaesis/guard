@@ -5,7 +5,11 @@ use crate::server::admin::{
 };
 use crate::server::execute::audit_session_fingerprint;
 #[cfg(unix)]
-use crate::server::execute::pause_command_initiation_for_test;
+use crate::server::execute::{
+    capture_approval_process_authority, observe_command_started_for_test,
+    pause_command_initiation_for_test, resolve_current_tool_env,
+    take_command_started_observation_for_test, ApprovedEnvironmentSnapshot, CommandAuthorization,
+};
 use crate::server::gate_runtime::{
     approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval_with_authority,
     hold_for_approval_with_trace, merge_revert_assessment_prompt, new_handle, now_unix,
@@ -14,7 +18,8 @@ use crate::server::gate_runtime::{
 #[cfg(unix)]
 use crate::server::gate_runtime::{
     arm_containment_with_access_use_for_test, arm_containment_with_authority,
-    finish_due_provisional, finish_revert, resume_approval, run_provisional_check, DaemonGateSink,
+    capture_persisted_command_authorization, finish_due_provisional, finish_revert,
+    resume_approval, run_provisional_check, run_provisional_revert, DaemonGateSink,
 };
 use crate::server::gate_runtime::{observe_approval_lifecycle_for_test, ApprovalLifecycleTestHook};
 #[cfg(unix)]
@@ -55,6 +60,8 @@ use tokio::io::AsyncWrite;
 use tokio::sync::RwLock;
 
 use super::make_test_config;
+#[cfg(unix)]
+use super::{trusted_artifact_tempdir, EnvRestore, TEST_ENV_LOCK};
 
 /// Capture the live session authority the way the daemon does before routing
 /// (`route_gated_allow` receives it in `GateInputs::authority`).
@@ -65,6 +72,97 @@ async fn live_authority(cfg: &ServerContext, token: &str) -> Option<SessionAutho
         .await
         .authority_snapshot(token)
         .map(SessionAuthoritySnapshot::from)
+}
+
+#[cfg(unix)]
+async fn bind_raw_snapshot_process_authority(
+    cfg: &ServerContext,
+    caller: &CallerIdentity,
+    snapshot: &mut ApprovalSnapshot,
+) {
+    let request = ExecuteRequest {
+        binary: snapshot.binary.clone(),
+        args: snapshot.args.clone(),
+        auth_token: None,
+        env: snapshot
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        secrets: snapshot
+            .secret_keys
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        secret_files: snapshot
+            .secret_file_keys
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: snapshot.cwd.clone(),
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let resolved = resolve_current_tool_env(
+        cfg,
+        &request.binary,
+        caller.principal().as_ref(),
+        caller.user_key().as_deref(),
+    )
+    .await
+    .unwrap();
+    let registry_fingerprint = resolved.authority_fingerprint();
+    let approved_environment = ApprovedEnvironmentSnapshot::new(
+        resolved,
+        request.secrets.keys().cloned().collect(),
+        request.secret_files.keys().cloned().collect(),
+        request
+            .secrets
+            .keys()
+            .cloned()
+            .map(|name| (name, None))
+            .collect(),
+        request
+            .secret_files
+            .keys()
+            .cloned()
+            .map(|name| (name, None))
+            .collect(),
+    )
+    .unwrap();
+    let timeout = snapshot
+        .exec_timeout_secs
+        .unwrap_or(cfg.config.exec_timeout_secs);
+    let verb_authority =
+        snapshot
+            .verb_name
+            .as_ref()
+            .map(|name| super::super::execute::VerbAuthorityExpectation {
+                name: name.clone(),
+                catalog_version: snapshot.catalog_version,
+                definition_digest: snapshot.verb_digest.clone(),
+                composition_digest: snapshot.verb_composition_digest.clone(),
+                environment_authority: snapshot.verb_environment_authority,
+                local_file_authority: snapshot.verb_local_file_authority,
+            });
+    snapshot.process_authority = Some(
+        capture_approval_process_authority(
+            cfg,
+            caller,
+            &request,
+            CommandAuthorization::replay(verb_authority, None, Some(timeout), None, None),
+            &approved_environment,
+            registry_fingerprint,
+        )
+        .unwrap(),
+    );
 }
 
 // ---- Consequence-gating orchestration tests -----------------------------
@@ -108,6 +206,7 @@ fn gating_config(
     cfg.config.gate = GateMode::Consequence;
     cfg.config.daemon_uid = operator_uid;
     cfg.config.daemon_principal = PrincipalKey::from_uid(operator_uid);
+    cfg.config.exec_as_caller = true;
     let operator = CallerIdentity::UnixAdmin { uid: operator_uid };
     let agent = CallerIdentity::Unix { uid: agent_uid };
     (cfg, operator, agent)
@@ -238,6 +337,7 @@ async fn containment_records_interruption_when_client_stream_drops_after_launch(
         .await
         .expect("open store");
     let (mut cfg, _operator, agent) = gating_config(7001, 1000);
+    cfg.config.exec_as_caller = true;
     cfg.state.session_store = Some(store.clone());
     let agent_principal = agent.principal();
     cfg.state
@@ -267,8 +367,8 @@ async fn containment_records_interruption_when_client_stream_drops_after_launch(
         ],
         RevertSpec::new("true", Vec::new()),
     );
-    request.secret_files.insert(
-        "STREAM_SECRET_FILE".to_string(),
+    request.secrets.insert(
+        "STREAM_SECRET".to_string(),
         "stream-file-secret".to_string(),
     );
     let mut writer = FlakyWriter::failing_after(2);
@@ -319,15 +419,8 @@ async fn containment_records_interruption_when_client_stream_drops_after_launch(
     assert!(reg.due_handles(u64::MAX).is_empty());
     assert_eq!(reg.outstanding(), 1, "the armed row still occupies a slot");
     assert_eq!(
-        p.secret_file_keys.get("STREAM_SECRET_FILE"),
+        p.secret_keys.get("STREAM_SECRET"),
         Some(&"stream-file-secret".to_string())
-    );
-    assert_eq!(
-        std::fs::read_dir(cfg.config.secret_file_root.as_ref().unwrap())
-            .unwrap()
-            .count(),
-        0,
-        "stream disconnect must remove child-lifetime secret files"
     );
     let child_pid = std::fs::read_to_string(&child_pid_file)
         .expect("the shell records its background child before streaming")
@@ -371,10 +464,7 @@ async fn interrupted_state_persistence_failure_fixture() -> (
     let request = contain_request(
         "sh",
         &["-c", "sleep 0.2; printf interrupted; sleep 5"],
-        RevertSpec::new(
-            "touch",
-            vec![reverted.to_str().expect("revert marker").to_string()],
-        ),
+        RevertSpec::new("true", Vec::new()),
     );
     let (initiation_reached, initiation_release) = pause_command_initiation_for_test(&cfg);
     let cfg_for_run = cfg.clone();
@@ -475,7 +565,7 @@ async fn interrupted_state_persistence_failure_can_be_confirmed_without_restart(
 #[cfg(unix)]
 #[tokio::test]
 async fn interrupted_state_persistence_failure_can_be_reverted_without_restart() {
-    let (cfg, operator, store, handle, reverted, _temp) =
+    let (cfg, operator, store, handle, _reverted, _temp) =
         interrupted_state_persistence_failure_fixture().await;
 
     let response = handle_admin_request_for_test(
@@ -486,8 +576,13 @@ async fn interrupted_state_persistence_failure_can_be_reverted_without_restart()
         },
     )
     .await;
-    assert!(matches!(response, AdminResponse::GateAction { .. }));
-    assert!(reverted.exists());
+    assert!(matches!(
+        response,
+        AdminResponse::GateAction {
+            exit_code: Some(0),
+            ..
+        }
+    ));
     assert_eq!(
         cfg.state
             .provisional
@@ -1043,15 +1138,12 @@ async fn running_containment_fixture() -> (
             "guard-test",
             release.to_str().expect("release path"),
         ],
-        RevertSpec::new(
-            "touch",
-            vec![reverted.to_str().expect("revert path").to_string()],
-        ),
+        RevertSpec::new("true", Vec::new()),
     );
     let (initiation_reached, initiation_release) = pause_command_initiation_for_test(&cfg);
     let task_cfg = Arc::clone(&cfg);
     let task_agent = agent.clone();
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         let mut sink = tokio::io::sink();
         arm_containment_with_authority(
             &mut RequestContext {
@@ -1068,7 +1160,20 @@ async fn running_containment_fixture() -> (
         )
         .await
     });
-    initiation_reached.acquire().await.unwrap().forget();
+    tokio::select! {
+        permit = initiation_reached.acquire() => {
+            permit.expect("initiation observer remains open").forget();
+        }
+        result = &mut task => {
+            panic!(
+                "forward returned before command initiation: {:?}",
+                result.expect("forward task").into_response()
+            );
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            panic!("forward did not reach command initiation");
+        }
+    }
     let handle = cfg
         .state
         .provisional
@@ -1115,6 +1220,7 @@ async fn confirm_is_blocked_until_the_forward_command_finishes() {
 async fn revert_is_blocked_until_the_forward_command_finishes() {
     let (cfg, operator, _agent, _temp, release, reverted, handle, task) =
         running_containment_fixture().await;
+    observe_command_started_for_test(&cfg);
     let blocked = handle_admin_request_for_test(
         &cfg,
         &operator,
@@ -1129,6 +1235,7 @@ async fn revert_is_blocked_until_the_forward_command_finishes() {
             if message.contains("forward command is still running")
     ));
     assert!(!reverted.exists());
+    assert!(!take_command_started_observation_for_test(&cfg));
 
     std::fs::write(release, b"release").expect("release forward");
     let response = task.await.expect("forward task").into_response();
@@ -1136,10 +1243,12 @@ async fn revert_is_blocked_until_the_forward_command_finishes() {
     let reverted_response =
         handle_admin_request_for_test(&cfg, &operator, AdminRequest::Revert { handle }).await;
     assert!(matches!(
-        reverted_response,
-        AdminResponse::GateAction { .. }
+        &reverted_response,
+        AdminResponse::GateAction {
+            exit_code: Some(0),
+            ..
+        }
     ));
-    assert!(reverted.exists());
 }
 
 /// Containment without a state store cannot make a restart-safe rollback
@@ -1802,11 +1911,11 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
 #[tokio::test]
 async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let revert_marker = temp.path().join("revert-ran");
     let store = SessionStore::open(temp.path().join("state.db"), 3_600)
         .await
         .expect("open store");
     let (mut cfg, _operator, agent) = gating_config(7_021, 1_000);
+    cfg.config.exec_as_caller = true;
     cfg.state.session_store = Some(store.clone());
     let principal = agent.principal().expect("agent principal");
     cfg.state
@@ -1820,20 +1929,17 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         .await
         .expect("seed check secret");
 
-    let mut revert = RevertSpec::new(
-        "sh",
-        vec!["-c".into(), format!("touch '{}'", revert_marker.display())],
-    );
+    let mut revert = RevertSpec::new("true", Vec::new());
     revert.confirm_check = Some(crate::server::CommandSpec {
-        binary: "sh".into(),
-        args: vec!["-c".into(), "test -n \"$CHECK_TOKEN_FILE\"".into()],
+        binary: "printenv".into(),
+        args: vec!["CHECK_TOKEN".into()],
     });
     revert.control_path = Some("local daemon identity and secret namespace".into());
     let mut request = contain_request("true", &[], revert);
     request.session_token = Some("check-session".into());
     request
-        .secret_files
-        .insert("CHECK_TOKEN_FILE".into(), "check-token".into());
+        .secrets
+        .insert("CHECK_TOKEN".into(), "check-token".into());
     let mut sink = tokio::io::sink();
     let result = arm_containment_with_authority(
         &mut RequestContext {
@@ -1893,26 +1999,18 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         row.session_fingerprint.as_deref(),
         Some(audit_session_fingerprint(Some("check-session")).as_str())
     );
-    assert!(
-        !revert_marker.exists(),
-        "successful check must not roll back"
-    );
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn due_failed_confirm_check_runs_the_rollback() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let revert_marker = temp.path().join("revert-ran");
     let store = SessionStore::open(temp.path().join("state.db"), 3_600)
         .await
         .expect("open store");
     let (mut cfg, _operator, agent) = gating_config(7_022, 1_000);
     cfg.state.session_store = Some(store.clone());
-    let mut revert = RevertSpec::new(
-        "sh",
-        vec!["-c".into(), format!("touch '{}'", revert_marker.display())],
-    );
+    let mut revert = RevertSpec::new("true", Vec::new());
     revert.confirm_check = Some(crate::server::CommandSpec {
         binary: "false".into(),
         args: Vec::new(),
@@ -1961,7 +2059,202 @@ async fn due_failed_confirm_check_runs_the_rollback() {
             .status,
         ProvisionalStatus::Reverted
     );
-    assert!(revert_marker.exists(), "failed check must roll back");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn persisted_control_authority_rejects_legacy_and_changed_plans() {
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    let (mut cfg, _operator, agent) = gating_config(7_026, 1_000);
+    cfg.state.session_store = Some(store.clone());
+    let mut revert_spec = RevertSpec::new("true".to_string(), Vec::new());
+    revert_spec.confirm_check = Some(crate::server::CommandSpec {
+        binary: "true".to_string(),
+        args: Vec::new(),
+    });
+    let mut sink = tokio::io::sink();
+    let armed = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        contain_request("true", &[], revert_spec),
+        agent.principal(),
+        "bound control commands".to_string(),
+        None,
+    )
+    .await;
+    match armed.exec {
+        ExecOutcome::Provisional { .. } => {}
+        other => panic!("expected provisional, got {other:?}"),
+    }
+    let persisted = store.load_provisionals().await.unwrap().remove(0);
+    assert!(persisted.revert_authorization.is_some());
+    assert!(persisted.confirm_check_authorization.is_some());
+
+    let mut legacy = persisted.clone();
+    legacy.revert_authorization = None;
+    legacy.confirm_check_authorization = None;
+    for result in [
+        run_provisional_check(&cfg, &legacy).await,
+        run_provisional_revert(&cfg, &legacy).await,
+    ] {
+        assert!(matches!(
+            result.exec,
+            ExecOutcome::Failed {
+                started: false,
+                ref reason,
+            } if reason.contains("lacks process and secret authority")
+        ));
+    }
+
+    let mut changed_check = persisted.clone();
+    changed_check
+        .confirm_check_authorization
+        .as_mut()
+        .unwrap()
+        .process_authority
+        .delayed_authority
+        .as_mut()
+        .unwrap()
+        .version += 1;
+    let checked = run_provisional_check(&cfg, &changed_check).await;
+    let ExecOutcome::Failed {
+        started: false,
+        reason,
+    } = &checked.exec
+    else {
+        panic!("changed confirmation authority must fail before start")
+    };
+    assert!(reason.contains("process authority changed"), "{reason}");
+
+    let mut changed_revert = persisted;
+    changed_revert
+        .revert_authorization
+        .as_mut()
+        .unwrap()
+        .process_authority
+        .delayed_authority
+        .as_mut()
+        .unwrap()
+        .version += 1;
+    let reverted = run_provisional_revert(&cfg, &changed_revert).await;
+    let ExecOutcome::Failed {
+        started: false,
+        reason,
+    } = &reverted.exec
+    else {
+        panic!("changed rollback authority must fail before start")
+    };
+    assert!(reason.contains("process authority changed"), "{reason}");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persisted_control_replay_carries_one_secret_snapshot_through_spawn() {
+    let _environment_lock = TEST_ENV_LOCK.lock().await;
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", "/usr/bin:/bin");
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    let (mut cfg, _operator, agent) = gating_config(7_027, 1_000);
+    cfg.config.exec_as_caller = true;
+    cfg.state.session_store = Some(store);
+    let principal = agent.principal().unwrap();
+    cfg.state
+        .secrets
+        .set(&principal, "control-token", "bound-value")
+        .await
+        .unwrap();
+    let mut revert_spec =
+        RevertSpec::new("printenv".to_string(), vec!["CONTROL_TOKEN".to_string()]);
+    revert_spec.confirm_check = Some(crate::server::CommandSpec {
+        binary: "printenv".to_string(),
+        args: vec!["CONTROL_TOKEN".to_string()],
+    });
+    let mut request = contain_request("true", &[], revert_spec);
+    request
+        .secrets
+        .insert("CONTROL_TOKEN".to_string(), "control-token".to_string());
+    let mut sink = tokio::io::sink();
+    let armed = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        Some(principal.clone()),
+        "secret snapshot".to_string(),
+        None,
+    )
+    .await;
+    let handle = match armed.exec {
+        ExecOutcome::Provisional { handle, .. } => handle,
+        other => panic!("expected provisional, got {other:?}"),
+    };
+    let provisional = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .unwrap()
+        .clone();
+
+    for run_check in [true, false] {
+        cfg.state
+            .secrets
+            .set(&principal, "control-token", "bound-value")
+            .await
+            .unwrap();
+        let (reached, release) = pause_command_initiation_for_test(&cfg);
+        let task_cfg = cfg.clone();
+        let task_provisional = provisional.clone();
+        let task = tokio::spawn(async move {
+            if run_check {
+                run_provisional_check(&task_cfg, &task_provisional).await
+            } else {
+                run_provisional_revert(&task_cfg, &task_provisional).await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        cfg.state
+            .secrets
+            .set(&principal, "control-token", "mutated-value")
+            .await
+            .unwrap();
+        release.add_permits(1);
+        let result = task.await.unwrap();
+        match result.exec {
+            ExecOutcome::Completed {
+                exit_code: Some(0),
+                stdout,
+                ..
+            } => {
+                assert_eq!(stdout.as_deref(), Some("[REDACTED]\n"));
+                assert!(!stdout
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("mutated-value"));
+            }
+            other => panic!("expected successful persisted control replay, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -2009,19 +2302,16 @@ async fn containment_check_cannot_bypass_the_server_binary_floor() {
     assert!(cfg.state.provisional.read().await.list().is_empty());
 }
 
-/// A persisted provisional keeps only a secret-file reference. After a
-/// simulated daemon restart, the operator-initiated revert resolves and
-/// materializes that reference from the new daemon's live secret manager. A
-/// temporarily missing secret defers the revert for an operator retry instead
-/// of burning the rollback.
+/// A persisted provisional keeps only a named secret reference and a keyed
+/// binding. After restart, a missing or changed value defers the rollback;
+/// restoring the bound value permits an operator retry.
 #[cfg(unix)]
 #[tokio::test]
-async fn provisional_revert_reresolves_secret_after_restart() {
+async fn provisional_revert_revalidates_secret_after_restart() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
         .await
         .expect("open store");
-    let output = tmp.path().join("revert-output");
     let agent_uid = 41_111;
     let agent_principal = PrincipalKey::from_uid(agent_uid);
     let secret_key = format!("REVERT_PARITY_{}", std::process::id());
@@ -2029,6 +2319,7 @@ async fn provisional_revert_reresolves_secret_after_restart() {
     let restart_value = "resolved-after-restart";
 
     let (mut cfg, _operator, agent) = gating_config(7_016, agent_uid);
+    cfg.config.exec_as_caller = true;
     cfg.state.session_store = Some(store.clone());
     cfg.state
         .secrets
@@ -2039,19 +2330,11 @@ async fn provisional_revert_reresolves_secret_after_restart() {
     let mut request = contain_request(
         "true",
         &[],
-        RevertSpec::new(
-            "sh",
-            vec![
-                "-c".to_string(),
-                "cat \"$REVERT_TOKEN_FILE\" > \"$1\"".to_string(),
-                "sh".to_string(),
-                output.display().to_string(),
-            ],
-        ),
+        RevertSpec::new("printenv", vec!["REVERT_TOKEN".to_string()]),
     );
     request
-        .secret_files
-        .insert("REVERT_TOKEN_FILE".to_string(), secret_key.clone());
+        .secrets
+        .insert("REVERT_TOKEN".to_string(), secret_key.clone());
 
     let mut sink = tokio::io::sink();
     let result = arm_containment_with_authority(
@@ -2079,7 +2362,7 @@ async fn provisional_revert_reresolves_secret_after_restart() {
         .expect("load persisted provisional");
     assert_eq!(persisted.len(), 1);
     assert_eq!(
-        persisted[0].secret_file_keys.get("REVERT_TOKEN_FILE"),
+        persisted[0].secret_keys.get("REVERT_TOKEN"),
         Some(&secret_key)
     );
     let persisted_json = serde_json::to_string(&persisted[0]).expect("serialize persisted row");
@@ -2096,6 +2379,8 @@ async fn provisional_revert_reresolves_secret_after_restart() {
     // completed forward remains armed; this test then models an immediate
     // operator revert while its named secret is unavailable.
     let (mut restarted, _operator, _agent) = gating_config(7_016, agent_uid);
+    restarted.config.exec_as_caller = true;
+    restarted.config.authority_mac_key = cfg.config.authority_mac_key.clone();
     restarted.state.session_store = Some(store.clone());
     let (registry, moved) = guard::gating::provisional::ProvisionalRegistry::from_rows(persisted);
     assert!(moved.is_empty());
@@ -2128,14 +2413,12 @@ async fn provisional_revert_reresolves_secret_after_restart() {
             .status,
         ProvisionalStatus::NeedsOperatorDecision
     );
-    assert!(!output.exists());
-
     restarted
         .state
         .secrets
         .set(&agent_principal, &secret_key, restart_value)
         .await
-        .expect("restore live secret after deferred revert");
+        .expect("change live secret after deferred revert");
     let retry = restarted
         .state
         .provisional
@@ -2143,13 +2426,27 @@ async fn provisional_revert_reresolves_secret_after_restart() {
         .await
         .begin_revert(&handle)
         .expect("retry deferred provisional");
+    let (message, exit) =
+        finish_revert(&restarted, &retry, &CallerIdentity::Unknown, "operator").await;
+    assert_eq!(exit, None);
+    assert!(message.contains("deferred"), "got: {message}");
+
+    restarted
+        .state
+        .secrets
+        .set(&agent_principal, &secret_key, initial_value)
+        .await
+        .expect("restore bound secret after deferred revert");
+    let retry = restarted
+        .state
+        .provisional
+        .write()
+        .await
+        .begin_revert(&handle)
+        .expect("retry restored provisional");
     let (_message, exit) =
         finish_revert(&restarted, &retry, &CallerIdentity::Unknown, "operator").await;
     assert_eq!(exit, Some(0));
-    assert_eq!(
-        std::fs::read_to_string(&output).expect("read revert output"),
-        "resolved-after-restart"
-    );
 
     restarted
         .state
@@ -2242,8 +2539,10 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
             "POST".to_string(),
             "/repos/o/r/labels".to_string(),
         ],
+        revert_authorization: None,
         confirm_check_binary: None,
         confirm_check_args: Vec::new(),
+        confirm_check_authorization: None,
         control_path: None,
         session_fingerprint: None,
         session_revision: None,
@@ -2433,7 +2732,9 @@ async fn failed_revert_is_durable_queryable_and_notifies_operator() {
 #[cfg(unix)]
 #[tokio::test]
 async fn api_revert_executes_through_registered_proxy_upstream() {
+    use std::sync::Arc as StdArc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsAcceptor;
 
     let state = tempfile::tempdir().expect("tempdir");
     let store = SessionStore::open(state.path().join("state.db"), 3_600)
@@ -2443,10 +2744,16 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
     // Minimal recording upstream: capture the one request, answer 200 JSON.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();
+    let upstream_tls = guard::proxy::ProxyTls::generate().expect("upstream TLS");
+    let upstream_ca = upstream_tls.ca_data_b64();
+    let mut upstream_server_config = (*upstream_tls.server_config()).clone();
+    upstream_server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let upstream_acceptor = TlsAcceptor::from(StdArc::new(upstream_server_config));
     let captured: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
     let captured_in = captured.clone();
     tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
+        if let Ok((stream, _)) = listener.accept().await {
+            let mut stream = upstream_acceptor.accept(stream).await.expect("accept TLS");
             let mut buf = vec![0u8; 8192];
             let n = stream.read(&mut buf).await.unwrap_or(0);
             *captured_in.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -2460,11 +2767,12 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
 
     let (mut cfg, _operator, _agent) = gating_config(7015, 1000);
     cfg.state.session_store = Some(store.clone());
-    let upstream = guard::proxy::Upstream::from_base_url(
-        &format!("http://{upstream_addr}"),
-        guard::proxy::UpstreamAuth::Bearer("revert-token".to_string()),
-    )
-    .expect("upstream");
+    let upstream_bearer = format!("fixture-{}", new_handle());
+    let upstream_kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: fixture\nclusters:\n  - name: fixture\n    cluster:\n      server: https://{upstream_addr}\n      certificate-authority-data: {upstream_ca}\ncontexts:\n  - name: fixture\n    context: {{cluster: fixture, user: fixture}}\nusers:\n  - name: fixture\n    user: {{token: {upstream_bearer}}}\n"
+    );
+    let upstream = guard::proxy::Upstream::from_kubeconfig_str(&upstream_kubeconfig, None)
+        .expect("TLS upstream");
     let proxy = Arc::new(guard::proxy::ApiProxy::with_protocol(
         Arc::new(guard::proxy::GithubProtocol),
         "127.0.0.1:0".parse().unwrap(),
@@ -2501,8 +2809,10 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
             "POST".to_string(),
             "/repos/o/r/labels".to_string(),
         ],
+        revert_authorization: None,
         confirm_check_binary: None,
         confirm_check_args: Vec::new(),
+        confirm_check_authorization: None,
         control_path: None,
         session_fingerprint: None,
         session_revision: None,
@@ -2564,8 +2874,8 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
     let raw = captured.lock().unwrap().clone();
     assert!(raw.starts_with("POST /repos/o/r/labels HTTP/1.1"), "{raw}");
     assert!(
-        raw.contains("authorization: Bearer revert-token")
-            || raw.contains("Authorization: Bearer revert-token"),
+        raw.contains(&format!("authorization: Bearer {upstream_bearer}"))
+            || raw.contains(&format!("Authorization: Bearer {upstream_bearer}")),
         "daemon credential must ride the revert: {raw}"
     );
     assert!(raw.contains(r#"{"name":"bug","color":"d73a4a"}"#), "{raw}");
@@ -2780,8 +3090,8 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
     let (cfg, _operator, agent) = gating_config(7011, 1000);
 
     let request = contain_request(
-        "systemctl",
-        &["restart", "app"],
+        "printf",
+        &["recoverable-forward"],
         RevertSpec::new(
             "../evil", // `..` rejected by invalid_binary_reason
             Vec::new(),
@@ -2838,6 +3148,30 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
         ApprovalStatus::Pending,
         "the forward command must be queued for an operator decision"
     );
+}
+
+#[test]
+fn typed_catalog_requires_a_positive_executable_profile() {
+    for (binary, args) in [
+        ("sh", "[\"-c\", \"/srv/guard/helper\"]"),
+        ("java", "[\"-jar\", \"/srv/guard/app.jar\"]"),
+        ("dotnet", "[\"/srv/guard/app.dll\"]"),
+        ("deno", "[\"run\", \"/srv/guard/app.ts\"]"),
+        ("bun", "[\"run\", \"/srv/guard/app.ts\"]"),
+        ("git", "[\"-c\", \"alias.run=!helper\", \"run\"]"),
+    ] {
+        let yaml = format!(
+            "verbs:\n  - name: unprofiled-operator-command\n    binary: {binary}\n    args: {args}\n    consequence: reversible\n    trusted: true\n"
+        );
+        let error = VerbCatalog::from_yaml(&yaml)
+            .expect_err("operator-authored unprofiled dispatch must fail catalog validation");
+        assert!(
+            error
+                .to_string()
+                .contains("no closed executable authority profile"),
+            "unexpected validation error for {binary}: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2969,8 +3303,10 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
             secret_file_keys: BTreeMap::new(),
             revert_binary: "true".to_string(),
             revert_args: Vec::new(),
+            revert_authorization: None,
             confirm_check_binary: None,
             confirm_check_args: Vec::new(),
+            confirm_check_authorization: None,
             control_path: Some("test".to_string()),
             session_fingerprint: Some(audit_session_fingerprint(Some(token))),
             session_revision: cfg
@@ -3028,8 +3364,10 @@ async fn requester_can_list_own_api_provisional_without_decision_authority() {
         secret_file_keys: BTreeMap::new(),
         revert_binary: String::new(),
         revert_args: Vec::new(),
+        revert_authorization: None,
         confirm_check_binary: None,
         confirm_check_args: Vec::new(),
+        confirm_check_authorization: None,
         control_path: Some("daemon API proxy for protocol kubernetes".to_string()),
         session_fingerprint: Some("sha256:requester-session".to_string()),
         session_revision: Some("requester-session-revision".to_string()),
@@ -3147,6 +3485,8 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
                 catalog_version: 1,
                 verb_digest: None,
                 composition_digest: None,
+                environment_authority: false,
+                local_file_authority: false,
                 learned_deny_match_policy: LearnedDenyMatchPolicy::Enforce,
                 access_evaluation_override_eligible: false,
             }),
@@ -3188,23 +3528,16 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn hold_approval_arms_then_requester_resumes_once_with_output() {
+async fn hold_approval_arms_then_requester_resumes_once() {
+    let _environment_guard = TEST_ENV_LOCK.lock().await;
     let (mut cfg, operator, agent) = gating_config(7005, 1000);
     let agent_principal = agent.principal();
-    let state = tempfile::tempdir().unwrap();
-    let marker = state.path().join("resumed");
 
-    // Hold a command with observable stdout, stderr, exit status, and side
-    // effect so approval and execution cannot be confused.
+    // Hold a direct command with observable stdout so approval and execution
+    // cannot be confused.
     let request = ExecuteRequest {
-        binary: "sh".to_string(),
-        args: vec![
-            "-c".to_string(),
-            format!(
-                "printf requester-stdout; printf requester-stderr >&2; printf resumed > '{}'; exit 7",
-                marker.display()
-            ),
-        ],
+        binary: "printf".to_string(),
+        args: vec!["requester-stdout".to_string()],
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
@@ -3360,10 +3693,6 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
         }
         other => panic!("operator approval should arm, got {:?}", other),
     }
-    assert!(
-        !marker.exists(),
-        "approval must not execute the held command"
-    );
     assert_eq!(
         cfg.state
             .approvals
@@ -3391,7 +3720,6 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
     )
     .await;
     assert!(matches!(refused, AdminResponse::Error { .. }));
-    assert!(!marker.exists());
 
     let resumed = handle_admin_request_for_test(
         &cfg,
@@ -3408,13 +3736,12 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
             stderr,
             ..
         } => {
-            assert_eq!(exit_code, Some(7));
+            assert_eq!(exit_code, Some(0));
             assert_eq!(stdout.as_deref(), Some("requester-stdout"));
-            assert_eq!(stderr.as_deref(), Some("requester-stderr"));
+            assert_eq!(stderr, None);
         }
         other => panic!("requester resume should execute, got {other:?}"),
     }
-    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "resumed");
     assert_eq!(
         cfg.state
             .approvals
@@ -3462,21 +3789,14 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
+async fn armed_hold_survives_restart_and_persists_result() {
     let (mut cfg, operator, agent) = gating_config(7_042, 1_000);
     let state = tempfile::tempdir().unwrap();
     let store = SessionStore::open(state.path().join("state.db"), 3_600)
         .await
         .unwrap();
     cfg.state.session_store = Some(store.clone());
-    let request = held_request(
-        "sh",
-        vec![
-            "-c".to_string(),
-            "yes x | head -c 300000; yes y | head -c 300000 >&2".to_string(),
-        ],
-        None,
-    );
+    let request = held_request("true", Vec::new(), None);
     let mut sink = tokio::io::sink();
     let held = hold_for_approval_with_authority(
         &mut RequestContext {
@@ -3525,6 +3845,7 @@ async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
         "armed"
     );
     let (mut restarted, _operator, requester) = gating_config(7_042, 1_000);
+    restarted.config.authority_mac_key = cfg.config.authority_mac_key.clone();
     restarted.state.session_store = Some(store.clone());
     *restarted.state.approvals.write().await = registry;
 
@@ -3544,8 +3865,8 @@ async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
             ..
         } => {
             assert_eq!(exit_code, Some(0));
-            assert_eq!(stdout.as_deref().map(str::len), Some(300_000));
-            assert_eq!(stderr.as_deref().map(str::len), Some(300_000));
+            assert_eq!(stdout, None);
+            assert_eq!(stderr, None);
         }
         other => panic!("restart resume failed: {other:?}"),
     }
@@ -3553,27 +3874,11 @@ async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
     let durable = store.load_approvals().await.unwrap();
     let row = durable.iter().find(|row| row.handle == handle).unwrap();
     assert_eq!(row.status, ApprovalStatus::Approved);
-    let stdout = row.result_stdout.as_deref().unwrap();
-    let stderr = row.result_stderr.as_deref().unwrap();
-    assert!(serde_json::to_vec(stdout).unwrap().len() <= 262_144);
-    assert!(serde_json::to_vec(stderr).unwrap().len() <= 262_144);
-    assert!(stdout.ends_with("[guard persisted transcript truncated]\n"));
-    assert!(stderr.ends_with("[guard persisted transcript truncated]\n"));
     let summary = crate::server::wire::ApprovalSummary::from_row(row);
-    assert!(summary.stdout_truncated);
-    assert!(summary.stderr_truncated);
-    assert!(
-        serde_json::to_vec(summary.stdout.as_deref().unwrap())
-            .unwrap()
-            .len()
-            <= 262_144
-    );
-    assert!(
-        serde_json::to_vec(summary.stderr.as_deref().unwrap())
-            .unwrap()
-            .len()
-            <= 262_144
-    );
+    assert_eq!(summary.stdout, None);
+    assert_eq!(summary.stderr, None);
+    assert!(!summary.stdout_truncated);
+    assert!(!summary.stderr_truncated);
 }
 
 #[cfg(unix)]
@@ -3582,12 +3887,11 @@ async fn armed_hold_expires_across_restart_without_execution() {
     let (mut cfg, operator, agent) = gating_config(7_043, 1_000);
     cfg.config.approval_ttl_secs = 0;
     let state = tempfile::tempdir().unwrap();
-    let marker = state.path().join("must-not-run");
     let store = SessionStore::open(state.path().join("state.db"), 3_600)
         .await
         .unwrap();
     cfg.state.session_store = Some(store.clone());
-    let request = held_request("touch", vec![marker.display().to_string()], None);
+    let request = held_request("true", Vec::new(), None);
     let mut sink = tokio::io::sink();
     let held = hold_for_approval_with_authority(
         &mut RequestContext {
@@ -3630,8 +3934,10 @@ async fn armed_hold_expires_across_restart_without_execution() {
         guard::gating::approval::ApprovalRegistry::from_rows(rows, now_unix());
     assert!(recovered.is_empty());
     let (mut restarted, _operator, requester) = gating_config(7_043, 1_000);
+    restarted.config.authority_mac_key = cfg.config.authority_mac_key.clone();
     restarted.state.session_store = Some(store.clone());
     *restarted.state.approvals.write().await = registry;
+    observe_command_started_for_test(&restarted);
     let response = handle_admin_request_for_test(
         &restarted,
         &requester,
@@ -3641,7 +3947,7 @@ async fn armed_hold_expires_across_restart_without_execution() {
     )
     .await;
     assert!(matches!(response, AdminResponse::Error { .. }));
-    assert!(!marker.exists());
+    assert!(!take_command_started_observation_for_test(&restarted));
     let durable = store.load_approvals().await.unwrap();
     assert_eq!(
         durable
@@ -3736,18 +4042,18 @@ async fn access_whoami_returns_the_callers_redacted_access_session() {
     let (mut cfg, _operator, agent) = gating_config(7_005, 1_000);
     cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
-            "verbs:\n  - name: private-scope\n    binary: fixture-private-binary\n    args: [\"{target}\"]\n    baseline: false\n    params:\n      target: { pattern: \"^private-[a-z]+$\" }\n    consequence: reversible\n    evidence: private evidence\n",
+            "verbs:\n  - name: private-scope\n    binary: printf\n    args: [\"{target}\"]\n    baseline: false\n    params:\n      target: { pattern: \"^private-[a-z]+$\" }\n    consequence: reversible\n    evidence: private evidence\n",
         )
         .unwrap(),
     ));
-    let token = "access-whoami-bearer-token";
+    let token = new_handle();
     let mut managed = active_session();
     managed.scope.access_managed = true;
     managed.scope.label = Some("self-managed-access".to_string());
     managed.activated_verbs = vec!["private-scope".to_string()];
     {
         let mut sessions = cfg.state.sessions.write().await;
-        sessions.grant(token.to_string(), managed);
+        sessions.grant(token.clone(), managed);
     }
 
     assert!(!AdminRequest::AccessWhoami.requires_admin_token());
@@ -3758,20 +4064,16 @@ async fn access_whoami_returns_the_callers_redacted_access_session() {
     };
     assert_eq!(item.kind, "session");
     assert_eq!(item.target, "self-managed-access");
-    assert_eq!(item.reference, crate::session::session_reference(token));
+    assert_eq!(item.reference, crate::session::session_reference(&token));
     assert_eq!(item.effective_scope, vec!["private-scope"]);
     assert!(item.capabilities.is_empty());
     assert!(item.intent.is_none());
     let encoded = serde_json::to_string(&item).unwrap();
     assert!(
-        !encoded.contains(token),
+        !encoded.contains(&token),
         "access whoami leaked the bearer token"
     );
-    for private in [
-        "fixture-private-binary",
-        "^private-[a-z]+$",
-        "private evidence",
-    ] {
+    for private in ["printf", "^private-[a-z]+$", "private evidence"] {
         assert!(!encoded.contains(private), "access whoami leaked {private}");
     }
 
@@ -3828,11 +4130,14 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
             catalog_version: None,
             verb_digest: None,
             verb_composition_digest: None,
+            verb_environment_authority: false,
+            verb_local_file_authority: false,
             exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(principal),
             secret_binding: None,
+            process_authority: None,
         },
         reason: "held access projection test".to_string(),
         risk: None,
@@ -4197,6 +4502,7 @@ async fn held_snapshot_does_not_fall_through_to_overlapping_authority() {
 #[cfg(unix)]
 #[tokio::test]
 async fn held_snapshot_binds_and_consumes_multiple_originating_requests() {
+    let _environment_lock = TEST_ENV_LOCK.lock().await;
     let (cfg, operator, agent) = gating_config(7_027, 1_000);
     cfg.state.sessions.write().await.grant(
         "access-token".to_string(),
@@ -4312,7 +4618,11 @@ async fn held_snapshot_binds_and_consumes_multiple_originating_requests() {
     assert!(items[0].success, "approval failed: {:?}", items[0]);
     assert_eq!(items[0].state, "armed");
     let resumed = resume_approval(&cfg, &agent, &handle).await;
-    assert!(matches!(resumed.exec, ExecOutcome::Completed { .. }));
+    assert!(
+        matches!(resumed.exec, ExecOutcome::Completed { .. }),
+        "resume failed: {:?}",
+        resumed.exec
+    );
     assert_eq!(
         cfg.state
             .sessions
@@ -4476,6 +4786,7 @@ async fn held_access_replay_fails_if_staged_session_was_revoked() {
         secret_keys: std::collections::BTreeMap::new(),
         secret_file_keys: std::collections::BTreeMap::new(),
         secret_binding: None,
+        process_authority: None,
         principal: agent.principal(),
         session_fingerprint: None,
         session_revision: None,
@@ -4485,6 +4796,8 @@ async fn held_access_replay_fails_if_staged_session_was_revoked() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        verb_environment_authority: false,
+        verb_local_file_authority: false,
         exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
@@ -4530,6 +4843,7 @@ async fn approved_replay_still_respects_explicit_static_deny() {
         secret_keys: BTreeMap::new(),
         secret_file_keys: BTreeMap::new(),
         secret_binding: None,
+        process_authority: None,
         principal: agent.principal(),
         session_fingerprint: None,
         session_revision: None,
@@ -4539,6 +4853,8 @@ async fn approved_replay_still_respects_explicit_static_deny() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        verb_environment_authority: false,
+        verb_local_file_authority: false,
         exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
@@ -4586,7 +4902,7 @@ async fn approved_replay_preempts_matching_learned_deny() {
         )
         .unwrap(),
     );
-    let snapshot = ApprovalSnapshot {
+    let mut snapshot = ApprovalSnapshot {
         binary: "true".to_string(),
         args: vec!["--check".to_string()],
         cwd: None,
@@ -4594,6 +4910,7 @@ async fn approved_replay_preempts_matching_learned_deny() {
         secret_keys: BTreeMap::new(),
         secret_file_keys: BTreeMap::new(),
         secret_binding: None,
+        process_authority: None,
         principal: agent.principal(),
         session_fingerprint: None,
         session_revision: None,
@@ -4603,10 +4920,14 @@ async fn approved_replay_preempts_matching_learned_deny() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        verb_environment_authority: false,
+        verb_local_file_authority: false,
         exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
     };
+
+    bind_raw_snapshot_process_authority(&cfg, &agent, &mut snapshot).await;
 
     let result = super::super::gate_runtime::execute_snapshot_with_access_request(
         &cfg,
@@ -4872,10 +5193,9 @@ async fn approval_state_must_be_durable_before_a_held_snapshot_executes() {
             .await
             .unwrap(),
     );
-    let output = state.path().join("must-not-exist");
     let request = ExecuteRequest {
-        binary: "touch".to_string(),
-        args: vec![output.display().to_string()],
+        binary: "true".to_string(),
+        args: Vec::new(),
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
@@ -4918,6 +5238,7 @@ async fn approval_state_must_be_durable_before_a_held_snapshot_executes() {
     let ExecOutcome::Held { handle, .. } = held.exec else {
         panic!("expected held command")
     };
+    observe_command_started_for_test(&cfg);
     cfg.state
         .session_store
         .as_ref()
@@ -4940,10 +5261,7 @@ async fn approval_state_must_be_durable_before_a_held_snapshot_executes() {
     assert!(items[0]
         .message
         .contains("failed to persist terminal approval"));
-    assert!(
-        !output.exists(),
-        "the held snapshot executed without durable admission"
-    );
+    assert!(!take_command_started_observation_for_test(&cfg));
     assert_eq!(
         cfg.state
             .approvals
@@ -5210,8 +5528,8 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
     let agent_principal = agent.principal();
 
     let request = ExecuteRequest {
-        binary: "rm".to_string(),
-        args: vec!["-rf".to_string(), "/data".to_string()],
+        binary: "true".to_string(),
+        args: Vec::new(),
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
@@ -5290,21 +5608,15 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn waiting_requester_resumes_armed_hold_and_receives_terminal_output() {
+async fn waiting_requester_resumes_armed_hold_and_receives_output() {
+    let _environment_lock = TEST_ENV_LOCK.lock().await;
     let (mut cfg, operator, agent) = gating_config(7_044, 1_000);
     let state = tempfile::tempdir().unwrap();
     let store = SessionStore::open(state.path().join("state.db"), 3_600)
         .await
         .unwrap();
     cfg.state.session_store = Some(store.clone());
-    let request = held_request(
-        "sh",
-        vec![
-            "-c".to_string(),
-            "printf waiting-stdout; printf waiting-stderr >&2; exit 9".to_string(),
-        ],
-        Some(30),
-    );
+    let request = held_request("printf", vec!["waiting-stdout".to_string()], Some(30));
     let lifecycle = observe_approval_lifecycle_for_test(&cfg);
     let cfg_for_waiter = cfg.clone();
     let waiter = tokio::spawn(async move {
@@ -5360,9 +5672,9 @@ async fn waiting_requester_resumes_armed_hold_and_receives_terminal_output() {
             stdout,
             stderr,
         } => {
-            assert_eq!(exit_code, Some(9));
+            assert_eq!(exit_code, Some(0));
             assert_eq!(stdout.as_deref(), Some("waiting-stdout"));
-            assert_eq!(stderr.as_deref(), Some("waiting-stderr"));
+            assert_eq!(stderr, None);
         }
         other => panic!("expected resumed completion, got {other:?}"),
     }
@@ -5391,8 +5703,8 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
         .grant(session_token.clone(), active_session());
 
     let request = ExecuteRequest {
-        binary: "rm".to_string(),
-        args: vec!["-rf".to_string(), "/data".to_string()],
+        binary: "true".to_string(),
+        args: Vec::new(),
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
@@ -5476,14 +5788,15 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
 }
 
 #[test]
-fn hash_secret_value_is_salted_and_value_sensitive() {
-    let a = hash_secret_value("salt1", "v1");
+fn hash_secret_value_is_keyed_salted_and_value_sensitive() {
+    let a = hash_secret_value(&[7u8; 32], "salt1", "v1");
     // Deterministic for the same (salt, value).
-    assert_eq!(a, hash_secret_value("salt1", "v1"));
+    assert_eq!(a, hash_secret_value(&[7u8; 32], "salt1", "v1"));
     // Sensitive to the value.
-    assert_ne!(a, hash_secret_value("salt1", "v2"));
+    assert_ne!(a, hash_secret_value(&[7u8; 32], "salt1", "v2"));
     // Sensitive to the salt (so a persisted digest is not a plain value hash).
-    assert_ne!(a, hash_secret_value("salt2", "v1"));
+    assert_ne!(a, hash_secret_value(&[7u8; 32], "salt2", "v1"));
+    assert_ne!(a, hash_secret_value(&[8u8; 32], "salt1", "v1"));
     // 32-byte SHA-256 -> 64 hex chars.
     assert_eq!(a.len(), 64);
 }
@@ -5685,6 +5998,292 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
     );
 
     let _ = cfg.state.secrets.delete(&p, "BIND_OK_KEY").await;
+}
+
+/// Approval replay carries the value that passed the held-value check through
+/// the process-start boundary. A later store mutation cannot change what the
+/// child receives.
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_secret_snapshot_survives_store_mutation_before_spawn() {
+    let (mut cfg, _operator, agent) = gating_config(7_204, 4_204);
+    cfg.config.exec_as_caller = true;
+    let principal = agent.principal().expect("agent principal");
+    cfg.state
+        .secrets
+        .set(&principal, "approval/value", "initial")
+        .await
+        .unwrap();
+    let request = ExecuteRequest {
+        binary: "printenv".to_string(),
+        args: vec!["APPROVED_VALUE".to_string()],
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::from([("APPROVED_VALUE".to_string(), "approval/value".to_string())]),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        Some(principal.clone()),
+        GateInputs {
+            reason: "secret snapshot hold".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+            force_hold: false,
+        },
+    )
+    .await;
+    let ExecOutcome::Held { handle, .. } = held.exec else {
+        panic!("expected held command")
+    };
+    let snapshot = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .expect("held approval")
+        .snapshot
+        .clone();
+
+    let cfg = Arc::new(cfg);
+    let (initiation_reached, initiation_release) = pause_command_initiation_for_test(&cfg);
+    let task_cfg = Arc::clone(&cfg);
+    let execution =
+        tokio::spawn(
+            async move { execute_snapshot(&task_cfg, &snapshot, "operator approved").await },
+        );
+    initiation_reached.acquire().await.unwrap().forget();
+    cfg.state
+        .secrets
+        .set(&principal, "approval/value", "changed-after-validation")
+        .await
+        .unwrap();
+    initiation_release.add_permits(1);
+
+    let response = execution
+        .await
+        .expect("approved execution task")
+        .into_response();
+    assert!(
+        response.allowed && response.exit_code == Some(0),
+        "the child must receive the value that passed approval validation: {response:?}"
+    );
+    assert_eq!(response.stdout.as_deref(), Some("[REDACTED]\n"));
+    assert!(!response
+        .stdout
+        .as_deref()
+        .unwrap_or_default()
+        .contains("changed-after-validation"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn raw_approval_hold_rejects_untyped_plain_environment_values() {
+    let (cfg, _, agent) = gating_config(7_204, 4_204);
+    let mut request = held_request("true", Vec::new(), None);
+    request
+        .env
+        .insert("FORMAT_STYLE".to_string(), "compact".to_string());
+    let mut sink = tokio::io::sink();
+
+    let result = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "untyped environment hold".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+            force_hold: false,
+        },
+    )
+    .await;
+
+    assert!(matches!(result.exec, ExecOutcome::NotAttempted));
+    assert!(result
+        .policy_reason()
+        .contains("operator-authored typed verb"));
+    assert!(cfg.state.approvals.read().await.list().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn typed_ansible_secret_file_approval_is_bound_then_refused_for_fixed_identity() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (mut cfg, _operator, agent) = gating_config(7_205, 4_205);
+    let principal = agent.principal().expect("agent principal");
+    cfg.state
+        .secrets
+        .set(&principal, "ansible/private-key", "stable-key")
+        .await
+        .unwrap();
+
+    let authority = trusted_artifact_tempdir();
+    let _environment_lock = TEST_ENV_LOCK.lock().await;
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var(
+        "PATH",
+        format!("{}:/usr/bin:/bin", authority.path().display()),
+    );
+    let secret_file_authority = trusted_artifact_tempdir();
+    cfg.config.secret_file_root = Some(secret_file_authority.path().to_path_buf());
+    let executable = authority.path().join("ansible-playbook");
+    let playbook = authority.path().join("site.yml");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\ntest \"$(cat \"$ANSIBLE_PRIVATE_KEY_FILE\")\" = stable-key && test \"$ANSIBLE_STDOUT_CALLBACK\" = default\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&playbook, "---\n- hosts: all\n  gather_facts: false\n").unwrap();
+    std::fs::set_permissions(&playbook, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let executable_yaml = serde_json::to_string(&executable).unwrap();
+    let playbook_yaml = serde_json::to_string(&playbook).unwrap();
+    let catalog = VerbCatalog::from_yaml(&format!(
+        "verbs:\n  - name: held-ansible-check\n    binary: {executable_yaml}\n    args: [{playbook_yaml}, \"--check\"]\n    consequence: irreversible\n    trusted: true\n    coverage:\n      - name: check\n        action: preauthorized\n        required_args: [\"--check\"]\n        target:\n          position: 0\n          values: [{playbook_yaml}]\n        environment:\n          - name: ANSIBLE_PRIVATE_KEY_FILE\n            source: secret-file\n            values: [\"ansible/private-key\"]\n          - name: ANSIBLE_STDOUT_CALLBACK\n            values: [\"default\"]\n"
+    ))
+    .unwrap();
+    let args = vec![
+        playbook.to_string_lossy().into_owned(),
+        "--check".to_string(),
+    ];
+    let secret_files = BTreeMap::from([(
+        "ANSIBLE_PRIVATE_KEY_FILE".to_string(),
+        "ansible/private-key".to_string(),
+    )]);
+    let mut matches = catalog.match_command_all_with_environment(
+        executable.to_str().unwrap(),
+        &args,
+        &BTreeMap::from([("ANSIBLE_STDOUT_CALLBACK".to_string(), "default".to_string())]),
+        &BTreeMap::new(),
+        &secret_files,
+    );
+    assert_eq!(matches.len(), 1);
+    let matched = matches.remove(0);
+    let catalog_version = catalog.version();
+    let verb_digest = catalog.verb_definition_digest(&matched.rendered.name);
+    *cfg.state.verbs.write().await = catalog;
+    let request = ExecuteRequest {
+        binary: executable.to_string_lossy().into_owned(),
+        args,
+        auth_token: None,
+        env: HashMap::from([("ANSIBLE_STDOUT_CALLBACK".to_string(), "default".to_string())]),
+        secrets: HashMap::new(),
+        secret_files: secret_files.into_iter().collect(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        Some(principal),
+        GateInputs {
+            reason: "typed Ansible secret-file hold".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: Some(VerbContext {
+                name: matched.rendered.name,
+                class: matched.rendered.consequence,
+                hold: matched.rendered.hold,
+                trusted: matched.rendered.trusted,
+                exec_timeout_secs: matched.rendered.exec_timeout_secs,
+                params: matched.rendered.params,
+                catalog_version,
+                verb_digest,
+                composition_digest: None,
+                environment_authority: matched.environment_authorized,
+                local_file_authority: matched.local_file_authorized,
+                learned_deny_match_policy: LearnedDenyMatchPolicy::Enforce,
+                access_evaluation_override_eligible: false,
+            }),
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+            force_hold: false,
+        },
+    )
+    .await;
+    let handle = match &held.exec {
+        ExecOutcome::Held { handle, .. } => handle.clone(),
+        other => panic!("expected held command, got {other:?}"),
+    };
+    let snapshot = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .expect("held approval")
+        .snapshot
+        .clone();
+    cfg.config.exec_as_caller = false;
+    let response = execute_snapshot(&cfg, &snapshot, "operator approved")
+        .await
+        .into_response();
+    assert!(
+        !response.allowed,
+        "fixed identity must reject: {response:?}"
+    );
+    assert!(response.reason.contains("immutable profile snapshots"));
+    assert_eq!(
+        std::fs::read_dir(cfg.config.secret_file_root.as_ref().unwrap())
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 /// The binding is mandatory: a secret that is UNRESOLVED at hold is bound by
@@ -5946,11 +6545,14 @@ fn held_verb_approval(
             catalog_version,
             verb_digest,
             verb_composition_digest: None,
+            verb_environment_authority: false,
+            verb_local_file_authority: false,
             exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal,
             secret_binding: None,
+            process_authority: None,
         },
         reason: "verb hold".to_string(),
         risk: Some(8),
@@ -6354,16 +6956,19 @@ async fn approve_survives_unrelated_verb_append() {
     *cfg.state.verbs.write().await = held_catalog;
 
     let handle = new_handle();
-    cfg.state
-        .approvals
-        .write()
-        .await
-        .enqueue(held_verb_approval(
-            &handle,
-            Some(held_version),
-            Some(held_digest.clone()),
-            agent.principal(),
-        ));
+    let held = held_verb_approval(
+        &handle,
+        Some(held_version),
+        Some(held_digest.clone()),
+        agent.principal(),
+    );
+    #[cfg(unix)]
+    let held = {
+        let mut held = held;
+        bind_raw_snapshot_process_authority(&cfg, &agent, &mut held.snapshot).await;
+        held
+    };
+    cfg.state.approvals.write().await.enqueue(held);
 
     // Append an unrelated verb: the catalog version changes, the matched
     // verb's definition does not.
@@ -6607,6 +7212,8 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
                     catalog_version: version,
                     verb_digest: Some(digest),
                     composition_digest: None,
+                    environment_authority: false,
+                    local_file_authority: false,
                     learned_deny_match_policy: LearnedDenyMatchPolicy::Enforce,
                     access_evaluation_override_eligible: false,
                 }),
@@ -6643,6 +7250,7 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn access_approval_and_command_start_follow_one_lock_order() {
+    let _environment_lock = TEST_ENV_LOCK.lock().await;
     let (cfg, operator, agent) = gating_config(7090, 1000);
     let catalog = VerbCatalog::from_yaml(
         r#"
@@ -6725,6 +7333,8 @@ verbs:
                     catalog_version: version,
                     verb_digest: Some(digest),
                     composition_digest: None,
+                    environment_authority: false,
+                    local_file_authority: false,
                     learned_deny_match_policy: LearnedDenyMatchPolicy::Enforce,
                     access_evaluation_override_eligible: false,
                 }),
@@ -6798,8 +7408,8 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
     let (mut cfg, _, agent) = gating_config(7015, 1000);
     cfg.config.allowed_binaries = Some(vec!["echo".to_string()]);
     let snapshot = ApprovalSnapshot {
-        binary: "sh".to_string(),
-        args: vec!["-c".to_string(), "true".to_string()],
+        binary: "printf".to_string(),
+        args: vec!["ignored".to_string()],
         cwd: None,
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
@@ -6812,11 +7422,14 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        verb_environment_authority: false,
+        verb_local_file_authority: false,
         exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
+        process_authority: None,
     };
 
     let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
@@ -6829,6 +7442,227 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
     if let ExecOutcome::Failed { reason, .. } = result.exec {
         assert!(reason.contains("not in the server allow-list"));
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_snapshot_requires_unchanged_bound_process_authority() {
+    let _environment_lock = TEST_ENV_LOCK.lock().await;
+    let _path_restore = EnvRestore::capture("PATH");
+    let (cfg, _, agent) = gating_config(7_019, 1_000);
+    std::env::set_var("PATH", "/usr/bin:/bin");
+    let request = ExecuteRequest {
+        binary: "true".to_string(),
+        args: Vec::new(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "executable approval binding".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+            force_hold: false,
+        },
+    )
+    .await;
+    let ExecOutcome::Held { handle, .. } = held.exec else {
+        panic!("expected executable command to be held")
+    };
+    let snapshot = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .unwrap()
+        .snapshot
+        .clone();
+    assert!(snapshot.process_authority.is_some());
+
+    let mut legacy = snapshot.clone();
+    legacy.process_authority = None;
+    let response = execute_snapshot(&cfg, &legacy, "operator approved")
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    assert!(
+        response.reason.contains("lacks bound process authority"),
+        "{response:?}"
+    );
+
+    let response = execute_snapshot(&cfg, &snapshot, "operator approved")
+        .await
+        .into_response();
+    assert!(
+        response.allowed,
+        "direct approved command failed: {response:?}"
+    );
+
+    let mut changed_plan = snapshot.clone();
+    changed_plan
+        .process_authority
+        .as_mut()
+        .unwrap()
+        .delayed_authority
+        .as_mut()
+        .unwrap()
+        .version += 1;
+    let response = execute_snapshot(&cfg, &changed_plan, "operator approved")
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    assert!(
+        response.reason.contains("process authority changed"),
+        "{response:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approval_hold_rejects_opaque_secondary_execution() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let _environment_lock = TEST_ENV_LOCK.lock().await;
+    let _path_restore = EnvRestore::capture("PATH");
+    let (cfg, _, agent) = gating_config(7_020, 1_001);
+    let directory = trusted_artifact_tempdir();
+    let shell = directory.path().join("sh");
+    let helper = directory.path().join("approval-helper");
+    let marker = directory.path().join("spawned");
+    symlink("/bin/sh", &shell).unwrap();
+    std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::env::set_var(
+        "PATH",
+        format!("{}:/usr/bin:/bin", directory.path().display()),
+    );
+
+    let request = ExecuteRequest {
+        binary: "sh".to_string(),
+        args: vec!["-c".to_string(), "approval-helper".to_string()],
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    let rejected = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "secondary executable approval binding".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+            force_hold: false,
+        },
+    )
+    .await;
+    assert!(matches!(rejected.exec, ExecOutcome::NotAttempted));
+    assert!(rejected
+        .policy_reason()
+        .contains("no closed executable authority profile"));
+    assert!(cfg.state.approvals.read().await.list().is_empty());
+
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\nprintf spawned > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    assert!(
+        !marker.exists(),
+        "changed secondary executable must not spawn"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approval_hold_rejects_raw_protected_tool_authority() {
+    let (cfg, _, agent) = gating_config(7_021, 1_001);
+    let request = held_request("kubectl", vec!["get".to_string(), "pods".to_string()], None);
+    let mut sink = tokio::io::sink();
+
+    let result = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "raw protected tool".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+            force_hold: false,
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Failed {
+            started: false,
+            ref reason,
+        } if reason.contains("requires typed operator authority")
+    ));
+    assert!(cfg.state.approvals.read().await.list().is_empty());
 }
 
 #[cfg(unix)]
@@ -7017,8 +7851,10 @@ async fn sensitive_provisional_snapshots_are_redacted_and_cannot_replay() {
         secret_file_keys: BTreeMap::new(),
         revert_binary: "docker.CMD".to_string(),
         revert_args: vec!["login".to_string(), format!("-p={sensitive}")],
+        revert_authorization: None,
         confirm_check_binary: Some("redis-cli.COM".to_string()),
         confirm_check_args: vec![format!("-a:{sensitive}")],
+        confirm_check_authorization: None,
         control_path: Some("fixture".to_string()),
         session_fingerprint: None,
         session_revision: None,
@@ -7068,7 +7904,11 @@ async fn sensitive_provisional_snapshots_are_redacted_and_cannot_replay() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() {
+    let _environment_lock = TEST_ENV_LOCK.lock().await;
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", "/usr/bin:/bin");
     let (mut cfg, _, agent) = gating_config(7020, 1000);
+    cfg.config.exec_as_caller = true;
     let state = tempfile::tempdir().unwrap();
     let store = SessionStore::open(state.path().join("state.db"), 3_600)
         .await
@@ -7089,7 +7929,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
     *cfg.state.tool_registry.write().await =
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
 
-    let snapshot = ApprovalSnapshot {
+    let mut snapshot = ApprovalSnapshot {
         binary: "true".to_string(),
         args: Vec::new(),
         cwd: None,
@@ -7104,6 +7944,8 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        verb_environment_authority: false,
+        verb_local_file_authority: false,
         exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
@@ -7115,11 +7957,17 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
                 "BROKER_TOKEN".to_string(),
                 ToolSecretBinding {
                     secret_name: "broker/token".to_string(),
-                    hash: hash_secret_value("test-salt", "never-printed"),
+                    hash: hash_secret_value(
+                        cfg.config.authority_mac_key.as_ref(),
+                        "test-salt",
+                        "never-printed",
+                    ),
                 },
             )])),
         }),
+        process_authority: None,
     };
+    bind_raw_snapshot_process_authority(&cfg, &agent, &mut snapshot).await;
     let approved = execute_snapshot(&cfg, &snapshot, "operator approved").await;
     assert!(matches!(
         approved.exec,
@@ -7127,6 +7975,15 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
             if reason.contains("does not entitle secret 'broker/token'")
     ));
 
+    let control_request = held_request("true", Vec::new(), None);
+    let control_authorization = capture_persisted_command_authorization(
+        &cfg,
+        &agent,
+        &control_request,
+        guard::gating::approval::DelayedAuthoritySource::RawControl,
+    )
+    .await
+    .unwrap();
     let provisional = Provisional {
         handle: "entitled-control-path".to_string(),
         principal: Some(principal),
@@ -7138,8 +7995,10 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         secret_file_keys: BTreeMap::new(),
         revert_binary: "true".to_string(),
         revert_args: Vec::new(),
+        revert_authorization: Some(control_authorization.clone()),
         confirm_check_binary: Some("true".to_string()),
         confirm_check_args: Vec::new(),
+        confirm_check_authorization: Some(control_authorization),
         control_path: Some("test".to_string()),
         session_fingerprint: None,
         session_revision: Some("revoked-session-revision".to_string()),
@@ -7248,11 +8107,14 @@ async fn approved_snapshot_rejects_changed_session_revision() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        verb_environment_authority: false,
+        verb_local_file_authority: false,
         exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
+        process_authority: None,
     };
     assert!(cfg.state.sessions.write().await.revoke(token));
     let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
@@ -7267,8 +8129,8 @@ async fn approved_snapshot_rejects_changed_session_revision() {
 async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
     let (cfg, _, agent) = gating_config(7018, 1000);
     let snapshot = ApprovalSnapshot {
-        binary: "sh".to_string(),
-        args: vec!["-c".to_string(), "printf should-not-run".to_string()],
+        binary: "true".to_string(),
+        args: Vec::new(),
         cwd: None,
         env: BTreeMap::from([(
             "SSH_AUTH_SOCK".to_string(),
@@ -7284,11 +8146,14 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        verb_environment_authority: false,
+        verb_local_file_authority: false,
         exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
+        process_authority: None,
     };
 
     let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
@@ -7306,57 +8171,12 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
 #[cfg(unix)]
 #[tokio::test]
 async fn approved_snapshot_executes_in_snapshotted_cwd() {
-    let (cfg, _, agent) = gating_config(7016, 1000);
-    let temp = tempfile::tempdir().unwrap();
-    let snapshot = ApprovalSnapshot {
-        binary: "sh".to_string(),
-        args: vec![
-            "-c".to_string(),
-            "printf approved > approval-cwd.txt".to_string(),
-        ],
-        cwd: Some(temp.path().to_path_buf()),
-        env: BTreeMap::new(),
-        secret_keys: BTreeMap::new(),
-        session_fingerprint: None,
-        session_revision: None,
-        secret_entitlements: None,
-        secret_file_keys: BTreeMap::new(),
-        verb_name: None,
-        verb_params: BTreeMap::new(),
-        catalog_version: None,
-        verb_digest: None,
-        verb_composition_digest: None,
-        exec_timeout_secs: None,
-        access_verbs: Vec::new(),
-        access_requests: Vec::new(),
-        principal: agent.principal(),
-        secret_binding: None,
-    };
-
-    let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
-
-    assert!(matches!(
-        result.exec,
-        ExecOutcome::Completed {
-            exit_code: Some(0),
-            ..
-        }
-    ));
-    assert_eq!(
-        std::fs::read_to_string(temp.path().join("approval-cwd.txt")).unwrap(),
-        "approved"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
-    let (cfg, _, agent) = gating_config(7017, 1000);
-    let temp = tempfile::tempdir().unwrap();
-    let cwd = temp.path().to_path_buf();
-    let snapshot = ApprovalSnapshot {
-        binary: "sh".to_string(),
-        args: vec!["-c".to_string(), "printf approved".to_string()],
+    let (cfg, _, agent) = gating_config(7016, 1001);
+    let directory = trusted_artifact_tempdir();
+    let cwd = directory.path().canonicalize().unwrap();
+    let mut snapshot = ApprovalSnapshot {
+        binary: "pwd".to_string(),
+        args: vec!["-P".to_string()],
         cwd: Some(cwd.clone()),
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
@@ -7369,11 +8189,60 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        verb_environment_authority: false,
+        verb_local_file_authority: false,
         exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
+        process_authority: None,
+    };
+
+    bind_raw_snapshot_process_authority(&cfg, &agent, &mut snapshot).await;
+
+    let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+
+    let ExecOutcome::Completed {
+        exit_code: Some(0),
+        stdout,
+        ..
+    } = result.exec
+    else {
+        panic!("expected approved cwd inspection to execute")
+    };
+    assert_eq!(stdout.as_deref().map(str::trim), cwd.to_str());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
+    let (cfg, _, agent) = gating_config(7017, 1000);
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_path_buf();
+    let snapshot = ApprovalSnapshot {
+        binary: "pwd".to_string(),
+        args: vec!["-P".to_string()],
+        cwd: Some(cwd.clone()),
+        env: BTreeMap::new(),
+        secret_keys: BTreeMap::new(),
+        session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
+        secret_file_keys: BTreeMap::new(),
+        verb_name: None,
+        verb_params: BTreeMap::new(),
+        catalog_version: None,
+        verb_digest: None,
+        verb_composition_digest: None,
+        verb_environment_authority: false,
+        verb_local_file_authority: false,
+        exec_timeout_secs: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
+        principal: agent.principal(),
+        secret_binding: None,
+        process_authority: None,
     };
     drop(temp);
 
@@ -7406,8 +8275,8 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
     std::fs::create_dir(&retargeted).unwrap();
     let cwd = approved.canonicalize().unwrap();
     let snapshot = ApprovalSnapshot {
-        binary: "sh".to_string(),
-        args: vec!["-c".to_string(), "printf approved".to_string()],
+        binary: "pwd".to_string(),
+        args: vec!["-P".to_string()],
         cwd: Some(cwd.clone()),
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
@@ -7420,11 +8289,14 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
         catalog_version: None,
         verb_digest: None,
         verb_composition_digest: None,
+        verb_environment_authority: false,
+        verb_local_file_authority: false,
         exec_timeout_secs: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
+        process_authority: None,
     };
 
     std::fs::remove_dir(&approved).unwrap();
@@ -7451,55 +8323,58 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
 #[cfg(unix)]
 #[tokio::test]
 async fn provisional_revert_executes_in_snapshotted_cwd() {
-    let (cfg, _operator, agent) = gating_config(7017, 1000);
-    let temp = tempfile::tempdir().unwrap();
-    let provisional = Provisional {
-        handle: "cwd-revert".to_string(),
-        principal: agent.principal(),
-        requester_principal: None,
-        binary: "true".to_string(),
-        args: Vec::new(),
-        cwd: Some(temp.path().to_path_buf()),
-        secret_keys: BTreeMap::new(),
-        secret_file_keys: BTreeMap::new(),
-        revert_binary: "sh".to_string(),
-        revert_args: vec![
-            "-c".to_string(),
-            "printf reverted > provisional-cwd.txt".to_string(),
-        ],
-        confirm_check_binary: None,
-        confirm_check_args: Vec::new(),
-        control_path: None,
-        session_fingerprint: None,
-        session_revision: None,
-        secret_entitlements: None,
-        api_revert: None,
-        reason: "cwd revert".to_string(),
-        decision_trace: None,
-        created_unix: now_unix(),
-        deadline_unix: now_unix(),
-        window_secs: 0,
-        auto_reverted_unix: None,
-        forward_done: true,
-        forward_exit: Some(0),
-        forward_persistence_failed: false,
-        status: ProvisionalStatus::Reverting,
-        revert_exit: None,
-        revert_detail: None,
-    };
-    cfg.state
-        .provisional
-        .write()
+    let _environment_lock = TEST_ENV_LOCK.lock().await;
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", "/usr/bin:/bin");
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
         .await
-        .insert(provisional.clone());
+        .unwrap();
+    let (mut cfg, _operator, agent) = gating_config(7017, 1001);
+    cfg.state.session_store = Some(store);
+    let directory = trusted_artifact_tempdir();
+    let cwd = directory.path().canonicalize().unwrap();
+    let revert = RevertSpec::new("pwd".to_string(), vec!["-P".to_string()]);
+    let mut request = contain_request("true", &[], revert);
+    request.cwd = Some(cwd.clone());
+    let mut sink = tokio::io::sink();
+    let armed = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        "cwd revert".to_string(),
+        None,
+    )
+    .await;
+    let handle = match armed.exec {
+        ExecOutcome::Provisional { handle, .. } => handle,
+        other => panic!("expected provisional, got {other:?}"),
+    };
+    let provisional = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .unwrap()
+        .clone();
 
-    let (_message, exit) = finish_revert(&cfg, &provisional, &agent, "test").await;
-
-    assert_eq!(exit, Some(0));
-    assert_eq!(
-        std::fs::read_to_string(temp.path().join("provisional-cwd.txt")).unwrap(),
-        "reverted"
-    );
+    let result = run_provisional_revert(&cfg, &provisional).await;
+    let ExecOutcome::Completed {
+        exit_code: Some(0),
+        stdout,
+        ..
+    } = result.exec
+    else {
+        panic!("expected cwd-bound revert execution")
+    };
+    assert_eq!(stdout.as_deref().map(str::trim), cwd.to_str());
 }
 
 /// Sanity: `Coverage::contain` is what a provisional carries, so the

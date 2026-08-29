@@ -1,7 +1,8 @@
 # System-prompt append: local tool knowledge
 
 Copyable evaluator prompt supplement for an in-house tool the compiled prompts
-do not know. Load with `guard server start --system-prompt-append <path>` or
+do not know. Load with
+`guard server start --exec-user guard-exec --system-prompt-append <path>` or
 `GUARD_PROMPT_APPEND=<path>`; the daemon appends the whole file to the mode
 prompt without replacing it, so everything in this file, including this
 paragraph, becomes evaluator context. Keep the content factual and tool-scoped;

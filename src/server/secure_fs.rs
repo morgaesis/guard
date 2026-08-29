@@ -5,6 +5,28 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(unix)]
+fn remove_new_private_file(path: &Path) -> Result<()> {
+    fs::remove_file(path)
+        .with_context(|| format!("remove incomplete private file {}", path.display()))?;
+    sync_parent_directory(path).with_context(|| {
+        format!(
+            "sync parent after removing incomplete private file {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Prepare an existing-or-new daemon-only directory and remove leases left by
 /// an interrupted daemon. The cleanup walks only the fixed two-level layout it
 /// creates and never follows links.
@@ -14,11 +36,24 @@ pub(super) fn prepare_private_root(root: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             create_private_dir(root)
                 .with_context(|| format!("create private directory {}", root.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(root, fs::Permissions::from_mode(0o711))?;
+            }
         }
         Err(e) => return Err(e).with_context(|| format!("inspect {}", root.display())),
     }
-    if !private_path_is_safe(root, true) {
-        bail!("private directory {} is not daemon-only", root.display());
+    #[cfg(unix)]
+    if private_path_is_safe(root, true) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o711))?;
+    }
+    if !secret_lease_directory_is_safe(root) {
+        bail!(
+            "secret lease root {} has unsafe permissions",
+            root.display()
+        );
     }
 
     for entry in fs::read_dir(root).with_context(|| format!("read {}", root.display()))? {
@@ -28,7 +63,7 @@ pub(super) fn prepare_private_root(root: &Path) -> Result<()> {
             fs::remove_file(&path)?;
             continue;
         }
-        if !meta.is_dir() || !private_path_is_safe(&path, true) {
+        if !meta.is_dir() || !secret_lease_directory_is_safe(&path) {
             bail!(
                 "unsafe stale entry in private directory: {}",
                 path.display()
@@ -46,6 +81,62 @@ pub(super) fn prepare_private_root(root: &Path) -> Result<()> {
             fs::remove_file(&child)?;
         }
         fs::remove_dir(&path)?;
+    }
+    Ok(())
+}
+
+fn secret_lease_directory_is_safe(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        !metadata.file_type().is_symlink()
+            && metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && matches!(metadata.permissions().mode() & 0o777, 0o700 | 0o711)
+    }
+    #[cfg(windows)]
+    {
+        private_path_is_safe(path, true)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn create_secret_lease_directory(path: &Path) -> Result<()> {
+    create_private_dir(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o711))?;
+    }
+    if !secret_lease_directory_is_safe(path) {
+        let _ = fs::remove_dir(path);
+        bail!("new secret lease directory failed its permission check");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assign_secret_file_to_child(path: &Path, user_id: u32, group_id: u32) -> Result<()> {
+    use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
+
+    chown(path, Some(user_id), Some(group_id))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o400))?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != user_id
+        || metadata.gid() != group_id
+        || metadata.permissions().mode() & 0o7777 != 0o400
+        || metadata.nlink() != 1
+    {
+        bail!("secret file child ownership validation failed");
     }
     Ok(())
 }
@@ -79,7 +170,7 @@ pub(super) fn create_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     let mut file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -102,6 +193,9 @@ pub(super) fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
     if !private_path_is_safe(path, false) {
         drop(file);
+        #[cfg(unix)]
+        remove_new_private_file(path)?;
+        #[cfg(not(unix))]
         let _ = fs::remove_file(path);
         bail!(
             "new private file {} failed its permission check",
@@ -111,13 +205,34 @@ pub(super) fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let result = file.write_all(bytes).and_then(|()| file.sync_all());
     if let Err(error) = result {
         drop(file);
+        #[cfg(unix)]
+        if let Err(cleanup_error) = remove_new_private_file(path) {
+            return Err(anyhow::Error::from(error).context(format!(
+                "remove failed private file {}; cleanup error: {cleanup_error}",
+                path.display()
+            )));
+        }
+        #[cfg(not(unix))]
         let _ = fs::remove_file(path);
         return Err(error.into());
+    }
+    #[cfg(unix)]
+    if let Err(error) = sync_parent_directory(path) {
+        drop(file);
+        if let Err(cleanup_error) = remove_new_private_file(path) {
+            return Err(anyhow::Error::from(error).context(format!(
+                "sync parent after creating private file {}; cleanup error: {cleanup_error}",
+                path.display()
+            )));
+        }
+        return Err(error).with_context(|| {
+            format!("sync parent after creating private file {}", path.display())
+        });
     }
     Ok(())
 }
 
-pub(super) fn private_path_is_safe(path: &Path, directory: bool) -> bool {
+pub(crate) fn private_path_is_safe(path: &Path, directory: bool) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -199,9 +314,10 @@ impl SecretFileLease {
     pub(super) fn create(
         root: &Path,
         values: &[(String, String)],
+        child_identity: Option<(u32, u32)>,
     ) -> Result<(Self, Vec<(String, PathBuf)>)> {
         let directory = root.join(format!("lease-{:032x}", rand::random::<u128>()));
-        create_private_dir(&directory)?;
+        create_secret_lease_directory(&directory)?;
         let mut lease = Self {
             directory,
             files: Vec::new(),
@@ -210,7 +326,17 @@ impl SecretFileLease {
         for (index, (env_name, value)) in values.iter().enumerate() {
             let path = lease.directory.join(format!("{index}.secret"));
             write_new_private(&path, value.as_bytes())?;
+            // Register immediately after creation so every later failure is
+            // covered by the lease's exact-path cleanup.
             lease.files.push(path.clone());
+            #[cfg(unix)]
+            {
+                let (user_id, group_id) = child_identity
+                    .context("secret-file delivery requires a resolved child identity")?;
+                assign_secret_file_to_child(&path, user_id, group_id)?;
+            }
+            #[cfg(not(unix))]
+            let _ = child_identity;
             bindings.push((env_name.clone(), path));
         }
         Ok((lease, bindings))
@@ -535,21 +661,43 @@ mod win {
 mod tests {
     use super::*;
 
+    fn generated_fixture_value() -> String {
+        format!("{:032x}", rand::random::<u128>())
+    }
+
+    fn test_child_identity() -> Option<(u32, u32)> {
+        #[cfg(unix)]
+        {
+            Some((unsafe { libc::geteuid() as u32 }, unsafe {
+                libc::getegid() as u32
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     #[test]
     fn lease_is_private_and_removed_on_drop() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("secret-files");
         prepare_private_root(&root).unwrap();
+        let value = generated_fixture_value();
         let (lease, bindings) = SecretFileLease::create(
             &root,
-            &[("TOKEN_FILE".to_string(), "not-logged-secret".to_string())],
+            &[("TOKEN_FILE".to_string(), value.clone())],
+            test_child_identity(),
         )
         .unwrap();
         let path = bindings[0].1.clone();
-        assert!(private_path_is_safe(&root, true));
-        assert!(private_path_is_safe(path.parent().unwrap(), true));
+        assert!(secret_lease_directory_is_safe(&root));
+        assert!(secret_lease_directory_is_safe(path.parent().unwrap()));
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&path).unwrap().len(), value.len() as u64);
+        #[cfg(windows)]
         assert!(private_path_is_safe(&path, false));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "not-logged-secret");
+        assert_eq!(fs::read_to_string(&path).unwrap(), value);
         drop(lease);
         assert!(!path.exists());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
@@ -561,7 +709,7 @@ mod tests {
         let root = parent.path().join("secret-files");
         prepare_private_root(&root).unwrap();
         let stale = root.join("lease-stale");
-        create_private_dir(&stale).unwrap();
+        create_secret_lease_directory(&stale).unwrap();
         write_new_private(&stale.join("0.secret"), b"stale").unwrap();
         prepare_private_root(&root).unwrap();
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
@@ -587,19 +735,53 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("secret-files");
         prepare_private_root(&root).unwrap();
-        let (lease, bindings) =
-            SecretFileLease::create(&root, &[("TOKEN_FILE".to_string(), "value".to_string())])
-                .unwrap();
+        let (lease, bindings) = SecretFileLease::create(
+            &root,
+            &[("TOKEN_FILE".to_string(), "value".to_string())],
+            test_child_identity(),
+        )
+        .unwrap();
         let path = &bindings[0].1;
         assert_eq!(
             fs::metadata(&root).unwrap().permissions().mode() & 0o777,
-            0o700
+            0o711
         );
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o600
+            0o400
         );
         drop(lease);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_failure_removes_the_written_secret_file() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("secret-files");
+        prepare_private_root(&root).unwrap();
+        let value = generated_fixture_value();
+
+        let result = SecretFileLease::create(
+            &root,
+            &[("TOKEN_FILE".to_string(), value)],
+            Some((u32::MAX, u32::MAX)),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_parent_directory_sync_accepts_new_private_file() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("secret-files");
+        prepare_private_root(&root).unwrap();
+        let path = root.join("authority.hmac");
+        write_new_private(&path, b"fixture").unwrap();
+
+        sync_parent_directory(&path).unwrap();
+        assert!(private_path_is_safe(&path, false));
     }
 
     #[cfg(windows)]
@@ -608,9 +790,12 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("secret-files");
         prepare_private_root(&root).unwrap();
-        let (lease, bindings) =
-            SecretFileLease::create(&root, &[("TOKEN_FILE".to_string(), "value".to_string())])
-                .unwrap();
+        let (lease, bindings) = SecretFileLease::create(
+            &root,
+            &[("TOKEN_FILE".to_string(), "value".to_string())],
+            test_child_identity(),
+        )
+        .unwrap();
         assert!(private_path_is_safe(&root, true));
         assert!(private_path_is_safe(&bindings[0].1, false));
         win::add_authenticated_users_read_for_test(&bindings[0].1).unwrap();

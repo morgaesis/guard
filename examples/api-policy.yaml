@@ -1,10 +1,11 @@
 # Kubernetes API policy: gated cluster access for in-process API clients.
 #
-# When the daemon fronts the apiserver with `guard server start --kube-proxy`,
-# every API request from a brokered client (helm, kubectl, terraform's k8s
+# When the daemon fronts the apiserver with
+# `guard server start --exec-user guard-exec --kube-proxy`,
+# every API request from an external operator/bootstrap client (helm, kubectl, terraform's k8s
 # provider, k9s, client libraries) is parsed into a typed operation and matched
 # against this policy. Unlike the verb catalog, which gates whole commands, this
-# gates individual API operations -- so `helm upgrade`, which performs many
+# gates individual API operations -- so an external `helm upgrade`, which performs many
 # create/update/delete calls in-process, is gated per object.
 #
 # Only an operator-owned deployment path edits this file; it is hot-reloaded.

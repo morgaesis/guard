@@ -1,41 +1,50 @@
 # Deterministic verb catalog for the consequence-gating adversarial harness.
 # All verbs are `trusted` (skip the LLM) so the control-plane attacks run
-# offline and deterministically. Each operates on files under /work so effects
-# (and the exec identity that produced them) are observable.
+# offline and deterministically. Mutations use typed Kubernetes operations
+# against a local fixture whose bounded effects are directly observable.
 verbs:
   - name: read-file
-    description: Read a file under /work (reversible)
+    description: Read the fixed seed file (reversible)
     binary: cat
-    args: ["{path}"]
-    params:
-      path: { pattern: "^/work/[a-z0-9._/-]+$", required: true }
+    args: ["/work/seed.txt"]
     consequence: reversible
     trusted: true
 
-  - name: stage-file
-    description: Create a file under /work; auto-reverts (removes it) unless confirmed
-    binary: touch
-    args: ["{path}"]
+  - name: child-secret-file-contract
+    description: Verify fixed-identity credential delivery remains unavailable
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: generated-file
+        action: preauthorized
+        environment:
+          - name: CHILD_FILE_PATH
+            source: secret-file
+            values: ["CHILD_FILE_FIXTURE"]
+
+  - name: child-capability-contract
+    description: Verify the child identity and empty effective capability set
+    binary: whoami
+    args: [child-contract]
+    consequence: reversible
+    trusted: true
+
+  - name: scale-workload
+    description: Scale a fixture workload; auto-reverts unless confirmed
+    binary: kubectl
+    args: ["scale", "deployment/{name}", "--replicas=2", "-n", "fixture"]
     params:
-      path: { pattern: "^/work/[a-z0-9._/-]+$", required: true }
+      name: { pattern: "^(provisional|kept|restart)$", required: true }
     consequence: recoverable
-    revert: { binary: rm, args: ["-f", "{path}"] }
+    revert: { binary: kubectl, args: ["scale", "deployment/{name}", "--replicas=1", "-n", "fixture"] }
     trusted: true
 
-  - name: wipe
-    description: Recursively delete a path under /work (irreversible; held)
-    binary: rm
-    args: ["-rf", "{path}"]
-    params:
-      path: { pattern: "^/work/[a-z0-9._/-]+$", required: true }
+  - name: delete-fixture-namespace
+    description: Delete the fixed fixture namespace (irreversible; held)
+    binary: kubectl
+    args: ["delete", "namespace", "secret"]
     consequence: irreversible
-    trusted: true
-
-  - name: ssh-safe-host
-    description: Exercise transparent ssh shim without caller SSH_AUTH_SOCK
-    binary: ssh
-    args: ["safe-host"]
-    consequence: reversible
     trusted: true
 
   - name: kubectl-version
@@ -46,103 +55,103 @@ verbs:
     trusted: true
 
   - name: helm-checked-upgrade
-    description: Exercise a typed Helm command with cooperative dry-run/diff/target limits
+    description: Verify fixed identity rejects Helm profile authority before execution
     binary: helm
     args: ["upgrade", "--install", "demo", "./chart", "--namespace", "staging", "--dry-run", "--diff"]
     consequence: reversible
     trusted: true
 
   - name: ansible-ping-check
-    description: Exercise a typed Ansible command with check mode
+    description: Verify fixed identity rejects Ansible profile authority before execution
     binary: ansible
     args: ["web", "-m", "ping", "--check"]
     consequence: reversible
     trusted: true
 
   - name: ansible-ping-all-cwd
-    description: Exercise Ansible inventory discovery from the caller cwd under a valid session
+    description: Verify caller-owned Ansible profile discovery remains unavailable
     binary: ansible
     args: ["-m", "ping", "all"]
     consequence: reversible
     trusted: true
 
   - name: ansible-playbook-check-diff
-    description: Exercise an opaque playbook carrier only with check/diff/limit controls
+    description: Verify fixed identity rejects ansible-playbook before execution
     binary: ansible-playbook
     args: ["/work/site.yml", "--check", "--diff", "--limit", "web"]
     consequence: reversible
     trusted: true
 
   - name: failing-revert
-    description: Create a fixture whose deterministic rollback fails
-    binary: touch
-    args: ["/scenario/fixtures/revert-target"]
+    description: Scale a fixture whose deterministic rollback fails
+    binary: kubectl
+    args: ["scale", "deployment/revert-target", "--replicas=2", "-n", "fixture"]
     consequence: recoverable
     revert: { binary: "false", args: [] }
     trusted: true
 
-  - name: ssh-diagnose
-    description: Inspect one fake SSH service through the broker
-    binary: ssh
-    args: ["fixture-host", "systemctl", "is-active", "fixture-service"]
+  - name: service-status
+    description: Inspect one fake service through a closed command profile
+    binary: printf
+    args: ["fixture-service:active\\n"]
     consequence: reversible
     trusted: true
 
   - name: cloudstack-inventory
     description: List fake CloudStack virtual machines
-    binary: cloudstack
-    args: ["list", "virtualmachines", "zoneid=fixture-zone"]
+    binary: printf
+    args: ["fixture-vm Running\\n"]
     consequence: reversible
     trusted: true
 
   - name: kubernetes-list
-    description: List pods through a daemon-owned fake kubeconfig
+    description: List pods through the active Guard proxy kubeconfig
     binary: kubectl
     args: ["get", "pods", "--namespace", "fixture"]
     consequence: reversible
     trusted: true
 
   - name: helm-list-direct
-    description: List fake Helm releases through a typed direct path
+    description: Verify fixed identity rejects Helm before execution
     binary: helm
     args: ["list", "--namespace", "fixture"]
     consequence: reversible
     trusted: true
 
   - name: ansible-check
-    description: Run one fake playbook in check mode with a bounded target
+    description: Verify caller identity rejects ansible-playbook before execution
     binary: ansible-playbook
     args: ["/scenario/ansible/site.yml", "--check", "--diff", "--limit", "fixture"]
     consequence: reversible
     trusted: true
 
-  - name: host-maintenance
-    description: Apply a recoverable fake host maintenance operation
-    binary: hostctl
-    args: ["apply", "/scenario/fixtures/maintenance-applied"]
+  - name: workload-maintenance
+    description: Apply a recoverable fake workload maintenance operation
+    binary: kubectl
+    args: ["scale", "deployment/workload-maintenance", "--replicas=2", "-n", "fixture"]
     consequence: recoverable
-    revert: { binary: rm, args: ["-f", "/scenario/fixtures/maintenance-applied"] }
+    revert: { binary: kubectl, args: ["scale", "deployment/workload-maintenance", "--replicas=1", "-n", "fixture"] }
     trusted: true
 
   - name: fixture-api-status
     description: Query a fake credential-bearing API
-    binary: fixture-api
-    args: ["status"]
+    binary: whoami
+    args: ["api-status"]
     consequence: reversible
     trusted: true
 
-  - name: access-ssh-inspect
-    description: Inspect the fake SSH service
-    binary: ssh
-    args: ["access-fixture-host", "systemctl", "is-active", "fixture-service"]
+  - name: access-service-status
+    description: Inspect the fake service
+    binary: printf
+    args: ["fixture-service:active\\n"]
     baseline: false
     consequence: reversible
     trusted: true
 
   - name: access-cloudstack-inspect
     description: Inspect the fake CloudStack virtual machines
-    binary: cloudstack
-    args: ["list", "virtualmachines", "zoneid=access-fixture-zone"]
+    binary: printf
+    args: ["fixture-vm Running\\n"]
     baseline: false
     consequence: reversible
     trusted: true
@@ -156,7 +165,7 @@ verbs:
     trusted: true
 
   - name: access-helm-inspect
-    description: Inspect the fake Helm releases
+    description: Exercise access approval without bypassing the Helm execution boundary
     binary: helm
     args: ["list", "--namespace", "access-fixture"]
     baseline: false
@@ -164,25 +173,25 @@ verbs:
     trusted: true
 
   - name: access-ansible-check
-    description: Check the fake Ansible project
+    description: Exercise access approval without bypassing the Ansible execution boundary
     binary: ansible-playbook
     args: ["/scenario/ansible/site.yml", "--check", "--diff", "--limit", "access-fixture"]
     baseline: false
     consequence: reversible
     trusted: true
 
-  - name: access-host-maintenance
-    description: Apply the fake host maintenance operation
-    binary: hostctl
-    args: ["apply", "/scenario/fixtures/access-maintenance-applied"]
+  - name: access-workload-maintenance
+    description: Apply the fake workload maintenance operation
+    binary: kubectl
+    args: ["scale", "deployment/access-maintenance", "--replicas=2", "-n", "access-fixture"]
     baseline: false
     consequence: recoverable
-    revert: { binary: rm, args: ["-f", "/scenario/fixtures/access-maintenance-applied"] }
+    revert: { binary: kubectl, args: ["scale", "deployment/access-maintenance", "--replicas=1", "-n", "access-fixture"] }
     trusted: true
 
   - name: access-api-status
     description: Query the fake credential-backed API
-    binary: fixture-api
+    binary: whoami
     args: ["access-status"]
     baseline: false
     consequence: reversible
@@ -205,8 +214,8 @@ verbs:
     trusted: true
 
   - name: access-missing-command
-    description: Run the missing fake command
-    binary: guard-missing-fixture-binary
+    description: Run the failing fake command
+    binary: "false"
     args: []
     baseline: false
     consequence: reversible
@@ -214,8 +223,8 @@ verbs:
 
   - name: access-held-delete
     description: Delete the fake staging tree
-    binary: rm
-    args: ["-rf", "/scenario/fixtures/staging"]
+    binary: kubectl
+    args: ["delete", "namespace", "access-staging"]
     baseline: false
     consequence: irreversible
     trusted: true

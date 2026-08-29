@@ -16,7 +16,8 @@
 # inject because there is nothing to substitute.
 #
 # Load with:
-#   guard server start --verbs examples/verbs-readonly.yaml --socket .cache/guard.sock
+#   guard server start --verbs examples/verbs-readonly.yaml \
+#     --socket .cache/guard.sock --exec-user guard-exec
 
 verbs:
   - name: whoami
@@ -63,7 +64,7 @@ verbs:
     binary: ls
     args: ["-la", "{path}"]
     params:
-      path: { pattern: "^/[a-zA-Z0-9._/-]*$", required: true }
+      path: { pattern: "^(/etc|/var/log)$", required: true }
     consequence: reversible
     trusted: true
 
@@ -73,45 +74,11 @@ verbs:
     args: ["/etc/hosts"]
     consequence: reversible
     trusted: true
-
-  - name: ip-addresses
-    description: Show network interface addresses
-    binary: ip
-    args: ["addr"]
-    consequence: reversible
-    trusted: true
-
-  - name: git-status
-    description: Show git working tree status for a repo
-    binary: git
-    args: ["-C", "{repo}", "status"]
-    params:
-      repo: { pattern: "^/[a-zA-Z0-9._/-]*$", required: true }
-    consequence: reversible
-    trusted: true
-
   - name: service-status
     description: Show a systemd unit's status (read-only)
     binary: systemctl
     args: ["status", "{unit}", "--no-pager"]
     params:
       unit: { pattern: "^[a-zA-Z0-9@._-]+$", required: true }
-    consequence: reversible
-    trusted: true
-
-  - name: k-get
-    description: Read a Kubernetes resource in a namespace
-    binary: kubectl
-    args: ["get", "{resource}", "-n", "{namespace}"]
-    params:
-      resource: { pattern: "^[a-z][a-z0-9.]*$", required: true }
-      namespace: { pattern: "^[a-z0-9-]{1,63}$", required: true }
-    consequence: reversible
-    trusted: true
-
-  - name: docker-ps
-    description: List running containers
-    binary: docker
-    args: ["ps"]
     consequence: reversible
     trusted: true

@@ -14,6 +14,8 @@ name: Dependabot review gate
 # privileged token.
 
 on:
+  push:
+    branches: [main]
   pull_request:
     types:
       - opened
@@ -36,7 +38,6 @@ concurrency:
 jobs:
   review-gate:
     name: Classify dependency update
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,6 +45,7 @@ jobs:
     steps:
       - name: Resolve pull request
         id: pr
+        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -72,11 +74,12 @@ jobs:
 
       - name: Resolve update metadata
         id: fetch_meta
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
       - name: Resolve dispatched update metadata
         id: meta
+        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
@@ -118,6 +121,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Enforce review policy
+        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
         env:
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
           PACKAGE_ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
@@ -138,3 +142,7 @@ jobs:
 
           echo "Major or unclassified dependency update requires human review."
           exit 1
+
+      - name: Record non-dependency change
+        if: github.event_name == 'push' || github.event.pull_request.user.login != 'dependabot[bot]'
+        run: echo "Dependency update classification applies only to Dependabot pull requests."

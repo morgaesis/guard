@@ -3,9 +3,9 @@
 //!
 //! Spins up a real guard daemon with a static (no-LLM) policy on a temp socket,
 //! spawns `guard mcp serve` as a child with piped stdio, and exercises the full
-//! JSON-RPC handshake (initialize -> tools/list -> tools/call). Verifies that
-//! the MCP transport layer correctly relays decisions from the daemon back to
-//! the client without an LLM in the loop.
+//! JSON-RPC handshake (initialize -> tools/list -> tools/call). The daemon runs
+//! in dry-run mode because an unprivileged test process cannot switch to the
+//! dedicated brokered-child identity required by production execution.
 //!
 //! Why static policy: this test covers the MCP plumbing, not LLM accuracy.
 //! Using --no-llm with a deterministic deny/allow list keeps the test
@@ -24,6 +24,20 @@ use tokio::time::{sleep, timeout};
 
 const GUARD_BIN: &str = env!("CARGO_BIN_EXE_guard");
 
+fn generated_test_credential(label: &str) -> String {
+    format!("fixture-{label}-{}", std::process::id())
+}
+
+fn trusted_tempdir() -> TempDir {
+    let directory = tempfile::Builder::new()
+        .prefix("guard-integration-")
+        .tempdir_in(std::env::current_dir().expect("integration working directory"))
+        .expect("trusted integration tempdir");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restrict integration tempdir");
+    directory
+}
+
 const POLICY_YAML: &str = r#"
 policy:
   commands:
@@ -32,7 +46,7 @@ policy:
       - "whoami"
       - "hostname"
       - "echo*"
-      - "sh*"
+      - "printenv*"
     deny:
       - "rm*"
       - "cat /etc/shadow*"
@@ -42,8 +56,8 @@ const VERBS_YAML: &str = r#"
 verbs:
   - name: inspect-identity
     description: Inspect the authenticated identity
-    binary: fixture-inspect
-    args: [status]
+    binary: printf
+    args: [identity]
     baseline: false
     consequence: reversible
     trusted: true
@@ -83,7 +97,7 @@ async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn run_socket_flag_overrides_environment_endpoint() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (_daemon, socket_path) = start_daemon(&tmp).await;
     let output = timeout(
         Duration::from_secs(10),
@@ -91,6 +105,7 @@ async fn run_socket_flag_overrides_environment_endpoint() {
             .args(["run", "--json", "--socket"])
             .arg(&socket_path)
             .args(["echo", "socket-ok"])
+            .current_dir("/")
             .env("HOME", tmp.path())
             .env("XDG_CONFIG_HOME", tmp.path())
             .env("GUARD_SOCKET", tmp.path().join("wrong.sock"))
@@ -101,20 +116,22 @@ async fn run_socket_flag_overrides_environment_endpoint() {
     .expect("run guard command");
     assert!(
         output.status.success(),
-        "guard run failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "guard run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
     let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse run envelope");
     assert_eq!(envelope["type"], "run_result");
     assert_eq!(envelope["response"]["allowed"], true);
-    assert!(envelope["response"]["stdout"]
-        .as_str()
-        .is_some_and(|value| value.contains("socket-ok")));
+    assert_eq!(
+        envelope["response"]["stdout"],
+        "[DRY-RUN] policy allowed; command was not executed\n"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn verb_lint_reports_every_named_failure_and_exits_one() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
         .expect("restrict tempdir");
     let catalog = tmp.path().join("verbs.yaml");
@@ -122,13 +139,13 @@ async fn verb_lint_reports_every_named_failure_and_exits_one() {
         &catalog,
         r#"verbs:
   - name: inspect-first
-    binary: fixturectl
+    binary: printf
     args: ["show", "{target}"]
     params:
       target: { pattern: "[a-z]+" }
     consequence: reversible
   - name: inspect-second
-    binary: fixturectl
+    binary: printf
     args: ["show", "{resource}"]
     params:
       resource: { pattern: "[0-9]+" }
@@ -165,10 +182,8 @@ async fn start_daemon_with_gate(
 ) -> (DaemonGuard, std::path::PathBuf) {
     // The daemon refuses to open its state database when any ancestor
     // directory is group- or other-writable (see validate_state_ancestor in
-    // src/session_store.rs). tempfile::tempdir() inherits the process umask,
-    // so on hosts with a group-writable umask (e.g. 007 -> mode 0770) the
-    // daemon exits at startup and the socket never appears. Pin the tempdir,
-    // which doubles as HOME, to 0700 so the test is umask-independent.
+    // src/session_store.rs). Temporary directories inherit the process umask,
+    // so pin the directory that doubles as HOME to 0700.
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
         .expect("restrict tempdir permissions");
 
@@ -183,7 +198,7 @@ async fn start_daemon_with_gate(
 
     let mut command = Command::new(GUARD_BIN);
     command
-        .args(["server", "start", "--no-llm", "--policy"])
+        .args(["server", "start", "--no-llm", "--dry-run", "--policy"])
         .arg(&policy_path)
         .arg("--socket")
         .arg(&socket_path)
@@ -244,6 +259,7 @@ impl McpClient {
         let mut child = Command::new(GUARD_BIN)
             .args(["mcp", "serve", "--socket"])
             .arg(socket_path)
+            .current_dir("/")
             .env("HOME", tmp.path())
             .env("XDG_CONFIG_HOME", tmp.path())
             .stdin(Stdio::piped())
@@ -266,6 +282,7 @@ impl McpClient {
     async fn spawn_from_config(tmp: &TempDir, session_token: &str) -> Self {
         let mut child = Command::new(GUARD_BIN)
             .args(["mcp", "serve"])
+            .current_dir("/")
             .env("HOME", tmp.path())
             .env("XDG_CONFIG_HOME", tmp.path())
             .env("GUARD_SESSION", session_token)
@@ -318,7 +335,7 @@ impl McpClient {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_client_config_fails_closed_with_versioned_json() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let config_dir = tmp.path().join("guard");
     std::fs::create_dir_all(&config_dir).expect("create config directory");
     std::fs::write(config_dir.join("client.yaml"), "server_socket: [\n")
@@ -354,7 +371,7 @@ async fn malformed_client_config_fails_closed_with_versioned_json() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn server_startup_rejects_malformed_client_config_before_listening() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let output = timeout(
         Duration::from_secs(10),
         Command::new(GUARD_BIN)
@@ -387,7 +404,7 @@ async fn stop_test_daemon(mut daemon: DaemonGuard, socket_path: &std::path::Path
 
 async fn restart_output(tmp: &TempDir, socket_path: &std::path::Path) -> std::process::Output {
     let mut child = Command::new(GUARD_BIN)
-        .args(["server", "start", "--no-llm", "--policy"])
+        .args(["server", "start", "--no-llm", "--dry-run", "--policy"])
         .arg(tmp.path().join("policy.yaml"))
         .arg("--socket")
         .arg(socket_path)
@@ -422,7 +439,7 @@ async fn restart_output(tmp: &TempDir, socket_path: &std::path::Path) -> std::pr
 
 #[tokio::test(flavor = "multi_thread")]
 async fn migration_index_corruption_prevents_daemon_listener_startup() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (daemon, socket_path) = start_daemon(&tmp).await;
     let request = Command::new(GUARD_BIN)
         .args([
@@ -487,7 +504,7 @@ async fn migration_index_corruption_prevents_daemon_listener_startup() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn saved_grant_name_index_corruption_prevents_daemon_listener_startup() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (daemon, socket_path) = start_daemon(&tmp).await;
     stop_test_daemon(daemon, &socket_path).await;
 
@@ -543,13 +560,17 @@ async fn removed_authority_commands_cannot_mint_or_modify_sessions() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn removed_authority_wire_operations_cannot_mint_hidden_sessions() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (_daemon, socket_path) = start_daemon_with_gate(&tmp, true).await;
     let mut stream = UnixStream::connect(&socket_path)
         .await
         .expect("connect daemon socket");
+    let credential = generated_test_credential("removed-wire");
+    let request = format!(
+        "{{\"admin\":{{\"op\":\"session_grant\",\"token\":\"{credential}\",\"activated_verbs\":[\"inspect-identity\"]}}}}\n"
+    );
     stream
-        .write_all(b"{\"admin\":{\"op\":\"session_grant\",\"token\":\"fixture-chosen-token\",\"activated_verbs\":[\"inspect-identity\"]}}\n")
+        .write_all(request.as_bytes())
         .await
         .expect("send removed wire operation");
     let mut response = String::new();
@@ -575,7 +596,8 @@ async fn removed_authority_wire_operations_cannot_mint_hidden_sessions() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn secret_setter_reads_stdin_without_accepting_an_argv_value() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
+    let credential = generated_test_credential("stdin");
     let mut child = Command::new(GUARD_BIN)
         .args(["config", "set-token"])
         .env("HOME", tmp.path())
@@ -589,7 +611,7 @@ async fn secret_setter_reads_stdin_without_accepting_an_argv_value() {
         .stdin
         .take()
         .expect("token setter stdin")
-        .write_all(b"fixture-token\n")
+        .write_all(format!("{credential}\n").as_bytes())
         .await
         .expect("write token through stdin");
     let output = timeout(Duration::from_secs(10), child.wait_with_output())
@@ -610,7 +632,7 @@ async fn secret_setter_reads_stdin_without_accepting_an_argv_value() {
         .is_some_and(|value| !value.is_empty()));
 
     let rejected = Command::new(GUARD_BIN)
-        .args(["config", "set-token", "fixture-token"])
+        .args(["config", "set-token", credential.as_str()])
         .env("HOME", tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path())
         .output()
@@ -621,7 +643,7 @@ async fn secret_setter_reads_stdin_without_accepting_an_argv_value() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_process_rejects_a_built_in_custom_tool_name() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let socket = tmp.path().join("missing.sock");
     let output = timeout(
         Duration::from_secs(10),
@@ -644,7 +666,7 @@ async fn mcp_process_rejects_a_built_in_custom_tool_name() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn typed_verb_denial_prints_requester_safe_access_guidance() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (_daemon, socket_path) = start_daemon_with_gate(&tmp, true).await;
     let output = timeout(
         Duration::from_secs(10),
@@ -675,16 +697,19 @@ async fn typed_verb_denial_prints_requester_safe_access_guidance() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_threads_execution_and_session_tokens_without_operator_authority() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let config_dir = tmp.path().join("guard");
     std::fs::create_dir_all(&config_dir).unwrap();
+    let execution = generated_test_credential("execution");
+    let admin = generated_test_credential("admin");
+    let session = generated_test_credential("session");
     std::fs::write(
         config_dir.join("client.yaml"),
         format!(
-            "server_socket: null\nserver_tcp_port: {port}\nauth_token: configured-exec\nadmin_token: configured-admin\ndefault_user: null\n"
+            "server_socket: null\nserver_tcp_port: {port}\nauth_token: {execution}\nadmin_token: {admin}\ndefault_user: null\n"
         ),
     )
     .unwrap();
@@ -740,7 +765,7 @@ async fn mcp_threads_execution_and_session_tokens_without_operator_authority() {
         execute
     });
 
-    let mut mcp = McpClient::spawn_from_config(&tmp, "configured-session").await;
+    let mut mcp = McpClient::spawn_from_config(&tmp, &session).await;
     let initialize = mcp
         .rpc(
             1,
@@ -781,13 +806,13 @@ async fn mcp_threads_execution_and_session_tokens_without_operator_authority() {
     assert_eq!(run["result"]["isError"], false);
 
     let execute = daemon.await.unwrap();
-    assert_eq!(execute["execute"]["auth_token"], "configured-exec");
-    assert_eq!(execute["execute"]["session_token"], "configured-session");
+    assert_eq!(execute["execute"]["auth_token"], execution);
+    assert_eq!(execute["execute"]["session_token"], session);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_end_to_end_initialize_list_call() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (_daemon, socket_path) = start_daemon(&tmp).await;
     let mut mcp = McpClient::spawn(&socket_path, &tmp).await;
 
@@ -948,7 +973,8 @@ async fn mcp_end_to_end_initialize_list_call() {
     assert_eq!(shown_item["requester"], uid.as_str());
     assert_eq!(shown_item["state"], "pending");
 
-    // 6. tools/call with an allowed command
+    // 6. tools/call with an allowed command. Dry-run proves transport and
+    // policy integration without weakening the production identity contract.
     let allowed = mcp
         .rpc(
             6,
@@ -968,10 +994,9 @@ async fn mcp_end_to_end_initialize_list_call() {
     assert!(structured["access_requests"].is_array());
     assert!(structured["verb_matches"].is_array());
     assert!(structured["decision_source"].is_string());
-    let stdout = structured["stdout"].as_str().unwrap_or("");
-    assert!(
-        stdout.contains("uid="),
-        "expected `id` output to contain uid=, got: {stdout}"
+    assert_eq!(
+        structured["stdout"],
+        "[DRY-RUN] policy allowed; command was not executed\n"
     );
 
     // 7. tools/call with a denied command
@@ -999,7 +1024,8 @@ async fn mcp_end_to_end_initialize_list_call() {
         "denied response should include a non-empty reason"
     );
 
-    // 8. tools/call with server-side secret injection
+    // 8. tools/call with a server-side secret request reaches the daemon and
+    // is refused at the fixed-child identity boundary.
     let injected = mcp
         .rpc(
             8,
@@ -1007,8 +1033,8 @@ async fn mcp_end_to_end_initialize_list_call() {
             json!({
                 "name": "guard_run",
                 "arguments": {
-                    "binary": "sh",
-                    "args": ["-lc", "[ -n \"$MCP_TEST_PLACEHOLDER\" ] && echo set"],
+                    "binary": "printenv",
+                    "args": ["MCP_TEST_PLACEHOLDER"],
                     "secrets": ["mcp-test-placeholder"]
                 }
             }),
@@ -1016,8 +1042,10 @@ async fn mcp_end_to_end_initialize_list_call() {
         .await;
     assert_eq!(injected["result"]["isError"], false);
     let injected_structured = &injected["result"]["structuredContent"];
-    assert_eq!(injected_structured["allowed"], true);
-    assert_eq!(injected_structured["stdout"], "set\n");
+    assert_eq!(injected_structured["allowed"], false);
+    assert!(injected_structured["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("fixed-identity execution")));
 
     // 9. tools/call against an unknown tool name
     let unknown = mcp
@@ -1033,7 +1061,9 @@ async fn mcp_end_to_end_initialize_list_call() {
     assert_eq!(unknown["error"]["code"], -32601);
 }
 
-const HTTP_TOKEN: &str = "integration-test-bearer";
+fn http_test_credential() -> String {
+    generated_test_credential("http")
+}
 
 /// Spawn `guard mcp serve --http` against a (not necessarily live) daemon
 /// socket path and wait until the HTTP listener accepts connections. The
@@ -1052,7 +1082,7 @@ async fn start_http_mcp(tmp: &TempDir) -> (McpHttpGuard, std::net::SocketAddr) {
         .args(["mcp", "serve", "--socket"])
         .arg(&socket_path)
         .args(["--http", &addr.to_string()])
-        .env("GUARD_MCP_TOKEN", HTTP_TOKEN)
+        .env("GUARD_MCP_TOKEN", http_test_credential())
         .env("HOME", tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path())
         .stdin(Stdio::null())
@@ -1147,7 +1177,8 @@ fn http_post(body: &str) -> String {
 
 fn http_post_with_headers(body: &str, additional_headers: &[(&str, &str)]) -> String {
     let mut request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {HTTP_TOKEN}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        http_test_credential(),
         body.len()
     );
     for (name, value) in additional_headers {
@@ -1160,7 +1191,7 @@ fn http_post_with_headers(body: &str, additional_headers: &[(&str, &str)]) -> St
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_http_transport_keepalive_pair_on_one_connection() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (_mcp, addr) = start_http_mcp(&tmp).await;
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -1212,7 +1243,7 @@ async fn mcp_http_transport_keepalive_pair_on_one_connection() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_http_transport_session_survives_reconnect() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (_mcp, addr) = start_http_mcp(&tmp).await;
     let init_body = json!({
         "jsonrpc": "2.0",
@@ -1259,7 +1290,7 @@ async fn mcp_http_transport_session_survives_reconnect() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_http_transport_validates_origin_accept_and_protocol_version() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (_mcp, addr) = start_http_mcp(&tmp).await;
     let ping = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}"#;
 
@@ -1289,7 +1320,8 @@ async fn mcp_http_transport_validates_origin_accept_and_protocol_version() {
     assert_eq!(read_one_http_response(&mut stream).await.0, 400);
 
     let request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {HTTP_TOKEN}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{ping}",
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{ping}",
+        http_test_credential(),
         ping.len()
     );
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -1302,7 +1334,7 @@ async fn mcp_http_transport_validates_origin_accept_and_protocol_version() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_http_transport_rejects_non_loopback_bind() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let socket_path = tmp.path().join("guard.sock");
     let output = timeout(
         Duration::from_secs(10),
@@ -1310,7 +1342,7 @@ async fn mcp_http_transport_rejects_non_loopback_bind() {
             .args(["mcp", "serve", "--socket"])
             .arg(&socket_path)
             .args(["--http", "0.0.0.0:7333"])
-            .env("GUARD_MCP_TOKEN", HTTP_TOKEN)
+            .env("GUARD_MCP_TOKEN", http_test_credential())
             .env("HOME", tmp.path())
             .env("XDG_CONFIG_HOME", tmp.path())
             .output(),
@@ -1324,14 +1356,15 @@ async fn mcp_http_transport_rejects_non_loopback_bind() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_http_transport_rejects_oversized_body() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (_mcp, addr) = start_http_mcp(&tmp).await;
 
     // Declare a body over the transport's 1 MiB cap; the rejection must arrive
     // without the body ever being sent.
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     let request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {HTTP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        http_test_credential(),
         2 * 1024 * 1024
     );
     stream
@@ -1344,7 +1377,7 @@ async fn mcp_http_transport_rejects_oversized_body() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_http_transport_rejects_malformed_http() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = trusted_tempdir();
     let (_mcp, addr) = start_http_mcp(&tmp).await;
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");

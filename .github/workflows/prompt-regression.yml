@@ -63,4 +63,4 @@ jobs:
         env:
           GUARD_PROMPT_REGRESSION: required
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: cargo test --test prompt_regression
+        run: cargo test --locked --test prompt_regression

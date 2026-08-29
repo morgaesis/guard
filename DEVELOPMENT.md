@@ -25,6 +25,23 @@ cargo clippy -- -D warnings
 cargo fmt --all -- --check
 ```
 
+Release and service changes also run the publication, upgrade, packaged-service,
+and adversarial static contracts locally:
+
+```bash
+scripts/test-publish-release.sh
+deployment/systemd/test-upgrade-guard.sh
+sudo deployment/systemd/test-guard-service-expansion.sh
+./ctf/gating/run.sh static
+```
+
+Windows installer changes run the packaged Pester contract on Windows:
+
+```powershell
+Import-Module Pester -MinimumVersion 5.0.0 -ErrorAction Stop
+Invoke-Pester -Path deployment/windows/install-guard.Tests.ps1 -CI
+```
+
 ## Pre-commit hooks
 
 A `.pre-commit-config.yaml` is included. Install with:
@@ -90,6 +107,7 @@ Inside the container:
 ```bash
 # Install VHS
 apt-get update && apt-get install -y curl
+useradd --system --create-home guard-exec
 curl -fsSL https://github.com/charmbracelet/vhs/releases/download/v0.11.0/vhs_0.11.0_amd64.deb -o vhs.deb
 dpkg -i vhs.deb
 
@@ -140,7 +158,8 @@ podman run -it --rm \
   -v ./target/release/guard:/usr/local/bin/guard:ro \
   -e GUARD_LLM_API_KEY \
   ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb bash -c '
-    guard server start --socket /tmp/guard.sock &
+    useradd --system --create-home guard-exec
+    guard server start --socket /tmp/guard.sock --exec-user guard-exec &
     sleep 2
     guard config set-server /tmp/guard.sock
     echo "=== Allowed ==="

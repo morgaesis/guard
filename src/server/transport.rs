@@ -17,7 +17,7 @@ use guard::gating::GateMode;
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -35,7 +35,10 @@ use super::admin::handle_admin_request_owned;
 use super::execute::{execute_command, execute_command_streaming, record_live_session_interaction};
 #[cfg(unix)]
 use super::gate_runtime::revert_dir_is_owner_only;
-use super::gate_runtime::{gating_sweeper, is_api_proxy_sentinel, now_unix, DaemonGateSink};
+use super::gate_runtime::{
+    gating_sweeper, is_api_proxy_sentinel, now_unix, reconstruct_caller,
+    replay_persisted_command_authorization, DaemonGateSink,
+};
 #[cfg(unix)]
 use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
 use super::runtime::NotifyEvent;
@@ -247,11 +250,14 @@ mod admin_response_lease_tests {
                 catalog_version: None,
                 verb_digest: None,
                 verb_composition_digest: None,
+                verb_environment_authority: false,
+                verb_local_file_authority: false,
                 exec_timeout_secs: None,
                 access_verbs: Vec::new(),
                 access_requests: Vec::new(),
                 principal: None,
                 secret_binding: None,
+                process_authority: None,
             },
             reason: "test".to_string(),
             risk: Some(8),
@@ -554,8 +560,68 @@ async fn provisional_recovery_error(server: &ServerContext, row: &Provisional) -
                 api.endpoint
             ));
         }
-    } else if row.revert_binary.is_empty() {
-        return Some("persisted command rollback has no revert binary".to_string());
+    } else {
+        if row.revert_binary.is_empty() {
+            return Some("persisted command rollback has no revert binary".to_string());
+        }
+        let caller = match reconstruct_caller(row.principal.clone(), &CallerIdentity::Unknown) {
+            Ok(caller) => caller,
+            Err(error) => return Some(error),
+        };
+        let request_for = |binary: String, args: Vec<String>| ExecuteRequest {
+            binary,
+            args,
+            cwd: row.cwd.clone(),
+            auth_token: None,
+            env: std::collections::HashMap::new(),
+            secrets: row
+                .secret_keys
+                .iter()
+                .map(|(name, secret)| (name.clone(), secret.clone()))
+                .collect(),
+            secret_files: row
+                .secret_file_keys
+                .iter()
+                .map(|(name, secret)| (name.clone(), secret.clone()))
+                .collect(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let revert_request = request_for(row.revert_binary.clone(), row.revert_args.clone());
+        if let Err(error) = replay_persisted_command_authorization(
+            server,
+            &caller,
+            &revert_request,
+            row.revert_authorization.as_ref(),
+        )
+        .await
+        {
+            return Some(format!(
+                "persisted rollback authorization cannot be revalidated: {error}"
+            ));
+        }
+        if let Some(binary) = &row.confirm_check_binary {
+            let check_request = request_for(binary.clone(), row.confirm_check_args.clone());
+            if let Err(error) = replay_persisted_command_authorization(
+                server,
+                &caller,
+                &check_request,
+                row.confirm_check_authorization.as_ref(),
+            )
+            .await
+            {
+                return Some(format!(
+                    "persisted confirmation-check authorization cannot be revalidated: {error}"
+                ));
+            }
+        }
     }
     None
 }
@@ -583,9 +649,13 @@ mod api_session_event_tests {
     }
 
     fn armed_command() -> Provisional {
+        #[cfg(windows)]
+        let principal = guard::principal::PrincipalKey::from_sid("S-1-5-21-1-2-3-1001");
+        #[cfg(not(windows))]
+        let principal = guard::principal::PrincipalKey::from_uid(1_001);
         Provisional {
             handle: "recovery".to_string(),
-            principal: Some(guard::principal::PrincipalKey::from_uid(1_001)),
+            principal: Some(principal),
             requester_principal: None,
             binary: "true".to_string(),
             args: Vec::new(),
@@ -594,8 +664,10 @@ mod api_session_event_tests {
             secret_file_keys: BTreeMap::new(),
             revert_binary: "true".to_string(),
             revert_args: Vec::new(),
+            revert_authorization: None,
             confirm_check_binary: None,
             confirm_check_args: Vec::new(),
+            confirm_check_authorization: None,
             control_path: Some("local".to_string()),
             session_fingerprint: None,
             session_revision: None,
@@ -614,6 +686,46 @@ mod api_session_event_tests {
             revert_exit: None,
             revert_detail: None,
         }
+    }
+
+    async fn bind_revert_authorization(server: &ServerContext, row: &mut Provisional) {
+        let caller = reconstruct_caller(row.principal.clone(), &CallerIdentity::Unknown).unwrap();
+        let request = ExecuteRequest {
+            binary: row.revert_binary.clone(),
+            args: row.revert_args.clone(),
+            cwd: row.cwd.clone(),
+            auth_token: None,
+            env: std::collections::HashMap::new(),
+            secrets: row
+                .secret_keys
+                .iter()
+                .map(|(name, secret)| (name.clone(), secret.clone()))
+                .collect(),
+            secret_files: row
+                .secret_file_keys
+                .iter()
+                .map(|(name, secret)| (name.clone(), secret.clone()))
+                .collect(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        row.revert_authorization = Some(
+            super::super::gate_runtime::capture_persisted_command_authorization(
+                server,
+                &caller,
+                &request,
+                guard::gating::approval::DelayedAuthoritySource::RawControl,
+            )
+            .await
+            .unwrap(),
+        );
     }
 
     #[test]
@@ -654,7 +766,38 @@ mod api_session_event_tests {
             )
             .await
             .unwrap();
+        bind_revert_authorization(&server, &mut row).await;
         assert!(provisional_recovery_error(&server, &row).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_authority_revalidation_requires_control_bindings() {
+        let server = recovery_context();
+        let mut row = armed_command();
+        let error = provisional_recovery_error(&server, &row)
+            .await
+            .expect("legacy command rollback must not re-arm");
+        assert!(error.contains("lacks process and secret authority"));
+
+        bind_revert_authorization(&server, &mut row).await;
+        row.confirm_check_binary = Some("true".to_string());
+        let error = provisional_recovery_error(&server, &row)
+            .await
+            .expect("confirmation checks also require frozen authority");
+        assert!(error.contains("confirmation-check authorization"));
+    }
+
+    #[tokio::test]
+    async fn restart_authority_revalidation_rejects_malformed_principal() {
+        let server = recovery_context();
+        let mut row = armed_command();
+        row.principal = Some(guard::principal::PrincipalKey::from_raw("not-a-uid"));
+
+        let error = provisional_recovery_error(&server, &row)
+            .await
+            .expect("malformed persisted identity must not re-arm");
+
+        assert!(error.contains("persisted caller principal"));
     }
 
     #[tokio::test]
@@ -706,6 +849,22 @@ pub struct Server {
     context: ServerContext,
 }
 
+fn default_secret_file_root(config: &ServerConfig) -> PathBuf {
+    config
+        .socket_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|path| path.join("secret-files"))
+        .or_else(|| {
+            config
+                .state_db_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|path| path.join("secret-files"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("guard-secret-files"))
+}
+
 impl Server {
     pub fn new(
         config: ServerConfig,
@@ -747,14 +906,10 @@ impl Server {
         let mut server = Self {
             context: ServerContext { config, state },
         };
-        let root = server
-            .context
-            .config
-            .state_db_path
-            .as_ref()
-            .and_then(|path| path.parent())
-            .map(|path| path.join("secret-files"))
-            .unwrap_or_else(|| std::env::temp_dir().join("guard-secret-files"));
+        // Secret files are runtime artifacts, not durable state. Prefer the
+        // local listener's runtime directory so a fixed child can traverse the
+        // parent without gaining access to the daemon's 0700 state directory.
+        let root = default_secret_file_root(&server.context.config);
         super::secure_fs::prepare_private_root(&root)
             .with_context(|| format!("prepare secret-file root {}", root.display()))?;
         server.context.config.secret_file_root = Some(root);
@@ -1684,6 +1839,24 @@ pub(crate) mod winplat {
     const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008; // byte type/readmode/wait = 0
     const PIPE_UNLIMITED_INSTANCES: u32 = 255;
     const PIPE_BUF: u32 = 65536;
+    const FILE_READ_DATA: u32 = 0x0000_0001;
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const FILE_CREATE_PIPE_INSTANCE: u32 = 0x0000_0004;
+    const FILE_READ_EA: u32 = 0x0000_0008;
+    const FILE_WRITE_EA: u32 = 0x0000_0010;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const PIPE_CLIENT_ACCESS: u32 = FILE_READ_DATA
+        | FILE_WRITE_DATA
+        | FILE_READ_EA
+        | FILE_WRITE_EA
+        | FILE_READ_ATTRIBUTES
+        | FILE_WRITE_ATTRIBUTES
+        | READ_CONTROL
+        | SYNCHRONIZE;
+    const _: () = assert!(PIPE_CLIENT_ACCESS & FILE_CREATE_PIPE_INSTANCE == 0);
 
     /// Create a named-pipe server instance with an explicit security descriptor
     /// so local authenticated users can connect to the gate. A pipe's security
@@ -1703,14 +1876,16 @@ pub(crate) mod winplat {
         // Authenticated User, so without this it can create the first instance
         // but is denied the second (the AU ACE below excludes create-instance).
         // Administrators/SYSTEM also get full control. Authenticated Users get
-        // only FILE_GENERIC_READ|FILE_GENERIC_WRITE (0x0012019b) so they can
-        // CONNECT but NOT stand up rogue instances.
+        // the ordinary client read/write rights assembled in
+        // PIPE_CLIENT_ACCESS. FILE_CREATE_PIPE_INSTANCE is deliberately absent,
+        // so a client cannot stand up a competing server instance.
         let owner_sid =
             unsafe { process_user_sid() }.context("resolve daemon SID for pipe DACL")?;
-        let sddl: Vec<u16> =
-            format!("D:(A;;GA;;;{owner_sid})(A;;GA;;;BA)(A;;GA;;;SY)(A;;0x0012019b;;;AU)\0")
-                .encode_utf16()
-                .collect();
+        let sddl: Vec<u16> = format!(
+            "D:(A;;GA;;;{owner_sid})(A;;GA;;;BA)(A;;GA;;;SY)(A;;0x{PIPE_CLIENT_ACCESS:08x};;;AU)\0"
+        )
+        .encode_utf16()
+        .collect();
         unsafe {
             let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             if ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -2038,10 +2213,10 @@ where
         let request = match incoming {
             IncomingMessage::Admin { admin, admin_token } => {
                 // Admin authority is the admin bearer token, never the Unix
-                // peer uid or Windows service SID: brokered children inherit
-                // the daemon identity and must not inherit its operator
-                // surface. Kernel-authenticated Windows SYSTEM is the one
-                // local exception used by the packaged operator task. Ping
+                // peer uid or Windows service SID. This boundary is
+                // independent of child-process identity. Kernel-authenticated
+                // Windows SYSTEM is the one local exception used by the
+                // packaged operator task. Ping
                 // stays open for health probes, matching the TCP listener.
                 let caller = if matches!(admin.as_ref(), AdminRequest::Ping) {
                     caller.clone()
@@ -2594,6 +2769,20 @@ pub(super) async fn write_policy_decision<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod line_limit_tests {
     use super::*;
+
+    #[test]
+    fn local_listener_runtime_directory_precedes_private_state_for_secret_files() {
+        let config = ServerConfig {
+            socket_path: Some(PathBuf::from("/run/guard/guard.sock")),
+            state_db_path: Some(PathBuf::from("/var/lib/guard/state.db")),
+            ..ServerConfig::default()
+        };
+
+        assert_eq!(
+            default_secret_file_root(&config),
+            PathBuf::from("/run/guard/secret-files")
+        );
+    }
     use std::time::Duration;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2957,8 +3146,8 @@ mod line_limit_tests {
 
     /// Regression: the daemon's own uid must NOT grant operator authority.
     /// Admin-gated operations require the admin bearer token at the unix
-    /// transport, so a brokered child running as the daemon uid cannot
-    /// approve or inspect operator state.
+    /// transport. Daemon identity alone cannot approve or inspect operator
+    /// state, independent of the distinct child-identity boundary.
     async fn one_admin_roundtrip(
         caller: CallerIdentity,
         admin_token_config: Option<&str>,
@@ -2990,11 +3179,16 @@ mod line_limit_tests {
         response
     }
 
+    fn generated_admin_token() -> String {
+        format!("{:032x}", rand::random::<u128>())
+    }
+
     #[tokio::test]
     async fn unix_admin_gated_op_refused_without_token_even_as_daemon_uid() {
+        let configured = generated_admin_token();
         let response = one_admin_roundtrip(
             CallerIdentity::Unix { uid: 1000 },
-            Some("operator-token"),
+            Some(&configured),
             false,
             r#"{"admin":{"op":"audit_verify"}}"#,
         )
@@ -3007,11 +3201,18 @@ mod line_limit_tests {
 
     #[tokio::test]
     async fn unix_admin_gated_op_refused_with_wrong_token() {
+        let configured = generated_admin_token();
+        let supplied = generated_admin_token();
+        let request = serde_json::json!({
+            "admin": {"op": "audit_verify"},
+            "admin_token": supplied,
+        })
+        .to_string();
         let response = one_admin_roundtrip(
             CallerIdentity::Unix { uid: 1000 },
-            Some("operator-token"),
+            Some(&configured),
             false,
-            r#"{"admin":{"op":"audit_verify"},"admin_token":"wrong"}"#,
+            &request,
         )
         .await;
         assert!(
@@ -3022,13 +3223,14 @@ mod line_limit_tests {
 
     #[tokio::test]
     async fn unix_admin_gated_op_refused_when_token_unconfigured() {
-        let response = one_admin_roundtrip(
-            CallerIdentity::Unix { uid: 1000 },
-            None,
-            false,
-            r#"{"admin":{"op":"audit_verify"},"admin_token":"anything"}"#,
-        )
-        .await;
+        let supplied = generated_admin_token();
+        let request = serde_json::json!({
+            "admin": {"op": "audit_verify"},
+            "admin_token": supplied,
+        })
+        .to_string();
+        let response =
+            one_admin_roundtrip(CallerIdentity::Unix { uid: 1000 }, None, false, &request).await;
         assert!(
             response.contains("admin RPC refused"),
             "gated op must be refused when no admin token is configured: {response}"
@@ -3051,14 +3253,36 @@ mod line_limit_tests {
     }
 
     #[tokio::test]
+    async fn status_reaches_its_transport_aware_operator_check_without_a_bearer() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Unix { uid: 4242 },
+            None,
+            false,
+            r#"{"admin":{"op":"status"}}"#,
+        )
+        .await;
+        let parsed: AdminResponse = serde_json::from_str(&response).expect("admin response");
+        assert!(
+            matches!(parsed, AdminResponse::Error { ref message } if message.contains("operator authority")),
+            "status must use the handler's transport-aware authority check: {parsed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn unix_admin_exempt_op_with_valid_token_gets_operator_identity() {
         // An exempt op with a valid bearer must not be refused; without it,
         // the operator's see-all view is silently lost.
+        let configured = generated_admin_token();
+        let request = serde_json::json!({
+            "admin": {"op": "access_list"},
+            "admin_token": configured.as_str(),
+        })
+        .to_string();
         let response = one_admin_roundtrip(
             CallerIdentity::Unix { uid: 1000 },
-            Some("operator-token"),
+            Some(&configured),
             false,
-            r#"{"admin":{"op":"access_list"},"admin_token":"operator-token"}"#,
+            &request,
         )
         .await;
         assert!(
@@ -3069,11 +3293,18 @@ mod line_limit_tests {
 
     #[tokio::test]
     async fn unix_admin_exempt_op_with_wrong_token_is_refused() {
+        let configured = generated_admin_token();
+        let supplied = generated_admin_token();
+        let request = serde_json::json!({
+            "admin": {"op": "access_list"},
+            "admin_token": supplied,
+        })
+        .to_string();
         let response = one_admin_roundtrip(
             CallerIdentity::Unix { uid: 1000 },
-            Some("operator-token"),
+            Some(&configured),
             false,
-            r#"{"admin":{"op":"access_list"},"admin_token":"wrong"}"#,
+            &request,
         )
         .await;
         assert!(
@@ -3158,13 +3389,20 @@ mod line_limit_tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_system_operator_with_an_invalid_bearer_is_refused() {
+        let configured = generated_admin_token();
+        let supplied = generated_admin_token();
+        let request = serde_json::json!({
+            "admin": {"op": "status"},
+            "admin_token": supplied,
+        })
+        .to_string();
         let response = one_admin_roundtrip(
             CallerIdentity::Windows {
                 sid: "S-1-5-18".to_string(),
             },
-            Some("operator-token"),
+            Some(&configured),
             true,
-            r#"{"admin":{"op":"status"},"admin_token":"wrong"}"#,
+            &request,
         )
         .await;
         let parsed: AdminResponse = serde_json::from_str(&response).expect("admin response");

@@ -15,6 +15,24 @@ FAILURE="$PRINCIPAL_ROOT/failure.txt"
 COLLECTOR_ROOT=/scenario/collector
 COLLECTOR_RESULTS="$COLLECTOR_ROOT/results"
 COLLECTOR_PHASES="$COLLECTOR_ROOT/phases"
+FIXTURE_API_TOKEN_FILE=/scenario/fixtures/api-token
+UPSTREAM_KUBECONFIG=/scenario/fixtures/upstream.kubeconfig
+BROKERED_KUBECONFIG=/scenario/run/brokered.kubeconfig
+KUBE_PROXY=127.0.0.1:18443
+
+generate_fixture_value() {
+  od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+write_generated_fixture_value() {
+  local destination="$1"
+  generate_fixture_value > "$destination"
+  printf '\n' >> "$destination"
+}
+
+add_fixture_api_token() {
+  guard secrets add fixture/api-token < "$FIXTURE_API_TOKEN_FILE"
+}
 
 setup_fixture() {
   mkdir -p /scenario/home /scenario/config/guard /scenario/data \
@@ -31,35 +49,76 @@ setup_fixture() {
   chmod 0711 /scenario
   chmod 1777 /scenario/raw
   chmod 0777 /scenario/fixtures /scenario/fixtures/staging /scenario/ansible
+  chgrp guard-clients /scenario/run
+  chmod 0755 /scenario/run
   printf 'synthetic operator note\n' > /scenario/fixtures/operator-note
-  printf 'apiVersion: v1\nkind: Config\nsynthetic: true\n' > /scenario/fixtures/daemon.kubeconfig
+  cat > "$UPSTREAM_KUBECONFIG" <<'EOF'
+apiVersion: v1
+kind: Config
+clusters:
+  - name: fixture
+    cluster:
+      server: https://127.0.0.1:19443
+contexts:
+  - name: fixture
+    context:
+      cluster: fixture
+      user: fixture
+current-context: fixture
+users:
+  - name: fixture
+    user: {}
+EOF
   printf '[fixture]\nlocalhost\n' > /scenario/ansible/inventory
   printf '[defaults]\ninventory = inventory\n' > /scenario/ansible/ansible.cfg
   printf '%s\n' '---' '- hosts: fixture' '  gather_facts: false' '  tasks: []' > /scenario/ansible/site.yml
+  if [ ! -s "$FIXTURE_API_TOKEN_FILE" ]; then
+    write_generated_fixture_value "$FIXTURE_API_TOKEN_FILE"
+  fi
   cat > /scenario/config/guard/tools.yaml <<'EOF'
 tools:
-  fixture-api:
+  whoami:
     secrets:
       FIXTURE_API_TOKEN: fixture/api-token
 EOF
-  cat > /scenario/bin/ssh <<'EOF'
-#!/bin/sh
-[ -n "${GUARD_DEPTH:-}" ] || exit 41
-[ -z "${SSH_AUTH_SOCK:-}" ] || exit 42
-printf 'fixture-service:active\n'
-EOF
-  cat > /scenario/bin/cloudstack <<'EOF'
-#!/bin/sh
-printf '{"virtualmachine":[{"id":"fixture-vm","state":"Running"}]}\n'
-EOF
   cat > /scenario/bin/kubectl <<'EOF'
 #!/bin/sh
-[ "${KUBECONFIG:-}" = /scenario/fixtures/daemon.kubeconfig ] || exit 43
-printf 'fixture-pod Running\n'
+case "${KUBECONFIG:-}" in
+  /scenario/run/brokered.kubeconfig|/scenario/private-install/run/brokered.kubeconfig) ;;
+  *) exit 43 ;;
+esac
+[ -r "$KUBECONFIG" ] || exit 44
+grep -q 'guard-proxy' "$KUBECONFIG" || exit 45
+case "$*" in
+  "scale deployment/revert-target --replicas=2 -n fixture")
+    : > /scenario/fixtures/revert-target
+    ;;
+  "scale deployment/workload-maintenance --replicas=2 -n fixture")
+    : > /scenario/fixtures/maintenance-applied
+    ;;
+  "scale deployment/workload-maintenance --replicas=1 -n fixture")
+    unlink /scenario/fixtures/maintenance-applied
+    ;;
+  "scale deployment/access-maintenance --replicas=2 -n access-fixture")
+    : > /scenario/fixtures/access-maintenance-applied
+    ;;
+  "scale deployment/access-maintenance --replicas=1 -n access-fixture")
+    unlink /scenario/fixtures/access-maintenance-applied
+    ;;
+  "delete namespace access-staging")
+    rmdir /scenario/fixtures/staging
+    ;;
+  "get pods --namespace fixture"|"get pods --namespace access-fixture")
+    printf 'fixture-pod Running\n'
+    ;;
+  *)
+    printf 'unexpected kubectl fixture command: %s\n' "$*" >&2
+    exit 51
+    ;;
+esac
 EOF
   cat > /scenario/bin/helm <<'EOF'
 #!/bin/sh
-[ "${KUBECONFIG:-}" = /scenario/fixtures/daemon.kubeconfig ] || exit 44
 printf 'fixture-release deployed\n'
 EOF
   cat > /scenario/bin/ansible-playbook <<'EOF'
@@ -68,16 +127,19 @@ EOF
 [ -z "${ANSIBLE_CONFIG:-}" ] || exit 46
 printf 'fixture ok changed=0\n'
 EOF
-  cat > /scenario/bin/hostctl <<'EOF'
+cat > /scenario/bin/whoami <<'EOF'
 #!/bin/sh
-[ "$1" = apply ] || exit 47
-touch "$2"
-printf 'maintenance applied\n'
-EOF
-  cat > /scenario/bin/fixture-api <<'EOF'
-#!/bin/sh
-[ "$1" = status ] || [ "$1" = access-status ] || exit 48
-[ "${FIXTURE_API_TOKEN:-}" = synthetic-fixture-token ] || exit 49
+if [ "$#" -eq 1 ] && [ "$1" = child-contract ]; then
+  cap_eff="$(awk '/^CapEff:/ { print $2 }' "/proc/$$/status")"
+  case "$cap_eff" in
+    ''|*[1-9a-fA-F]*) exit 52 ;;
+  esac
+  printf 'uid=%s\ncap_eff=%s\n' "$(id -u)" "$cap_eff"
+  exit 0
+fi
+[ "$1" = api-status ] || [ "$1" = access-status ] || exit 48
+[ -r /scenario/fixtures/api-token ] || exit 49
+[ "${FIXTURE_API_TOKEN:-}" = "$(cat /scenario/fixtures/api-token)" ] || exit 49
 printf 'fixture-api:healthy\n'
 EOF
   cat > /scenario/bin/novelctl <<'EOF'
@@ -125,11 +187,24 @@ daemon() {
   export XDG_CONFIG_HOME=/scenario/config
   export XDG_DATA_HOME=/scenario/data
   export PATH=/scenario/bin:/usr/local/bin:/usr/bin:/bin
-  export KUBECONFIG=/scenario/fixtures/daemon.kubeconfig
   local evaluator_args=(--no-llm)
+  local identity_args=(--exec-user guardexec)
+  local profile_args=(
+    --child-env KUBECONFIG
+    --kube-proxy "$KUBE_PROXY"
+    --kubeconfig "$UPSTREAM_KUBECONFIG"
+    --brokered-kubeconfig-out "$BROKERED_KUBECONFIG"
+  )
+  export KUBECONFIG="$BROKERED_KUBECONFIG"
+  if [ "$SCENARIO" = SU-12-api ] || [ "$SCENARIO" = SU-12-ansible ]; then
+    identity_args=(--exec-as-caller)
+    profile_args=()
+    unset KUBECONFIG
+  fi
   if [ "$SCENARIO" = SU-13 ]; then
     guard-fake-llm >>/scenario/raw/fake-llm.log 2>&1 &
-    export GUARD_LLM_API_KEY=fake-container-credential
+    GUARD_LLM_API_KEY="$(generate_fixture_value)"
+    export GUARD_LLM_API_KEY
     evaluator_args=(
       --llm
       --llm-api-url http://127.0.0.1:38473
@@ -137,15 +212,22 @@ daemon() {
       --llm-retries 0
     )
   fi
-  exec guard server start \
+  exec setpriv \
+    --bounding-set=-all,+setgid,+setuid \
+    --inh-caps=+setgid,+setuid \
+    --ambient-caps=+setgid,+setuid \
+    --no-new-privs \
+    guard server start \
     "${evaluator_args[@]}" \
     --gate consequence \
     --socket "$SOCKET" \
+    --socket-group guard-clients \
     --verbs "$PROTECTED_CATALOG" \
     --state-db /scenario/data/state.db \
     --audit-log /scenario/data/audit.jsonl \
     --history-retention 3600 \
-    --child-env KUBECONFIG \
+    "${identity_args[@]}" \
+    "${profile_args[@]}" \
     --users 1001,1002 \
     --admin-token-stdin \
     </scenario/run/admin.token >>/scenario/raw/daemon.log 2>&1
@@ -174,7 +256,9 @@ safe_error_line() {
 run_test_filter() {
   local filter="$1" matched=0 binary listing output
   for binary in /src/target/release/deps/*; do
-    [ -f "$binary" ] && [ -x "$binary" ] || continue
+    if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+      continue
+    fi
     case "$binary" in
       *.so) continue ;;
     esac
@@ -245,7 +329,7 @@ run_contracts() {
       local live_output
       run_test_filter legacy_and_incomplete_envelopes_get_direct_upgrade_errors
       run_test_filter local_contract_requires_supported_version_feature_and_cwd
-      if ! live_output="$(guard verb run ssh-diagnose --socket "$SOCKET" 2>&1)"; then
+      if ! live_output="$(guard verb run service-status --socket "$SOCKET" 2>&1)"; then
         printf '%s\n' "$live_output" >> "$RAW"
         printf 'current versioned client failed against the isolated daemon: %s\n' \
           "$(printf '%s\n' "$live_output" | safe_error_line)" > "$FAILURE"
@@ -299,7 +383,7 @@ capture_mcp_denial() {
   set +e
   output="$({
     printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"synthetic-user","version":"1"}}}'
-    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"guard_run","arguments":{"binary":"hostctl","args":["apply","/scenario/fixtures/access-maintenance-applied"]}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"guard_run","arguments":{"binary":"kubectl","args":["scale","deployment/access-maintenance","--replicas=2","-n","access-fixture"]}}}'
   } | guard mcp serve --socket "$SOCKET" 2>&1)"
   status=$?
   set -e
@@ -427,6 +511,8 @@ PY
 
 PRIVATE_ROOT=/scenario/private-install
 PRIVATE_SOCKET="$PRIVATE_ROOT/run/guard.sock"
+PRIVATE_BROKERED_KUBECONFIG="$PRIVATE_ROOT/run/brokered.kubeconfig"
+PRIVATE_KUBE_PROXY=127.0.0.1:18444
 
 private_daemon_start() {
   local binary="$1" log_name="$2" pid ready=false
@@ -437,16 +523,26 @@ private_daemon_start() {
     XDG_CONFIG_HOME="$PRIVATE_ROOT/config" \
     XDG_DATA_HOME="$PRIVATE_ROOT/data" \
     PATH="/scenario/bin:/usr/local/bin:/usr/bin:/bin" \
-    KUBECONFIG=/scenario/fixtures/daemon.kubeconfig \
-    nohup "$binary" server start \
+    KUBECONFIG="$PRIVATE_BROKERED_KUBECONFIG" \
+    nohup setpriv \
+      --bounding-set=-all,+setgid,+setuid \
+      --inh-caps=+setgid,+setuid \
+      --ambient-caps=+setgid,+setuid \
+      --no-new-privs \
+      "$binary" server start \
       --no-llm \
       --gate consequence \
       --socket "$PRIVATE_SOCKET" \
+      --socket-group guard-clients \
       --verbs "$PROTECTED_CATALOG" \
       --state-db "$PRIVATE_ROOT/data/state.db" \
       --audit-log "$PRIVATE_ROOT/data/audit.jsonl" \
       --history-retention 3600 \
+      --exec-user guardexec \
       --child-env KUBECONFIG \
+      --kube-proxy "$PRIVATE_KUBE_PROXY" \
+      --kubeconfig "$UPSTREAM_KUBECONFIG" \
+      --brokered-kubeconfig-out "$PRIVATE_BROKERED_KUBECONFIG" \
       --users 1001,1002 \
       --admin-token-stdin \
       > "$PRIVATE_ROOT/log/$log_name.log" 2>&1 < /scenario/run/admin.token &
@@ -460,8 +556,8 @@ private_daemon_start() {
     sleep 0.1
   done
   [ "$ready" = true ]
-  chmod 0711 "$PRIVATE_ROOT/run"
-  chmod 0666 "$PRIVATE_SOCKET"
+  [ "$(stat -c '%a:%G' "$PRIVATE_SOCKET")" = 660:guard-clients ]
+  [ "$(awk '/^CapEff:/ { value = tolower($2); sub(/^0+/, "", value); print value == "" ? "0" : value }' "/proc/$pid/status")" = c0 ]
 }
 
 private_daemon_stop() {
@@ -586,9 +682,9 @@ phase_su14() {
   case "$phase" in
     request)
       [ "$(id -u)" -eq 1001 ]
-      save_request owner 'Inspect the fake SSH service'
+      save_request owner 'Inspect the fake service'
       handle="$(read_handle owner)"
-      capture_phase owner-retry guard access request '  Inspect   the fake SSH service  ' --json
+      capture_phase owner-retry guard access request '  Inspect   the fake service  ' --json
       retry="$(request_reference /scenario/journey/owner-retry.out)"
       [ "$retry" = "$handle" ]
       ;;
@@ -632,20 +728,20 @@ PY
       [ "$replay_handle" != "$handle" ]
       ! grep -q 'fixture-release' /scenario/journey/replay-bearer.out
       unset GUARD_SESSION
-      save_request other 'Inspect the fake SSH service'
+      save_request other 'Inspect the fake service'
       other="$(read_handle other)"
       [ "$other" != "$handle" ]
       ;;
     consume)
       [ "$(id -u)" -eq 1001 ]
-      capture_phase owner-consume guard run --json ssh access-fixture-host systemctl is-active fixture-service
+      capture_phase owner-consume guard run --json printf 'fixture-service:active\n'
       grep -q 'fixture-service:active' /scenario/journey/owner-consume.out
-      expect_failure owner-exhausted guard run --json ssh access-fixture-host systemctl is-active fixture-service
+      expect_failure owner-exhausted guard run --json printf 'fixture-service:active\n'
       grep -q 'use limit is exhausted' /scenario/journey/owner-exhausted.out
       ;;
     after-restart)
       [ "$(id -u)" -eq 1001 ]
-      expect_failure owner-restart-exhausted guard run --json ssh access-fixture-host systemctl is-active fixture-service
+      expect_failure owner-restart-exhausted guard run --json printf 'fixture-service:active\n'
       grep -q 'use limit is exhausted' /scenario/journey/owner-restart-exhausted.out
       ;;
     verify)
@@ -666,7 +762,7 @@ phase_su15() {
   case "$phase" in
     deny)
       [ "$(id -u)" -eq 1001 ]
-      expect_failure maintenance-denied guard run --json hostctl apply /scenario/fixtures/access-maintenance-applied
+      expect_failure maintenance-denied guard run --json kubectl scale deployment/access-maintenance --replicas=2 -n access-fixture
       denied_handle="$(response_handle /scenario/journey/maintenance-denied.out)"
       [ -n "$denied_handle" ]
       printf '%s\n' "$denied_handle" > /scenario/journey/maintenance.handle
@@ -676,7 +772,7 @@ phase_su15() {
       grep -Fq "ask your admin to approve request $denied_handle" /scenario/journey/maintenance-mcp.out
       ! grep -Fq "guard access approve $denied_handle" /scenario/journey/maintenance-mcp.out
       grep -Fq "guard access show $denied_handle" /scenario/journey/maintenance-mcp.out
-      expect_failure maintenance-retry guard run --json hostctl apply /scenario/fixtures/access-maintenance-applied
+      expect_failure maintenance-retry guard run --json kubectl scale deployment/access-maintenance --replicas=2 -n access-fixture
       retry_handle="$(response_handle /scenario/journey/maintenance-retry.out)"
       [ "$retry_handle" = "$denied_handle" ]
       save_request delete 'Delete the fake staging tree'
@@ -690,15 +786,15 @@ phase_su15() {
       ;;
     hold)
       [ "$(id -u)" -eq 1001 ]
-      capture_phase maintenance-provisional guard run --json hostctl apply /scenario/fixtures/access-maintenance-applied
+      capture_phase maintenance-provisional guard run --json kubectl scale deployment/access-maintenance --replicas=2 -n access-fixture
       grep -q '"status": "provisional"' /scenario/journey/maintenance-provisional.out
-      expect_failure delete-held guard run --json rm -rf /scenario/fixtures/staging
+      expect_failure delete-held guard run --json kubectl delete namespace access-staging
       grep -q '"status": "held"' /scenario/journey/delete-held.out
       hold="$(response_handle /scenario/journey/delete-held.out)"
       [ -n "$hold" ]
       printf '%s\n' "$hold" > /scenario/journey/hold.handle
       require_hold_guidance /scenario/journey/delete-held.out "$hold"
-      expect_failure denied-held guard run --json rm -rf /work/staging-denied
+      expect_failure denied-held guard run --json kubectl delete namespace denied-staging
       grep -q '"status": "held"' /scenario/journey/denied-held.out
       denied_hold="$(response_handle /scenario/journey/denied-held.out)"
       [ -n "$denied_hold" ]
@@ -727,7 +823,7 @@ phase_su15() {
       [ "$(id -u)" -eq 1000 ]
       hold="$(read_handle hold)"
       approved_snapshot_count="$(awk -v handle="$hold" \
-        'index($0, "\"kind\":\"APPROVED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "\"cmd\":\"rm -rf /scenario/fixtures/staging\"") { count++ } END { print count + 0 }' \
+        'index($0, "\"kind\":\"APPROVED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "\"cmd\":\"kubectl delete namespace access-staging\"") { count++ } END { print count + 0 }' \
         /scenario/data/audit.jsonl)"
       [ "$approved_snapshot_count" -eq 1 ]
       approved_claim_count="$(awk -v handle="$hold" \
@@ -769,15 +865,15 @@ phase_su16() {
   case "$phase" in
     request-primary)
       [ "$(id -u)" -eq 1001 ]
-      save_request ssh 'Inspect the fake SSH service'
+      save_request ssh 'Inspect the fake service'
       save_request kube 'Inspect the fake Kubernetes pods'
-      save_request missing 'Run the missing fake command'
+      save_request missing 'Run the failing fake command'
       save_request command 'Run the fake bounded command'
       save_request cloud 'Inspect the fake CloudStack virtual machines'
       save_request file 'Read the fake operator file'
       save_request ansible 'Check the fake Ansible project'
       save_request api 'Query the fake credential-backed API'
-      printf '%s' synthetic-fixture-token | guard secrets add fixture/api-token >> "$RAW" 2>&1
+      add_fixture_api_token >> "$RAW" 2>&1
       ;;
     request-secondary)
       [ "$(id -u)" -eq 1002 ]
@@ -790,26 +886,26 @@ phase_su16() {
       ;;
     reject-primary-cross-scope)
       [ "$(id -u)" -eq 1001 ]
-      capture_phase ssh-before-other-approvals guard run --json ssh access-fixture-host systemctl is-active fixture-service
-      grep -q 'fixture-service:active' /scenario/journey/ssh-before-other-approvals.out
+      capture_phase service-before-other-approvals guard run --json printf 'fixture-service:active\n'
+      grep -q 'fixture-service:active' /scenario/journey/service-before-other-approvals.out
       expect_failure cross-kube guard run --json kubectl get pods --namespace access-fixture
       [ "$(response_handle /scenario/journey/cross-kube.out)" = "$(read_handle kube)" ]
       expect_failure cross-command guard run --json printf 'bounded-command-complete\n'
       [ "$(response_handle /scenario/journey/cross-command.out)" = "$(read_handle command)" ]
-      expect_failure cross-cloud guard run --json cloudstack list virtualmachines zoneid=access-fixture-zone
+      expect_failure cross-cloud guard run --json printf 'fixture-vm Running\n'
       [ "$(response_handle /scenario/journey/cross-cloud.out)" = "$(read_handle cloud)" ]
       expect_failure cross-file guard run --json cat /scenario/fixtures/operator-note
       [ "$(response_handle /scenario/journey/cross-file.out)" = "$(read_handle file)" ]
       (cd /scenario/ansible && expect_failure cross-ansible guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
       [ "$(response_handle /scenario/journey/cross-ansible.out)" = "$(read_handle ansible)" ]
-      expect_failure cross-api guard run --json fixture-api access-status
+      expect_failure cross-api guard run --json whoami access-status
       [ "$(response_handle /scenario/journey/cross-api.out)" = "$(read_handle api)" ]
       assert_denied_without_execution /scenario/journey/cross-*.out
       ;;
     reject-secondary-cross-scope)
       [ "$(id -u)" -eq 1002 ]
-      expect_failure secondary-cross-ssh guard run --json ssh access-fixture-host systemctl is-active fixture-service
-      ! grep -q 'fixture-service:active' /scenario/journey/secondary-cross-ssh.out
+      expect_failure secondary-cross-service guard run --json printf 'fixture-service:active\n'
+      ! grep -q 'fixture-service:active' /scenario/journey/secondary-cross-service.out
       expect_failure secondary-helm-before-approval guard run --json helm list --namespace access-fixture
       [ "$(response_handle /scenario/journey/secondary-helm-before-approval.out)" = "$(read_handle helm)" ]
       ;;
@@ -824,7 +920,7 @@ phase_su16() {
       api_request="$(read_handle api)"
       helm_request="$(read_handle helm)"
       capture_phase approve-once guard access approve "$kube_request" --once --json
-      capture_phase approve-spawn-failure guard access approve "$missing_request" --once --json
+      capture_phase approve-failed-exit guard access approve "$missing_request" --once --json
       capture_phase approve-n-use guard access approve "$command_request" --uses 2 --json
       expect_failure approve-multiple-partial guard access approve "$cloud_request" "$file_request" missing-request --json
       [ "$(grep -c '"success": true' /scenario/journey/approve-multiple-partial.out)" -eq 2 ]
@@ -835,8 +931,11 @@ phase_su16() {
       ;;
     consume-secondary)
       [ "$(id -u)" -eq 1002 ]
-      capture_phase helm-first guard run --json helm list --namespace access-fixture
-      capture_phase helm-second guard run --json helm list --namespace access-fixture
+      expect_failure helm-first guard run --json helm list --namespace access-fixture
+      grep -Eq 'fixed-identity|shared child UID' /scenario/journey/helm-first.out
+      ! grep -q 'fixture-release' /scenario/journey/helm-first.out
+      expect_failure helm-second guard run --json helm list --namespace access-fixture
+      grep -Eq 'fixed-identity|shared child UID' /scenario/journey/helm-second.out
       ;;
     race-and-fail)
       [ "$(id -u)" -eq 1001 ]
@@ -850,34 +949,36 @@ phase_su16() {
       set -e
       printf 'phase=race uid=%s exits=%s,%s\n' "$(id -u)" "$first_status" "$second_status" >> "$RAW"
       [ "$(( (first_status == 0) + (second_status == 0) ))" -eq 1 ]
-      expect_failure missing-first guard run --json guard-missing-fixture-binary
-      grep -q 'execution error' /scenario/journey/missing-first.out
-      expect_failure missing-second guard run --json guard-missing-fixture-binary
+      expect_failure missing-first guard run --json false
+      grep -Eq '"exit_code":[[:space:]]*1' /scenario/journey/missing-first.out
+      expect_failure missing-second guard run --json false
       grep -q 'use limit is exhausted' /scenario/journey/missing-second.out
       capture_phase command-first guard run --json printf 'bounded-command-complete\n'
       grep -q 'bounded-command-complete' /scenario/journey/command-first.out
-      capture_phase ssh-first guard run --json ssh access-fixture-host systemctl is-active fixture-service
-      capture_phase ssh-second guard run --json ssh access-fixture-host systemctl is-active fixture-service
+      capture_phase service-first guard run --json printf 'fixture-service:active\n'
+      capture_phase service-second guard run --json printf 'fixture-service:active\n'
       ;;
     after-restart)
       [ "$(id -u)" -eq 1001 ]
       capture_phase command-second guard run --json printf 'bounded-command-complete\n'
       expect_failure command-third guard run --json printf 'bounded-command-complete\n'
       grep -q 'use limit is exhausted' /scenario/journey/command-third.out
-      capture_phase cloud-use guard run --json cloudstack list virtualmachines zoneid=access-fixture-zone
+      capture_phase cloud-use guard run --json printf 'fixture-vm Running\n'
       capture_phase file-use guard run --json cat /scenario/fixtures/operator-note
-      (cd /scenario/ansible && capture_phase ansible-use guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
-      printf '%s' synthetic-fixture-token | guard secrets add fixture/api-token >> "$RAW" 2>&1
-      capture_phase api-use guard run --json fixture-api access-status
+      (cd /scenario/ansible && expect_failure ansible-use guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
+      grep -Eq 'fixed-identity|shared child UID' /scenario/journey/ansible-use.out
+      ! grep -q 'changed=0' /scenario/journey/ansible-use.out
+      add_fixture_api_token >> "$RAW" 2>&1
+      capture_phase api-use guard run --json whoami access-status
       grep -q 'fixture-api:healthy' /scenario/journey/api-use.out
-      ! grep -q 'synthetic-fixture-token' /scenario/journey/api-use.out
+      ! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" /scenario/journey/api-use.out
       ;;
     verify)
       [ "$(id -u)" -eq 1000 ]
       capture_phase batch-final-list guard access list --json
       run_test_filter access_request_is_principal_bound_coalesced_batched_and_bounded
       record_result passed 'intended policy' \
-        'ordinary, one-time, N-use, multi-request, replay, cross-system denial, last-use race, failed spawn, restart, and partial-failure paths preserved independent authority'
+        'ordinary, one-time, N-use, multi-request, replay, cross-system denial, last-use race, failed execution, restart, partial-failure, and post-approval profile-boundary paths preserved independent authority'
       ;;
     *) return 2 ;;
   esac
@@ -888,7 +989,7 @@ phase_su17() {
   case "$phase" in
     request)
       [ "$(id -u)" -eq 1001 ]
-      save_request initial 'Inspect the fake SSH service'
+      save_request initial 'Inspect the fake service'
       ;;
     approve-and-extend)
       [ "$(id -u)" -eq 1000 ]
@@ -910,21 +1011,21 @@ phase_su17() {
       capture_phase extension-consume guard run --json kubectl get pods --namespace access-fixture
       expect_failure extension-exhausted guard run --json kubectl get pods --namespace access-fixture
       grep -q 'use limit is exhausted' /scenario/journey/extension-exhausted.out
-      capture_phase original-still-active guard run --json ssh access-fixture-host systemctl is-active fixture-service
+      capture_phase original-still-active guard run --json printf 'fixture-service:active\n'
       ;;
     retry-extension)
       [ "$(id -u)" -eq 1000 ]
       session="$(sed -n '1p' /scenario/journey/extend.session)"
       capture_phase extend-after-use guard access extend "$session" 'Inspect the fake Kubernetes pods' --once --json
       grep -q '"remaining_uses": 0' /scenario/journey/extend-after-use.out
-      capture_phase extend-maintenance guard access extend "$session" 'Apply the fake host maintenance operation' --json
+      capture_phase extend-maintenance guard access extend "$session" 'Apply the fake workload maintenance operation' --json
       extension="$(sed -nE 's/.*"request": "(gr-[^"]+)".*/\1/p' /scenario/journey/extend-maintenance.out | head -n 1)"
       [ -n "$extension" ]
       printf '%s\n' "$extension" > /scenario/journey/maintenance-extension.handle
       ;;
     consume-maintenance)
       [ "$(id -u)" -eq 1001 ]
-      capture_phase maintenance-contained guard run --json --confirm-within 1 hostctl apply /scenario/fixtures/access-maintenance-applied
+      capture_phase maintenance-contained guard run --json --confirm-within 1 kubectl scale deployment/access-maintenance --replicas=2 -n access-fixture
       grep -q '"status": "provisional"' /scenario/journey/maintenance-contained.out
       [ -f /scenario/fixtures/access-maintenance-applied ]
       sleep 5
@@ -936,7 +1037,7 @@ phase_su17() {
       [ "$(grep -c '"kind": "session"' /scenario/journey/extension-final-list.out)" -eq 1 ]
       extension="$(read_handle maintenance-extension)"
       capture_phase maintenance-extension-show guard access show "$extension" --json
-      grep -q '"verb": "access-host-maintenance"' /scenario/journey/maintenance-extension-show.out
+      grep -q '"verb": "access-workload-maintenance"' /scenario/journey/maintenance-extension-show.out
       grep -q '"has_revert": true' /scenario/journey/maintenance-extension-show.out
       run_test_filter access_request_is_principal_bound_coalesced_batched_and_bounded
       record_result passed 'intended policy' \
@@ -1340,6 +1441,7 @@ phase_su22() {
           --verbs "$PROTECTED_CATALOG" \
           --state-db "$PRIVATE_ROOT/data/state.db" \
           --audit-log "$PRIVATE_ROOT/data/audit.jsonl" \
+          --exec-user guardexec \
           --users 1001,1002 \
           > "$PRIVATE_ROOT/log/failed-upgrade.log" 2>&1
       candidate_status=$?
@@ -1435,25 +1537,60 @@ run_journey() {
   grep -q "$expected" "$RAW"
 }
 
+assert_child_capability_contract() {
+  local expected_uid="$1" output
+  output="$(guard verb run child-capability-contract --socket "$SOCKET" 2>&1)"
+  printf '%s\n' "$output" >> "$RAW"
+  printf '%s\n' "$output" | grep -qx "uid=$expected_uid"
+  printf '%s\n' "$output" | grep -Eq '^cap_eff=0+$'
+}
+
+expect_profile_tool_denial() {
+  local mode="$1" verb="$2" cwd="${3:-/scenario/fixtures}" output
+  output="/scenario/raw/$SCENARIO-$mode-$verb.out"
+  if (cd "$cwd" && guard verb run "$verb" --socket "$SOCKET") >"$output" 2>&1; then
+    printf 'typed profile tool unexpectedly executed: mode=%s verb=%s\n' "$mode" "$verb" > "$FAILURE"
+    return 1
+  fi
+  cat "$output" >> "$RAW"
+  case "$mode" in
+    fixed) grep -Eq 'fixed-identity|shared child UID' "$output" ;;
+    caller) grep -Eq 'exec-as-caller|caller profile|immutable profile|unavailable' "$output" ;;
+    *) return 2 ;;
+  esac
+  ! grep -Eq 'fixture-release|changed=0|fixture-pod' "$output"
+}
+
 run_su12() {
   case "$SCENARIO" in
-    SU-12-ssh) run_journey ssh-diagnose fixture-service:active ;;
+    SU-12-service) run_journey service-status fixture-service:active ;;
     SU-12-cloudstack) run_journey cloudstack-inventory fixture-vm ;;
-    SU-12-kubernetes) run_journey kubernetes-list fixture-pod ;;
-    SU-12-helm) run_journey helm-list-direct fixture-release ;;
-    SU-12-ansible) run_journey ansible-check 'changed=0' /scenario/ansible ;;
-    SU-12-host-maintenance)
-      printf 'authority=typed-verb:host-maintenance consequence=recoverable cwd=/scenario/fixtures\n' >> "$RAW"
-      guard verb run host-maintenance --confirm-within 1 --socket "$SOCKET" >>"$RAW" 2>&1
+    SU-12-kubernetes)
+      assert_child_capability_contract 1003
+      run_journey kubernetes-list fixture-pod
+      ;;
+    SU-12-helm)
+      expect_profile_tool_denial fixed helm-list-direct
+      expect_profile_tool_denial fixed ansible-check /scenario/ansible
+      ;;
+    SU-12-ansible)
+      assert_child_capability_contract 1001
+      expect_profile_tool_denial caller ansible-check /scenario/ansible
+      expect_profile_tool_denial caller helm-list-direct
+      expect_profile_tool_denial caller kubernetes-list
+      ;;
+    SU-12-workload-maintenance)
+      printf 'authority=typed-verb:workload-maintenance consequence=recoverable cwd=/scenario/fixtures\n' >> "$RAW"
+      guard verb run workload-maintenance --confirm-within 1 --socket "$SOCKET" >>"$RAW" 2>&1
       [ -f /scenario/fixtures/maintenance-applied ]
       sleep 5
       [ ! -e /scenario/fixtures/maintenance-applied ]
       ;;
     SU-12-api)
       mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
-      printf '%s' synthetic-fixture-token | guard secrets add fixture/api-token >>"$RAW" 2>&1
+      add_fixture_api_token >>"$RAW" 2>&1
       run_journey fixture-api-status fixture-api:healthy
-      ! grep -q 'synthetic-fixture-token' "$RAW"
+      ! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" "$RAW"
       ;;
     *) return 2 ;;
   esac
@@ -1462,7 +1599,7 @@ run_su12() {
 postcheck() {
   case "$SCENARIO" in
     SU-12-api)
-      if ! grep -q 'synthetic-fixture-token' /scenario/data/audit.jsonl \
+      if ! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" /scenario/data/audit.jsonl \
         && grep -q 'fixture/api-token' /scenario/data/audit.jsonl; then
         return 0
       fi
@@ -1480,7 +1617,7 @@ run() {
   : > "$RAW"
   if [[ "$SCENARIO" = SU-12-* ]]; then
     if run_su12; then
-      record_result passed "intended policy" "the typed workload completed inside the isolated fake environment"
+      record_result passed "intended policy" "the isolated workload observed the configured execution and profile boundary"
       echo "$SCENARIO: passed"
       return 0
     fi
@@ -1516,7 +1653,7 @@ prepare_principals() {
   # The operator persona (uid 1000) is the only principal that can read the
   # admin token; the daemon receives it through stdin, and uids 1001/1002
   # hold neither the file nor the value.
-  printf 'synthetic-operator-token\n' > /scenario/run/admin.token
+  write_generated_fixture_value /scenario/run/admin.token
   chmod 0400 /scenario/run/admin.token
   chown 1000:0 /scenario/run/admin.token
   chown -R 0:0 "$COLLECTOR_ROOT"
@@ -1524,6 +1661,12 @@ prepare_principals() {
   chown -R 1000:1000 /scenario/home /scenario/config /scenario/data /scenario/raw \
     /scenario/fixtures /scenario/bin /scenario/ansible /scenario/run
   chown 1000:1000 /scenario
+  chgrp guard-clients /scenario/run
+  chmod 0755 /scenario/run
+  install -o 1000 -g guardexec -m 0640 /dev/null "$BROKERED_KUBECONFIG"
+  install -d -o 1000 -g guard-clients -m 0755 "$PRIVATE_ROOT/run"
+  install -o 1000 -g guardexec -m 0640 /dev/null \
+    "$PRIVATE_ROOT/run/brokered.kubeconfig"
 
   # Keep the operator catalog immutable while giving DestinationLock a
   # daemon-owned writable sidecar on the mounted scenario volume.

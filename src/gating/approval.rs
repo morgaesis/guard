@@ -26,20 +26,20 @@ use crate::principal::{scope_eq, PrincipalKey};
 
 /// Optional binding of held secret VALUES to the artifact the operator reviewed.
 /// Captured at hold time, keyed by the injected env-var name: every referenced
-/// secret is bound - a resolved one by a salted SHA-256 hash of its value (never
-/// the value itself), an unresolved one by a sentinel. Verified at approve time:
-/// if a mapped value changed, a bound-resolved secret vanished, or a
+/// secret is bound - a resolved one by an installation-keyed HMAC of its value
+/// (never the value itself), an unresolved one by a sentinel. Verified at
+/// approve time: if a mapped value changed, a bound-resolved secret vanished, or a
 /// bound-unresolved secret now resolves, approval fails closed. This closes the
 /// window where a same-principal caller alters (or creates) its own mapped
 /// secret values between hold and approval. `None` means no binding was captured
 /// (an older row, or a hold with no referenced secrets) and verification is
-/// skipped for back-compat. The salt makes a stored hash not a plain value hash,
-/// so the snapshot does not leak a brute-forceable digest of the secret.
+/// accepted only when no secret authority exists. The HMAC key lives outside
+/// SQLite, so a copied state database does not expose an offline secret-guessing oracle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash, Default)]
 pub struct SecretBinding {
     /// Per-hold random salt (hex).
     pub salt: String,
-    /// env-var -> hex SHA-256(salt-bytes, 0x00, value-bytes).
+    /// env-var -> hex HMAC-SHA-256(domain, salt, value).
     pub hashes: BTreeMap<String, String>,
     /// Secret-store names injected by the tool configuration. `None` marks a
     /// legacy hold that did not capture tool-level secret provenance.
@@ -55,10 +55,109 @@ pub struct ToolSecretBinding {
     pub hash: String,
 }
 
+/// Provenance of command authority that may survive an approval or restart
+/// boundary. Typed sources are required for tools whose behavior depends on
+/// operator-bound configuration and artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DelayedAuthoritySource {
+    RawApproval,
+    TypedVerb,
+    RawControl,
+    TypedControl,
+}
+
+/// Closed command grammar used to reconstruct delayed process authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DelayedAuthorityProfile {
+    PrimaryOnly,
+    SystemdControl,
+    TypedAnsible,
+    TypedKubectl,
+    TypedHelm,
+}
+
+impl DelayedAuthorityProfile {
+    /// Whether the tool can discover executable, configuration, credential,
+    /// or filesystem authority through its user profile and environment.
+    /// Keeping this property on the closed profile enum makes every new
+    /// process-authority profile classify its environment behavior.
+    pub const fn discovers_profile_authority(self) -> bool {
+        match self {
+            Self::TypedAnsible | Self::TypedKubectl | Self::TypedHelm => true,
+            Self::PrimaryOnly | Self::SystemdControl => false,
+        }
+    }
+}
+
+/// Versioned proof that a delayed command remains inside a known process and
+/// secondary-authority grammar. Replay regenerates the plan under current code
+/// and requires exact equality before process start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct DelayedAuthorityPlan {
+    pub version: u8,
+    pub source: DelayedAuthoritySource,
+    pub profile: DelayedAuthorityProfile,
+    pub normalized_command_digest: String,
+    pub secondary_path_search: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessExecutionIdentityMode {
+    FixedUser,
+    Caller,
+}
+
+/// Complete Unix process identity selected for an approved child. Group
+/// membership is executable and filesystem authority, so replay must bind it
+/// with the command rather than resolve it after approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ProcessExecutionIdentity {
+    pub mode: ProcessExecutionIdentityMode,
+    pub user_id: u32,
+    pub primary_group_id: u32,
+    pub supplementary_group_ids: Vec<u32>,
+}
+
+/// Immutable process-start authority captured when a command enters the hold
+/// queue. Replay recomputes this binding before approval can spawn a child, so
+/// executable resolution, tool mappings, profiles, and secondary executable
+/// search paths cannot change underneath an operator decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ProcessAuthorityBinding {
+    /// Closed delayed-execution grammar and its authority provenance. `None`
+    /// marks a legacy row that cannot be replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delayed_authority: Option<DelayedAuthorityPlan>,
+    /// Exact execution mode and OS identity selected when authority was
+    /// captured. `None` marks a legacy row that must be re-armed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_identity: Option<ProcessExecutionIdentity>,
+    /// Canonical primary executable selected by the daemon.
+    pub executable: PathBuf,
+    /// Daemon executable-search input retained only for profiles that permit
+    /// secondary process discovery.
+    pub daemon_path: Option<String>,
+    /// Non-secret digest of the complete tool environment registry.
+    pub tool_registry_fingerprint: String,
+    /// Installation-keyed HMAC of the complete effective child environment. Secret
+    /// values and daemon-created secret-file paths are represented by their
+    /// stable secret references before hashing, so this binds environment
+    /// authority without persisting credentials or ephemeral paths.
+    #[serde(default)]
+    pub effective_environment_fingerprint: String,
+    /// Canonical operator artifacts and their content-bound SHA-256 digests.
+    pub artifacts: BTreeMap<PathBuf, String>,
+    /// Ordered executable-search directories and their entry fingerprints.
+    pub executable_search_directories: Vec<(PathBuf, String)>,
+}
+
 /// The immutable execution inputs an approval is bound to. Stored at enqueue and
 /// replayed verbatim at approve time. Secret *values* are never stored - only the
 /// env-var -> secret-key mappings for environment and file injection, resolved
-/// at exec under the original caller's namespace, plus an optional salted-hash
+/// at exec under the original caller's namespace, plus an optional keyed-HMAC
 /// [`SecretBinding`] used to detect a value swap between hold and approval.
 /// `BTreeMap` gives a stable order for a stable fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -69,7 +168,9 @@ pub struct ApprovalSnapshot {
     /// cwd propagation existed, which replays under the daemon's default cwd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
-    /// Plain per-run env injections.
+    /// Non-sensitive plain per-run environment values authorized by the bound
+    /// operator-authored typed verb. Credential-shaped bindings use
+    /// `secret_keys` or `secret_file_keys` instead.
     pub env: BTreeMap<String, String>,
     /// env-var -> secret-key mapping (keys only; values resolved at exec).
     pub secret_keys: BTreeMap<String, String>,
@@ -112,6 +213,14 @@ pub struct ApprovalSnapshot {
     /// check at replay.
     #[serde(default)]
     pub verb_composition_digest: Option<String>,
+    /// Whether the held typed matcher explicitly authorized every
+    /// caller-controlled environment binding. Older rows fail closed.
+    #[serde(default)]
+    pub verb_environment_authority: bool,
+    /// Whether the held typed matcher authorized local file authority through
+    /// an exact argv template. Older rows fail closed.
+    #[serde(default)]
+    pub verb_local_file_authority: bool,
     /// Effective execution timeout captured with the immutable approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_timeout_secs: Option<u64>,
@@ -136,9 +245,20 @@ pub struct ApprovalSnapshot {
     /// [`SecretBinding`]). Absent on rows written before value binding existed.
     #[serde(default)]
     pub secret_binding: Option<SecretBinding>,
+    /// Exact non-secret process authority captured at hold time. Legacy
+    /// executable rows without this field fail closed; descriptive API holds
+    /// never spawn and do not require it.
+    #[serde(default)]
+    pub process_authority: Option<ProcessAuthorityBinding>,
 }
 
 impl ApprovalSnapshot {
+    pub fn has_typed_environment_authority(&self) -> bool {
+        self.verb_environment_authority
+            && self.verb_name.is_some()
+            && self.catalog_version.is_some()
+    }
+
     pub fn command_line(&self) -> String {
         crate::redact::redact_command_line(&self.binary, &self.args)
     }
@@ -753,11 +873,14 @@ mod tests {
             catalog_version: None,
             verb_digest: None,
             verb_composition_digest: None,
+            verb_environment_authority: false,
+            verb_local_file_authority: false,
             exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(PrincipalKey::from_uid(1001)),
             secret_binding: None,
+            process_authority: None,
         }
     }
 

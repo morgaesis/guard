@@ -52,6 +52,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             metrics_addr,
             history_retention,
             exec_as_caller,
+            exec_user,
             exec_timeout_secs,
             system_prompt,
             system_prompt_append,
@@ -68,6 +69,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             api_token_env,
             api_token_file,
             api_ca_out,
+            api_client_config_out,
             kube_proxy,
             kubeconfig,
             kube_context,
@@ -143,6 +145,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             metrics_addr,
             history_retention,
             exec_as_caller,
+            exec_user,
             exec_timeout_secs,
             system_prompt,
             system_prompt_append,
@@ -159,6 +162,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             api_token_env,
             api_token_file,
             api_ca_out,
+            api_client_config_out,
             kube_proxy,
             kubeconfig,
             kube_context,
@@ -593,6 +597,16 @@ fn test_server_start_exec_as_caller_flag() {
 }
 
 #[test]
+fn test_server_start_exec_user_flag() {
+    let ServerCommands::Start { exec_user, .. } =
+        parse_start(&["guard", "server", "start", "--exec-user", "guard-exec"])
+    else {
+        panic!("expected start");
+    };
+    assert_eq!(exec_user.as_deref(), Some("guard-exec"));
+}
+
+#[test]
 fn test_server_start_state_db_flag() {
     let ServerCommands::Start { state_db, .. } = parse_start(&[
         "guard",
@@ -604,6 +618,43 @@ fn test_server_start_state_db_flag() {
         panic!("expected start");
     };
     assert_eq!(state_db, Some(PathBuf::from("/var/lib/guard/state.db")));
+}
+
+#[test]
+fn state_db_retirement_accepts_a_bounded_stored_row_key() {
+    let expected = "legacy-invalid-row";
+    match MainArgs::try_parse_from([
+        "guard",
+        "state-db",
+        "retire-rejected-grant-request",
+        "--file",
+        "/var/lib/guard/state.db",
+        expected,
+        "--json",
+    ]) {
+        Ok(MainArgs::StateDb(StateDbCommands::RetireRejectedGrantRequest {
+            file,
+            handle,
+            json,
+        })) => {
+            assert_eq!(file, PathBuf::from("/var/lib/guard/state.db"));
+            assert_eq!(handle, expected);
+            assert!(json);
+        }
+        Ok(_) => panic!("expected rejected grant-request retirement"),
+        Err(error) => panic!("parser rejected state database retirement: {error}"),
+    }
+
+    let oversized = "x".repeat(4_097);
+    assert!(MainArgs::try_parse_from([
+        "guard",
+        "state-db",
+        "retire-rejected-grant-request",
+        "--file",
+        "/var/lib/guard/state.db",
+        oversized.as_str(),
+    ])
+    .is_err());
 }
 
 #[test]
@@ -1520,6 +1571,95 @@ fn machine_readable_flags_cover_read_and_execution_commands() {
         MainArgs::try_parse_from(["guard", "shim", "--json"]),
         Ok(MainArgs::Shim { json: true, .. })
     ));
+}
+
+#[test]
+fn leading_socket_option_is_normalized_without_touching_child_arguments() {
+    assert_eq!(
+        normalize_root_socket_option(&[
+            "--socket".to_string(),
+            "/tmp/guard.sock".to_string(),
+            "status".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap(),
+        ["status", "--socket", "/tmp/guard.sock", "--json"]
+    );
+    assert_eq!(
+        normalize_root_socket_option(&[
+            "--socket=/tmp/guard.sock".to_string(),
+            "run".to_string(),
+            "printf".to_string(),
+            "--socket=child-value".to_string(),
+        ])
+        .unwrap(),
+        [
+            "run",
+            "--socket=/tmp/guard.sock",
+            "printf",
+            "--socket=child-value"
+        ]
+    );
+    assert_eq!(
+        normalize_root_socket_option(&[
+            "--socket".to_string(),
+            "/tmp/guard.sock".to_string(),
+            "--help".to_string(),
+        ])
+        .unwrap(),
+        ["--help"]
+    );
+}
+
+#[test]
+fn leading_socket_normalization_covers_the_clap_command_tree() {
+    fn collect_socket_paths(
+        command: &clap::Command,
+        path: &[String],
+        paths: &mut Vec<Vec<String>>,
+    ) {
+        for subcommand in command.get_subcommands() {
+            if subcommand.get_name() == "help" {
+                continue;
+            }
+            let mut subcommand_path = path.to_vec();
+            subcommand_path.push(subcommand.get_name().to_string());
+            if subcommand
+                .get_arguments()
+                .any(|argument| argument.get_id() == "socket")
+            {
+                paths.push(subcommand_path.clone());
+            }
+            collect_socket_paths(subcommand, &subcommand_path, paths);
+        }
+    }
+
+    let mut socket_paths = Vec::new();
+    collect_socket_paths(&MainArgs::command(), &[], &mut socket_paths);
+    assert!(!socket_paths.is_empty());
+    for path in socket_paths {
+        let mut input = vec!["--socket=/tmp/guard.sock".to_string()];
+        input.extend(path.iter().cloned());
+        let normalized = normalize_root_socket_option(&input).unwrap();
+        let mut expected = path.clone();
+        expected.push("--socket=/tmp/guard.sock".to_string());
+        assert_eq!(normalized, expected, "socket command path: {path:?}");
+    }
+}
+
+#[test]
+fn verb_run_positional_parameter_has_actionable_usage_error() {
+    let command = MainArgs::try_parse_from(["guard", "verb", "run", "inspect", "name=value"])
+        .expect("capture misplaced parameter for a precise diagnostic");
+    let MainArgs::Verb(command) = command else {
+        panic!("expected verb command");
+    };
+    assert_eq!(
+        verb_usage_error(&command).as_deref(),
+        Some(
+            "verb parameters require `--param key=value`; received unexpected positional argument `name=value`"
+        )
+    );
 }
 
 #[test]

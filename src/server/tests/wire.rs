@@ -1,4 +1,3 @@
-#[cfg(windows)]
 use crate::server::gate_runtime::reconstruct_caller;
 #[cfg(windows)]
 use crate::server::transport::winplat;
@@ -283,8 +282,24 @@ fn exec_failed_constructors_set_started_flag() {
 #[test]
 fn reconstruct_caller_round_trips_windows_sid() {
     let sid = "S-1-5-21-1-2-3-1001";
-    let rebuilt = reconstruct_caller(Some(PrincipalKey::from_sid(sid)), &CallerIdentity::Unknown);
+    let rebuilt =
+        reconstruct_caller(Some(PrincipalKey::from_sid(sid)), &CallerIdentity::Unknown).unwrap();
     assert!(matches!(rebuilt, CallerIdentity::Windows { sid: s } if s == sid));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn reconstruct_caller_rejects_malformed_persisted_uid() {
+    assert!(reconstruct_caller(
+        Some(PrincipalKey::from_raw("not-a-uid")),
+        &CallerIdentity::Unknown,
+    )
+    .is_err());
+    assert!(reconstruct_caller(
+        Some(PrincipalKey::from_raw("001000")),
+        &CallerIdentity::Unknown,
+    )
+    .is_err());
 }
 
 #[cfg(windows)]

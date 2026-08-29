@@ -25,6 +25,12 @@ use tokio::sync::RwLock;
 use super::make_test_config;
 #[cfg(unix)]
 use super::run_verb_synthesis_llm_with_preflight;
+#[cfg(unix)]
+use super::{trusted_artifact_tempdir, EnvRestore, TEST_ENV_LOCK};
+
+fn generated_provider_credential() -> String {
+    format!("fixture-{:032x}", rand::random::<u128>())
+}
 
 fn authority_tempdir() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("catalog test dir");
@@ -138,6 +144,128 @@ verbs:
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_artifact_mutation_before_process_start_denies_execution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _environment_guard = TEST_ENV_LOCK.lock().await;
+    let directory = trusted_artifact_tempdir();
+    let private_key = directory.path().join("id_ed25519");
+    write_authority_file(&private_key, "test key");
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", "/usr/bin:/bin");
+    let yaml = format!(
+        "verbs:\n  - name: pinned-artifact\n    binary: cat\n    args: [{}]\n    consequence: reversible\n    trusted: true\n",
+        serde_json::to_string(&private_key).unwrap(),
+    );
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.config.preflight = false;
+    server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(yaml.as_str()).unwrap()));
+
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let executing_server = server.clone();
+    let key_text = private_key.to_string_lossy().into_owned();
+    let mut execution = tokio::spawn(async move {
+        execute_command(
+            raw_request("cat", &[&key_text], None),
+            &executing_server,
+            &CallerIdentity::Unix { uid: 1000 },
+        )
+        .await
+        .into_response()
+    });
+    tokio::select! {
+        permit = reached.acquire() => permit.unwrap().forget(),
+        response = &mut execution => panic!(
+            "command completed before the process-start mutation point: {:?}",
+            response.unwrap()
+        ),
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            panic!("command did not reach the process-start mutation point")
+        }
+    }
+    std::fs::set_permissions(&private_key, std::fs::Permissions::from_mode(0o660)).unwrap();
+    release.add_permits(1);
+
+    let denied = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+        .await
+        .expect("command completes after releasing the process-start mutation point")
+        .unwrap();
+    assert!(!denied.allowed);
+    assert!(
+        denied.reason.contains("operator authority artifact"),
+        "{denied:?}"
+    );
+    std::fs::set_permissions(&private_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ansible_password_helper_profile_is_denied_before_process_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _environment_guard = TEST_ENV_LOCK.lock().await;
+    let directory = trusted_artifact_tempdir();
+    let password_helper = directory.path().join("become-password-helper");
+    write_authority_file(&password_helper, "#!/bin/sh\nprintf password\n");
+    let ansible_config = directory.path().join("ansible.cfg");
+    write_authority_file(
+        &ansible_config,
+        format!(
+            "[defaults]\nbecome_password_file = {}\n",
+            password_helper.display()
+        ),
+    );
+    let playbook = directory.path().join("site.yml");
+    write_authority_file(&playbook, "---\n- hosts: all\n  tasks: []\n");
+    let executable = directory.path().join("ansible-playbook");
+    write_authority_file(&executable, "#!/bin/sh\nexit 0\n");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var(
+        "PATH",
+        format!("{}:/usr/bin:/bin", directory.path().display()),
+    );
+    let yaml = format!(
+        "verbs:\n  - name: ansible-check\n    binary: ansible-playbook\n    args: [{}, \"--check\"]\n    consequence: reversible\n    trusted: true\n    coverage:\n      - name: check\n        action: preauthorized\n        required_args: [\"--check\"]\n",
+        serde_json::to_string(&playbook).unwrap(),
+    );
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.config.preflight = false;
+    server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(&yaml).unwrap()));
+    let tool_config = directory.path().join("tools.yaml");
+    write_authority_file(
+        &tool_config,
+        format!(
+            "tools:\n  ansible-playbook:\n    env:\n      ANSIBLE_CONFIG: {}\n",
+            serde_json::to_string(&ansible_config).unwrap()
+        ),
+    );
+    *server.state.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(&tool_config).unwrap();
+
+    let playbook_text = playbook.to_string_lossy().into_owned();
+    let denied = execute_command(
+        raw_request(
+            "ansible-playbook",
+            &[playbook_text.as_str(), "--check"],
+            None,
+        ),
+        &server,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+    assert!(!denied.allowed);
+    assert!(
+        denied.reason.contains("immutable profile snapshots"),
+        "{denied:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn final_composed_match_rejects_nonprimary_amendment_and_new_deny() {
     const ORIGINAL: &str = r#"
 verbs:
@@ -190,7 +318,12 @@ verbs:
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verb_lease_ends_after_process_start_while_child_is_running() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _environment_guard = TEST_ENV_LOCK.lock().await;
+    let _path_restore = EnvRestore::capture("PATH");
     let directory = tempfile::tempdir().unwrap();
+    let executable_directory = trusted_artifact_tempdir();
     let authority_directory = authority_tempdir();
     let deny_config = DenyLearningConfig::new(authority_directory.path().join("deny.yaml"));
     let deny_store = DenyShapeStore::load(deny_config.clone()).unwrap();
@@ -199,23 +332,26 @@ async fn verb_lease_ends_after_process_start_while_child_is_running() {
         "while [ ! -e {} ]; do sleep 0.01; done",
         release_child.display()
     );
-    let yaml = format!(
-        "verbs:\n  - name: finite-start\n    binary: sh\n    args: [\"-c\", {}]\n    consequence: reversible\n    trusted: true\n",
-        serde_json::to_string(&script).unwrap()
+    let executable = executable_directory.path().join("printf");
+    std::fs::write(&executable, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::env::set_var(
+        "PATH",
+        format!("{}:/usr/bin:/bin", executable_directory.path().display()),
     );
+    let yaml = "verbs:\n  - name: finite-start\n    binary: printf\n    consequence: reversible\n    trusted: true\n";
     let (mut server, _buffer) = make_test_config();
     server.config.gate = GateMode::Consequence;
     server.state.evaluator = Arc::new(
         Evaluator::new(EvalConfig::default().deny_shapes(Arc::new(RwLock::new(deny_store))))
             .unwrap(),
     );
-    server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(&yaml).unwrap()));
+    server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(yaml).unwrap()));
     let command_started = observe_command_started_for_test(&server);
     let executing_server = server.clone();
-    let executing_script = script.clone();
     let execution = tokio::spawn(async move {
         execute_command(
-            raw_request("sh", &["-c", &executing_script], None),
+            raw_request("printf", &[], None),
             &executing_server,
             &CallerIdentity::Unix { uid: 1000 },
         )
@@ -241,11 +377,11 @@ async fn verb_lease_ends_after_process_start_while_child_is_running() {
         std::time::Duration::from_secs(10),
         tokio::task::spawn_blocking(move || {
             let mut independent = DenyShapeStore::load(deny_config).unwrap();
-            let evidence = canonical_argv(&["-c".to_string()]);
+            let evidence = canonical_argv(&[]);
             independent
                 .promote_shape(
                     "fixture",
-                    "sh",
+                    "printf",
                     &format!("^{}$", regex::escape(&evidence)),
                     &[evidence],
                     "blocked",
@@ -279,7 +415,7 @@ async fn learned_deny_committed_after_initial_allow_prevents_process_start() {
     let evaluator = Evaluator::new(
         EvalConfig::default()
             .cache_enabled(false)
-            .llm_api_key("test-key".to_string())
+            .llm_api_key(generated_provider_credential())
             .llm_api_url(llm_url)
             .llm_retries(0)
             .gate_mode(GateMode::Consequence)
@@ -799,11 +935,12 @@ verbs:
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cwd_bound_coverage_resolves_after_canonicalization_and_rejects_changed_directory() {
     let (mut cfg, _buf) = make_test_config();
     cfg.config.gate = GateMode::Consequence;
-    let root = tempfile::tempdir().unwrap();
+    let root = trusted_artifact_tempdir();
     let root = root.path().canonicalize().unwrap();
     let root_yaml = serde_yaml_ng::to_string(&root).unwrap();
     let other = tempfile::tempdir().unwrap();
@@ -1252,6 +1389,7 @@ async fn raw_command_reverse_matches_trusted_verb_and_executes_now() {
 async fn trusted_reverse_match_cannot_skip_evaluator_for_untyped_ansible_config() {
     let (mut cfg, _buf) = make_test_config();
     cfg.config.gate = GateMode::Consequence;
+    cfg.config.exec_as_caller = true;
     cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
             r#"
@@ -1293,7 +1431,7 @@ verbs:
 }
 
 #[tokio::test]
-async fn trusted_reverse_match_accepts_exact_typed_ansible_config() {
+async fn trusted_reverse_match_accepts_exact_typed_ansible_config_before_identity_floor() {
     let (mut cfg, _buf) = make_test_config();
     cfg.config.gate = GateMode::Consequence;
     cfg.state.verbs = Arc::new(RwLock::new(
@@ -1323,14 +1461,17 @@ verbs:
     let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
         .await
         .into_response();
-    assert!(response.allowed, "{response:?}");
-    assert_eq!(response.exit_code, Some(0));
+    assert!(
+        !response.allowed,
+        "fixed identity must reject: {response:?}"
+    );
+    assert!(response.reason.contains("shared child UID"));
     let trace = response.decision_trace.as_ref().expect("decision trace");
     assert_eq!(trace.version, guard::gating::DecisionTrace::VERSION);
     assert_eq!(trace.decision_source, response.decision_source);
     assert_eq!(trace.verb_matches.len(), 1);
     assert_eq!(trace.verb_matches[0].action, "preauthorized");
-    assert!(trace.failed_dimensions.is_empty());
+    assert_eq!(trace.failed_dimensions, vec!["validation"]);
     let admission = cfg.state.command_admission.snapshot();
     assert_eq!(admission.handler_admitted, 1);
     assert_eq!(admission.evaluator_attempted, 0);
@@ -1452,7 +1593,7 @@ async fn non_operator_verb_reads_expose_only_the_sanitized_menu() {
 verbs:
   - name: inspect-fixture
     description: Inspect one fixture
-    binary: fixturectl
+    binary: printf
     args: ["show", "{target}"]
     params:
       target: { pattern: "^[a-z0-9-]+$" }
@@ -1478,7 +1619,7 @@ verbs:
     assert_eq!(items[0].params, vec!["target"]);
     let encoded = serde_json::to_string(&response).unwrap();
     for private in [
-        "fixturectl",
+        "printf",
         "^[a-z0-9-]+$",
         "operator-only provenance",
         "trusted",
@@ -1517,14 +1658,14 @@ async fn non_operator_verb_menu_is_filtered_to_activatable_scope() {
             r#"
 verbs:
   - name: open-fixture
-    binary: fixturectl
+    binary: printf
     consequence: reversible
   - name: session-only
-    binary: fixturectl
+    binary: printf
     baseline: false
     consequence: reversible
   - name: foreign-only
-    binary: fixturectl
+    binary: printf
     baseline: false
     consequence: reversible
 "#,
@@ -1613,7 +1754,7 @@ async fn requester_verb_show_matches_menu_visibility_without_leaking_catalog_det
 verbs:
   - name: baseline-read
     description: Read a fixture
-    binary: fixturectl
+    binary: printf
     args: ["read", "{target}"]
     params:
       target: { pattern: "^[a-z0-9-]+$" }
@@ -1621,7 +1762,7 @@ verbs:
     evidence: private catalog evidence
   - name: requester-maintenance
     description: Maintain one fixture
-    binary: fixturectl
+    binary: printf
     args: ["maintain", "{target}"]
     baseline: false
     params:
@@ -1630,7 +1771,7 @@ verbs:
     evidence: requester-only evidence
   - name: foreign-maintenance
     description: Maintain a foreign fixture
-    binary: fixturectl
+    binary: printf
     baseline: false
     consequence: recoverable
 "#,
@@ -1692,7 +1833,7 @@ verbs:
         assert_eq!(items[0].name, name);
         let encoded = serde_json::to_string(&items).unwrap();
         for private in [
-            "fixturectl",
+            "printf",
             "^[a-z0-9-]+$",
             "private catalog evidence",
             "requester-only evidence",
@@ -1737,7 +1878,7 @@ verbs:
     let AdminResponse::VerbCreated { verb, .. } = operator_detail else {
         panic!("operator must retain complete verb detail");
     };
-    assert_eq!(verb.binary, "fixturectl");
+    assert_eq!(verb.binary, "printf");
 }
 
 fn overbroad_until_gate_feedback_arrives(request: &str) -> serde_json::Value {
@@ -1765,7 +1906,7 @@ fn nonfinite_synthesis_arguments(_request: &str) -> serde_json::Value {
     serde_json::json!({
         "name": "inspect-fixture",
         "description": "Inspect one named fixture",
-        "binary": "fixturectl",
+        "binary": "printf",
         "args": ["show", "{target}"],
         "params": {"target": {"pattern": "^[a-z0-9-]{1,63}$"}},
         "consequence": "reversible",
@@ -1779,7 +1920,7 @@ fn synthesis_arguments_with_sensitive_prose(_request: &str) -> serde_json::Value
     serde_json::json!({
         "name": "check-compiler",
         "description": format!("password={value}"),
-        "binary": "rustc",
+        "binary": "uptime",
         "args": ["--version"],
         "params": {},
         "consequence": "reversible",
@@ -1794,7 +1935,7 @@ fn synthesis_arguments_with_sensitive_name(_request: &str) -> serde_json::Value 
     serde_json::json!({
         "name": format!("password={value}"),
         "description": "Inspect compiler version",
-        "binary": "rustc",
+        "binary": "uptime",
         "args": ["--version"],
         "params": {},
         "consequence": "reversible",
@@ -1832,7 +1973,7 @@ fn amend_test_catalog() -> (tempfile::TempDir, std::path::PathBuf, VerbCatalog) 
         r#"verbs:
   - name: inspect-fixture
     description: Inspect one fixture
-    binary: fixturectl
+    binary: printf
     args: [show, "{target}"]
     params:
       target: { pattern: "^[a-z0-9-]+$" }
@@ -2071,7 +2212,10 @@ async fn verb_add_persists_one_operator_definition_and_rejects_bad_writes_atomic
     .await;
     assert!(matches!(
         rejected,
-        AdminResponse::Error { message } if message.contains("operator-authored")
+        AdminResponse::Error { message }
+            if message.contains("operator-authored")
+                && message.contains("evidence")
+                && !message.contains("generated-added-fixture' cannot be added")
     ));
     assert_eq!(std::fs::read(&path).unwrap(), committed);
     assert!(AdminRequest::VerbAdd {
@@ -2169,7 +2313,7 @@ fn synthesis_test_config(llm_url: String) -> (ServerContext, CallerIdentity) {
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(llm_url)
                 .llm_retries(0),
         )
@@ -2187,7 +2331,7 @@ fn install_static_synthesis_policy(cfg: &mut ServerContext, decision: &str) -> t
     let path = dir.path().join("policy.yaml");
     std::fs::write(
         &path,
-        format!("policy:\n  commands:\n    {decision}:\n      - \"rustc --version\"\n"),
+        format!("policy:\n  commands:\n    {decision}:\n      - \"uptime --version\"\n"),
     )
     .expect("write synthesis admission policy");
     cfg.state.evaluator = Arc::new(
@@ -2211,7 +2355,7 @@ async fn preview_digest_round_trip_installs_the_exact_reviewed_candidate() {
         &daemon,
         AdminRequest::VerbCreate {
             prose: "Inspect compiler version.".to_string(),
-            binary_hint: Some("rustc".to_string()),
+            binary_hint: Some("uptime".to_string()),
             preview: true,
             gate_feedback: Vec::new(),
         },
@@ -2281,7 +2425,7 @@ async fn successful_synthesis_sanitizes_preview_persistence_and_admin_projection
         &daemon,
         AdminRequest::VerbCreate {
             prose: format!("Inspect compiler version with password={value}."),
-            binary_hint: Some("rustc".to_string()),
+            binary_hint: Some("uptime".to_string()),
             preview: true,
             gate_feedback: Vec::new(),
         },
@@ -2339,7 +2483,7 @@ async fn sensitive_synthesized_name_never_reaches_preview_catalog_or_response() 
         &daemon,
         AdminRequest::VerbCreate {
             prose: "Inspect compiler version.".to_string(),
-            binary_hint: Some("rustc".to_string()),
+            binary_hint: Some("uptime".to_string()),
             preview: true,
             gate_feedback: Vec::new(),
         },
@@ -2409,7 +2553,7 @@ async fn evaluator_admission_denial_prevents_preview_installation() {
         &daemon,
         AdminRequest::VerbCreate {
             prose: "Inspect compiler version.".to_string(),
-            binary_hint: Some("rustc".to_string()),
+            binary_hint: Some("uptime".to_string()),
             preview: true,
             gate_feedback: Vec::new(),
         },
@@ -2457,7 +2601,7 @@ async fn nonfinite_synthesis_preflight_fails_explicitly_before_storage() {
         &daemon,
         AdminRequest::VerbCreate {
             prose: "Inspect one named fixture.".to_string(),
-            binary_hint: Some("fixturectl".to_string()),
+            binary_hint: Some("printf".to_string()),
             preview: true,
             gate_feedback: Vec::new(),
         },

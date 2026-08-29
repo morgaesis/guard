@@ -20,8 +20,6 @@ use guard::redact::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(unix)]
-use std::ffi::CString;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -61,6 +59,8 @@ use super::{
     dangerous_env_name, deterministic_credential_deny_reason, deterministic_safe_allow_reason,
     validate_request_injections, RequestContext, ServerContext, MAX_GUARD_DEPTH, MAX_OUTPUT_BYTES,
 };
+#[cfg(windows)]
+use super::{binary_path_candidates, is_executable_path};
 use super::{DEFAULT_CONFIRM_WITHIN_SECS, MAX_CONFIRM_WITHIN_SECS};
 
 type ExecuteError = Box<ExecuteResult>;
@@ -234,6 +234,9 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     if let Err(result) = canonicalize_request_cwd(&mut phase, &mut request).await {
         return *result;
     }
+    if let Err(result) = bind_default_request_cwd(&mut phase, &mut request).await {
+        return *result;
+    }
 
     let request_before_verb_resolution = request.clone();
     let mut verb_resolution = match resolve_verb_context(&mut phase, &mut request).await {
@@ -299,14 +302,8 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
             .guidance
             .clone()
             .unwrap_or_else(|| "typed verb coverage denied this command".to_string());
-        return deny_and_record(
-            phase,
-            &request,
-            SessionDecisionSource::SessionDeny,
-            None,
-            reason,
-        )
-        .await;
+        let decision_source = typed_verb_deny_decision_source(&verb_resolution);
+        return deny_and_record(phase, &request, decision_source, None, reason).await;
     }
 
     let approved_access_evaluation =
@@ -351,6 +348,7 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
         };
     }
 
+    let exact_cwd_verb_authority = selected_verb_authority_binds_exact_cwd(&verb_resolution);
     evaluate_and_route(
         phase,
         request,
@@ -361,9 +359,33 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
         EvaluationConstraints {
             unresolved_plan: verb_resolution.unresolved_plan,
             typed_evaluation_required: force_evaluate,
+            exact_cwd_verb_authority,
         },
     )
     .await
+}
+
+fn selected_verb_authority_binds_exact_cwd(resolution: &VerbResolution) -> bool {
+    let mut found = false;
+    for matched in resolution.matches.iter().filter(|matched| matched.selected) {
+        found = true;
+        if !matched.exact_cwd_authorized {
+            return false;
+        }
+    }
+    found
+}
+
+fn typed_verb_deny_decision_source(resolution: &VerbResolution) -> SessionDecisionSource {
+    if resolution.matches.iter().any(|matched| {
+        matched.selected
+            && matched.scope == VerbMatchScope::Session
+            && matched.action == CoverageAction::Deny
+    }) {
+        SessionDecisionSource::SessionDeny
+    } else {
+        SessionDecisionSource::StaticPolicy
+    }
 }
 
 async fn access_evaluation_is_approved<W: AsyncWrite + Unpin>(
@@ -481,6 +503,67 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
     }
     request.cwd = Some(canonical);
     Ok(())
+}
+
+pub(super) fn safe_default_working_directory() -> std::result::Result<PathBuf, String> {
+    #[cfg(unix)]
+    let candidate = PathBuf::from("/");
+    #[cfg(windows)]
+    let candidate = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "safe default working directory is unavailable: SystemRoot is unset".to_string()
+        })?;
+    #[cfg(not(any(unix, windows)))]
+    return Err("safe default working directory is unsupported on this platform".to_string());
+
+    let canonical = candidate.canonicalize().map_err(|error| {
+        format!(
+            "safe default working directory '{}' cannot be canonicalized: {error}",
+            candidate.display()
+        )
+    })?;
+    if !canonical.is_absolute() || !canonical.is_dir() {
+        return Err(format!(
+            "safe default working directory '{}' is not an absolute directory",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn request_authority_working_directory(request: &ExecuteRequest) -> Option<&Path> {
+    request.cwd.as_deref().and_then(|cwd| {
+        safe_default_working_directory()
+            .ok()
+            .is_none_or(|safe| safe != cwd)
+            .then_some(cwd)
+    })
+}
+
+async fn bind_default_request_cwd<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: &mut ExecuteRequest,
+) -> Result<(), ExecuteError> {
+    if request.cwd.is_some() {
+        return Ok(());
+    }
+    match safe_default_working_directory() {
+        Ok(cwd) => {
+            request.cwd = Some(cwd);
+            Ok(())
+        }
+        Err(reason) => Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await,
+        )),
+    }
 }
 
 async fn revalidate_exec_cwd(cwd: &Path) -> std::result::Result<(), String> {
@@ -980,6 +1063,7 @@ pub(super) fn evaluation_cache_scope(
 struct EvaluationConstraints {
     unresolved_plan: bool,
     typed_evaluation_required: bool,
+    exact_cwd_verb_authority: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -988,6 +1072,8 @@ pub(super) struct VerbAuthorityExpectation {
     pub(super) catalog_version: Option<u64>,
     pub(super) definition_digest: Option<String>,
     pub(super) composition_digest: Option<String>,
+    pub(super) environment_authority: bool,
+    pub(super) local_file_authority: bool,
 }
 
 impl VerbAuthorityExpectation {
@@ -997,6 +1083,8 @@ impl VerbAuthorityExpectation {
             catalog_version: Some(context.catalog_version),
             definition_digest: context.verb_digest.clone(),
             composition_digest: context.composition_digest.clone(),
+            environment_authority: context.environment_authority,
+            local_file_authority: context.local_file_authority,
         }
     }
 }
@@ -1004,9 +1092,14 @@ impl VerbAuthorityExpectation {
 #[derive(Debug, Clone)]
 pub(super) struct CommandAuthorization {
     learned_deny_authority: LearnedDenyProcessStartAuthority,
+    delayed_authority_source: guard::gating::approval::DelayedAuthoritySource,
     verb: Option<VerbAuthorityExpectation>,
     session: Option<SessionAuthoritySnapshot>,
     exec_timeout_secs: Option<u64>,
+    process_authority: Option<guard::gating::approval::ProcessAuthorityBinding>,
+    /// One in-memory resolution of every approved secret and tool mapping.
+    /// This is never serialized and is carried unchanged through final spawn.
+    approved_environment: Option<ApprovedEnvironmentSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1014,6 +1107,8 @@ enum LearnedDenyProcessStartAuthority {
     Enforce,
     TypedVerb,
     ApprovedReplay,
+    PersistedControlCapture,
+    PersistedControlReplay,
 }
 
 impl CommandAuthorization {
@@ -1031,11 +1126,19 @@ impl CommandAuthorization {
                 LearnedDenyProcessStartAuthority::TypedVerb
             }
         };
+        let delayed_authority_source = if verb.is_some() {
+            guard::gating::approval::DelayedAuthoritySource::TypedVerb
+        } else {
+            guard::gating::approval::DelayedAuthoritySource::RawApproval
+        };
         Self {
             learned_deny_authority,
+            delayed_authority_source,
             verb: verb.map(VerbAuthorityExpectation::from_context),
             session: session.cloned(),
             exec_timeout_secs: Some(exec_timeout_secs),
+            process_authority: None,
+            approved_environment: None,
         }
     }
 
@@ -1043,24 +1146,1125 @@ impl CommandAuthorization {
         verb: Option<VerbAuthorityExpectation>,
         session: Option<SessionAuthoritySnapshot>,
         exec_timeout_secs: Option<u64>,
+        process_authority: Option<guard::gating::approval::ProcessAuthorityBinding>,
+        approved_environment: Option<ApprovedEnvironmentSnapshot>,
     ) -> Self {
+        let delayed_authority_source = if verb.is_some() {
+            guard::gating::approval::DelayedAuthoritySource::TypedVerb
+        } else {
+            guard::gating::approval::DelayedAuthoritySource::RawApproval
+        };
         Self {
             // Replay executes the immutable snapshot the operator reviewed;
             // the named authority below is the only non-verb path that may
             // preempt an automatic learned-deny heuristic. Frozen verb,
             // session, secret, and process-start authority checks still run.
             learned_deny_authority: LearnedDenyProcessStartAuthority::ApprovedReplay,
+            delayed_authority_source,
             verb,
             session,
             exec_timeout_secs,
+            process_authority,
+            approved_environment,
         }
     }
+
+    pub(super) fn persisted_control_capture(
+        exec_timeout_secs: u64,
+        delayed_authority_source: guard::gating::approval::DelayedAuthoritySource,
+    ) -> Self {
+        Self {
+            learned_deny_authority: LearnedDenyProcessStartAuthority::PersistedControlCapture,
+            delayed_authority_source,
+            verb: None,
+            session: None,
+            exec_timeout_secs: Some(exec_timeout_secs),
+            process_authority: None,
+            approved_environment: None,
+        }
+    }
+
+    pub(super) fn persisted_control_replay(
+        exec_timeout_secs: u64,
+        delayed_authority_source: guard::gating::approval::DelayedAuthoritySource,
+        process_authority: guard::gating::approval::ProcessAuthorityBinding,
+        approved_environment: ApprovedEnvironmentSnapshot,
+    ) -> Self {
+        Self {
+            learned_deny_authority: LearnedDenyProcessStartAuthority::PersistedControlReplay,
+            delayed_authority_source,
+            verb: None,
+            session: None,
+            exec_timeout_secs: Some(exec_timeout_secs),
+            process_authority: Some(process_authority),
+            approved_environment: Some(approved_environment),
+        }
+    }
+}
+
+fn authorization_extracts_explicit_artifacts(authorization: Option<&CommandAuthorization>) -> bool {
+    authorization.is_some_and(|authorization| {
+        authorization.verb.is_some()
+            || matches!(
+                authorization.learned_deny_authority,
+                LearnedDenyProcessStartAuthority::PersistedControlCapture
+                    | LearnedDenyProcessStartAuthority::PersistedControlReplay
+            )
+    })
+}
+
+fn authorization_revalidates_process_authority(authorization: &CommandAuthorization) -> bool {
+    matches!(
+        authorization.learned_deny_authority,
+        LearnedDenyProcessStartAuthority::ApprovedReplay
+            | LearnedDenyProcessStartAuthority::PersistedControlReplay
+    )
+}
+
+fn command_delayed_authority_plan(
+    request: &ExecuteRequest,
+    authorization: &CommandAuthorization,
+) -> Result<guard::gating::approval::DelayedAuthorityPlan, String> {
+    guard::gating::verb::delayed_authority_plan(
+        &request.binary,
+        &request.args,
+        authorization.delayed_authority_source,
+    )
+    .map_err(|error| format!("delayed process authority is not closed: {error}"))
+}
+
+/// Authorized execution cannot safely infer local executable authority from
+/// shell, language, or command-dispatch syntax. These carriers are rejected at
+/// process admission, with earlier checks on durable hold and containment paths.
+pub(super) fn missing_authorized_execution_profile_reason(binary: &str) -> Option<String> {
+    guard::gating::verb::authorized_executable_profile(binary)
+        .is_none()
+        .then(|| {
+        format!(
+            "authorized execution rejects binary '{binary}' because it has no closed executable authority profile"
+        )
+    })
 }
 
 struct CommandInitiationLease {
     _learned_deny: Option<guard::evaluate::LearnedDenyUseLease>,
     _verb: Option<guard::learned_rules::AuthorityUseLease<VerbCatalog>>,
     _session: Option<tokio::sync::OwnedRwLockReadGuard<SessionRegistry>>,
+    _artifacts: Vec<guard::learned_rules::OperatorAuthorityArtifactLease>,
+    _executable_search_directories: Vec<guard::learned_rules::OperatorAuthorityArtifactLease>,
+}
+
+struct ProcessExecutionAuthorityLeases {
+    _artifacts: Vec<guard::learned_rules::OperatorAuthorityArtifactLease>,
+    _executable_search_directories: Vec<guard::learned_rules::OperatorAuthorityArtifactLease>,
+}
+
+impl CommandInitiationLease {
+    fn release_policy_authority(self) -> ProcessExecutionAuthorityLeases {
+        let Self {
+            _learned_deny,
+            _verb,
+            _session,
+            _artifacts,
+            _executable_search_directories,
+        } = self;
+        drop((_learned_deny, _verb, _session));
+        ProcessExecutionAuthorityLeases {
+            _artifacts,
+            _executable_search_directories,
+        }
+    }
+}
+
+/// Environment variable names use the target process's comparison semantics.
+/// Windows stores one case-insensitive environment block, while Unix permits
+/// distinct names that differ only by case.
+fn child_environment_name_key(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        name.to_ascii_uppercase()
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_string()
+    }
+}
+
+fn fixed_child_environment_name_is_inert(name: &str, value: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    match upper.as_str() {
+        "PATH" | "HOME" | "USER" | "LOGNAME" | "LANG" | "LANGUAGE" | "LC_ALL" | "LC_CTYPE"
+        | "TERM" | "TZ" | "XDG_RUNTIME_DIR" | "GUARD_DEPTH" => true,
+        "KUBECTL_ENABLE_CMD_SHADOW" | "KUBECTL_KUBERC" => {
+            matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off")
+        }
+        _ => false,
+    }
+}
+
+async fn fixed_child_environment_binding_is_sensitive(
+    server: &ServerContext,
+    name: &str,
+    value: &str,
+) -> bool {
+    if dangerous_env_name(name) {
+        return true;
+    }
+    if child_environment_name_key(name) == "KUBECONFIG" {
+        let path = Path::new(value);
+        if !path.is_absolute() {
+            return true;
+        }
+        let Ok(yaml) = std::fs::read_to_string(path) else {
+            return true;
+        };
+        let registry = server.state.protocol_registry.read().await;
+        return !registry.values().any(|proxy| {
+            proxy.protocol_name() == "kubernetes"
+                && guard::proxy::validate_brokered_kubeconfig_matches(
+                    &yaml,
+                    &proxy.brokered_kubeconfig(),
+                )
+                .is_ok()
+        });
+    }
+    !fixed_child_environment_name_is_inert(name, value)
+}
+
+async fn fixed_child_environment_contains_sensitive_binding(
+    server: &ServerContext,
+    bindings: &HashMap<String, String>,
+) -> bool {
+    for (name, value) in bindings {
+        if fixed_child_environment_binding_is_sensitive(server, name, value).await {
+            return true;
+        }
+    }
+    false
+}
+
+async fn validate_fixed_identity_profile_authority(
+    server: &ServerContext,
+    request: &ExecuteRequest,
+    effective_child_env: &HashMap<String, String>,
+) -> Result<(), String> {
+    use guard::gating::approval::DelayedAuthorityProfile;
+
+    let Some(profile) = guard::gating::verb::authorized_executable_profile(&request.binary) else {
+        return Err("fixed-identity execution requires a closed executable profile".to_string());
+    };
+    match profile {
+        DelayedAuthorityProfile::PrimaryOnly | DelayedAuthorityProfile::SystemdControl => Ok(()),
+        DelayedAuthorityProfile::TypedKubectl => {
+            if request.args.iter().any(|argument| {
+                matches!(argument.as_str(), "--kubeconfig" | "--kuberc")
+                    || argument.starts_with("--kubeconfig=")
+                    || argument.starts_with("--kuberc=")
+            }) {
+                return Err(
+                    "fixed-identity kubectl requires Guard's immutable KUBECONFIG binding and disables kuberc"
+                        .to_string(),
+                );
+            }
+            let kubeconfig = child_environment_value(effective_child_env, "KUBECONFIG")
+                .ok_or_else(|| {
+                    "fixed-identity kubectl requires an active Guard proxy KUBECONFIG binding"
+                        .to_string()
+                })?;
+            if fixed_child_environment_binding_is_sensitive(server, "KUBECONFIG", kubeconfig)
+                .await
+            {
+                return Err(
+                    "fixed-identity kubectl KUBECONFIG does not match an active Guard proxy"
+                        .to_string(),
+                );
+            }
+            for name in ["KUBECTL_ENABLE_CMD_SHADOW", "KUBECTL_KUBERC"] {
+                let value = child_environment_value(effective_child_env, name).ok_or_else(|| {
+                    format!("fixed-identity kubectl requires Guard's {name} disablement")
+                })?;
+                if !fixed_child_environment_name_is_inert(name, value) {
+                    return Err(format!(
+                        "fixed-identity kubectl requires Guard's {name} disablement"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        DelayedAuthorityProfile::TypedAnsible | DelayedAuthorityProfile::TypedHelm => Err(
+            "fixed-identity execution cannot safely expose mutable Ansible or Helm profile authority; immutable profile snapshots are not available"
+                .to_string(),
+        ),
+    }
+}
+
+fn child_environment_contains(bindings: &HashMap<String, String>, name: &str) -> bool {
+    let key = child_environment_name_key(name);
+    bindings
+        .keys()
+        .any(|candidate| child_environment_name_key(candidate) == key)
+}
+
+fn child_environment_value<'a>(
+    bindings: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a str> {
+    let key = child_environment_name_key(name);
+    bindings
+        .iter()
+        .find(|(candidate, _)| child_environment_name_key(candidate) == key)
+        .map(|(_, value)| value.as_str())
+}
+
+fn caller_environment_is_executable_authority(name: &str) -> bool {
+    child_environment_name_key(name) == child_environment_name_key("PATH")
+}
+
+fn caller_environment_redirects_tool_authority(binary: &str, name: &str) -> bool {
+    let protected_tool = guard::gating::verb::authorized_executable_profile(binary)
+        .is_some_and(|profile| profile.discovers_profile_authority());
+    protected_tool
+        && [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+        ]
+        .into_iter()
+        .any(|protected| child_environment_name_key(name) == child_environment_name_key(protected))
+}
+
+fn tool_discovers_profile_authority(binary: &str) -> bool {
+    guard::gating::verb::authorized_executable_profile(binary)
+        .is_some_and(|profile| profile.discovers_profile_authority())
+}
+
+fn unsupported_execution_identity_profile_reason(
+    server: &ServerContext,
+    binary: &str,
+) -> Option<&'static str> {
+    use guard::gating::approval::DelayedAuthorityProfile;
+
+    match guard::gating::verb::authorized_executable_profile(binary) {
+        Some(DelayedAuthorityProfile::TypedAnsible | DelayedAuthorityProfile::TypedHelm) => Some(
+            "typed Ansible and Helm execution requires immutable profile snapshots, which are not available",
+        ),
+        Some(DelayedAuthorityProfile::TypedKubectl) if server.config.exec_as_caller => Some(
+            "typed kubectl execution is unavailable with --exec-as-caller because a mutable caller profile cannot be bound as immutable process authority",
+        ),
+        _ => None,
+    }
+}
+
+fn request_supplies_child_environment_name(request: &ExecuteRequest, name: &str) -> bool {
+    request
+        .env
+        .keys()
+        .chain(request.secrets.keys())
+        .chain(request.secret_files.keys())
+        .any(|candidate| child_environment_name_key(candidate) == child_environment_name_key(name))
+}
+
+fn insert_child_environment_binding(
+    bindings: &mut HashMap<String, String>,
+    name: impl Into<String>,
+    value: impl Into<String>,
+) {
+    let name = name.into();
+    let normalized = child_environment_name_key(&name);
+    bindings.retain(|existing, _| child_environment_name_key(existing) != normalized);
+    bindings.insert(name, value.into());
+}
+
+fn kubectl_has_operator_kuberc_binding(
+    request: &ExecuteRequest,
+    trusted_tool_env: &HashMap<String, String>,
+    daemon_child_env: &HashMap<String, String>,
+) -> bool {
+    request
+        .args
+        .iter()
+        .any(|argument| argument == "--kuberc" || argument.strip_prefix("--kuberc=").is_some())
+        || request_supplies_child_environment_name(request, "KUBERC")
+        || child_environment_contains(trusted_tool_env, "KUBERC")
+        || child_environment_contains(daemon_child_env, "KUBERC")
+}
+
+fn apply_authorized_tool_environment_defaults(
+    request: &ExecuteRequest,
+    authorization: Option<&CommandAuthorization>,
+    daemon_child_env: &HashMap<String, String>,
+    trusted_tool_env: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    if authorization.is_none() {
+        return Ok(());
+    }
+
+    match guard::gating::semantic_executable_key(&request.binary).as_str() {
+        "kubectl" => {
+            for name in ["KUBECTL_ENABLE_CMD_SHADOW", "KUBECTL_KUBERC"] {
+                if request_supplies_child_environment_name(request, name) {
+                    return Err(format!(
+                        "caller environment may not override Guard's {} setting",
+                        name
+                    ));
+                }
+            }
+            insert_child_environment_binding(
+                trusted_tool_env,
+                "KUBECTL_ENABLE_CMD_SHADOW",
+                "false",
+            );
+            if !kubectl_has_operator_kuberc_binding(request, trusted_tool_env, daemon_child_env) {
+                insert_child_environment_binding(trusted_tool_env, "KUBECTL_KUBERC", "false");
+            }
+        }
+        "helm" => {
+            if request_supplies_child_environment_name(request, "HELM_NO_PLUGINS") {
+                return Err(
+                    "caller environment may not override Guard's HELM_NO_PLUGINS setting"
+                        .to_string(),
+                );
+            }
+            insert_child_environment_binding(trusted_tool_env, "HELM_NO_PLUGINS", "1");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn effective_child_environment(
+    server: &ServerContext,
+    daemon_child_env: &HashMap<String, String>,
+    trusted_tool_env: &HashMap<String, String>,
+    request_env: &HashMap<String, String>,
+    exec_caller: Option<&ExecCallerContext>,
+    depth: u32,
+) -> HashMap<String, String> {
+    #[cfg(not(unix))]
+    let _ = server;
+    let mut environment = HashMap::new();
+    for name in child_env_allowlist() {
+        if let Ok(value) = std::env::var(name) {
+            if !server.config.exec_as_caller && !fixed_child_environment_name_is_inert(name, &value)
+            {
+                continue;
+            }
+            insert_child_environment_binding(&mut environment, *name, value);
+        }
+    }
+    for (name, value) in daemon_child_env {
+        insert_child_environment_binding(&mut environment, name.clone(), value.clone());
+    }
+    for (name, value) in trusted_tool_env {
+        insert_child_environment_binding(&mut environment, name.clone(), value.clone());
+    }
+    for (name, value) in request_env {
+        insert_child_environment_binding(&mut environment, name.clone(), value.clone());
+    }
+    if let Some(context) = exec_caller {
+        insert_child_environment_binding(
+            &mut environment,
+            "HOME",
+            context.home_dir.to_string_lossy(),
+        );
+        insert_child_environment_binding(&mut environment, "USER", context.username.clone());
+        insert_child_environment_binding(&mut environment, "LOGNAME", context.username.clone());
+        environment.retain(|name, _| {
+            child_environment_name_key(name) != child_environment_name_key("XDG_RUNTIME_DIR")
+        });
+        #[cfg(unix)]
+        {
+            let runtime_dir = PathBuf::from(format!("/run/user/{}", context.uid));
+            if runtime_dir.exists() {
+                insert_child_environment_binding(
+                    &mut environment,
+                    "XDG_RUNTIME_DIR",
+                    runtime_dir.to_string_lossy(),
+                );
+            }
+        }
+    }
+    insert_child_environment_binding(&mut environment, "GUARD_DEPTH", (depth + 1).to_string());
+    #[cfg(unix)]
+    if let Some(shim_dir) = &server.config.shim_dir {
+        if let Some(path) = path_with_shim_dir(shim_dir) {
+            insert_child_environment_binding(&mut environment, "PATH", path.to_string_lossy());
+        }
+    }
+    environment
+}
+
+fn process_start_operator_authority_paths(
+    request: &ExecuteRequest,
+    authorization: Option<&CommandAuthorization>,
+    primary_binary: &Path,
+    effective_child_env: &HashMap<String, String>,
+) -> Result<Vec<PathBuf>, String> {
+    if authorization.is_none() {
+        return Ok(Vec::new());
+    }
+
+    // Every persisted or evaluator-issued authorization binds execution to the
+    // exact daemon-resolved primary executable, including approved raw replay.
+    let safe_default_cwd = safe_default_working_directory()?;
+    let effective_cwd = request.cwd.as_ref().unwrap_or(&safe_default_cwd);
+    let mut paths = vec![primary_binary.to_path_buf()];
+    // The immutable request snapshot binds the canonical working-directory
+    // value. A caller-selected directory is also content-bound because tools
+    // can discover authority beneath it. The fixed OS root is trusted by
+    // identity and is never recursively scanned as an artifact tree.
+    if effective_cwd != &safe_default_cwd {
+        paths.push(effective_cwd.clone());
+    }
+    if !authorization_extracts_explicit_artifacts(authorization) {
+        // Evaluator-only approval never grants typed local-file authority.
+        // Bind its executable and complete environment here; the exec boundary
+        // separately refuses any untyped local filesystem input.
+        paths.sort();
+        paths.dedup();
+        return Ok(paths);
+    }
+
+    paths.extend(
+        guard::gating::verb::operator_authority_paths(
+            &request.binary,
+            &request.args,
+            effective_child_env,
+        )
+        .map_err(|error| format!("operator authority selection is invalid: {error}"))?,
+    );
+    paths.extend(default_tool_profile_authority_paths(
+        &request.binary,
+        &request.args,
+        effective_child_env,
+        effective_cwd,
+    ));
+
+    // A typed command that executes from a propagated directory can discover
+    // configuration, plugins, and executable content below that root. Keep the
+    // entire tree pinned for the child lifetime after the final catalog recheck.
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn process_start_transitive_operator_authority_paths(
+    request: &ExecuteRequest,
+    authorization: Option<&CommandAuthorization>,
+    effective_child_env: &HashMap<String, String>,
+) -> Result<Vec<PathBuf>, String> {
+    if authorization.is_none() || !tool_discovers_profile_authority(&request.binary) {
+        return Ok(Vec::new());
+    }
+    let default_working_directory;
+    let authority_working_directory = if let Some(cwd) = request.cwd.as_deref() {
+        Some(cwd)
+    } else {
+        default_working_directory = safe_default_working_directory()?;
+        Some(default_working_directory.as_path())
+    };
+    let mut paths = guard::gating::verb::transitive_operator_authority_paths(
+        &request.binary,
+        &request.args,
+        effective_child_env,
+        authority_working_directory,
+    )
+    .map_err(|error| format!("transitive operator authority is invalid: {error}"))?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn default_tool_profile_authority_paths(
+    binary: &str,
+    args: &[String],
+    effective_child_env: &HashMap<String, String>,
+    effective_cwd: &Path,
+) -> Vec<PathBuf> {
+    let binary = guard::gating::semantic_executable_key(binary);
+    let mut candidates = BTreeSet::new();
+    let home = child_environment_value(effective_child_env, "HOME")
+        .or_else(|| child_environment_value(effective_child_env, "USERPROFILE"))
+        .map(PathBuf::from);
+    #[cfg(not(windows))]
+    let xdg_config = child_environment_value(effective_child_env, "XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|path| path.join(".config")));
+    #[cfg(windows)]
+    let xdg_config = child_environment_value(effective_child_env, "XDG_CONFIG_HOME")
+        .or_else(|| child_environment_value(effective_child_env, "APPDATA"))
+        .map(PathBuf::from);
+    #[cfg(not(windows))]
+    let xdg_data = child_environment_value(effective_child_env, "XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|path| path.join(".local/share")));
+    #[cfg(windows)]
+    let xdg_data = child_environment_value(effective_child_env, "XDG_DATA_HOME")
+        .or_else(|| child_environment_value(effective_child_env, "APPDATA"))
+        .map(PathBuf::from);
+    #[cfg(not(windows))]
+    let xdg_cache = child_environment_value(effective_child_env, "XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|path| path.join(".cache")));
+    #[cfg(windows)]
+    let xdg_cache = child_environment_value(effective_child_env, "XDG_CACHE_HOME")
+        .or_else(|| child_environment_value(effective_child_env, "TEMP"))
+        .map(PathBuf::from);
+
+    let mut include = |path: PathBuf| {
+        if std::fs::symlink_metadata(&path).is_ok() {
+            candidates.insert(path);
+        }
+    };
+    match binary.as_str() {
+        "ansible" | "ansible-playbook" => {
+            if !child_environment_contains(effective_child_env, "ANSIBLE_CONFIG") {
+                include(effective_cwd.join("ansible.cfg"));
+            }
+            if let Some(home) = &home {
+                if !child_environment_contains(effective_child_env, "ANSIBLE_CONFIG") {
+                    include(home.join(".ansible.cfg"));
+                }
+                include(home.join(".ssh"));
+                if !child_environment_contains(effective_child_env, "ANSIBLE_HOME") {
+                    for discovered_tree in ["plugins", "collections", "roles"] {
+                        include(home.join(".ansible").join(discovered_tree));
+                    }
+                }
+            }
+            if !child_environment_contains(effective_child_env, "ANSIBLE_CONFIG") {
+                include(PathBuf::from("/etc/ansible/ansible.cfg"));
+            }
+            let explicit_inventory =
+                child_environment_contains(effective_child_env, "ANSIBLE_INVENTORY")
+                    || args.iter().any(|argument| {
+                        matches!(argument.as_str(), "-i" | "--inventory" | "--inventory-file")
+                            || argument.starts_with("-i=")
+                            || argument
+                                .strip_prefix("-i")
+                                .is_some_and(|value| !value.is_empty())
+                            || argument.starts_with("--inventory=")
+                            || argument.starts_with("--inventory-file=")
+                    });
+            if !explicit_inventory {
+                include(PathBuf::from("/etc/ansible/hosts"));
+            }
+        }
+        "kubectl" => {
+            if !child_environment_contains(effective_child_env, "KUBECONFIG")
+                && !args.iter().any(|argument| {
+                    argument == "--kubeconfig" || argument.starts_with("--kubeconfig=")
+                })
+            {
+                if let Some(home) = &home {
+                    include(home.join(".kube/config"));
+                }
+            }
+        }
+        "helm" => {
+            if !child_environment_contains(effective_child_env, "KUBECONFIG")
+                && !args.iter().any(|argument| {
+                    argument == "--kubeconfig" || argument.starts_with("--kubeconfig=")
+                })
+            {
+                if let Some(home) = &home {
+                    include(home.join(".kube/config"));
+                }
+            }
+            if !child_environment_contains(effective_child_env, "HELM_CONFIG_HOME") {
+                if let Some(config) = &xdg_config {
+                    include(config.join("helm"));
+                }
+            }
+            if !child_environment_contains(effective_child_env, "HELM_DATA_HOME") {
+                if let Some(data) = &xdg_data {
+                    include(data.join("helm"));
+                }
+            }
+            if !child_environment_contains(effective_child_env, "HELM_CACHE_HOME") {
+                if let Some(cache) = &xdg_cache {
+                    include(cache.join("helm"));
+                }
+            }
+        }
+        _ => {}
+    }
+    candidates.into_iter().collect()
+}
+
+fn process_execution_executable_search_directories(
+    secondary_path_search: bool,
+    effective_child_env: &HashMap<String, String>,
+) -> Result<Vec<PathBuf>, String> {
+    if !secondary_path_search {
+        return Ok(Vec::new());
+    }
+
+    let search_path = child_environment_value(effective_child_env, "PATH")
+        .ok_or_else(|| "authorized executable search path is unavailable".to_string())?;
+    let mut directories = Vec::new();
+    let mut seen = BTreeSet::new();
+    for directory in std::env::split_paths(search_path) {
+        if directory.as_os_str().is_empty() || !directory.is_absolute() {
+            return Err(
+                "authorized executable search path contains an empty or relative directory"
+                    .to_string(),
+            );
+        }
+        let canonical = match directory.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A missing PATH entry cannot resolve either the primary
+                // executable or a child command. Remove it from the effective
+                // child PATH so it cannot acquire authority after approval.
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "authorized executable search directory '{}' cannot be resolved: {error}",
+                    directory.display()
+                ))
+            }
+        };
+        if seen.insert(canonical.clone()) {
+            directories.push(canonical);
+        }
+    }
+    if directories.is_empty() {
+        return Err("authorized executable search path contains no directories".to_string());
+    }
+    Ok(directories.into_iter().collect())
+}
+
+fn canonicalize_authorized_executable_search_path(
+    secondary_path_search: bool,
+    effective_child_env: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    if !secondary_path_search {
+        effective_child_env.retain(|name, _| {
+            child_environment_name_key(name) != child_environment_name_key("PATH")
+        });
+        return Ok(());
+    }
+    let directories = process_execution_executable_search_directories(true, effective_child_env)?;
+    let canonical_path = std::env::join_paths(&directories)
+        .map_err(|error| format!("authorized executable search path is invalid: {error}"))?;
+    insert_child_environment_binding(
+        effective_child_env,
+        "PATH",
+        canonical_path.to_string_lossy(),
+    );
+    Ok(())
+}
+
+fn update_authority_metadata_digest(hasher: &mut Sha256, metadata: &std::fs::Metadata) {
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update([u8::from(metadata.is_file()), u8::from(metadata.is_dir())]);
+    if let Ok(modified) = metadata.modified() {
+        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+            hasher.update(duration.as_secs().to_le_bytes());
+            hasher.update(duration.subsec_nanos().to_le_bytes());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for value in [
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode() as u64,
+            metadata.uid() as u64,
+            metadata.gid() as u64,
+            metadata.mtime() as u64,
+            metadata.mtime_nsec() as u64,
+            metadata.ctime() as u64,
+            metadata.ctime_nsec() as u64,
+        ] {
+            hasher.update(value.to_le_bytes());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        for value in [
+            metadata.file_attributes() as u64,
+            metadata.creation_time(),
+            metadata.last_write_time(),
+            metadata.file_size(),
+        ] {
+            hasher.update(value.to_le_bytes());
+        }
+    }
+}
+
+fn update_authority_path_digest(hasher: &mut Sha256, root: &Path, path: &Path) {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let value = relative.to_string_lossy();
+    hasher.update(value.len().to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn authority_digest_hex(digest: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+
+    let bytes = digest.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn update_authority_file_content_digest(hasher: &mut Sha256, path: &Path) -> Result<()> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(())
+}
+
+fn operator_artifact_fingerprint(
+    path: &Path,
+    untrusted_unix_user_id: Option<u32>,
+) -> Result<String> {
+    let _lease =
+        guard::learned_rules::lease_operator_authority_artifact(path, untrusted_unix_user_id)?;
+    let mut hasher = Sha256::new();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&current)?;
+        update_authority_path_digest(&mut hasher, path, &current);
+        update_authority_metadata_digest(&mut hasher, &metadata);
+        if metadata.is_dir() {
+            let mut children = std::fs::read_dir(&current)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            children.sort();
+            children.reverse();
+            pending.extend(children);
+        } else if metadata.is_file() {
+            update_authority_file_content_digest(&mut hasher, &current)?;
+        }
+    }
+    Ok(authority_digest_hex(hasher.finalize()))
+}
+
+fn executable_search_directory_fingerprint(
+    path: &Path,
+    untrusted_unix_user_id: Option<u32>,
+) -> Result<String> {
+    let _lease = guard::learned_rules::lease_operator_executable_search_directory(
+        path,
+        untrusted_unix_user_id,
+    )?;
+    let mut hasher = Sha256::new();
+    let metadata = std::fs::symlink_metadata(path)?;
+    update_authority_metadata_digest(&mut hasher, &metadata);
+    let mut children = std::fs::read_dir(path)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    children.sort();
+    for child in children {
+        update_authority_path_digest(&mut hasher, path, &child);
+        let metadata = std::fs::symlink_metadata(&child)?;
+        update_authority_metadata_digest(&mut hasher, &metadata);
+        if metadata.file_type().is_symlink() {
+            if let Ok(target) = child.canonicalize() {
+                update_authority_path_digest(&mut hasher, Path::new("/"), &target);
+                update_authority_metadata_digest(&mut hasher, &std::fs::metadata(target)?);
+            }
+        }
+    }
+    Ok(authority_digest_hex(hasher.finalize()))
+}
+
+fn semantic_secret_file_path(environment_name: &str) -> PathBuf {
+    let digest = authority_digest_hex(Sha256::digest(environment_name.as_bytes()));
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"C:\ProgramData\Guard\approval-secret-files").join(digest)
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/run/guard/approval-secret-files").join(digest)
+    }
+}
+
+fn process_authority_selection_environment(
+    request: &ExecuteRequest,
+    effective_child_env: &HashMap<String, String>,
+) -> (HashMap<String, String>, BTreeSet<PathBuf>) {
+    let mut environment = effective_child_env.clone();
+    let mut semantic_secret_files = BTreeSet::new();
+    for environment_name in request.secret_files.keys() {
+        let path = semantic_secret_file_path(environment_name);
+        insert_child_environment_binding(
+            &mut environment,
+            environment_name.clone(),
+            path.to_string_lossy(),
+        );
+        semantic_secret_files.insert(path);
+    }
+    (environment, semantic_secret_files)
+}
+
+fn process_environment_fingerprint(
+    key: &[u8],
+    request: &ExecuteRequest,
+    approved_environment: &ApprovedEnvironmentSnapshot,
+    effective_child_env: &HashMap<String, String>,
+) -> String {
+    // Values use the same precedence as `effective_child_environment`. Every
+    // secret-bearing slot is replaced by its stable store reference before
+    // hashing, including daemon-created secret files whose absolute path is
+    // intentionally different for every child.
+    let mut bindings = BTreeMap::<String, (u8, String)>::new();
+    for (name, value) in effective_child_env {
+        bindings.insert(child_environment_name_key(name), (0, value.clone()));
+    }
+    for (name, reference) in &approved_environment.tool.secret_sources {
+        bindings.insert(child_environment_name_key(name), (1, reference.clone()));
+    }
+    for (name, value) in &request.env {
+        bindings.insert(child_environment_name_key(name), (0, value.clone()));
+    }
+    for (name, reference) in &request.secrets {
+        bindings.insert(child_environment_name_key(name), (2, reference.clone()));
+    }
+    for (name, reference) in &request.secret_files {
+        bindings.insert(child_environment_name_key(name), (3, reference.clone()));
+    }
+
+    use hmac::{Hmac, Mac};
+    let mut hasher = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts keys of every length");
+    hasher.update(b"guard-process-environment-v1\0");
+    for (name, (source, value)) in bindings {
+        hasher.update(&name.len().to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&[source]);
+        hasher.update(&value.len().to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    authority_digest_hex(hasher.finalize().into_bytes())
+}
+
+struct ProcessAuthorityBindingInputs<'a> {
+    authority_mac_key: &'a [u8],
+    request: &'a ExecuteRequest,
+    authorization: &'a CommandAuthorization,
+    primary_binary: &'a Path,
+    effective_child_env: &'a HashMap<String, String>,
+    approved_environment: &'a ApprovedEnvironmentSnapshot,
+    tool_registry_fingerprint: String,
+    untrusted_unix_user_id: Option<u32>,
+    execution_identity: guard::gating::approval::ProcessExecutionIdentity,
+}
+
+fn process_authority_binding_from_effective_environment(
+    inputs: ProcessAuthorityBindingInputs<'_>,
+) -> Result<guard::gating::approval::ProcessAuthorityBinding, String> {
+    let ProcessAuthorityBindingInputs {
+        authority_mac_key,
+        request,
+        authorization,
+        primary_binary,
+        effective_child_env,
+        approved_environment,
+        tool_registry_fingerprint,
+        untrusted_unix_user_id,
+        execution_identity,
+    } = inputs;
+    let delayed_authority = command_delayed_authority_plan(request, authorization)?;
+    let (authority_environment, semantic_secret_files) =
+        process_authority_selection_environment(request, effective_child_env);
+    let mut paths = process_start_operator_authority_paths(
+        request,
+        Some(authorization),
+        primary_binary,
+        &authority_environment,
+    )?;
+    paths.extend(process_start_transitive_operator_authority_paths(
+        request,
+        Some(authorization),
+        &authority_environment,
+    )?);
+    paths.retain(|path| !semantic_secret_files.contains(path));
+    paths.sort();
+    paths.dedup();
+    let artifacts = paths
+        .into_iter()
+        .map(|path| {
+            operator_artifact_fingerprint(&path, untrusted_unix_user_id)
+                .map(|fingerprint| (path.clone(), fingerprint))
+                .map_err(|error| {
+                    format!(
+                        "cannot bind process authority artifact '{}': {error}",
+                        path.display()
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let executable_search_directories = process_execution_executable_search_directories(
+        delayed_authority.secondary_path_search,
+        &authority_environment,
+    )?
+    .into_iter()
+    .map(|path| {
+        executable_search_directory_fingerprint(&path, untrusted_unix_user_id)
+            .map(|fingerprint| (path.clone(), fingerprint))
+            .map_err(|error| {
+                format!(
+                    "cannot bind executable search directory '{}': {error}",
+                    path.display()
+                )
+            })
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    let secondary_path_search = delayed_authority.secondary_path_search;
+    Ok(guard::gating::approval::ProcessAuthorityBinding {
+        delayed_authority: Some(delayed_authority),
+        execution_identity: Some(execution_identity),
+        executable: primary_binary.to_path_buf(),
+        daemon_path: secondary_path_search
+            .then(|| std::env::var_os("PATH"))
+            .flatten()
+            .map(|path| path.to_string_lossy().into_owned()),
+        tool_registry_fingerprint,
+        effective_environment_fingerprint: process_environment_fingerprint(
+            authority_mac_key,
+            request,
+            approved_environment,
+            effective_child_env,
+        ),
+        artifacts,
+        executable_search_directories,
+    })
+}
+
+pub(super) fn capture_approval_process_authority(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    request: &ExecuteRequest,
+    authorization: CommandAuthorization,
+    approved_environment: &ApprovedEnvironmentSnapshot,
+    tool_registry_fingerprint: String,
+) -> Result<guard::gating::approval::ProcessAuthorityBinding, String> {
+    let mut effective_request = request.clone();
+    if effective_request.cwd.is_none() {
+        effective_request.cwd = Some(safe_default_working_directory()?);
+    }
+    let request = &effective_request;
+    let delayed_authority = command_delayed_authority_plan(request, &authorization)?;
+    let daemon_child_env: HashMap<String, String> = server
+        .config
+        .extra_child_env
+        .iter()
+        .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
+        .collect();
+    let mut trusted_tool_env = approved_environment.tool.env.clone();
+    apply_authorized_tool_environment_defaults(
+        request,
+        Some(&authorization),
+        &daemon_child_env,
+        &mut trusted_tool_env,
+    )
+    .map_err(|error| error.to_string())?;
+    let primary_binary = resolve_primary_binary(server, &request.binary)
+        .map_err(|error| format!("cannot bind approved executable: {error}"))?;
+    let mut command = Command::new(&primary_binary);
+    let exec_caller = apply_exec_identity(&mut command, server, caller)
+        .map_err(|error| format!("cannot bind approved execution identity: {error}"))?;
+    let mut request_env = request.env.clone();
+    for environment_name in request.secrets.keys() {
+        if let Some(Some(value)) = approved_environment.request_secret(environment_name) {
+            insert_child_environment_binding(
+                &mut request_env,
+                environment_name.clone(),
+                value.to_string(),
+            );
+        }
+    }
+    let mut effective_child_env = effective_child_environment(
+        server,
+        &daemon_child_env,
+        &trusted_tool_env,
+        &request_env,
+        exec_caller.as_ref(),
+        0,
+    );
+    canonicalize_authorized_executable_search_path(
+        delayed_authority.secondary_path_search,
+        &mut effective_child_env,
+    )?;
+    process_authority_binding_from_effective_environment(ProcessAuthorityBindingInputs {
+        authority_mac_key: server.config.authority_mac_key.as_ref(),
+        request,
+        authorization: &authorization,
+        primary_binary: &primary_binary,
+        effective_child_env: &effective_child_env,
+        approved_environment,
+        tool_registry_fingerprint,
+        untrusted_unix_user_id: untrusted_unix_child_user_id(server, exec_caller.as_ref()),
+        execution_identity: process_execution_identity_binding(server, exec_caller.as_ref())?,
+    })
+}
+
+#[cfg(unix)]
+fn process_execution_identity_binding(
+    server: &ServerContext,
+    exec_caller: Option<&ExecCallerContext>,
+) -> Result<guard::gating::approval::ProcessExecutionIdentity, String> {
+    let context = exec_caller
+        .ok_or_else(|| "approved execution identity is unavailable on Unix".to_string())?;
+    Ok(guard::gating::approval::ProcessExecutionIdentity {
+        mode: if server.config.exec_as_caller {
+            guard::gating::approval::ProcessExecutionIdentityMode::Caller
+        } else {
+            guard::gating::approval::ProcessExecutionIdentityMode::FixedUser
+        },
+        user_id: context.uid,
+        primary_group_id: context.gid,
+        supplementary_group_ids: context.supplementary_group_ids.clone(),
+    })
+}
+
+#[cfg(not(unix))]
+fn process_execution_identity_binding(
+    _server: &ServerContext,
+    _exec_caller: Option<&ExecCallerContext>,
+) -> Result<guard::gating::approval::ProcessExecutionIdentity, String> {
+    Err("approved local process execution is unavailable on this platform".to_string())
+}
+
+fn untrusted_unix_child_user_id(
+    server: &ServerContext,
+    exec_caller: Option<&ExecCallerContext>,
+) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(exec_caller.map_or(server.config.daemon_uid, |context| context.uid))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (server, exec_caller);
+        None
+    }
 }
 
 struct ProcessInitiationLeases {
@@ -1117,6 +2321,15 @@ pub(super) fn observe_command_started_for_test(
 }
 
 #[cfg(all(test, unix))]
+pub(super) fn take_command_started_observation_for_test(server: &ServerContext) -> bool {
+    command_started_hooks()
+        .lock()
+        .unwrap()
+        .remove(&(std::sync::Arc::as_ptr(&server.state.verbs) as usize))
+        .is_some_and(|reached| reached.available_permits() > 0)
+}
+
+#[cfg(all(test, unix))]
 fn signal_command_started_for_test(server: &ServerContext) {
     if let Some(reached) = command_started_hooks()
         .lock()
@@ -1131,6 +2344,10 @@ async fn acquire_command_initiation_lease(
     server: &ServerContext,
     request: &ExecuteRequest,
     authorization: Option<&CommandAuthorization>,
+    delayed_authority: Option<&guard::gating::approval::DelayedAuthorityPlan>,
+    primary_binary: &Path,
+    effective_child_env: &HashMap<String, String>,
+    untrusted_unix_user_id: Option<u32>,
 ) -> Result<CommandInitiationLease, String> {
     // Explicit operator policy is immutable within this evaluator instance and
     // remains absolute for trusted verbs and approved replay alike.
@@ -1174,10 +2391,17 @@ async fn acquire_command_initiation_lease(
                     return Err(format!("command denied before process start: {reason}"));
                 }
                 LearnedDenyProcessStartAuthority::TypedVerb
-                | LearnedDenyProcessStartAuthority::ApprovedReplay => {
+                | LearnedDenyProcessStartAuthority::ApprovedReplay
+                | LearnedDenyProcessStartAuthority::PersistedControlReplay => {
                     // Explicit typed or approved immutable authority outranks
                     // an automatic heuristic, but the match is still observed
                     // under the fresh process-start lease.
+                }
+                LearnedDenyProcessStartAuthority::PersistedControlCapture => {
+                    return Err(
+                        "internal error: persisted control capture reached process start"
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -1268,10 +2492,74 @@ async fn acquire_command_initiation_lease(
             );
         }
     }
+
+    let mut artifacts = process_start_operator_authority_paths(
+        request,
+        authorization,
+        primary_binary,
+        effective_child_env,
+    )?
+    .into_iter()
+    .map(|path| {
+        guard::learned_rules::lease_operator_authority_artifact(&path, untrusted_unix_user_id)
+            .map_err(|error| {
+                format!(
+                    "operator authority artifact '{}' is unavailable before process start: {error}",
+                    path.display()
+                )
+            })
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    // Parse nested configuration only after its containing profile and argv
+    // artifacts are retained. The child cannot race a different kubeconfig or
+    // Ansible configuration into the transitive authority set.
+    artifacts.extend(
+        process_start_transitive_operator_authority_paths(
+            request,
+            authorization,
+            effective_child_env,
+        )?
+        .into_iter()
+        .map(|path| {
+            guard::learned_rules::lease_operator_authority_artifact(
+                &path,
+                untrusted_unix_user_id,
+            )
+            .map_err(|error| {
+                format!(
+                    "transitive operator authority artifact '{}' is unavailable before process start: {error}",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?,
+    );
+    let executable_search_directories = process_execution_executable_search_directories(
+        delayed_authority.is_some_and(|plan| plan.secondary_path_search),
+        effective_child_env,
+    )?;
+    let executable_search_directories = executable_search_directories
+        .into_iter()
+        .map(|path| {
+            guard::learned_rules::lease_operator_executable_search_directory(
+                &path,
+                untrusted_unix_user_id,
+            )
+            .map_err(|error| {
+                format!(
+                    "operator executable search directory '{}' is unavailable before process start: {error}",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(CommandInitiationLease {
         _learned_deny: learned_deny,
         _verb: verb,
         _session: session,
+        _artifacts: artifacts,
+        _executable_search_directories: executable_search_directories,
     })
 }
 
@@ -1429,13 +2717,14 @@ async fn compose_verb_authority_with_session(
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
+    let authority_cwd = request_authority_working_directory(request);
     let raw_matches = catalog.match_command_all_with_environment_and_cwd(
         &request.binary,
         &request.args,
         &plain,
         &secrets,
         &secret_files,
-        request.cwd.as_deref(),
+        authority_cwd,
     );
     if raw_matches.is_empty() {
         return VerbResolution::none();
@@ -1527,6 +2816,8 @@ async fn compose_verb_authority_with_session(
             "revert": resolution.revert,
             "exec_timeout_secs": context.exec_timeout_secs,
             "access_evaluation_override_eligible": context.access_evaluation_override_eligible,
+            "environment_authority": context.environment_authority,
+            "local_file_authority": context.local_file_authority,
         });
         let canonical = serde_json::to_vec(&material).expect("verb authority material serializes");
         context.composition_digest = Some(
@@ -1659,7 +2950,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                 token,
                 &request.binary,
                 &request.args,
-                request.cwd.as_deref(),
+                request_authority_working_directory(&request),
             );
             (
                 decision,
@@ -2340,10 +3631,11 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 }
             }
             // Deterministic safe-mode floor: a cwd-dependent opaque carrier
-            // approved solely by the model (fresh or cached verdict) is
-            // clamped to an operator hold rather than executed. An
-            // operator-authored typed verb match expresses the trust the
-            // floor demands and bypasses it; a model deny is untouched.
+            // approved solely by the model (fresh or cached verdict) cannot
+            // enter a raw approval hold because that hold cannot bind the
+            // executable authority. Selected typed coverage bypasses the
+            // floor only when every selected cell binds the exact working
+            // directory from which the carrier discovers authority.
             let carrier_floor_reason = if matches!(
                 source,
                 guard::evaluate::EvalSource::Llm | guard::evaluate::EvalSource::Cache
@@ -2351,14 +3643,20 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 guard::gating::opaque_carrier_floor_reason(
                     server.state.evaluator.mode(),
                     &request.binary,
-                    verb_ctx.is_some(),
+                    constraints.exact_cwd_verb_authority,
                 )
             } else {
                 None
             };
-            let force_hold = carrier_floor_reason.is_some();
             if let Some(floor) = carrier_floor_reason {
-                reason = format!("{reason} [{floor}]");
+                return deny_and_record(
+                    phase,
+                    &request,
+                    SessionDecisionSource::Validation,
+                    risk,
+                    format!("{reason} [{floor}]"),
+                )
+                .await;
             }
             tracing::debug!("command allowed: {}", reason);
             if !log_audit_policy_for_request(server, phase.caller, &request, true, &reason) {
@@ -2399,7 +3697,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 bypass,
                 authority: evaluated_authority,
                 consume_access_verbs: selected_session_verbs(phase),
-                force_hold,
+                force_hold: false,
             };
             route_allow_and_record(
                 phase,
@@ -2537,6 +3835,7 @@ pub(super) async fn resolve_current_tool_env(
     })
 }
 
+#[derive(Clone)]
 pub(super) struct ResolvedCurrentToolEnv {
     resolved: ResolvedToolEnv,
     authority: ToolRegistry,
@@ -2551,8 +3850,8 @@ impl std::fmt::Debug for ResolvedCurrentToolEnv {
 }
 
 impl ResolvedCurrentToolEnv {
-    pub(super) fn into_resolved(self) -> ResolvedToolEnv {
-        self.resolved
+    pub(super) fn authority_fingerprint(&self) -> String {
+        self.authority.authority_fingerprint()
     }
 }
 
@@ -2561,6 +3860,68 @@ impl std::ops::Deref for ResolvedCurrentToolEnv {
 
     fn deref(&self) -> &Self::Target {
         &self.resolved
+    }
+}
+
+/// In-memory values selected by approval validation. Values are deliberately
+/// absent from `Debug` and from every persisted approval type. Replay consumes
+/// this exact snapshot instead of consulting mutable secret storage again.
+#[derive(Clone)]
+pub(super) struct ApprovedEnvironmentSnapshot {
+    tool: ResolvedCurrentToolEnv,
+    request_secrets: BTreeMap<String, Option<String>>,
+    request_secret_files: BTreeMap<String, Option<String>>,
+}
+
+impl std::fmt::Debug for ApprovedEnvironmentSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApprovedEnvironmentSnapshot")
+            .field("request_secret_count", &self.request_secrets.len())
+            .field(
+                "request_secret_file_count",
+                &self.request_secret_files.len(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ApprovedEnvironmentSnapshot {
+    pub(super) fn new(
+        tool: ResolvedCurrentToolEnv,
+        expected_secrets: BTreeSet<String>,
+        expected_secret_files: BTreeSet<String>,
+        request_secrets: BTreeMap<String, Option<String>>,
+        request_secret_files: BTreeMap<String, Option<String>>,
+    ) -> Result<Self, String> {
+        let resolved_secrets = request_secrets.keys().cloned().collect::<BTreeSet<_>>();
+        let resolved_secret_files = request_secret_files
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if expected_secrets != resolved_secrets || expected_secret_files != resolved_secret_files {
+            return Err(
+                "approved secret snapshot does not cover the immutable request mappings"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            tool,
+            request_secrets,
+            request_secret_files,
+        })
+    }
+
+    fn request_secret(&self, environment_name: &str) -> Option<Option<&str>> {
+        self.request_secrets
+            .get(environment_name)
+            .map(|value| value.as_deref())
+    }
+
+    fn request_secret_file(&self, environment_name: &str) -> Option<Option<&str>> {
+        self.request_secret_files
+            .get(environment_name)
+            .map(|value| value.as_deref())
     }
 }
 
@@ -2749,9 +4110,11 @@ pub(super) async fn record_live_session_interaction(
 #[derive(Debug, Clone)]
 pub(super) struct ExecCallerContext {
     #[cfg(unix)]
-    uid: u32,
+    pub(super) uid: u32,
     #[cfg(unix)]
     pub(super) gid: u32,
+    #[cfg(unix)]
+    supplementary_group_ids: Vec<u32>,
     username: String,
     pub(super) home_dir: PathBuf,
 }
@@ -2765,42 +4128,122 @@ pub(super) fn resolve_exec_caller_context(uid: u32) -> Result<ExecCallerContext>
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("caller uid {} has a non-utf8 username", uid))?
         .to_string();
+    let gid = user.primary_group_id();
+    let mut supplementary_group_ids = uzers::get_user_groups(&username, gid)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve groups for execution user '{username}'"))?
+        .into_iter()
+        .map(|group| group.gid())
+        .collect::<Vec<_>>();
+    if !supplementary_group_ids.contains(&gid) {
+        supplementary_group_ids.push(gid);
+    }
+    supplementary_group_ids.sort_unstable();
+    supplementary_group_ids.dedup();
     Ok(ExecCallerContext {
         uid,
-        gid: user.primary_group_id(),
+        gid,
+        supplementary_group_ids,
         username,
         home_dir: user.home_dir().to_path_buf(),
     })
 }
 
 #[cfg(unix)]
-fn apply_exec_identity(
+fn current_process_supplementary_groups(primary_group_id: u32) -> Result<Vec<u32>> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    if count > 0 {
+        let resolved = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        if resolved != count {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    let mut groups = groups
+        .into_iter()
+        .map(|group| group as u32)
+        .collect::<Vec<_>>();
+    if !groups.contains(&primary_group_id) {
+        groups.push(primary_group_id);
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    Ok(groups)
+}
+
+#[cfg(unix)]
+pub(super) fn apply_exec_identity(
     cmd: &mut Command,
     server: &ServerContext,
     caller: &CallerIdentity,
 ) -> Result<Option<ExecCallerContext>> {
-    if !server.config.exec_as_caller {
-        return Ok(None);
-    }
-
-    let caller_uid = match caller {
-        CallerIdentity::Unix { uid } => *uid,
-        _ => bail!("exec-as-caller requires a unix socket caller"),
+    let child_uid = if server.config.exec_as_caller {
+        match caller {
+            CallerIdentity::Unix { uid } => *uid,
+            _ => bail!("exec-as-caller requires a unix socket caller"),
+        }
+    } else {
+        server.config.exec_user_id.ok_or_else(|| {
+            anyhow::anyhow!("brokered process execution requires a dedicated --exec-user account")
+        })?
     };
-    let context = resolve_exec_caller_context(caller_uid)?;
-    let username = CString::new(context.username.clone())
-        .context("caller username contains an interior NUL byte")?;
+    if child_uid == server.config.daemon_uid {
+        bail!("brokered process execution identity must differ from the daemon identity");
+    }
+    if child_uid == 0 {
+        bail!("brokered process execution identity must not be root");
+    }
+    #[cfg(test)]
+    if server.config.preserve_test_process_identity {
+        let mut context = resolve_exec_caller_context(unsafe { libc::geteuid() as u32 })?;
+        context.uid = child_uid;
+        return Ok(Some(context));
+    }
+    let mut context = resolve_exec_caller_context(child_uid)?;
     let gid = context.gid;
 
-    cmd.gid(gid);
-    cmd.uid(context.uid);
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::initgroups(username.as_ptr(), gid as _) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    let identity_switch_required =
+        unsafe { libc::geteuid() as u32 != context.uid || libc::getegid() as u32 != gid };
+    if identity_switch_required {
+        let mut supplementary_groups: Vec<libc::gid_t> = context
+            .supplementary_group_ids
+            .iter()
+            .map(|group| *group as libc::gid_t)
+            .collect();
+        let uid = context.uid as libc::uid_t;
+        let gid = gid as libc::gid_t;
+        if !supplementary_groups.contains(&gid) {
+            supplementary_groups.push(gid);
+        }
+        supplementary_groups.sort_unstable();
+        supplementary_groups.dedup();
+
+        // Resolve groups in the parent, then apply the complete identity change
+        // in privilege-dropping order. CommandExt applies uid and gid before
+        // pre_exec callbacks, which would make a later initgroups call fail
+        // after the child has lost CAP_SETGID.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::setgroups(
+                    supplementary_groups.len() as _,
+                    supplementary_groups.as_ptr(),
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setgid(gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(uid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
+        context.supplementary_group_ids = current_process_supplementary_groups(gid)?;
     }
 
     Ok(Some(context))
@@ -2812,32 +4255,29 @@ fn apply_exec_identity(
     server: &ServerContext,
     _caller: &CallerIdentity,
 ) -> Result<Option<ExecCallerContext>> {
-    if server.config.exec_as_caller {
-        bail!("--exec-as-caller is not supported on this platform");
+    #[cfg(test)]
+    if server.config.preserve_test_process_identity {
+        return Ok(None);
     }
-    Ok(None)
+    #[cfg(not(test))]
+    let _ = server;
+    bail!(
+        "brokered local process execution is unavailable on this platform because no distinct child identity is configured"
+    )
 }
 
 /// Strip inherited capabilities from a brokered child before `execve`.
 ///
-/// Under the packaged unit the daemon holds `CAP_FOWNER` and
-/// `CAP_DAC_READ_SEARCH` in its ambient set so its own read-grant `setfacl`/
-/// `getfacl` calls can manipulate ACLs on files it does not own. Ambient
-/// capabilities are, by design, preserved across `execve()` for a non-privileged
-/// process, so without this every caller-requested command (a plain
-/// `cat /etc/shadow`, an `ansible-playbook` reading arbitrary files) would
-/// inherit those capabilities and bypass file DAC entirely -- `CAP_DAC_READ_SEARCH`
-/// bypasses file read permission checks and `CAP_FOWNER` bypasses the file-owner
-/// checks `chmod`/`setfacl` enforce -- defeating the scoped, policy-gated read
-/// grants. This clears the ambient set (so nothing survives `execve`) and zeroes
-/// the inheritable set (so a target binary carrying its own file-inheritable caps
-/// cannot pick anything up via the `P(inh) & F(inh)` intersection).
+/// The packaged unit gives the daemon `CAP_SETUID` and `CAP_SETGID` only so it
+/// can initialize supplementary groups and select the dedicated child account.
+/// Ambient capabilities otherwise survive `execve()` into a non-privileged
+/// target. Clearing the ambient and inheritable sets ensures an approved
+/// command receives neither identity-switching capability.
 ///
-/// Applies only inside the forked child via `pre_exec`; the long-lived daemon
-/// keeps its capabilities for its own direct `setfacl`/`getfacl` `Command`s,
-/// which are separate and never pass through here. Clearing capabilities needs
-/// no privilege (only raising them does), so it is safe under both the default
-/// service-identity model and `--exec-as-caller`.
+/// This applies only inside the forked child via `pre_exec`; the long-lived
+/// daemon keeps the capabilities required for later identity switches.
+/// Clearing capabilities needs no privilege, so the operation is valid for
+/// both the dedicated child model and `--exec-as-caller`.
 ///
 /// The capget/capset structs and version magic are declared here because the
 /// `libc` crate does not expose `capget`/`capset` or the `cap_user_*` types; the
@@ -2930,40 +4370,142 @@ fn executable_file(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+fn daemon_executable_search_directories(
+    path: &std::ffi::OsStr,
+    shim_directory: Option<&Path>,
+) -> Vec<PathBuf> {
+    let shim_dir =
+        shim_directory.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    let mut directories = Vec::new();
+    for directory in std::env::split_paths(path) {
+        if directory.as_os_str().is_empty() || !directory.is_absolute() {
+            continue;
+        }
+        let canonical = directory
+            .canonicalize()
+            .unwrap_or_else(|_| directory.clone());
+        if shim_dir.as_ref() != Some(&canonical) {
+            directories.push(canonical);
+        }
+    }
+    directories
+}
+
 #[cfg(unix)]
 fn resolve_primary_binary(server: &ServerContext, binary: &str) -> Result<PathBuf> {
-    let Some(shim_dir) = &server.config.shim_dir else {
-        return Ok(PathBuf::from(binary));
-    };
-    let shim_dir = shim_dir.canonicalize().unwrap_or_else(|_| shim_dir.clone());
+    let requested = Path::new(binary);
+    if requested.is_absolute() {
+        let resolved = requested.canonicalize().with_context(|| {
+            format!(
+                "cannot resolve requested executable '{}'",
+                requested.display()
+            )
+        })?;
+        if !executable_file(&resolved) {
+            bail!(
+                "requested executable '{}' is not a regular executable file",
+                resolved.display()
+            );
+        }
+        return Ok(resolved);
+    }
+    if requested.components().count() != 1 {
+        bail!(
+            "requested executable '{}' must be an absolute path or a bare program name",
+            binary
+        );
+    }
     let Some(path) = std::env::var_os("PATH") else {
         bail!(
-            "underlying executable '{}' is unavailable outside Guard's shim directory; install it or add its non-shim directory to the daemon PATH",
+            "daemon executable search path is unavailable for '{}'",
             binary
         );
     };
-    for dir in std::env::split_paths(&path) {
-        if dir.as_os_str().is_empty() || !dir.is_absolute() {
-            continue;
-        }
-        let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-        if canonical_dir == shim_dir {
-            continue;
-        }
+    for dir in daemon_executable_search_directories(&path, server.config.shim_dir.as_deref()) {
         let candidate = dir.join(binary);
         if executable_file(&candidate) {
-            return Ok(candidate);
+            return candidate.canonicalize().with_context(|| {
+                format!(
+                    "cannot resolve daemon-selected executable '{}'",
+                    candidate.display()
+                )
+            });
         }
     }
+    let qualifier = if server.config.shim_dir.is_some() {
+        " outside Guard's shim directory"
+    } else {
+        ""
+    };
     bail!(
-        "underlying executable '{}' is unavailable outside Guard's shim directory; install it or add its non-shim directory to the daemon PATH",
+        "underlying executable '{}' is unavailable{qualifier}; install it or add its directory to the daemon PATH",
         binary
     )
 }
 
 #[cfg(not(unix))]
-fn resolve_primary_binary(_server: &ServerContext, binary: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from(binary))
+fn resolve_primary_binary(server: &ServerContext, binary: &str) -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let requested = Path::new(binary);
+        if requested.is_absolute() {
+            let resolved = requested.canonicalize().with_context(|| {
+                format!(
+                    "cannot resolve requested executable '{}'",
+                    requested.display()
+                )
+            })?;
+            if !is_executable_path(&resolved) {
+                bail!(
+                    "requested executable '{}' is not a regular file",
+                    resolved.display()
+                );
+            }
+            return Ok(resolved);
+        }
+        if requested.components().count() != 1 {
+            bail!(
+                "requested executable '{}' must be an absolute path or a bare program name",
+                binary
+            );
+        }
+        let Some(path) = std::env::var_os("PATH") else {
+            bail!(
+                "daemon executable search path is unavailable for '{}'",
+                binary
+            );
+        };
+        for directory in
+            daemon_executable_search_directories(&path, server.config.shim_dir.as_deref())
+        {
+            for candidate in binary_path_candidates(&directory, binary) {
+                if !is_executable_path(&candidate) {
+                    continue;
+                }
+                return candidate.canonicalize().with_context(|| {
+                    format!(
+                        "cannot resolve daemon-selected executable '{}'",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+        let qualifier = server
+            .config
+            .shim_dir
+            .is_some()
+            .then_some(" outside Guard's shim directory")
+            .unwrap_or_default();
+        bail!(
+            "underlying executable '{}' is unavailable{qualifier}; install it or add its directory to the daemon PATH",
+            binary
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = server;
+        Ok(PathBuf::from(binary))
+    }
 }
 
 /// Execute a command the policy layer has already approved.
@@ -2981,100 +4523,6 @@ pub(super) const AUTO_READ_GRANT_TTL_SECS: u64 = 600;
 /// operator files in sequence, e.g. an inventory and a vars file).
 #[cfg(unix)]
 const AUTO_READ_GRANT_MAX_ROUNDS: usize = 3;
-
-const ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC: &str =
-    "guard: ansible reported no usable explicit inventory; treating exit 0 as failure\n";
-
-/// Tracks the narrow class of Ansible diagnostics that otherwise produce a
-/// misleading successful exit. An invocation without an explicit inventory is
-/// deliberately ignored because Ansible's implicit localhost behavior is valid.
-#[derive(Debug)]
-pub(super) struct AnsibleInventoryDiagnostics {
-    explicit_sources: BTreeSet<String>,
-    unparseable_sources: BTreeSet<String>,
-    no_inventory_parsed: bool,
-}
-
-impl AnsibleInventoryDiagnostics {
-    pub(super) fn for_command(binary: &str, args: &[String]) -> Option<Self> {
-        if !matches!(
-            Path::new(binary)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(binary)
-                .trim_end_matches(".exe"),
-            "ansible" | "ansible-playbook"
-        ) {
-            return None;
-        }
-
-        let mut explicit_sources = BTreeSet::new();
-        let mut arguments = args.iter();
-        while let Some(argument) = arguments.next() {
-            if matches!(argument.as_str(), "-i" | "--inventory") {
-                if let Some(source) = arguments.next() {
-                    explicit_sources.insert(source.clone());
-                }
-            } else if let Some(source) = argument.strip_prefix("--inventory=") {
-                if !source.is_empty() {
-                    explicit_sources.insert(source.to_string());
-                }
-            }
-        }
-        if explicit_sources.is_empty() {
-            return None;
-        }
-
-        Some(Self {
-            explicit_sources,
-            unparseable_sources: BTreeSet::new(),
-            no_inventory_parsed: false,
-        })
-    }
-
-    pub(super) fn observe(&mut self, output: &str) {
-        for line in output.lines() {
-            let lower = line.to_ascii_lowercase();
-            if lower.contains("no inventory was parsed") {
-                self.no_inventory_parsed = true;
-            }
-            if lower.contains("unable to parse") && lower.contains("as an inventory source") {
-                for source in &self.explicit_sources {
-                    if line.contains(source) {
-                        self.unparseable_sources.insert(source.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    pub(super) fn normalizes_success_to_failure(&self, exit_code: Option<i32>) -> bool {
-        exit_code == Some(0)
-            && (self.no_inventory_parsed
-                || self.unparseable_sources.len() == self.explicit_sources.len())
-    }
-}
-
-fn append_accounted_diagnostic(
-    output: Option<String>,
-    diagnostic: &str,
-    retained_total: &AtomicUsize,
-) -> Option<String> {
-    let separator_len: usize = output
-        .as_deref()
-        .filter(|value| !value.is_empty() && !value.ends_with('\n'))
-        .map_or(0, |_| 1);
-    let additional = separator_len.saturating_add(diagnostic.len());
-    if reserve_bounded_output(retained_total, additional).is_err() {
-        return output;
-    }
-    let mut output = output.unwrap_or_default();
-    if separator_len != 0 {
-        output.push('\n');
-    }
-    output.push_str(diagnostic);
-    Some(output)
-}
 
 /// Extract the absolute file path named by a permission-denied error line, if
 /// any. Understands the common shapes: `cat: /path: Permission denied`,
@@ -3117,7 +4565,7 @@ pub(super) fn permission_denied_path(output: &str) -> Option<String> {
 /// the command. A denied or failed grant returns the original failure
 /// untouched; each round must unblock a new path or the loop stops.
 #[cfg(all(test, unix))]
-pub(super) async fn exec_with_read_grant_retry_with_secret_authority<W: AsyncWrite + Unpin>(
+pub(super) async fn exec_with_read_grant_retry_for_test<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     allow_reason: String,
@@ -3222,12 +4670,12 @@ pub(super) async fn exec_with_read_grant_retry_with_command_authority<W: AsyncWr
     }
 }
 
-pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Unpin>(
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) async fn exec_after_approval_for_test<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     allow_reason: String,
-    // `None` consults the live session. `Some(None)` is unrestricted and
-    // `Some(Some(selectors))` replays the immutable saved-grant entitlement.
     authority: Option<Option<Vec<String>>>,
 ) -> ExecuteResult {
     exec_after_approval_with_command_authority(context, request, allow_reason, authority, None)
@@ -3236,7 +4684,7 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
 
 pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
-    request: ExecuteRequest,
+    mut request: ExecuteRequest,
     allow_reason: String,
     authority: Option<Option<Vec<String>>>,
     command_authority: Option<CommandAuthorization>,
@@ -3258,31 +4706,97 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         };
     }
 
+    if request.cwd.is_none() {
+        request.cwd = match safe_default_working_directory() {
+            Ok(cwd) => Some(cwd),
+            Err(reason) => return ExecuteResult::exec_failed(allow_reason, reason),
+        };
+    }
+
+    let delayed_authority = if let Some(command_authority) = command_authority.as_ref() {
+        match command_delayed_authority_plan(&request, command_authority) {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                return ExecuteResult::denied(format!(
+                    "authorized execution lacks closed process authority: {error}"
+                ))
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(reason) = unsupported_execution_identity_profile_reason(server, &request.binary) {
+        return ExecuteResult::exec_failed(allow_reason, reason.to_string());
+    }
+    if !command_authority.as_ref().is_some_and(|authorization| {
+        authorization
+            .verb
+            .as_ref()
+            .is_some_and(|authority| authority.local_file_authority)
+            || authorization_extracts_explicit_artifacts(Some(authorization))
+    }) && guard::gating::verb::command_uses_untyped_local_file_authority(
+        &request.binary,
+        &request.args,
+    ) {
+        return ExecuteResult::exec_failed(
+            allow_reason,
+            "local filesystem input or destination requires exact typed authority so evaluator-only commands cannot read or mutate daemon-visible paths"
+                .to_string(),
+        );
+    }
+
     let user_key = caller.user_key();
     let caller_principal = caller.principal();
-    let tool_env = resolve_current_tool_env(
-        server,
-        &request.binary,
-        caller_principal.as_ref(),
-        user_key.as_deref(),
-    )
-    .await;
-    let tool_env = match tool_env {
-        Ok(env) => env,
-        Err(e) => {
-            return ExecuteResult::exec_failed(allow_reason, format!("tool config error: {}", e));
+    let approved_environment = command_authority
+        .as_ref()
+        .and_then(|authorization| authorization.approved_environment.as_ref());
+    let tool_env = if let Some(environment) = approved_environment {
+        environment.tool.clone()
+    } else {
+        match resolve_current_tool_env(
+            server,
+            &request.binary,
+            caller_principal.as_ref(),
+            user_key.as_deref(),
+        )
+        .await
+        {
+            Ok(environment) => environment,
+            Err(error) => {
+                return ExecuteResult::exec_failed(
+                    allow_reason,
+                    format!("tool config error: {error}"),
+                )
+            }
         }
     };
     let ResolvedCurrentToolEnv {
         resolved: tool_env,
         authority: tool_authority,
     } = tool_env;
+    if !server.config.exec_as_caller && !tool_env.secret_sources.is_empty() {
+        return ExecuteResult::exec_failed(
+            allow_reason,
+            "fixed-identity execution cannot receive tool-config credentials because the shared child UID is not an execution-isolation boundary"
+                .to_string(),
+        );
+    }
+    if !server.config.exec_as_caller
+        && fixed_child_environment_contains_sensitive_binding(server, &tool_env.env).await
+    {
+        return ExecuteResult::exec_failed(
+            allow_reason,
+            "fixed-identity execution cannot receive credential-authority tool environment because the shared child UID is not an execution-isolation boundary"
+                .to_string(),
+        );
+    }
     let mut exact_output_secrets = tool_env
         .secret_sources
         .keys()
         .filter_map(|key| tool_env.env.get(key).cloned())
         .collect::<Vec<_>>();
-    let trusted_tool_env = tool_env.env;
+    let mut trusted_tool_env = tool_env.env;
     let mut credential_reference_names = tool_env.secret_refs;
     credential_reference_names.extend(request.secrets.values().cloned());
     credential_reference_names.extend(request.secret_files.values().cloned());
@@ -3354,6 +4868,52 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                 format!("dangerous injected environment variable name: '{}'", key),
             );
         }
+        if caller_environment_is_executable_authority(key) {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                "caller environment may not set PATH because executable search authority belongs to Guard"
+                    .to_string(),
+            );
+        }
+        if caller_environment_redirects_tool_authority(&request.binary, key) {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                format!(
+                    "caller environment may not set '{}' for {} because it redirects implicit configuration authority",
+                    key, request.binary
+                ),
+            );
+        }
+    }
+
+    for (source, bindings) in [
+        (
+            guard::gating::verb::EnvironmentBindingSource::Plain,
+            &request.env,
+        ),
+        (
+            guard::gating::verb::EnvironmentBindingSource::Secret,
+            &request.secrets,
+        ),
+        (
+            guard::gating::verb::EnvironmentBindingSource::SecretFile,
+            &request.secret_files,
+        ),
+    ] {
+        for (name, value) in bindings {
+            if let Err(error) = guard::gating::verb::validate_runtime_tool_environment_binding(
+                &request.binary,
+                source,
+                name,
+                value,
+                command_authority
+                    .as_ref()
+                    .and_then(|authority| authority.verb.as_ref())
+                    .is_some_and(|authority| authority.environment_authority),
+            ) {
+                return ExecuteResult::exec_failed(allow_reason, error.to_string());
+            }
+        }
     }
 
     let mut injection_names = std::collections::HashSet::new();
@@ -3363,7 +4923,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         .chain(request.secrets.keys())
         .chain(request.secret_files.keys())
     {
-        if !injection_names.insert(key) {
+        if !injection_names.insert(child_environment_name_key(key)) {
             return ExecuteResult::exec_failed(
                 allow_reason,
                 format!(
@@ -3374,10 +4934,22 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         }
     }
 
+    if !server.config.exec_as_caller
+        && (!request.env.is_empty()
+            || !request.secrets.is_empty()
+            || !request.secret_files.is_empty())
+    {
+        return ExecuteResult::exec_failed(
+            allow_reason,
+            "fixed-identity execution cannot receive per-run environment or credentials because the shared child UID is not an execution-isolation boundary"
+                .to_string(),
+        );
+    }
+
     if server.config.exec_as_caller && !request.secret_files.is_empty() {
         return ExecuteResult::exec_failed(
             allow_reason,
-            "--secret-file is unavailable when the daemon uses --exec-as-caller because the caller identity must not receive access to daemon-owned secret files"
+            "--secret-file is unavailable with --exec-as-caller because a daemon-created credential file must not become caller-owned"
                 .to_string(),
         );
     }
@@ -3413,22 +4985,43 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             }
         };
         for (env_var, secret_key) in &request.secrets {
-            let value = match server.state.secrets.get(&principal, secret_key).await {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    return ExecuteResult::exec_failed(
-                        allow_reason,
-                        format!(
-                            "secret not found: '{}' (required by --secret {})",
-                            secret_key, env_var
-                        ),
-                    );
+            let value = if let Some(environment) = approved_environment {
+                match environment.request_secret(env_var) {
+                    Some(Some(value)) => value.to_string(),
+                    Some(None) => {
+                        return ExecuteResult::exec_failed(
+                            allow_reason,
+                            format!(
+                                "secret not found: '{}' (required by --secret {})",
+                                secret_key, env_var
+                            ),
+                        )
+                    }
+                    None => {
+                        return ExecuteResult::exec_failed(
+                            allow_reason,
+                            "approved secret snapshot is incomplete".to_string(),
+                        )
+                    }
                 }
-                Err(e) => {
-                    return ExecuteResult::exec_failed(
-                        allow_reason,
-                        format!("failed to read secret '{}': {}", secret_key, e),
-                    );
+            } else {
+                match server.state.secrets.get(&principal, secret_key).await {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        return ExecuteResult::exec_failed(
+                            allow_reason,
+                            format!(
+                                "secret not found: '{}' (required by --secret {})",
+                                secret_key, env_var
+                            ),
+                        )
+                    }
+                    Err(error) => {
+                        return ExecuteResult::exec_failed(
+                            allow_reason,
+                            format!("failed to read secret '{}': {}", secret_key, error),
+                        )
+                    }
                 }
             };
             exact_output_secrets.push(value.clone());
@@ -3453,22 +5046,43 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         let mut mappings: Vec<_> = request.secret_files.iter().collect();
         mappings.sort_by(|a, b| a.0.cmp(b.0));
         for (env_var, secret_key) in mappings {
-            let value = match server.state.secrets.get(&principal, secret_key).await {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    return ExecuteResult::exec_failed(
-                        allow_reason,
-                        format!(
-                            "secret not found: '{}' (required by --secret-file {})",
-                            secret_key, env_var
-                        ),
-                    );
+            let value = if let Some(environment) = approved_environment {
+                match environment.request_secret_file(env_var) {
+                    Some(Some(value)) => value.to_string(),
+                    Some(None) => {
+                        return ExecuteResult::exec_failed(
+                            allow_reason,
+                            format!(
+                                "secret not found: '{}' (required by --secret-file {})",
+                                secret_key, env_var
+                            ),
+                        )
+                    }
+                    None => {
+                        return ExecuteResult::exec_failed(
+                            allow_reason,
+                            "approved secret-file snapshot is incomplete".to_string(),
+                        )
+                    }
                 }
-                Err(e) => {
-                    return ExecuteResult::exec_failed(
-                        allow_reason,
-                        format!("failed to read secret '{}': {}", secret_key, e),
-                    );
+            } else {
+                match server.state.secrets.get(&principal, secret_key).await {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        return ExecuteResult::exec_failed(
+                            allow_reason,
+                            format!(
+                                "secret not found: '{}' (required by --secret-file {})",
+                                secret_key, env_var
+                            ),
+                        )
+                    }
+                    Err(error) => {
+                        return ExecuteResult::exec_failed(
+                            allow_reason,
+                            format!("failed to read secret '{}': {}", secret_key, error),
+                        )
+                    }
                 }
             };
             exact_output_secrets.push(value.clone());
@@ -3481,8 +5095,17 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         .iter()
         .filter_map(|var| std::env::var(var).ok().map(|value| (var.clone(), value)))
         .collect();
+    if !server.config.exec_as_caller
+        && fixed_child_environment_contains_sensitive_binding(server, &daemon_child_env).await
+    {
+        return ExecuteResult::exec_failed(
+            allow_reason,
+            "fixed-identity execution cannot receive credential-authority daemon environment because the shared child UID is not an execution-isolation boundary"
+                .to_string(),
+        );
+    }
     for key in request_env.keys().chain(request.secret_files.keys()) {
-        if trusted_tool_env.contains_key(key) {
+        if child_environment_contains(&trusted_tool_env, key) {
             return ExecuteResult::exec_failed(
                 allow_reason,
                 format!(
@@ -3491,7 +5114,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                 ),
             );
         }
-        if daemon_child_env.contains_key(key) {
+        if child_environment_contains(&daemon_child_env, key) {
             return ExecuteResult::exec_failed(
                 allow_reason,
                 format!(
@@ -3501,14 +5124,13 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             );
         }
     }
-    let mut redaction_env = daemon_child_env.clone();
-    redaction_env.extend(request_env.clone());
-    redaction_env.extend(trusted_tool_env.clone());
-    for (index, (_, value)) in secret_file_values.iter().enumerate() {
-        redaction_env.insert(
-            format!("GUARD_SECRET_FILE_REDACTION_{index}"),
-            value.clone(),
-        );
+    if let Err(reason) = apply_authorized_tool_environment_defaults(
+        &request,
+        command_authority.as_ref(),
+        &daemon_child_env,
+        &mut trusted_tool_env,
+    ) {
+        return ExecuteResult::exec_failed(allow_reason, reason);
     }
 
     tracing::info!(
@@ -3519,7 +5141,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             .cwd
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(daemon-default)".to_string())
+            .unwrap_or_else(|| "(unavailable)".to_string())
     );
 
     let exec_binary = match resolve_primary_binary(server, &request.binary) {
@@ -3536,6 +5158,32 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         cmd.current_dir(cwd);
     }
 
+    let exec_caller = match apply_exec_identity(&mut cmd, server, caller) {
+        Ok(context) => context,
+        Err(e) => {
+            return ExecuteResult::exec_failed(allow_reason, format!("exec identity error: {}", e));
+        }
+    };
+    #[cfg(unix)]
+    let secret_file_child_identity = {
+        #[cfg(test)]
+        if server.config.preserve_test_process_identity {
+            Some((unsafe { libc::geteuid() as u32 }, unsafe {
+                libc::getegid() as u32
+            }))
+        } else {
+            exec_caller
+                .as_ref()
+                .map(|context| (context.uid, context.gid))
+        }
+        #[cfg(not(test))]
+        exec_caller
+            .as_ref()
+            .map(|context| (context.uid, context.gid))
+    };
+    #[cfg(not(unix))]
+    let secret_file_child_identity = None;
+
     let secret_file_lease = if secret_file_values.is_empty() {
         None
     } else {
@@ -3545,7 +5193,11 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                 "secret-file storage is not initialized".to_string(),
             );
         };
-        match super::secure_fs::SecretFileLease::create(root, &secret_file_values) {
+        match super::secure_fs::SecretFileLease::create(
+            root,
+            &secret_file_values,
+            secret_file_child_identity,
+        ) {
             Ok((lease, bindings)) => {
                 for (env_var, path) in bindings {
                     request_env.insert(env_var, path.to_string_lossy().into_owned());
@@ -3561,82 +5213,55 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         }
     };
 
-    // SECURITY: Clear ALL inherited env vars. The child process gets only what we
-    // explicitly allow. This prevents leaking the guard's own secrets (API keys,
-    // auth tokens) via env, printenv, /proc/self/environ, or $VAR expansion.
-    cmd.env_clear();
+    let untrusted_unix_user_id = untrusted_unix_child_user_id(server, exec_caller.as_ref());
 
-    for var in child_env_allowlist() {
-        if let Ok(val) = std::env::var(var) {
-            cmd.env(var, val);
+    // SECURITY: Clear ALL inherited env vars. The child process gets only the
+    // fully merged environment below. This single snapshot feeds both spawn and
+    // process-start artifact selection, so an authority-bearing tool variable
+    // cannot be omitted from the lease by arriving through a daemon binding.
+    let mut effective_child_env = effective_child_environment(
+        server,
+        &daemon_child_env,
+        &trusted_tool_env,
+        &request_env,
+        exec_caller.as_ref(),
+        context.depth,
+    );
+    if let Some(plan) = &delayed_authority {
+        if let Err(reason) = canonicalize_authorized_executable_search_path(
+            plan.secondary_path_search,
+            &mut effective_child_env,
+        ) {
+            return ExecuteResult::exec_failed(allow_reason, reason);
         }
     }
-
-    // Operator-declared passthroughs (GUARD_CHILD_ENV): forward these daemon
-    // env vars to the child so brokered credentials reach a tool generically.
-    // The value comes from the DAEMON's environment (not the caller), so an
-    // agent cannot introduce one here; e.g. KUBECONFIG points kubectl at a server
-    // only the daemon can read.
-    for (key, value) in &daemon_child_env {
+    exact_output_secrets.extend(environment_output_secrets(&effective_child_env));
+    exact_output_secrets.sort();
+    exact_output_secrets.dedup();
+    if !server.config.exec_as_caller {
+        if fixed_child_environment_contains_sensitive_binding(server, &effective_child_env).await {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                "fixed-identity execution environment is outside Guard's explicit inert-variable schema"
+                    .to_string(),
+            );
+        }
+        if let Err(reason) =
+            validate_fixed_identity_profile_authority(server, &request, &effective_child_env).await
+        {
+            return ExecuteResult::exec_failed(allow_reason, reason);
+        }
+    }
+    cmd.env_clear();
+    for (key, value) in &effective_child_env {
         cmd.env(key, value);
     }
 
-    let exec_caller = match apply_exec_identity(&mut cmd, server, caller) {
-        Ok(context) => context,
-        Err(e) => {
-            return ExecuteResult::exec_failed(allow_reason, format!("exec identity error: {}", e));
-        }
-    };
-
-    // Drop the daemon's read-grant capabilities (CAP_FOWNER / CAP_DAC_READ_SEARCH)
-    // from the brokered child so they never survive execve into a caller-requested
-    // command. Applies to both the default and --exec-as-caller models.
+    // Drop every daemon capability from the brokered child so none survives
+    // execve into a caller-requested command. This covers both fixed-child and
+    // --exec-as-caller identity selection.
     #[cfg(unix)]
     drop_brokered_child_capabilities(&mut cmd);
-
-    for (key, value) in &trusted_tool_env {
-        cmd.env(key, value);
-    }
-    for (key, value) in &request_env {
-        cmd.env(key, value);
-    }
-
-    if let Some(context) = &exec_caller {
-        cmd.env("HOME", &context.home_dir);
-        cmd.env("USER", &context.username);
-        cmd.env("LOGNAME", &context.username);
-        cmd.env_remove("XDG_RUNTIME_DIR");
-        #[cfg(unix)]
-        {
-            let runtime_dir = PathBuf::from(format!("/run/user/{}", context.uid));
-            if runtime_dir.exists() {
-                cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-            }
-        }
-    }
-
-    cmd.env("GUARD_DEPTH", (context.depth + 1).to_string());
-
-    // Nested-eval shims are a Unix construct; on Windows, prepending a shim dir
-    // only widens CreateProcess's bare-name search path with no benefit, so it is
-    // skipped there.
-    #[cfg(unix)]
-    if let Some(ref shim_dir) = server.config.shim_dir {
-        if let Some(path) = path_with_shim_dir(shim_dir) {
-            cmd.env("PATH", path);
-        }
-    }
-
-    // On Windows, pin the child working directory to a fixed system directory so
-    // the inherited (daemon) CWD is not part of CreateProcess's bare-name search
-    // order, removing a path by which a planted executable could shadow the
-    // intended binary.
-    #[cfg(windows)]
-    if request.cwd.is_none() {
-        if let Some(sysroot) = std::env::var_os("SystemRoot") {
-            cmd.current_dir(sysroot);
-        }
-    }
 
     #[cfg(unix)]
     cmd.as_std_mut().process_group(0);
@@ -3648,6 +5273,10 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         server,
         &request,
         command_authority.as_ref(),
+        delayed_authority.as_ref(),
+        &exec_binary,
+        &effective_child_env,
+        untrusted_unix_user_id,
     )
     .await
     {
@@ -3662,6 +5291,65 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             ))
         }
     };
+    if !server.config.exec_as_caller {
+        if let Err(reason) =
+            validate_fixed_identity_profile_authority(server, &request, &effective_child_env).await
+        {
+            return ExecuteResult::denied(format!(
+                "fixed-identity profile authority changed before process start: {reason}"
+            ));
+        }
+    }
+    if let Some(authorization) = command_authority
+        .as_ref()
+        .filter(|authorization| authorization_revalidates_process_authority(authorization))
+    {
+        let Some(expected) = authorization.process_authority.as_ref() else {
+            return ExecuteResult::denied(
+                "approved command lacks bound process authority; submit it for a new approval",
+            );
+        };
+        let Some(approved_environment) = approved_environment else {
+            return ExecuteResult::denied(
+                "approved command lacks a resolved environment snapshot; submit it for a new approval",
+            );
+        };
+        let current = match process_authority_binding_from_effective_environment(
+            ProcessAuthorityBindingInputs {
+                authority_mac_key: server.config.authority_mac_key.as_ref(),
+                request: &request,
+                authorization,
+                primary_binary: &exec_binary,
+                effective_child_env: &effective_child_env,
+                approved_environment,
+                tool_registry_fingerprint: tool_authority.authority_fingerprint(),
+                untrusted_unix_user_id,
+                execution_identity: match process_execution_identity_binding(
+                    server,
+                    exec_caller.as_ref(),
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        return ExecuteResult::denied(format!(
+                            "approved execution identity cannot be revalidated before process start: {error}"
+                        ))
+                    }
+                },
+            },
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return ExecuteResult::denied(format!(
+                    "approved process authority cannot be revalidated before process start: {error}"
+                ))
+            }
+        };
+        if current != *expected {
+            return ExecuteResult::denied(
+                "approved process authority changed before process start; submit the command for a new approval",
+            );
+        }
+    }
     let exec_timeout_secs = command_authority
         .as_ref()
         .and_then(|authority| authority.exec_timeout_secs)
@@ -3674,7 +5362,6 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             exec_timeout_secs,
             server,
             OutputRedactionContext {
-                environment: &redaction_env,
                 exact_secrets: &exact_output_secrets,
             },
             SpawnAuditContext {
@@ -3705,7 +5392,10 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         }
     };
     drop(tool_mapping_lease);
-    drop(initiation_lease);
+    // Mutable policy locks cover only the spawn boundary. Filesystem and PATH
+    // authority handles remain live until the child exits so secondary process
+    // discovery cannot race a directory replacement on platforms that permit it.
+    let _execution_authority_leases = initiation_lease.release_policy_authority();
     #[cfg(all(test, unix))]
     signal_command_started_for_test(server);
     let mut process_guard = child
@@ -3800,7 +5490,6 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
     } else {
         let redacted = match redact_bounded_buffered_output(
             server,
-            &redaction_env,
             &exact_output_secrets,
             String::from_utf8_lossy(&stdout_bytes).to_string(),
             &retained_total,
@@ -3814,12 +5503,11 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         Some(redacted)
     };
 
-    let mut stderr = if stderr_bytes.is_empty() {
+    let stderr = if stderr_bytes.is_empty() {
         None
     } else {
         let redacted = match redact_bounded_buffered_output(
             server,
-            &redaction_env,
             &exact_output_secrets,
             String::from_utf8_lossy(&stderr_bytes).to_string(),
             &retained_total,
@@ -3833,24 +5521,8 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         Some(redacted)
     };
 
-    let mut exit_code = status.code();
-    if let Some(mut diagnostics) =
-        AnsibleInventoryDiagnostics::for_command(&request.binary, &request.args)
-    {
-        diagnostics.observe(&String::from_utf8_lossy(&stdout_bytes));
-        diagnostics.observe(&String::from_utf8_lossy(&stderr_bytes));
-        if diagnostics.normalizes_success_to_failure(exit_code) {
-            exit_code = Some(1);
-            stderr = append_accounted_diagnostic(
-                stderr,
-                ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC,
-                &retained_total,
-            );
-        }
-    }
-
     drop(secret_file_lease);
-    ExecuteResult::completed(allow_reason, exit_code, stdout, stderr)
+    ExecuteResult::completed(allow_reason, status.code(), stdout, stderr)
         .with_credential_references(credential_references)
 }
 
@@ -3906,12 +5578,11 @@ fn reserve_bounded_output(total: &AtomicUsize, amount: usize) -> Result<(), Boun
 
 fn redact_bounded_buffered_output(
     server: &ServerContext,
-    tool_env: &HashMap<String, String>,
     exact_output_secrets: &[String],
     text: String,
     retained_total: &AtomicUsize,
 ) -> Result<String, BoundedOutputError> {
-    let redacted = redact_command_text(server, tool_env, exact_output_secrets, text);
+    let redacted = redact_command_text(server, exact_output_secrets, text);
     reserve_bounded_output(retained_total, redacted.len())?;
     Ok(redacted)
 }
@@ -4150,7 +5821,6 @@ impl StreamingHeuristicRedactor {
 }
 
 struct OutputRedactionContext<'a> {
-    environment: &'a HashMap<String, String>,
     exact_secrets: &'a [String],
 }
 
@@ -4178,7 +5848,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         }
     };
     drop(leases.tool_mapping);
-    drop(leases.command);
+    let _execution_authority_leases = leases.command.release_policy_authority();
     #[cfg(all(test, unix))]
     signal_command_started_for_test(server);
     let mut process_guard = child
@@ -4243,8 +5913,6 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     let mut stderr_exact = ExactSecretStreamRedactor::new(exact_secrets, MAX_OUTPUT_BYTES)
         .expect("the same bounded redaction context was already validated");
     let mut emitted_total = 0usize;
-    let mut ansible_diagnostics =
-        AnsibleInventoryDiagnostics::for_command(&audit.request.binary, &audit.request.args);
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(1));
     let execution_deadline =
         tokio::time::sleep(std::time::Duration::from_secs(exec_timeout_secs.max(1)));
@@ -4262,9 +5930,6 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
             maybe_chunk = rx.recv() => {
                 match maybe_chunk {
                     Some(StreamChunk::Data { stream, data }) => {
-                    if let Some(diagnostics) = &mut ansible_diagnostics {
-                        diagnostics.observe(&String::from_utf8_lossy(&data));
-                    }
                     let (heuristic_redactor, exact_redactor) = match stream {
                         OutputStream::Stdout => (&mut stdout_redaction, &mut stdout_exact),
                         OutputStream::Stderr => (&mut stderr_redaction, &mut stderr_exact),
@@ -4280,7 +5945,6 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                     let data = match heuristic_redactor.push(&data, |line, state| {
                         redact_command_text_with_state(
                             server,
-                            redaction.environment,
                             redaction.exact_secrets,
                             line,
                             state,
@@ -4365,7 +6029,6 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                             let mut data = match heuristic_redactor.push(&data, |line, state| {
                                 redact_command_text_with_state(
                                     server,
-                                    redaction.environment,
                                     redaction.exact_secrets,
                                     line,
                                     state,
@@ -4384,7 +6047,6 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                             let tail = match heuristic_redactor.finish(|line, state| {
                                 redact_command_text_with_state(
                                     server,
-                                    redaction.environment,
                                     redaction.exact_secrets,
                                     line,
                                     state,
@@ -4501,30 +6163,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         guard.complete();
     }
 
-    let mut exit_code = status.code();
-    if ansible_diagnostics
-        .as_ref()
-        .is_some_and(|diagnostics| diagnostics.normalizes_success_to_failure(exit_code))
-    {
-        exit_code = Some(1);
-        if reserve_emitted_output(
-            &mut emitted_total,
-            ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC.len(),
-        ) {
-            let diagnostic = ExecuteStreamMessage::Stderr {
-                data: ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC.to_string(),
-            };
-            if let Err(e) = write_stream_message(writer, &diagnostic).await {
-                return ExecuteResult::exec_failed_after_start(
-                    allow_reason,
-                    format!("client stream error: {}", e),
-                )
-                .with_credential_references(audit.credential_references);
-            }
-        }
-    }
-
-    ExecuteResult::completed(allow_reason, exit_code, None, None)
+    ExecuteResult::completed(allow_reason, status.code(), None, None)
         .with_credential_references(audit.credential_references)
 }
 
@@ -4604,26 +6243,33 @@ async fn forward_stream_chunks<R>(
 
 fn redact_command_text(
     server: &ServerContext,
-    tool_env: &HashMap<String, String>,
     exact_output_secrets: &[String],
     text: String,
 ) -> String {
-    redact_command_text_inner(server, tool_env, exact_output_secrets, text, None)
+    redact_command_text_inner(server, exact_output_secrets, text, None)
+}
+
+fn environment_output_secrets(environment: &HashMap<String, String>) -> Vec<String> {
+    environment
+        .iter()
+        .filter(|(name, value)| {
+            !value.is_empty() && guard::redact::named_value_contains_sensitive_literals(name, value)
+        })
+        .map(|(_, value)| value.clone())
+        .collect()
 }
 
 fn redact_command_text_with_state(
     server: &ServerContext,
-    tool_env: &HashMap<String, String>,
     exact_output_secrets: &[String],
     text: String,
     state: &mut RedactionState,
 ) -> String {
-    redact_command_text_inner(server, tool_env, exact_output_secrets, text, Some(state))
+    redact_command_text_inner(server, exact_output_secrets, text, Some(state))
 }
 
 fn redact_command_text_inner(
     server: &ServerContext,
-    tool_env: &HashMap<String, String>,
     exact_output_secrets: &[String],
     text: String,
     state: Option<&mut RedactionState>,
@@ -4641,10 +6287,11 @@ fn redact_command_text_inner(
     if !server.config.redact {
         return text;
     }
-    let heuristic_exact_refs = tool_env.values().map(String::as_str).collect::<Vec<_>>();
-    let text = redact_exact_secrets(&text, &heuristic_exact_refs);
-    // Then: regex and context-based redaction catches KEY=value, YAML env
-    // pairs, PEM blocks, etc.
+    // Then regex and context-based redaction catches named values, token
+    // shapes, PEM blocks, and structured secret fields. Plain environment
+    // bindings are intentionally not exact secrets: values such as `1`, a
+    // username, or a path must remain observable unless their source is typed
+    // as secret-bearing.
     if let Some(state) = state {
         let had_trailing_newline = text.ends_with('\n');
         let mut redacted = text
@@ -4706,11 +6353,703 @@ pub(super) fn merge_envelope_context(
 }
 
 #[cfg(test)]
+mod process_start_hardening_tests {
+    use super::*;
+
+    fn typed_authorization() -> CommandAuthorization {
+        CommandAuthorization {
+            learned_deny_authority: LearnedDenyProcessStartAuthority::TypedVerb,
+            delayed_authority_source: guard::gating::approval::DelayedAuthoritySource::TypedVerb,
+            verb: Some(VerbAuthorityExpectation {
+                name: "fixture".to_string(),
+                catalog_version: Some(1),
+                definition_digest: Some("fixture-digest".to_string()),
+                composition_digest: Some("fixture-composition".to_string()),
+                environment_authority: false,
+                local_file_authority: false,
+            }),
+            session: None,
+            exec_timeout_secs: Some(30),
+            process_authority: None,
+            approved_environment: None,
+        }
+    }
+
+    fn fixture_request(cwd: Option<PathBuf>) -> ExecuteRequest {
+        ExecuteRequest {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_files: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        }
+    }
+
+    #[test]
+    fn output_redaction_preserves_plain_low_entropy_values() {
+        let server = crate::server::tests::config_for_proposal_test();
+        let output = redact_command_text(
+            &server,
+            &["typed-secret-value".to_string()],
+            "depth=1 user=worker typed-secret-value".to_string(),
+        );
+
+        assert!(output.contains("depth=1 user=worker"), "{output}");
+        assert!(!output.contains("typed-secret-value"), "{output}");
+        assert!(output.contains("[REDACTED]"), "{output}");
+    }
+
+    #[test]
+    fn output_redaction_types_environment_values_by_name() {
+        let environment = HashMap::from([
+            ("GUARD_DEPTH".to_string(), "1".to_string()),
+            ("USER".to_string(), "worker".to_string()),
+            ("REQUEST_SECRET".to_string(), "q7".to_string()),
+        ]);
+
+        assert_eq!(environment_output_secrets(&environment), vec!["q7"]);
+    }
+
+    fn approved_environment_fixture(
+        request_secrets: BTreeMap<String, Option<String>>,
+        request_secret_files: BTreeMap<String, Option<String>>,
+    ) -> ApprovedEnvironmentSnapshot {
+        ApprovedEnvironmentSnapshot::new(
+            ResolvedCurrentToolEnv {
+                resolved: ResolvedToolEnv::default(),
+                authority: crate::tool_config::ToolRegistry::isolated_for_tests(),
+            },
+            request_secrets.keys().cloned().collect(),
+            request_secret_files.keys().cloned().collect(),
+            request_secrets,
+            request_secret_files,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn process_environment_binding_covers_plain_values_but_redacts_secret_values() {
+        let mut request = fixture_request(None);
+        request
+            .secrets
+            .insert("SERVICE_TOKEN".to_string(), "service/token".to_string());
+        request.secret_files.insert(
+            "SERVICE_TOKEN_FILE".to_string(),
+            "service/token-file".to_string(),
+        );
+        let first_snapshot = approved_environment_fixture(
+            BTreeMap::from([("SERVICE_TOKEN".to_string(), Some("first".to_string()))]),
+            BTreeMap::from([(
+                "SERVICE_TOKEN_FILE".to_string(),
+                Some("first-file".to_string()),
+            )]),
+        );
+        let second_snapshot = approved_environment_fixture(
+            BTreeMap::from([("SERVICE_TOKEN".to_string(), Some("second".to_string()))]),
+            BTreeMap::from([(
+                "SERVICE_TOKEN_FILE".to_string(),
+                Some("second-file".to_string()),
+            )]),
+        );
+        let first_environment = HashMap::from([
+            ("PLAIN_SETTING".to_string(), "one".to_string()),
+            ("SERVICE_TOKEN".to_string(), "first".to_string()),
+            (
+                "SERVICE_TOKEN_FILE".to_string(),
+                "/run/guard/secret-files/first".to_string(),
+            ),
+        ]);
+        let mut second_environment = first_environment.clone();
+        second_environment.insert("SERVICE_TOKEN".to_string(), "second".to_string());
+        second_environment.insert(
+            "SERVICE_TOKEN_FILE".to_string(),
+            "/run/guard/secret-files/second".to_string(),
+        );
+
+        let first = process_environment_fingerprint(
+            &[7u8; 32],
+            &request,
+            &first_snapshot,
+            &first_environment,
+        );
+        assert_eq!(
+            first,
+            process_environment_fingerprint(
+                &[7u8; 32],
+                &request,
+                &second_snapshot,
+                &second_environment,
+            ),
+            "secret values and ephemeral file paths are bound by stable references elsewhere"
+        );
+
+        second_environment.insert("PLAIN_SETTING".to_string(), "two".to_string());
+        assert_ne!(
+            first,
+            process_environment_fingerprint(
+                &[7u8; 32],
+                &request,
+                &second_snapshot,
+                &second_environment,
+            ),
+            "plain effective child environment remains approval authority"
+        );
+    }
+
+    #[test]
+    fn caller_path_is_never_accepted_as_environment_data() {
+        assert!(caller_environment_is_executable_authority("PATH"));
+        #[cfg(windows)]
+        assert!(caller_environment_is_executable_authority("path"));
+        #[cfg(not(windows))]
+        assert!(!caller_environment_is_executable_authority("path"));
+        assert!(!caller_environment_is_executable_authority("PATH_INFO"));
+    }
+
+    #[test]
+    fn environment_name_matching_uses_the_child_platform_semantics() {
+        let bindings = HashMap::from([("KUBECONFIG".to_string(), "fixture".to_string())]);
+        #[cfg(windows)]
+        assert!(child_environment_contains(&bindings, "kubeconfig"));
+        #[cfg(not(windows))]
+        assert!(!child_environment_contains(&bindings, "kubeconfig"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_authority_identity_binds_mode_and_complete_group_membership() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        server.config.exec_as_caller = false;
+        let mut context = ExecCallerContext {
+            uid: 2001,
+            gid: 2002,
+            supplementary_group_ids: vec![2002, 2003],
+            username: "fixture-user".to_string(),
+            home_dir: PathBuf::from("/nonexistent/fixture-home"),
+        };
+        let fixed = process_execution_identity_binding(&server, Some(&context)).unwrap();
+        assert_eq!(
+            fixed.mode,
+            guard::gating::approval::ProcessExecutionIdentityMode::FixedUser
+        );
+
+        context.supplementary_group_ids.push(2004);
+        let changed_groups = process_execution_identity_binding(&server, Some(&context)).unwrap();
+        assert_ne!(fixed, changed_groups);
+
+        server.config.exec_as_caller = true;
+        let caller = process_execution_identity_binding(&server, Some(&context)).unwrap();
+        assert_eq!(
+            caller.mode,
+            guard::gating::approval::ProcessExecutionIdentityMode::Caller
+        );
+        assert_ne!(changed_groups, caller);
+    }
+
+    #[tokio::test]
+    async fn fixed_child_kubeconfig_must_match_one_active_guard_proxy() {
+        let server = crate::server::tests::config_for_proposal_test();
+        let upstream_credential = format!("fixture-{:032x}", rand::random::<u128>());
+        let proxy = Arc::new(guard::proxy::ApiProxy::new(
+            "127.0.0.1:18443".parse().unwrap(),
+            guard::proxy::ProxyTls::generate().unwrap(),
+            guard::proxy::Upstream::from_base_url(
+                "https://127.0.0.1:16443",
+                guard::proxy::UpstreamAuth::Bearer(upstream_credential),
+            )
+            .unwrap(),
+            guard::proxy::ApiPolicy::deny_all(),
+            None,
+        ));
+        server
+            .state
+            .protocol_registry
+            .write()
+            .await
+            .insert("fixture".to_string(), proxy.clone());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kubeconfig");
+        std::fs::write(&path, proxy.brokered_kubeconfig()).unwrap();
+        assert!(
+            !fixed_child_environment_binding_is_sensitive(
+                &server,
+                "KUBECONFIG",
+                path.to_str().unwrap(),
+            )
+            .await
+        );
+
+        let other_proxy = guard::proxy::ApiProxy::new(
+            "127.0.0.1:19443".parse().unwrap(),
+            guard::proxy::ProxyTls::generate().unwrap(),
+            guard::proxy::Upstream::from_base_url(
+                "https://127.0.0.1:16443",
+                guard::proxy::UpstreamAuth::Bearer(format!(
+                    "fixture-{:032x}",
+                    rand::random::<u128>()
+                )),
+            )
+            .unwrap(),
+            guard::proxy::ApiPolicy::deny_all(),
+            None,
+        );
+        std::fs::write(&path, other_proxy.brokered_kubeconfig()).unwrap();
+        assert!(
+            fixed_child_environment_binding_is_sensitive(
+                &server,
+                "KUBECONFIG",
+                path.to_str().unwrap(),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_child_environment_uses_an_explicit_inert_variable_schema() {
+        let server = crate::server::tests::config_for_proposal_test();
+        for name in [
+            "DOCKER_CONFIG",
+            "KRB5CCNAME",
+            "GNUPGHOME",
+            "LD_PRELOAD",
+            "PYTHONPATH",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert!(
+                fixed_child_environment_binding_is_sensitive(&server, name, "/tmp/fixture").await,
+                "{name} must not cross the fixed-identity boundary"
+            );
+        }
+        for (name, value) in [
+            ("LANG", "C.UTF-8"),
+            ("TERM", "dumb"),
+            ("KUBECTL_KUBERC", "false"),
+            ("KUBECTL_ENABLE_CMD_SHADOW", "0"),
+        ] {
+            assert!(
+                !fixed_child_environment_binding_is_sensitive(&server, name, value).await,
+                "{name} should remain inert"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_child_rejects_tools_with_unbounded_implicit_profiles() {
+        let server = crate::server::tests::config_for_proposal_test();
+        for binary in ["ansible", "ansible-playbook", "helm"] {
+            let request = ExecuteRequest {
+                binary: binary.to_string(),
+                ..fixture_request(None)
+            };
+            let error =
+                validate_fixed_identity_profile_authority(&server, &request, &HashMap::new())
+                    .await
+                    .unwrap_err();
+            assert!(
+                error.contains("immutable profile snapshots"),
+                "{binary}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_identity_support_is_explicit_for_profile_driven_tools() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        server.config.exec_as_caller = false;
+        assert!(unsupported_execution_identity_profile_reason(&server, "kubectl").is_none());
+        for binary in ["ansible", "ansible-playbook", "helm"] {
+            let reason = unsupported_execution_identity_profile_reason(&server, binary)
+                .expect("mutable profile must be rejected");
+            assert!(
+                reason.contains("immutable profile snapshots"),
+                "{binary}: {reason}"
+            );
+        }
+
+        server.config.exec_as_caller = true;
+        let kubectl_reason = unsupported_execution_identity_profile_reason(&server, "kubectl")
+            .expect("caller profile must be rejected");
+        assert!(kubectl_reason.contains("mutable caller profile"));
+        assert!(unsupported_execution_identity_profile_reason(&server, "ssh").is_none());
+    }
+
+    #[test]
+    fn typed_command_authority_retains_the_selected_working_tree() {
+        let cwd = PathBuf::from("/operator/project");
+        let primary = PathBuf::from("/operator/bin/fixture");
+        let request = fixture_request(Some(cwd.clone()));
+        let paths = process_start_operator_authority_paths(
+            &request,
+            Some(&typed_authorization()),
+            &primary,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert!(paths.contains(&cwd));
+        assert!(paths.contains(&primary));
+    }
+
+    #[test]
+    fn omitted_working_directory_is_explicit_process_authority() {
+        let request = fixture_request(None);
+        let primary = PathBuf::from("/operator/bin/fixture");
+        let paths = process_start_operator_authority_paths(
+            &request,
+            Some(&typed_authorization()),
+            &primary,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let default = safe_default_working_directory().unwrap();
+
+        assert!(default.is_absolute());
+        assert!(!paths.contains(&default));
+        assert!(paths.contains(&primary));
+
+        let mut evaluated = request;
+        evaluated.cwd = Some(default.clone());
+        assert!(request_authority_working_directory(&evaluated).is_none());
+        let prompt = evaluation_context_prompt(&evaluated, None).unwrap();
+        assert!(prompt.contains(&default.display().to_string()));
+    }
+
+    #[test]
+    fn authorized_executable_search_uses_only_absolute_canonical_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let missing = temp.path().join("missing-bin");
+        let path = std::env::join_paths([&missing, &directory]).unwrap();
+        let environment = HashMap::from([("PATH".to_string(), path.to_string_lossy().into())]);
+
+        assert_eq!(
+            process_execution_executable_search_directories(true, &environment).unwrap(),
+            vec![directory]
+        );
+
+        let relative = HashMap::from([("PATH".to_string(), "relative".to_string())]);
+        assert!(
+            process_execution_executable_search_directories(true, &relative)
+                .unwrap_err()
+                .contains("empty or relative")
+        );
+    }
+
+    #[test]
+    fn untyped_command_does_not_claim_operator_working_tree_authority() {
+        let request = fixture_request(Some(PathBuf::from("/operator/project")));
+        let paths = process_start_operator_authority_paths(
+            &request,
+            None,
+            Path::new("/operator/bin/fixture"),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn approved_raw_replay_retains_its_resolved_primary_executable() {
+        let cwd = PathBuf::from("/caller/project");
+        let request = fixture_request(Some(cwd.clone()));
+        let primary = PathBuf::from("/operator/bin/fixture");
+        let authorization = CommandAuthorization::replay(None, None, Some(30), None, None);
+        let paths = process_start_operator_authority_paths(
+            &request,
+            Some(&authorization),
+            &primary,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            paths.into_iter().collect::<BTreeSet<_>>(),
+            [cwd, primary].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn protected_tool_roots_follow_platform_environment_semantics() {
+        for name in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+        ] {
+            assert!(caller_environment_redirects_tool_authority("kubectl", name));
+            assert!(caller_environment_redirects_tool_authority(
+                "ansible-playbook",
+                name
+            ));
+        }
+        assert!(!caller_environment_redirects_tool_authority("ssh", "HOME"));
+        #[cfg(windows)]
+        assert!(caller_environment_redirects_tool_authority("helm", "home"));
+        #[cfg(not(windows))]
+        assert!(!caller_environment_redirects_tool_authority("helm", "home"));
+        assert!(tool_discovers_profile_authority("ansible"));
+        assert!(tool_discovers_profile_authority("kubectl"));
+        assert!(tool_discovers_profile_authority("helm"));
+        assert!(!tool_discovers_profile_authority("ssh"));
+    }
+
+    #[test]
+    fn daemon_search_directories_exclude_the_canonical_shim_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let shim = root.path().join("shim");
+        let tools = root.path().join("tools");
+        std::fs::create_dir(&shim).unwrap();
+        std::fs::create_dir(&tools).unwrap();
+        let search = std::env::join_paths([&shim, &tools]).unwrap();
+
+        assert_eq!(
+            daemon_executable_search_directories(&search, Some(&shim)),
+            vec![tools.canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
+    fn default_tool_profile_authority_collects_existing_discovery_roots() {
+        let home = tempfile::tempdir().unwrap();
+        for relative in [
+            ".ansible/plugins",
+            ".ansible/collections",
+            ".ansible/roles",
+            ".ssh",
+            ".kube",
+            ".config/helm",
+            ".local/share/helm",
+            ".cache/helm",
+        ] {
+            std::fs::create_dir_all(home.path().join(relative)).unwrap();
+        }
+        std::fs::write(home.path().join(".ansible.cfg"), "[defaults]\n").unwrap();
+        std::fs::write(home.path().join(".kube/config"), "apiVersion: v1\n").unwrap();
+        let environment = HashMap::from([(
+            "HOME".to_string(),
+            home.path().to_string_lossy().into_owned(),
+        )]);
+
+        let ansible =
+            default_tool_profile_authority_paths("ansible", &[], &environment, home.path());
+        assert!(ansible.contains(&home.path().join(".ansible.cfg")));
+        assert!(ansible.contains(&home.path().join(".ansible/plugins")));
+        assert!(ansible.contains(&home.path().join(".ansible/collections")));
+        assert!(ansible.contains(&home.path().join(".ansible/roles")));
+        assert!(ansible.contains(&home.path().join(".ssh")));
+        assert!(!ansible.contains(&home.path().join(".ansible")));
+
+        let kubectl =
+            default_tool_profile_authority_paths("kubectl", &[], &environment, home.path());
+        assert_eq!(kubectl, vec![home.path().join(".kube/config")]);
+
+        let helm = default_tool_profile_authority_paths("helm", &[], &environment, home.path())
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert!(helm.contains(&home.path().join(".kube/config")));
+        assert!(helm.contains(&home.path().join(".config/helm")));
+        assert!(helm.contains(&home.path().join(".local/share/helm")));
+        assert!(helm.contains(&home.path().join(".cache/helm")));
+
+        let explicit_kubeconfig = default_tool_profile_authority_paths(
+            "kubectl",
+            &["--kubeconfig=/srv/guard/cluster.yaml".to_string()],
+            &environment,
+            home.path(),
+        );
+        assert!(!explicit_kubeconfig.contains(&home.path().join(".kube/config")));
+        let explicit_ansible = default_tool_profile_authority_paths(
+            "ansible",
+            &["-i/srv/guard/inventory".to_string()],
+            &HashMap::from([
+                (
+                    "HOME".to_string(),
+                    home.path().to_string_lossy().into_owned(),
+                ),
+                (
+                    "ANSIBLE_CONFIG".to_string(),
+                    "/srv/guard/ansible.cfg".to_string(),
+                ),
+                ("ANSIBLE_HOME".to_string(), "/srv/guard/ansible".to_string()),
+            ]),
+            home.path(),
+        );
+        assert!(!explicit_ansible.contains(&home.path().join(".ansible.cfg")));
+        assert!(!explicit_ansible.contains(&home.path().join(".ansible/plugins")));
+    }
+
+    #[test]
+    fn authorized_tool_defaults_replace_daemon_values() {
+        let request = fixture_request(None);
+        let mut trusted = HashMap::new();
+        let daemon = HashMap::from([("KUBECTL_ENABLE_CMD_SHADOW".to_string(), "true".to_string())]);
+        let request = ExecuteRequest {
+            binary: "kubectl".to_string(),
+            ..request
+        };
+
+        apply_authorized_tool_environment_defaults(
+            &request,
+            Some(&typed_authorization()),
+            &daemon,
+            &mut trusted,
+        )
+        .unwrap();
+
+        assert_eq!(
+            trusted.get("KUBECTL_ENABLE_CMD_SHADOW"),
+            Some(&"false".to_string())
+        );
+        assert_eq!(trusted.get("KUBECTL_KUBERC"), Some(&"false".to_string()));
+
+        let mut replay_trusted = HashMap::new();
+        let replay = CommandAuthorization::replay(None, None, Some(30), None, None);
+        apply_authorized_tool_environment_defaults(
+            &request,
+            Some(&replay),
+            &HashMap::new(),
+            &mut replay_trusted,
+        )
+        .unwrap();
+        assert_eq!(
+            replay_trusted.get("KUBECTL_ENABLE_CMD_SHADOW"),
+            Some(&"false".to_string())
+        );
+        assert_eq!(
+            replay_trusted.get("KUBECTL_KUBERC"),
+            Some(&"false".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_child_path_uses_the_canonical_leased_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("z-real-bin");
+        let second = temp.path().join("a-real-bin");
+        let alias = temp.path().join("bin-alias");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        symlink(&real, &alias).unwrap();
+        let mut environment = HashMap::from([(
+            "PATH".to_string(),
+            std::env::join_paths([&alias, &second])
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        canonicalize_authorized_executable_search_path(true, &mut environment).unwrap();
+
+        let expected =
+            std::env::join_paths([real.canonicalize().unwrap(), second.canonicalize().unwrap()])
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+        assert_eq!(
+            child_environment_value(&environment, "PATH"),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn primary_only_delayed_authority_removes_child_path() {
+        let mut environment = HashMap::from([("PATH".to_string(), "/operator/bin".to_string())]);
+
+        canonicalize_authorized_executable_search_path(false, &mut environment).unwrap();
+
+        assert!(child_environment_value(&environment, "PATH").is_none());
+        assert!(
+            process_execution_executable_search_directories(false, &environment)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
 mod decision_trace_feature_tests {
     use super::*;
     use guard::gating::verb::CoverageAction;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
+
+    fn denied_verb_resolution(scope: VerbMatchScope) -> VerbResolution {
+        VerbResolution {
+            decision: VerbDecision::Deny,
+            context: None,
+            matches: vec![VerbMatchInfo {
+                verb: "fixture".to_string(),
+                cell: "denied".to_string(),
+                scope,
+                action: CoverageAction::Deny,
+                features: Vec::new(),
+                selected: true,
+                overridden: false,
+                exact_cwd_authorized: false,
+            }],
+            guidance: None,
+            conflict_prompt: None,
+            unresolved_plan: false,
+            revert: None,
+        }
+    }
+
+    #[test]
+    fn typed_verb_denial_source_distinguishes_baseline_and_session_policy() {
+        assert_eq!(
+            typed_verb_deny_decision_source(&denied_verb_resolution(VerbMatchScope::Baseline)),
+            SessionDecisionSource::StaticPolicy
+        );
+        assert_eq!(
+            typed_verb_deny_decision_source(&denied_verb_resolution(VerbMatchScope::Session)),
+            SessionDecisionSource::SessionDeny
+        );
+    }
+
+    #[test]
+    fn carrier_floor_requires_exact_cwd_on_every_selected_verb_cell() {
+        let mut resolution = denied_verb_resolution(VerbMatchScope::Baseline);
+        assert!(!selected_verb_authority_binds_exact_cwd(&resolution));
+
+        resolution.matches[0].exact_cwd_authorized = true;
+        assert!(selected_verb_authority_binds_exact_cwd(&resolution));
+
+        let mut unselected = resolution.matches[0].clone();
+        unselected.selected = false;
+        unselected.exact_cwd_authorized = false;
+        resolution.matches.push(unselected);
+        assert!(selected_verb_authority_binds_exact_cwd(&resolution));
+
+        let mut selected_without_cwd = resolution.matches[0].clone();
+        selected_without_cwd.exact_cwd_authorized = false;
+        resolution.matches.push(selected_without_cwd);
+        assert!(!selected_verb_authority_binds_exact_cwd(&resolution));
+
+        resolution.matches.clear();
+        assert!(!selected_verb_authority_binds_exact_cwd(&resolution));
+    }
 
     #[test]
     fn buffered_output_truncation_preserves_utf8_and_the_byte_cap() {
@@ -4946,24 +7285,6 @@ mod decision_trace_feature_tests {
         task.await.unwrap();
     }
 
-    #[test]
-    fn diagnostics_consume_the_shared_output_budgets() {
-        let diagnostic = ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC;
-        let retained_total = AtomicUsize::new(MAX_OUTPUT_BYTES - 1);
-        let existing = Some("x".to_string());
-        assert_eq!(
-            append_accounted_diagnostic(existing.clone(), diagnostic, &retained_total,),
-            existing
-        );
-        assert_eq!(retained_total.load(Ordering::Acquire), MAX_OUTPUT_BYTES - 1);
-
-        let mut emitted_total = MAX_OUTPUT_BYTES - diagnostic.len();
-        assert!(reserve_emitted_output(&mut emitted_total, diagnostic.len()));
-        assert_eq!(emitted_total, MAX_OUTPUT_BYTES);
-        assert!(!reserve_emitted_output(&mut emitted_total, 1));
-        assert_eq!(emitted_total, MAX_OUTPUT_BYTES);
-    }
-
     #[tokio::test]
     async fn buffered_output_coordinator_kills_pending_sibling_on_stdout_limit() {
         let total = Arc::new(AtomicUsize::new(MAX_OUTPUT_BYTES));
@@ -5070,6 +7391,7 @@ mod decision_trace_feature_tests {
             ],
             selected: true,
             overridden: false,
+            exact_cwd_authorized: false,
         }];
 
         let persisted = decision_trace_verb_matches(&matches);

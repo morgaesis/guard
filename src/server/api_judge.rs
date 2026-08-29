@@ -1030,7 +1030,7 @@ mod tests {
 
         let llm = LlmConfig {
             enabled: true,
-            api_key: Some("test-key".to_string()),
+            api_key: Some(format!("fixture-{:032x}", rand::random::<u128>())),
             api_url: Some(url),
             proxy_url: None,
             reasoning_effort: None,
@@ -1146,7 +1146,7 @@ mod tests {
     fn llm_config(url: String) -> LlmConfig {
         LlmConfig {
             enabled: true,
-            api_key: Some("test-key".to_string()),
+            api_key: Some(format!("fixture-{:032x}", rand::random::<u128>())),
             api_url: Some(url),
             proxy_url: None,
             reasoning_effort: None,

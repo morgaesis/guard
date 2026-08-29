@@ -32,6 +32,57 @@ use tokio::sync::RwLock;
 use super::{
     capture_async, make_test_config, run_verb_synthesis_llm, run_verb_synthesis_llm_with_preflight,
 };
+#[cfg(unix)]
+use super::{trusted_artifact_tempdir, write_trusted_artifact, TEST_ENV_LOCK};
+
+fn generated_provider_credential() -> String {
+    format!("fixture-{:032x}", rand::random::<u128>())
+}
+
+#[cfg(unix)]
+struct SessionEnvRestore {
+    name: &'static str,
+    value: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl SessionEnvRestore {
+    fn capture(name: &'static str) -> Self {
+        Self {
+            name,
+            value: std::env::var_os(name),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SessionEnvRestore {
+    fn drop(&mut self) {
+        match self.value.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn install_trusted_compiler_fixture() -> (tempfile::TempDir, SessionEnvRestore) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = trusted_artifact_tempdir();
+    let bin = directory.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let compiler = bin.join("uptime");
+    write_trusted_artifact(
+        &compiler,
+        "#!/bin/sh\ncase \"$*\" in\n  --version) printf 'uptime fixture' ;;\n  '--print sysroot') printf '/fixture/sysroot' ;;\n  '--print target-libdir') printf '/fixture/target-libdir' ;;\n  *) exit 2 ;;\nesac\n",
+    );
+    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let restore = SessionEnvRestore::capture("PATH");
+    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+    (directory, restore)
+}
 
 fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> SessionGrant {
     SessionGrant {
@@ -74,7 +125,7 @@ async fn synthesized_verbs_default_to_session_scope() {
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -90,7 +141,7 @@ async fn synthesized_verbs_default_to_session_scope() {
         &daemon,
         AdminRequest::VerbCreate {
             prose: "Inspect compiler version.".to_string(),
-            binary_hint: Some("rustc".to_string()),
+            binary_hint: Some("uptime".to_string()),
             preview: true,
             gate_feedback: Vec::new(),
         },
@@ -109,7 +160,7 @@ fn synthesized_held_read_arguments(_request: &str) -> serde_json::Value {
     serde_json::json!({
         "name": "enumerate-accounts",
         "description": "Enumerate account records",
-        "binary": "fixturectl",
+        "binary": "printf",
         "args": ["accounts", "list"],
         "params": {},
         "consequence": "reversible",
@@ -132,7 +183,7 @@ async fn verb_synthesis_preserves_sensitive_read_hold() {
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -146,7 +197,7 @@ async fn verb_synthesis_preserves_sensitive_read_hold() {
         },
         AdminRequest::VerbCreate {
             prose: "Enumerate all account records for an audit.".to_string(),
-            binary_hint: Some("fixturectl".to_string()),
+            binary_hint: Some("printf".to_string()),
             preview: true,
             gate_feedback: Vec::new(),
         },
@@ -160,6 +211,10 @@ async fn verb_synthesis_preserves_sensitive_read_hold() {
 
 #[tokio::test]
 async fn approved_synthesized_access_executes_deterministically_without_catalog_file() {
+    #[cfg(unix)]
+    let _environment_guard = TEST_ENV_LOCK.lock().await;
+    #[cfg(unix)]
+    let (_compiler_fixture, _path_restore) = install_trusted_compiler_fixture();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(run_verb_synthesis_llm(listener));
@@ -171,7 +226,7 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -276,14 +331,17 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
             .verbs
             .read()
             .await
-            .match_command_all("rustc", &["--version".to_string()])
+            .match_command_all("uptime", &["--version".to_string()])
             .len(),
         1,
         "approved generated coverage must match its synthesized command"
     );
 
-    let mut request =
-        request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
+    let mut request = request_with_session(
+        "uptime",
+        vec!["--version".to_string()],
+        "unused".to_string(),
+    );
     request.session_token = None;
     let first = execute_command(request.clone(), &cfg, &worker)
         .await
@@ -344,7 +402,7 @@ fn configure_synthesis_evaluator(server: &mut crate::server::ServerContext, url:
     server.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -547,7 +605,7 @@ fn synthesis_arguments_with_description(description: &str) -> serde_json::Value 
     serde_json::json!({
         "name": "check-compiler",
         "description": description,
-        "binary": "rustc",
+        "binary": "uptime",
         "args": ["--version"],
         "params": {},
         "consequence": "reversible",
@@ -558,7 +616,7 @@ fn synthesis_arguments_with_description(description: &str) -> serde_json::Value 
 
 fn described_compiler_check_arguments(_request: &str) -> serde_json::Value {
     synthesis_arguments_with_description(
-        "Runs rustc --version, which prints the installed compiler version and writes nothing.",
+        "Runs uptime --version, which prints the installed version and writes nothing.",
     )
 }
 
@@ -570,7 +628,7 @@ fn unsupported_compiler_check_arguments(_request: &str) -> serde_json::Value {
     serde_json::json!({
         "name": "unsupported-compiler-check",
         "description": "Run an unsupported compiler diagnostic",
-        "binary": "rustc",
+        "binary": "uptime",
         "args": ["--definitely-unsupported"],
         "params": {},
         "consequence": "reversible",
@@ -603,7 +661,7 @@ async fn synthesized_access_capability_description(
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -637,7 +695,7 @@ async fn synthesized_access_carries_the_described_grant() {
         synthesized_access_capability_description(described_compiler_check_arguments).await;
     assert_eq!(
         description,
-        "Runs rustc with pinned arguments --version and no caller-supplied values."
+        "Runs uptime with pinned arguments --version and no caller-supplied values."
     );
     assert_ne!(
         Some(description.as_str()),
@@ -654,7 +712,7 @@ async fn undescribed_synthesis_uses_the_matcher_derived_description() {
         synthesized_access_capability_description(undescribed_compiler_check_arguments).await;
     assert_eq!(
         description,
-        "Runs rustc with pinned arguments --version and no caller-supplied values."
+        "Runs uptime with pinned arguments --version and no caller-supplied values."
     );
     assert_eq!(item.use_policy, "unselected");
     assert_eq!(item.default_use_policy.as_deref(), Some("unlimited"));
@@ -672,14 +730,14 @@ async fn access_request_minting_ignores_evaluator_verdicts() {
         listener,
         unsupported_compiler_check_arguments,
         "DENY",
-        "executable check failed: rustc does not support --definitely-unsupported",
+        "executable check failed: uptime does not support --definitely-unsupported",
     ));
 
     let (mut cfg, _) = make_test_config();
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -713,7 +771,7 @@ async fn access_request_rejects_api_policy_refused_capability() {
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -769,7 +827,7 @@ async fn access_request_synthesis_is_rate_limited_per_principal() {
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -833,7 +891,7 @@ async fn equivalent_synthesized_access_converges_across_principals() {
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -915,7 +973,7 @@ async fn pending_reused_generated_access_survives_revoke_and_restart() {
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url)
                 .llm_retries(0),
         )
@@ -1036,7 +1094,7 @@ async fn full_access_queue_rejects_before_synthesis_or_catalog_change() {
     cfg.state.evaluator = Arc::new(
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url("http://127.0.0.1:9".to_string())
                 .llm_retries(0),
         )
@@ -1228,13 +1286,17 @@ verbs:
 }
 
 async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() {
+    #[cfg(unix)]
+    let _environment_guard = TEST_ENV_LOCK.lock().await;
+    #[cfg(unix)]
+    let (_compiler_fixture, _path_restore) = install_trusted_compiler_fixture();
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     cfg.config.gate = GateMode::Consequence;
     cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
-            "verbs:\n  - name: inspect-fixture\n    description: Inspect fixture\n    binary: rustc\n    args: [--version]\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: operate-fixture\n    description: Operate fixture\n    binary: rustc\n    args: [--print, sysroot]\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: baseline-fixture\n    description: Run baseline fixture\n    binary: rustc\n    args: [--print, target-libdir]\n    baseline: true\n    consequence: reversible\n    trusted: true\n  - name: missing-fixture\n    description: Run missing fixture binary\n    binary: guard-missing-fixture-binary\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+            "verbs:\n  - name: inspect-fixture\n    description: Inspect fixture\n    binary: uptime\n    args: [--version]\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: operate-fixture\n    description: Operate fixture\n    binary: uptime\n    args: [--print, sysroot]\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: baseline-fixture\n    description: Run baseline fixture\n    binary: uptime\n    args: [--print, target-libdir]\n    baseline: true\n    consequence: reversible\n    trusted: true\n  - name: missing-fixture\n    description: Run failing fixture command\n    binary: false\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
         )
         .unwrap(),
     ));
@@ -1249,7 +1311,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     let other = CallerIdentity::Unix { uid: 1002 };
 
     let mut unrelated_without_overlay = request_with_session(
-        "rustc",
+        "uptime",
         vec!["--print".to_string(), "target-libdir".to_string()],
         "unused".to_string(),
     );
@@ -1330,7 +1392,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .any(|item| item.reference == isolated.reference));
 
     let mut unrelated = request_with_session(
-        "rustc",
+        "uptime",
         vec!["--print".to_string(), "target-libdir".to_string()],
         "unused".to_string(),
     );
@@ -1365,7 +1427,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .unwrap();
     let explicitly_overlaid = execute_command(
         request_with_session(
-            "rustc",
+            "uptime",
             vec!["--print".to_string(), "target-libdir".to_string()],
             access_token.clone(),
         ),
@@ -1393,8 +1455,11 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     };
     assert_eq!(remaining_before_access, Some(1));
 
-    let execution =
-        request_with_session("rustc", vec!["--version".to_string()], access_token.clone());
+    let execution = request_with_session(
+        "uptime",
+        vec!["--version".to_string()],
+        access_token.clone(),
+    );
     // Keep the two large execute futures off the test thread's bounded stack.
     // Their simultaneous admission is the behavior under test, not their
     // placement in the generated test future.
@@ -1441,7 +1506,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     assert!(items[0].success);
     for _ in 0..2 {
         let mut operate = request_with_session(
-            "rustc",
+            "uptime",
             vec!["--print".to_string(), "sysroot".to_string()],
             "unused".to_string(),
         );
@@ -1450,8 +1515,11 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
             .await
             .policy_allowed());
     }
-    let mut exhausted_inspect =
-        request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
+    let mut exhausted_inspect = request_with_session(
+        "uptime",
+        vec!["--version".to_string()],
+        "unused".to_string(),
+    );
     exhausted_inspect.session_token = None;
     let denied = execute_command(exhausted_inspect.clone(), &cfg, &worker)
         .await
@@ -1532,12 +1600,12 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         &cfg,
         &other,
         AdminRequest::AccessRequest {
-            intent: "Run missing fixture binary".to_string(),
+            intent: "Run failing fixture command".to_string(),
         },
     )
     .await
     else {
-        panic!("expected spawn-failure access request")
+        panic!("expected failed-command access request")
     };
     let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
@@ -1550,20 +1618,19 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     )
     .await
     else {
-        panic!("expected spawn-failure approval")
+        panic!("expected failed-command approval")
     };
     assert!(items[0].success);
-    let mut missing = request_with_session(
-        "guard-missing-fixture-binary",
-        Vec::new(),
-        "unused".to_string(),
-    );
+    let mut missing = request_with_session("false", Vec::new(), "unused".to_string());
     missing.session_token = None;
-    let failed_spawn = execute_command(missing, &cfg, &other).await;
-    assert!(failed_spawn.policy_allowed());
+    let failed_command = execute_command(missing, &cfg, &other).await;
+    assert!(failed_command.policy_allowed());
     assert!(matches!(
-        failed_spawn.exec,
-        ExecOutcome::Failed { started: false, .. }
+        failed_command.exec,
+        ExecOutcome::Completed {
+            exit_code: Some(1),
+            ..
+        }
     ));
     let restored = cfg
         .state
@@ -1607,8 +1674,11 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     assert_eq!(retried[0].request, extended[0].request);
     assert_eq!(retried[0].remaining_uses, Some(2));
 
-    let mut one_use =
-        request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
+    let mut one_use = request_with_session(
+        "uptime",
+        vec!["--version".to_string()],
+        "unused".to_string(),
+    );
     one_use.session_token = None;
     assert!(execute_command(one_use, &cfg, &worker)
         .await
@@ -1664,7 +1734,7 @@ async fn legacy_unowned_session_is_revocable_by_fingerprint() {
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
 
-    let mut legacy = granted_session(vec!["rustc*".to_string()], Vec::new());
+    let mut legacy = granted_session(vec!["uptime*".to_string()], Vec::new());
     legacy.owner = crate::session::SessionOwner::Unowned;
     cfg.state
         .sessions
@@ -1698,15 +1768,15 @@ async fn legacy_unowned_session_is_revocable_by_fingerprint() {
 #[tokio::test]
 async fn access_request_can_name_multiple_catalog_verbs() {
     let (mut cfg, _) = make_test_config();
+    cfg.config.exec_as_caller = true;
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     cfg.config.gate = GateMode::Consequence;
-    cfg.state.verbs = Arc::new(RwLock::new(
-        VerbCatalog::from_yaml(
+    let catalog = VerbCatalog::from_yaml(
             "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: false\n  - name: inspect-b\n    description: Inspect system B\n    binary: printf\n    args: [b]\n    baseline: false\n    consequence: reversible\n    trusted: false\n  - name: run\n    description: Run a different operation\n    binary: printf\n    args: [run]\n    baseline: false\n    consequence: reversible\n    trusted: false\n  - name: stop\n    description: Stop a different operation\n    binary: printf\n    args: [stop]\n    baseline: false\n    consequence: reversible\n    trusted: false\n",
         )
-        .unwrap(),
-    ));
+        .unwrap();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
 
@@ -3148,11 +3218,14 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
             catalog_version: None,
             verb_digest: None,
             verb_composition_digest: None,
+            verb_environment_authority: false,
+            verb_local_file_authority: false,
             exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(PrincipalKey::from_uid(1001)),
             secret_binding: None,
+            process_authority: None,
         },
         reason: "fixture hold".to_string(),
         risk: Some(5),
@@ -3300,7 +3373,7 @@ async fn sessionless_denied_typed_command_returns_access_request_guidance() {
     cfg.config.gate = GateMode::Consequence;
     cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
-            "verbs:\n  - name: inspect-fixture\n    description: Inspect fixture\n    binary: fixture-inspect\n    args: [status]\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+            "verbs:\n  - name: inspect-fixture\n    description: Inspect fixture\n    binary: printf\n    args: [status]\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
         )
         .unwrap(),
     ));
@@ -3311,11 +3384,8 @@ async fn sessionless_denied_typed_command_returns_access_request_guidance() {
             .unwrap(),
     );
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let mut request = request_with_session(
-        "fixture-inspect",
-        vec!["status".to_string()],
-        "unused".to_string(),
-    );
+    let mut request =
+        request_with_session("printf", vec!["status".to_string()], "unused".to_string());
     request.session_token = None;
 
     let response = execute_command(request.clone(), &cfg, &worker)
@@ -3355,7 +3425,7 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let mut request = request_with_session(
-        "novel-fixture",
+        "printf",
         vec![
             "--extra".to_string(),
             "value one".to_string(),
@@ -3472,22 +3542,20 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
     );
     {
         let catalog = approving.state.verbs.read().await;
-        let matches = catalog.match_command_all("novel-fixture", &original);
+        let matches = catalog.match_command_all("printf", &original);
         assert_eq!(
             matches.len(),
             1,
             "approved generated access must select once"
         );
-        assert_eq!(matches[0].rendered.binary, "novel-fixture");
+        assert_eq!(matches[0].rendered.binary, "printf");
         assert_eq!(matches[0].rendered.args, original);
         assert!(
-            catalog
-                .match_command_all("novel-fixture", &split)
-                .is_empty(),
+            catalog.match_command_all("printf", &split).is_empty(),
             "whitespace-split argv must not select exact generated access"
         );
         assert!(catalog
-            .match_command_all("novel-fixture", &omitted_repeated_pair)
+            .match_command_all("printf", &omitted_repeated_pair)
             .is_empty());
     }
 
@@ -3540,15 +3608,13 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
     );
     {
         let catalog = restarted.state.verbs.read().await;
-        let matches = catalog.match_command_all("novel-fixture", &original);
+        let matches = catalog.match_command_all("printf", &original);
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].rendered.binary, "novel-fixture");
+        assert_eq!(matches[0].rendered.binary, "printf");
         assert_eq!(matches[0].rendered.args, original);
+        assert!(catalog.match_command_all("printf", &split).is_empty());
         assert!(catalog
-            .match_command_all("novel-fixture", &split)
-            .is_empty());
-        assert!(catalog
-            .match_command_all("novel-fixture", &omitted_repeated_pair)
+            .match_command_all("printf", &omitted_repeated_pair)
             .is_empty());
     }
     let mut changed = original;
@@ -3561,7 +3627,7 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
         .verbs
         .read()
         .await
-        .match_command_all("novel-fixture", &changed)
+        .match_command_all("printf", &changed)
         .is_empty());
 }
 
@@ -3578,7 +3644,7 @@ async fn approved_matcher_name_tamper_fails_closed_across_restart_boundaries() {
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let mut execute = request_with_session(
-        "novel-fixture",
+        "printf",
         vec!["inspect".to_string(), "resource/example".to_string()],
         "unused".to_string(),
     );
@@ -3627,7 +3693,7 @@ async fn approved_matcher_name_tamper_fails_closed_across_restart_boundaries() {
     connection
         .execute(
             "UPDATE grant_requests SET json = ?1 WHERE handle = ?2",
-            rusqlite::params![serde_json::to_string(&tampered).unwrap(), handle],
+            rusqlite::params![serde_json::to_string(&tampered).unwrap(), &handle],
         )
         .unwrap();
     drop(connection);
@@ -3647,9 +3713,12 @@ async fn approved_matcher_name_tamper_fails_closed_across_restart_boundaries() {
         .write()
         .await
         .insert(tampered.handle.clone(), tampered);
-    assert!(validate_durable_access_provenance(&restarted)
+    let error = validate_durable_access_provenance(&restarted)
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(error.contains("access session"), "{error}");
+    assert!(error.contains(&handle), "{error}");
+    assert!(error.contains("matcher digest"), "{error}");
     assert!(install_approved_access_verbs(&restarted).await.is_err());
 }
 
@@ -3714,7 +3783,7 @@ async fn independently_sensitive_argv_does_not_create_or_expose_generated_access
     let sensitive = [["s", "k"].concat(), "-".to_string(), "Ab1".repeat(8)].concat();
     assert_ne!(guard::redact::redact_output_text(&sensitive), sensitive);
     assert_sensitive_argv_rejected(
-        "novel-fixture",
+        "printf",
         vec!["--credential".to_string(), sensitive.clone()],
         &sensitive,
     )
@@ -3726,13 +3795,13 @@ async fn split_and_inline_sensitive_argv_do_not_create_or_expose_generated_acces
     let sensitive = ["low", "entropy"].concat();
     assert_eq!(guard::redact::redact_output_text(&sensitive), sensitive);
     assert_sensitive_argv_rejected(
-        "novel-fixture",
+        "printf",
         vec!["--api-token".to_string(), sensitive.clone()],
         &sensitive,
     )
     .await;
     assert_sensitive_argv_rejected(
-        "novel-fixture",
+        "printf",
         vec![format!("--api-token={sensitive}")],
         &sensitive,
     )
@@ -3743,15 +3812,9 @@ async fn split_and_inline_sensitive_argv_do_not_create_or_expose_generated_acces
 async fn strict_and_opaque_sensitive_argv_do_not_reach_durable_or_audit_surfaces() {
     let sensitive = ["q", "7"].concat();
     for (binary, args) in [
-        (
-            "novel-fixture",
-            vec!["--key".to_string(), sensitive.clone()],
-        ),
-        ("novel-fixture", vec![format!("--pass={sensitive}")]),
-        (
-            "novel-fixture",
-            vec![format!("--passphrase=\n{sensitive}\u{1}")],
-        ),
+        ("printf", vec!["--key".to_string(), sensitive.clone()]),
+        ("printf", vec![format!("--pass={sensitive}")]),
+        ("printf", vec![format!("--passphrase=\n{sensitive}\u{1}")]),
         ("curl", vec!["-u".to_string(), sensitive.clone()]),
         ("curl", vec![format!("--user={sensitive}")]),
         (
@@ -3893,15 +3956,15 @@ async fn display_colliding_argv_create_distinct_convergent_requests() {
     let first_args = vec!["alpha beta".to_string()];
     let second_args = vec!["alpha".to_string(), "beta".to_string()];
     assert_eq!(
-        guard::redact::command_line("novel-fixture", &first_args),
-        guard::redact::command_line("novel-fixture", &second_args)
+        guard::redact::command_line("printf", &first_args),
+        guard::redact::command_line("printf", &second_args)
     );
 
     let deny = |args: Vec<String>| {
         let cfg = &cfg;
         let worker = &worker;
         async move {
-            let mut request = request_with_session("novel-fixture", args, "unused".to_string());
+            let mut request = request_with_session("printf", args, "unused".to_string());
             request.session_token = None;
             execute_command(request, cfg, worker).await.into_response()
         }
@@ -3950,13 +4013,12 @@ async fn structured_argv_converges_to_one_matcher_across_principals() {
     cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
     let args = vec!["inspect".to_string(), "resource with spaces".to_string()];
 
-    let mut first_request =
-        request_with_session("novel-fixture", args.clone(), "unused".to_string());
+    let mut first_request = request_with_session("printf", args.clone(), "unused".to_string());
     first_request.session_token = None;
     let first = execute_command(first_request, &cfg, &CallerIdentity::Unix { uid: 1001 })
         .await
         .into_response();
-    let mut second_request = request_with_session("novel-fixture", args, "unused".to_string());
+    let mut second_request = request_with_session("printf", args, "unused".to_string());
     second_request.session_token = None;
     let second = execute_command(second_request, &cfg, &CallerIdentity::Unix { uid: 1002 })
         .await
@@ -4007,7 +4069,7 @@ async fn structured_argv_retries_converge_before_capacity_rejection() {
         let global = &global;
         let worker = &worker;
         async move {
-            let mut request = request_with_session("novel-fixture", args, "unused".to_string());
+            let mut request = request_with_session("printf", args, "unused".to_string());
             request.session_token = None;
             execute_command(request, global, worker)
                 .await
@@ -4047,7 +4109,7 @@ async fn structured_argv_retries_converge_before_capacity_rejection() {
         let principal = &principal;
         let worker = &worker;
         async move {
-            let mut request = request_with_session("novel-fixture", args, "unused".to_string());
+            let mut request = request_with_session("printf", args, "unused".to_string());
             request.session_token = None;
             execute_command(request, principal, worker)
                 .await
@@ -4102,8 +4164,8 @@ async fn observed_argv_is_not_replaced_by_a_similar_authored_verb() {
             r#"
 verbs:
   - name: inspect-similar-resource
-    description: novel-fixture inspect target
-    binary: novel-fixture
+    description: printf inspect target
+    binary: printf
     args: ["inspect", "different-target"]
     consequence: reversible
 "#,
@@ -4112,7 +4174,7 @@ verbs:
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
     let expected = vec!["inspect".to_string(), "target".to_string()];
-    let mut request = request_with_session("novel-fixture", expected.clone(), "unused".to_string());
+    let mut request = request_with_session("printf", expected.clone(), "unused".to_string());
     request.session_token = None;
 
     let response = execute_command(request, &cfg, &worker)
@@ -4148,7 +4210,7 @@ async fn hard_typed_denial_is_labeled_non_overridable_without_request() {
             r#"
 verbs:
   - name: block-fixture
-    binary: fixture-denied
+    binary: "false"
     baseline: true
     consequence: reversible
     coverage:
@@ -4161,11 +4223,8 @@ verbs:
         .unwrap(),
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let mut request = request_with_session(
-        "fixture-denied",
-        vec!["status".to_string()],
-        "unused".to_string(),
-    );
+    let mut request =
+        request_with_session("false", vec!["status".to_string()], "unused".to_string());
     request.session_token = None;
 
     let response = execute_command(request, &cfg, &worker)
@@ -4198,7 +4257,7 @@ policy:
     - name: protected
       priority: 10
       rules:
-        - patterns: ["fixture-denied*"]
+        - patterns: ["false*"]
           action: deny
           description: "explicit default-deny fixture"
 "#,
@@ -4208,11 +4267,8 @@ policy:
         Evaluator::new(EvalConfig::default().llm_enabled(false).policy_path(policy)).unwrap(),
     );
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let mut request = request_with_session(
-        "fixture-denied",
-        vec!["status".to_string()],
-        "unused".to_string(),
-    );
+    let mut request =
+        request_with_session("false", vec!["status".to_string()], "unused".to_string());
     request.session_token = None;
 
     let response = execute_command(request, &cfg, &worker)
@@ -4392,6 +4448,7 @@ verbs:
     coverage:
       - name: web
         action: preauthorized
+        command_path: ["apply"]
         required_args: ["apply"]
 "#,
         )
@@ -4595,10 +4652,11 @@ async fn cwd_request_does_not_match_legacy_session_allow_glob() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cwd_request_matches_cwd_bound_exact_session_allow_only() {
     let (cfg, _) = make_test_config();
-    let allowed = tempfile::tempdir().unwrap();
+    let allowed = trusted_artifact_tempdir();
     let other = tempfile::tempdir().unwrap();
     let allowed_cwd = allowed.path().canonicalize().unwrap();
     let token = format!("cwd-exact-{}", std::process::id());
@@ -4607,50 +4665,28 @@ async fn cwd_request_matches_cwd_bound_exact_session_allow_only() {
         granted_session(
             Vec::new(),
             vec![SessionExactRule::with_cwd(
-                "sh",
-                vec![
-                    "-c".to_string(),
-                    "printf ok > cwd-exact-sentinel.txt".to_string(),
-                ],
+                "pwd",
+                vec!["-P".to_string()],
                 allowed_cwd.clone(),
             )],
         ),
     );
 
-    let mut req = request_with_session(
-        "sh",
-        vec![
-            "-c".to_string(),
-            "printf ok > cwd-exact-sentinel.txt".to_string(),
-        ],
-        token.clone(),
-    );
+    let mut req = request_with_session("pwd", vec!["-P".to_string()], token.clone());
     req.cwd = Some(allowed_cwd.clone());
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
     match result.exec {
         ExecOutcome::Completed {
-            exit_code: Some(0), ..
+            exit_code: Some(0),
+            stdout,
+            ..
         } => {
-            let sentinel = allowed_cwd.join("cwd-exact-sentinel.txt");
-            let content = std::fs::read_to_string(&sentinel);
-            assert!(
-                matches!(content.as_deref(), Ok("ok")),
-                "sentinel content at {}: {:?}",
-                sentinel.display(),
-                content
-            );
+            assert_eq!(stdout.as_deref().map(str::trim), allowed_cwd.to_str());
         }
         other => panic!("expected cwd-bound exact allow to execute, got {:?}", other),
     }
 
-    let mut req = request_with_session(
-        "sh",
-        vec![
-            "-c".to_string(),
-            "printf ok > cwd-exact-sentinel.txt".to_string(),
-        ],
-        token,
-    );
+    let mut req = request_with_session("pwd", vec!["-P".to_string()], token);
     req.cwd = Some(other.path().canonicalize().unwrap());
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
     assert!(!result.policy_allowed());
@@ -4835,23 +4871,25 @@ async fn exact_amendment_publishes_only_after_persistence_and_preserves_concurre
         .is_some_and(|(decision, _)| decision == crate::session::SessionDecision::Deny));
 }
 
-// Synthetic test-fixture credential shapes (never real secrets): a
-// kubernetes-style service-account bearer JWT and a --password= flag.
 fn fixture_bearer_jwt() -> String {
     [
-        "eyJhbGciOiJSUzI1NiJ9",
-        "eyJzdWIiOiJndWFyZC10ZXN0LWZpeHR1cmUifQ",
-        "c3ludGhldGljLXNpZ25hdHVyZS1ub3QtYS1jcmVkZW50aWFs",
+        [["e", "y", "J"].concat(), "A".repeat(21)].concat(),
+        "B".repeat(32),
+        "C".repeat(48),
     ]
     .join(".")
 }
-const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
+
+fn fixture_password_flag() -> String {
+    format!("--password={:032x}", rand::random::<u128>())
+}
 
 #[test]
 fn session_auto_amend_refuses_credential_shaped_argv() {
     // A session exact rule persists argv verbatim; credential-shaped material
     // (bearer tokens, --password= flags, URL userinfo) must refuse amendment
     // on both the allow and the deny side.
+    let password_flag = fixture_password_flag();
     assert!(allow_session_auto_amend_candidate(
         "kubectl",
         &[format!("--token={}", fixture_bearer_jwt()), "get".into()],
@@ -4860,7 +4898,7 @@ fn session_auto_amend_refuses_credential_shaped_argv() {
     .is_err());
     assert!(allow_session_auto_amend_candidate(
         "mysql",
-        &["-u".into(), "root".into(), FIXTURE_PASSWORD_FLAG.into()],
+        &["-u".into(), "root".into(), password_flag],
         Some(1)
     )
     .is_err());
@@ -4888,7 +4926,9 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
-    let token = "inspection-redaction-token".to_string();
+    let token = format!("inspection-{:032x}", rand::random::<u128>());
+    let bearer = fixture_bearer_jwt();
+    let password_flag = fixture_password_flag();
 
     // Install rows the way a pre-sanitization daemon would have persisted
     // them: raw credential material in the grant prompt, a learned exact
@@ -4902,7 +4942,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
             deny: Vec::new(),
             allow_exact: vec![SessionExactRule::new(
                 "kubectl",
-                vec![format!("--token={}", fixture_bearer_jwt()), "get".into()],
+                vec![format!("--token={bearer}"), "get".into()],
             )],
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
@@ -4910,7 +4950,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
             scope: Default::default(),
             expires_at: None,
             granted_at: 1,
-            prompt_append: Some(format!("session context {FIXTURE_PASSWORD_FLAG}")),
+            prompt_append: Some(format!("session context {password_flag}")),
             generated_notes: Vec::new(),
             static_only: false,
             auto_amend: false,
@@ -4926,10 +4966,10 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
             token.clone(),
             SessionInteraction {
                 at_unix: guard::env::now_unix(),
-                command: format!("kubectl --token={} get pods", fixture_bearer_jwt()),
+                command: format!("kubectl --token={bearer} get pods"),
                 allowed: true,
                 source: SessionDecisionSource::Llm,
-                reason: format!("allowed despite {FIXTURE_PASSWORD_FLAG}"),
+                reason: format!("allowed despite {password_flag}"),
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
@@ -4954,11 +4994,11 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
     .await;
     let show_json = serde_json::to_string(&show).unwrap();
     assert!(
-        !show_json.contains("SyntheticSignature123"),
+        !show_json.contains(&bearer),
         "session show leaked the bearer token: {show_json}"
     );
     assert!(
-        !show_json.contains("SyntheticHunter2Value"),
+        !show_json.contains(&password_flag),
         "session show leaked the password: {show_json}"
     );
     assert!(
@@ -4988,14 +5028,8 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
     )
     .await;
     let status_json = serde_json::to_string(&status).unwrap();
-    assert!(
-        !status_json.contains("SyntheticSignature123"),
-        "{status_json}"
-    );
-    assert!(
-        !status_json.contains("SyntheticHunter2Value"),
-        "{status_json}"
-    );
+    assert!(!status_json.contains(&bearer), "{status_json}");
+    assert!(!status_json.contains(&password_flag), "{status_json}");
     assert!(status_json.contains("[REDACTED]"), "{status_json}");
 
     let list = handle_admin_request_for_test(
@@ -5009,8 +5043,8 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
     )
     .await;
     let list_json = serde_json::to_string(&list).unwrap();
-    assert!(!list_json.contains("SyntheticSignature123"), "{list_json}");
-    assert!(!list_json.contains("SyntheticHunter2Value"), "{list_json}");
+    assert!(!list_json.contains(&bearer), "{list_json}");
+    assert!(!list_json.contains(&password_flag), "{list_json}");
     assert!(list_json.contains("[REDACTED]"), "{list_json}");
 }
 
@@ -5029,27 +5063,27 @@ fn session_source_reports_cache_separately_from_static_policy() {
 #[test]
 fn tcp_admin_token_validation_is_separate_from_exec_token() {
     let (mut cfg, _) = make_test_config();
-    cfg.config.auth_token = Some("exec-token".into());
-    cfg.config.admin_token = Some("admin-token".into());
+    let exec_token = format!("{:032x}", rand::random::<u128>());
+    let admin_token = format!("{:032x}", rand::random::<u128>());
+    cfg.config.auth_token = Some(exec_token.clone());
+    cfg.config.admin_token = Some(admin_token.clone());
 
-    assert!(cfg.validate_token(Some("exec-token")).is_ok());
-    assert!(cfg.validate_admin_token(Some("admin-token")).is_ok());
-    assert!(cfg.validate_admin_token(Some("exec-token")).is_err());
+    assert!(cfg.validate_token(Some(&exec_token)).is_ok());
+    assert!(cfg.validate_admin_token(Some(&admin_token)).is_ok());
+    assert!(cfg.validate_admin_token(Some(&exec_token)).is_err());
     assert!(cfg
-        .validate_admin(&CallerIdentity::TcpAdmin {
-            token: "admin-token".into(),
-        })
+        .validate_admin(&CallerIdentity::TcpAdmin { token: admin_token })
         .is_ok());
     assert!(cfg
         .validate_admin(&CallerIdentity::Tcp {
-            token: "exec-token".into(),
+            token: exec_token.clone(),
         })
         .is_err());
 
-    cfg.config.daemon_principal = PrincipalKey::from_raw("exec-token");
+    cfg.config.daemon_principal = PrincipalKey::from_raw(&exec_token);
     assert!(
         cfg.validate_admin(&CallerIdentity::Tcp {
-            token: "exec-token".into(),
+            token: exec_token,
         })
         .is_err(),
         "an ordinary TCP bearer must not become operator authority by colliding with the daemon principal"
@@ -6402,7 +6436,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
     let evaluator = |model: &str| {
         Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(generated_provider_credential())
                 .llm_api_url(url.clone())
                 .llm_model(model.to_string())
                 .llm_retries(0),
@@ -6642,6 +6676,112 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
         AdminResponse::GrantRequest { request }
             if request.status == crate::grant_profile::GrantRequestStatus::Withdrawn
     ));
+}
+
+#[tokio::test]
+async fn access_deny_retires_only_an_unloadable_durable_grant_request() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let temporary = tempfile::tempdir().unwrap();
+    let state_db = temporary.path().join("state.db");
+    let store = SessionStore::open(state_db.clone(), 3_600).await.unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let seed_invalid = |request: &crate::grant_profile::GrantRequest| {
+        let connection = rusqlite::Connection::open(&state_db).unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    &request.handle,
+                    serde_json::to_string(request).unwrap(),
+                    request.status.as_str(),
+                    i64::try_from(request.created_unix).unwrap(),
+                ],
+            )
+            .unwrap();
+    };
+    let invalid = crate::grant_profile::GrantRequest::new_access_with_uses(
+        PrincipalKey::from_uid(1001),
+        None,
+        "agent:fixture".to_string(),
+        crate::grant_profile::GrantRequestDelta::default(),
+        "invalid durable access fixture".to_string(),
+        Some(1),
+    )
+    .unwrap();
+    seed_invalid(&invalid);
+    assert!(store.load_grant_requests().await.unwrap().is_empty());
+    assert!(cfg.state.grant_requests.read().await.is_empty());
+
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessDeny {
+            handles: vec![invalid.handle.clone()],
+            reason: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected durable access request retirement")
+    };
+    assert_eq!(items.len(), 1);
+    assert!(items[0].success);
+    assert_eq!(items[0].state, "retired");
+    assert_eq!(
+        items[0].message,
+        "invalid durable access request was retired"
+    );
+    assert!(store
+        .load_grant_request(invalid.handle.clone())
+        .await
+        .unwrap()
+        .is_none());
+
+    let reloaded = SessionStore::open(state_db.clone(), 3_600).await.unwrap();
+    assert!(reloaded.load_grant_requests().await.unwrap().is_empty());
+
+    let failed = crate::grant_profile::GrantRequest::new_access_with_uses(
+        PrincipalKey::from_uid(1001),
+        None,
+        "agent:fixture".to_string(),
+        crate::grant_profile::GrantRequestDelta::default(),
+        "failed durable access retirement fixture".to_string(),
+        Some(1),
+    )
+    .unwrap();
+    seed_invalid(&failed);
+    store.fail_next_write_for_test();
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessDeny {
+            handles: vec![failed.handle.clone()],
+            reason: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected durable access request retirement failure")
+    };
+    assert_eq!(items.len(), 1);
+    assert!(!items[0].success);
+    assert_eq!(items[0].state, "error");
+    assert!(items[0]
+        .message
+        .contains("failed to retire invalid durable access request"));
+    let connection = rusqlite::Connection::open(&state_db).unwrap();
+    let retained: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM grant_requests WHERE handle = ?1",
+            rusqlite::params![&failed.handle],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 1);
 }
 
 #[tokio::test]
@@ -6890,13 +7030,14 @@ async fn evaluate_batch_seeds_the_identical_real_run_cache_key() {
 
     let evaluator = Evaluator::new(
         EvalConfig::default()
-            .llm_api_key("test-key".to_string())
+            .llm_api_key(generated_provider_credential())
             .llm_api_url(url)
             .llm_retries(0),
     )
     .unwrap();
     let (mut cfg, _) = make_test_config();
     cfg.state.evaluator = Arc::new(evaluator);
+    cfg.config.exec_as_caller = true;
     let token = "batch-cache-owner".to_string();
     let mut grant = granted_session(Vec::new(), Vec::new());
     grant.static_only = false;
