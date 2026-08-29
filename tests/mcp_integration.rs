@@ -30,7 +30,7 @@ fn generated_test_credential(label: &str) -> String {
 
 fn trusted_tempdir() -> TempDir {
     let directory = tempfile::Builder::new()
-        .prefix("guard-integration-")
+        .prefix("guard-")
         .tempdir_in(std::env::current_dir().expect("integration working directory"))
         .expect("trusted integration tempdir");
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
