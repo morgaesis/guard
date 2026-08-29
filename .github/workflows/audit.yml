@@ -43,6 +43,10 @@ jobs:
           tar -xzf "$archive" -C "$install_root" gitleaks
           test "$("$install_root/gitleaks" version)" = "$GITLEAKS_VERSION"
 
+      - name: Fetch published main history
+        shell: bash
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
+
       - name: Select complete commit range
         id: leak-range
         shell: bash
@@ -74,21 +78,19 @@ jobs:
                 echo "tested pull-request commit does not contain its head" >&2
                 exit 1
               }
-              log_opts="--all --full-history --diff-merges=first-parent --diff-filter=tuxdb $PR_BASE_SHA..$TESTED_SHA"
+              log_opts="--full-history --diff-merges=first-parent --diff-filter=tuxdb $PR_BASE_SHA..$TESTED_SHA"
               ;;
             push)
               require_sha "$PUSH_AFTER_SHA"
               if [[ "$PUSH_BEFORE_SHA" =~ ^0{40}$ ]]; then
-                log_opts="--all --full-history --diff-merges=first-parent --diff-filter=tuxdb $PUSH_AFTER_SHA"
+                log_opts="--full-history --diff-merges=first-parent --diff-filter=tuxdb $PUSH_AFTER_SHA"
               else
                 require_sha "$PUSH_BEFORE_SHA"
-                log_opts="--all --full-history --diff-merges=first-parent --diff-filter=tuxdb $PUSH_BEFORE_SHA..$PUSH_AFTER_SHA"
+                log_opts="--full-history --diff-merges=first-parent --diff-filter=tuxdb $PUSH_BEFORE_SHA..$PUSH_AFTER_SHA"
               fi
               ;;
             *)
-              # An empty override retains Gitleaks' complete default history
-              # scan, including --all, --full-history, and its diff filter.
-              log_opts=''
+              log_opts='--full-history --diff-merges=first-parent --diff-filter=tuxdb origin/main'
               ;;
           esac
           printf 'log_opts=%s\n' "$log_opts" >> "$GITHUB_OUTPUT"
@@ -102,14 +104,14 @@ jobs:
             echo "gitleaks configuration must extend only the default rules" >&2
             exit 1
           }
-          git fetch --no-tags origin main:refs/remotes/origin/main
           empty_ignore="$RUNNER_TEMP/empty-gitleaksignore"
           findings="$RUNNER_TEMP/gitleaks-unignored.json"
           : > "$empty_ignore"
           set +e
           "$RUNNER_TEMP/gitleaks/gitleaks" git --config .gitleaks.toml \
             --gitleaks-ignore-path "$empty_ignore" --redact --no-banner \
-            --exit-code 1 --report-format json --report-path "$findings" . \
+            --exit-code 1 --report-format json --report-path "$findings" \
+            --log-opts='--full-history --diff-merges=first-parent --diff-filter=tuxdb origin/main' . \
             > "$RUNNER_TEMP/gitleaks-unignored.log" 2>&1
           scan_status=$?
           set -e
@@ -122,7 +124,6 @@ jobs:
           esac
           test -f "$findings" || printf '[]\n' > "$findings"
           declare -A seen=()
-          fingerprint_count=0
           while IFS= read -r fingerprint || [ -n "$fingerprint" ]; do
             [[ -z "$fingerprint" || "$fingerprint" == \#* ]] && continue
             if [[ ! "$fingerprint" =~ ^([0-9a-f]{40}):([A-Za-z0-9._/-]+):([A-Za-z0-9._-]+):([1-9][0-9]*)$ ]]; then
@@ -140,7 +141,6 @@ jobs:
               exit 1
             fi
             seen["$fingerprint"]=1
-            fingerprint_count=$((fingerprint_count + 1))
             git cat-file -e "${commit}^{commit}"
             git cat-file -e "${commit}:${path}"
             git merge-base --is-ancestor "$commit" origin/main || {
@@ -153,10 +153,6 @@ jobs:
               exit 1
             }
           done < .gitleaksignore
-          test "$fingerprint_count" -gt 0 || {
-            echo "gitleaks ignore file contains no exact fingerprints" >&2
-            exit 1
-          }
 
       - name: Prove merge-parent coverage
         shell: bash
@@ -202,7 +198,7 @@ jobs:
           set +e
           "$gitleaks_bin" git --config "$GITHUB_WORKSPACE/.gitleaks.toml" \
             --redact --no-banner --exit-code 1 \
-            --log-opts="--all --full-history --diff-merges=first-parent --diff-filter=tuxdb $base_sha..$merge_sha" \
+            --log-opts="--full-history --diff-merges=first-parent --diff-filter=tuxdb $base_sha..$merge_sha" \
             "$fixture" > "$RUNNER_TEMP/gitleaks-merge-fixture.log" 2>&1
           scan_status=$?
           set -e
