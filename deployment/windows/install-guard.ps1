@@ -1336,7 +1336,7 @@ function Assert-CanonicalStateDatabasePath {
     if ($Path -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _().,@+=\-$]+(?:\\[A-Za-z0-9 _().,@+=\-$]+)*$') {
         throw 'Guard service --state-db must be a canonical absolute Windows path.'
     }
-    foreach ($component in $Path.Substring(3).Split('\\')) {
+    foreach ($component in $Path.Substring(3).Split([char[]]@('\'))) {
         if ([string]::IsNullOrWhiteSpace($component) -or $component -in @('.', '..')) {
             throw 'Guard service --state-db must be a canonical absolute Windows path.'
         }
@@ -1545,12 +1545,7 @@ function Write-GuardTransactionJournal {
             $stream.Dispose()
         }
         Set-ExactFileSystemAcl -Path $temporary -OwnerSid $SidAdmins -Entries (Get-AdministrativeAclEntries)
-        if (Test-Path -LiteralPath $TransactionJournal) {
-            [IO.File]::Replace($temporary, $TransactionJournal, $null)
-        }
-        else {
-            Move-Item -LiteralPath $temporary -Destination $TransactionJournal
-        }
+        [IO.File]::Move($temporary, $TransactionJournal, $true)
         Assert-ExactFileSystemAcl -Path $TransactionJournal -OwnerSid $SidAdmins -Entries (Get-AdministrativeAclEntries)
     }
     finally {

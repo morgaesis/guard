@@ -1,6 +1,7 @@
 BeforeAll {
     $InstallerTestModeBeforeTests = $env:GUARD_INSTALLER_TEST_MODE
     $env:GUARD_INSTALLER_TEST_MODE = '1'
+    $script:TestGuardSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 }
 
 AfterAll {
@@ -12,6 +13,27 @@ AfterAll {
     }
 }
 
+function New-GuardTestIdentifier {
+    return [guid]::NewGuid().ToString('N')
+}
+
+function New-GuardTestDigest {
+    return (New-GuardTestIdentifier) + (New-GuardTestIdentifier)
+}
+
+function New-GuardTestGrantReference {
+    return "gr-$(New-GuardTestIdentifier)"
+}
+
+function New-GuardTestBackupName {
+    param([string]$Version = '1.2.3')
+    return "before-v$Version-$(Get-Date -Format 'yyyyMMddTHHmmssZ')-$(New-GuardTestIdentifier)"
+}
+
+function New-GuardTestTaskName {
+    return "guard-op-$(New-GuardTestIdentifier)"
+}
+
 Describe 'Guard Windows operator command contract' {
     BeforeEach {
         . (Join-Path $PSScriptRoot 'install-guard.ps1') -Action status
@@ -21,27 +43,27 @@ Describe 'Guard Windows operator command contract' {
         $Intent = $null
         $Reason = $null
         $Json = $false
-        $SessionReference = 'session:' + '01234567' + '89abcdef'
+        $SessionReference = 'session:' + (New-GuardTestIdentifier)
     }
 
     It 'maps ordinary, once, N-use, and batch approvals' {
         $Action = 'access-approve'
-        $Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'gr-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
-        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be 'access approve gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa gr-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --socket guard'
+        $Reference = @((New-GuardTestGrantReference), (New-GuardTestGrantReference))
+        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "access approve $($Reference -join ' ') --socket guard"
 
         $ApprovalMode = 'once'
-        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be 'access approve gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa gr-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --once --socket guard'
+        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "access approve $($Reference -join ' ') --once --socket guard"
 
         $ApprovalMode = 'uses'
         $Uses = 3
-        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be 'access approve gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa gr-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --uses 3 --socket guard'
+        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "access approve $($Reference -join ' ') --uses 3 --socket guard"
     }
 
     It 'maps deny, extend, revoke, list, show, confirm, and revert' {
         $Action = 'access-deny'
-        $Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+        $Reference = @((New-GuardTestGrantReference))
         $Reason = 'outside the approved task'
-        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be 'access deny gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --reason outside the approved task --socket guard'
+        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "access deny $Reference --reason outside the approved task --socket guard"
 
         $Action = 'access-extend'
         $Reference = @($SessionReference)
@@ -59,23 +81,23 @@ Describe 'Guard Windows operator command contract' {
         (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be 'access list --socket guard'
 
         $Action = 'access-show'
-        foreach ($inspectable in @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', $SessionReference)) {
+        foreach ($inspectable in @((New-GuardTestGrantReference), (New-GuardTestIdentifier), $SessionReference)) {
             $Reference = @($inspectable)
             (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "access show $inspectable --socket guard"
         }
 
         foreach ($operatorAction in @('confirm', 'revert')) {
             $Action = $operatorAction
-            $Reference = @('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
-            (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "$operatorAction aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --socket guard"
+            $Reference = @((New-GuardTestIdentifier))
+            (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "$operatorAction $Reference --socket guard"
         }
     }
 
     It 'maps held execution references through access approve and deny' {
         foreach ($operatorAction in @('access-approve', 'access-deny')) {
             $Action = $operatorAction
-            $Reference = @('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
-            (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be (($operatorAction -replace '-', ' ') + ' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --socket guard')
+            $Reference = @((New-GuardTestIdentifier))
+            (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be (($operatorAction -replace '-', ' ') + " $Reference --socket guard")
         }
     }
 
@@ -90,13 +112,13 @@ Describe 'Guard Windows operator command contract' {
         { Get-GuardActionArguments -Socket $SocketName } | Should -Throw
 
         $Action = 'access-approve'
-        $Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+        $Reference = @((New-GuardTestGrantReference))
         $ApprovalMode = 'uses'
         $Uses = 0
         { Get-GuardActionArguments -Socket $SocketName } | Should -Throw
 
         $Action = 'confirm'
-        $Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+        $Reference = @((New-GuardTestGrantReference))
         { Get-GuardActionArguments -Socket $SocketName } | Should -Throw
 
         $Action = 'access-revoke'
@@ -106,10 +128,10 @@ Describe 'Guard Windows operator command contract' {
 
     It 'keeps untrusted prose out of executable task syntax' {
         $Action = 'access-deny'
-        $Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+        $Reference = @((New-GuardTestGrantReference))
         $Reason = 'maintenance & whoami | calc.exe > output'
         $arguments = Get-GuardActionArguments -Socket $SocketName
-        $output = Join-Path $TaskOutDir 'guard-op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.out'
+        $output = Join-Path $TaskOutDir "$(New-GuardTestTaskName).out"
         $payload = New-GuardOperatorPayload -GuardExe $DeployedExe -Arguments $arguments -OutputFile $output
         $decodedPayload = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($payload))
 
@@ -125,8 +147,8 @@ Describe 'Guard Windows operator command contract' {
     It 'rejects task executable and output paths outside installer-owned roots' {
         $Action = 'access-list'
         $arguments = Get-GuardActionArguments -Socket $SocketName
-        { New-GuardOperatorPayload -GuardExe 'C:\Windows\System32\whoami.exe' -Arguments $arguments -OutputFile (Join-Path $TaskOutDir 'guard-op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.out') } | Should -Throw
-        { New-GuardOperatorPayload -GuardExe $DeployedExe -Arguments $arguments -OutputFile 'C:\Temp\guard-op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.out' } | Should -Throw
+        { New-GuardOperatorPayload -GuardExe 'C:\Windows\System32\whoami.exe' -Arguments $arguments -OutputFile (Join-Path $TaskOutDir "$(New-GuardTestTaskName).out") } | Should -Throw
+        { New-GuardOperatorPayload -GuardExe $DeployedExe -Arguments $arguments -OutputFile (Join-Path 'C:\Temp' "$(New-GuardTestTaskName).out") } | Should -Throw
     }
 
     It 'preserves valid JSON for mixed decisions and propagates its native status' {
@@ -188,8 +210,8 @@ Describe 'Guard Windows installer state and ACL contract' {
     It 'requires a verified release digest before staging' {
         $ExpectedSha256 = $null
         { Assert-ExpectedCandidateHash } | Should -Throw
-        $ExpectedSha256 = 'ab' * 32
-        Assert-ExpectedCandidateHash | Should -Be ('ab' * 32)
+        $ExpectedSha256 = New-GuardTestDigest
+        Assert-ExpectedCandidateHash | Should -Be $ExpectedSha256
     }
 
     It 'parses the version format emitted by shipped binaries' {
@@ -326,7 +348,7 @@ Describe 'Guard Windows installer state and ACL contract' {
     }
 
     It 'gives the service read-execute without write in program and config ACLs' {
-        $guardSid = 'S-1-5-80-12345'
+        $guardSid = $script:TestGuardSid
         $entries = Get-ServiceReadAclEntries -GuardSid $guardSid
         $guardEntry = @($entries | Where-Object Sid -eq $guardSid)
         $guardEntry.Count | Should -Be 1
@@ -335,7 +357,7 @@ Describe 'Guard Windows installer state and ACL contract' {
     }
 
     It 'constructs protected directory ACLs with only explicit inheritable rules' {
-        $guardSid = 'S-1-5-80-12345'
+        $guardSid = $script:TestGuardSid
         $entries = Get-ServiceReadAclEntries -GuardSid $guardSid
         $acl = New-ExactFileSystemAcl -Directory $true -OwnerSid $SidAdmins -Entries $entries
         $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
@@ -369,7 +391,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         $root = Join-Path $TestDrive 'private-acl-root'
         New-Item -ItemType Directory -Path $root | Out-Null
         Set-Content -LiteralPath (Join-Path $root 'body.bin') -Value 'fixture'
-        $ownerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $ownerSid = $script:TestGuardSid
         Protect-PrivateServiceTree -Path $root -GuardSid $ownerSid
         $entries = @((New-AclEntry -Sid $ownerSid -Rights ([Security.AccessControl.FileSystemRights]::FullControl)))
         { Assert-ExactAclTree -Path $root -OwnerSid $ownerSid -Entries $entries } | Should -Not -Throw
@@ -638,10 +660,10 @@ Describe 'Guard Windows installer state and ACL contract' {
                 ApiRevertRoot = Join-Path $DataDir 'api-proxy-reverts'
                 SocketName = 'guard'
             }
-            $guardSid = 'S-1-5-80-12345'
+            $guardSid = $script:TestGuardSid
 
             Set-DeploymentAcls -GuardSid $guardSid -StatePaths $statePaths
-            Set-Content -LiteralPath $statePaths.AuthorityKey -Value ('a' * 32) -NoNewline
+            Set-Content -LiteralPath $statePaths.AuthorityKey -Value (New-GuardTestIdentifier) -NoNewline
             Set-DeploymentAcls -GuardSid $guardSid -StatePaths $statePaths
 
             { Assert-DeploymentAcls -GuardSid $guardSid -StatePaths $statePaths } | Should -Not -Throw
@@ -695,7 +717,7 @@ Describe 'Guard Windows installer state and ACL contract' {
     }
 
     It 'performs readiness status as SYSTEM and validates server.full.socket_path' {
-        $expectedHash = 'ab' * 32
+        $expectedHash = New-GuardTestDigest
         $expectedSocket = 'guard-custom'
         $status = [ordered]@{
             type = 'status'
@@ -784,9 +806,9 @@ Describe 'Guard Windows installer state and ACL contract' {
             New-Item -ItemType Directory -Force -Path $legacyKubeRoot | Out-Null
             Set-Content -LiteralPath (Join-Path $legacyKubeRoot 'config') -Value 'context' -NoNewline
 
-            $customGuardSid = 'S-1-5-80-12345'
+            $customGuardSid = $script:TestGuardSid
             Set-DeploymentAcls -GuardSid $customGuardSid -StatePaths $statePaths
-            Set-Content -LiteralPath $statePaths.AuthorityKey -Value ('a' * 32) -NoNewline
+            Set-Content -LiteralPath $statePaths.AuthorityKey -Value (New-GuardTestIdentifier) -NoNewline
             Set-DeploymentAcls -GuardSid $customGuardSid -StatePaths $statePaths
             Assert-DeploymentAcls -GuardSid $customGuardSid -StatePaths $statePaths
             Assert-ExactFileSystemAcl -Path $statePaths.AuthorityKey -OwnerSid $customGuardSid -Entries @((New-AclEntry -Sid $customGuardSid -Rights ([Security.AccessControl.FileSystemRights]::FullControl)))
@@ -1080,7 +1102,7 @@ Describe 'Guard Windows installer state and ACL contract' {
             $snapshot = [pscustomobject]@{
                 PathName = ('"' + $DeployedExe + '" "server" "start" "--socket" "guard" "--state-db" "' + $statePaths.StateDb + '"')
                 StatePaths = $statePaths
-                BinaryHash = 'ab' * 32
+                BinaryHash = New-GuardTestDigest
                 BinaryVersion = '1.2.3'
                 StartMode = 'Auto'
                 WasRunning = $true
@@ -1088,12 +1110,12 @@ Describe 'Guard Windows installer state and ACL contract' {
             }
             $transaction = Start-GuardTransaction -Operation install -Snapshot $snapshot
             $transaction.authority_key_present | Should -BeFalse
-            $backupName = 'before-v1.2.3-20260828T010203Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            $backupName = New-GuardTestBackupName
             Set-GuardTransactionPhase -Transaction $transaction -Phase prepared -BackupName $backupName
             Set-GuardTransactionPhase -Transaction $transaction -Phase mutating -BackupName $backupName
             Mock Read-ValidatedGuardBackup { [pscustomobject]@{ Name = 'fixture' } }
             Mock Restore-GuardInstallation { return }
-            Mock Get-GuardSid { return 'S-1-5-80-12345' }
+            Mock Get-GuardSid { return $script:TestGuardSid }
 
             Recover-GuardTransaction
 
@@ -1125,11 +1147,11 @@ Describe 'Guard Windows installer state and ACL contract' {
         }
         Mock Set-ExactFileSystemAcl { return }
 
-        { Restore-SnapshotPrivateServiceAcls -StatePaths $statePaths -GuardSid 'S-1-5-80-12345' -AuthorityKeyPresent $false } | Should -Not -Throw
-        { Restore-SnapshotPrivateServiceAcls -StatePaths $statePaths -GuardSid 'S-1-5-80-12345' -AuthorityKeyPresent $true } | Should -Throw '*no longer matches*'
+        { Restore-SnapshotPrivateServiceAcls -StatePaths $statePaths -GuardSid $script:TestGuardSid -AuthorityKeyPresent $false } | Should -Not -Throw
+        { Restore-SnapshotPrivateServiceAcls -StatePaths $statePaths -GuardSid $script:TestGuardSid -AuthorityKeyPresent $true } | Should -Throw '*no longer matches*'
         Set-Content -LiteralPath $statePaths.AuthorityKey -Value 'generated-fixture' -NoNewline
-        { Restore-SnapshotPrivateServiceAcls -StatePaths $statePaths -GuardSid 'S-1-5-80-12345' -AuthorityKeyPresent $false } | Should -Throw '*no longer matches*'
-        { Restore-SnapshotPrivateServiceAcls -StatePaths $statePaths -GuardSid 'S-1-5-80-12345' -AuthorityKeyPresent $true } | Should -Not -Throw
+        { Restore-SnapshotPrivateServiceAcls -StatePaths $statePaths -GuardSid $script:TestGuardSid -AuthorityKeyPresent $false } | Should -Throw '*no longer matches*'
+        { Restore-SnapshotPrivateServiceAcls -StatePaths $statePaths -GuardSid $script:TestGuardSid -AuthorityKeyPresent $true } | Should -Not -Throw
         Should -Invoke Set-ExactFileSystemAcl -Times 1 -Exactly -ParameterFilter { $Path -eq $statePaths.AuthorityKey }
     }
 
@@ -1142,7 +1164,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         $initial = [pscustomobject]@{
             PathName = $initialPathName
             StatePaths = $initialStatePaths
-            BinaryHash = 'ab' * 32
+            BinaryHash = New-GuardTestDigest
             BinaryVersion = '1.2.3'
             StartMode = 'Auto'
             WasRunning = $true
@@ -1153,7 +1175,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         $completed = [pscustomobject]@{
             PathName = $completedPathName
             StatePaths = $completedStatePaths
-            BinaryHash = 'cd' * 32
+            BinaryHash = New-GuardTestDigest
             BinaryVersion = '1.1.0'
             StartMode = 'Disabled'
             WasRunning = $false
@@ -1161,7 +1183,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         }
         $transaction = New-GuardTransactionJournal -Operation rollback -Snapshot $initial
         $transaction.phase = 'mutating'
-        $transaction.backup_name = 'before-v1.2.3-20260828T010203Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        $transaction.backup_name = New-GuardTestBackupName
         Mock Write-GuardTransactionJournal { return }
         Mark-GuardTransactionVerified -Transaction $transaction -CompletedSnapshot $completed
         $record = [pscustomobject]@{
@@ -1176,7 +1198,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         Mock Start-Service { return }
         Mock Verify-GuardService { return }
         Mock Assert-DeploymentAcls { return }
-        Mock Get-GuardSid { return 'S-1-5-80-12345' }
+        Mock Get-GuardSid { return $script:TestGuardSid }
         Mock Complete-GuardTransaction { return }
 
         Recover-GuardTransaction
@@ -1194,7 +1216,7 @@ Describe 'Guard Windows installer state and ACL contract' {
     It 'recovers immediately when rollback backup creation fails after service stop' {
         $savedBackup = $Backup
         try {
-            $Backup = 'before-v1.2.3-20260828T010203Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            $Backup = New-GuardTestBackupName
             $statePaths = [pscustomobject]@{
                 StateDb = 'C:\ProgramData\Guard\state.db'
                 AuthorityKey = 'C:\ProgramData\Guard\authority.hmac'
@@ -1204,14 +1226,19 @@ Describe 'Guard Windows installer state and ACL contract' {
             $snapshot = [pscustomobject]@{
                 StatePaths = $statePaths
                 PathName = '"C:\Program Files\Guard\guard.exe" "server" "start" "--socket" "guard" "--state-db" "C:\ProgramData\Guard\state.db"'
+                BinaryHash = New-GuardTestDigest
+                BinaryVersion = '1.2.3'
+                StartMode = 'Auto'
+                WasRunning = $true
+                AuthorityKeyPresent = $false
             }
             $target = [pscustomobject]@{ Metadata = [pscustomobject]@{ binary_version = '1.2.3' } }
             Mock Assert-Admin { return }
             Mock Recover-GuardTransaction { return }
             Mock Read-ValidatedGuardBackup { return $target }
             Mock Get-ServiceSnapshot { return $snapshot }
-            Mock Get-GuardSid { return 'S-1-5-80-12345' }
-            Mock Start-GuardTransaction { return [ordered]@{} }
+            Mock Get-GuardSid { return $script:TestGuardSid }
+            Mock Write-GuardTransactionJournal { return }
             Mock Wait-ServiceStopped { return }
             Mock New-GuardBackup { throw 'fixture backup failure' }
 
@@ -1351,14 +1378,14 @@ Describe 'Guard Windows installer state and ACL contract' {
         Mock Reset-TreeForAdministrativeMaintenance { return }
         Mock Protect-PrivateServiceTree { return }
         try {
-            $files = @(Copy-ApiRevertBackup -BackupPath $backupPath -GuardSid 'S-1-5-80-12345' -StatePaths $statePaths)
+            $files = @(Copy-ApiRevertBackup -BackupPath $backupPath -GuardSid $script:TestGuardSid -StatePaths $statePaths)
             $files.Count | Should -Be 1
             [IO.File]::WriteAllBytes($body, [byte[]](9, 9))
             $record = [pscustomobject]@{
                 Path = $backupPath
                 Metadata = [pscustomobject]@{ api_reverts_present = $true; files = $files }
             }
-            Restore-ApiRevertBackup -BackupRecord $record -GuardSid 'S-1-5-80-12345' -StatePaths $statePaths
+            Restore-ApiRevertBackup -BackupRecord $record -GuardSid $script:TestGuardSid -StatePaths $statePaths
             ([BitConverter]::ToString([IO.File]::ReadAllBytes($body)) -replace '-', '') | Should -Be '01020304'
             ([BitConverter]::ToString([IO.File]::ReadAllBytes($defaultDecoy)) -replace '-', '') | Should -Be '090909'
             Should -Invoke Protect-PrivateServiceTree -Times 2 -Exactly
@@ -1428,7 +1455,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         Mock Verify-GuardService { return }
         Mock Assert-DeploymentAcls { return }
         try {
-            $backupName = New-GuardBackup -Snapshot $snapshot -BeforeVersion '1.2.3' -GuardSid 'S-1-5-80-12345'
+            $backupName = New-GuardBackup -Snapshot $snapshot -BeforeVersion '1.2.3' -GuardSid $script:TestGuardSid
             $backupPath = Join-Path $BackupRoot $backupName
             $metadata = Get-Content -LiteralPath (Join-Path $backupPath 'metadata.json') -Raw | ConvertFrom-Json
             $metadata.state_database | Should -Be $statePaths.StateDb
@@ -1473,7 +1500,7 @@ Describe 'Guard Windows installer state and ACL contract' {
                 Environment = $snapshot.Environment
                 StatePaths = $statePaths
             }
-            Restore-GuardInstallation -BackupRecord $backupRecord -GuardSid 'S-1-5-80-12345'
+            Restore-GuardInstallation -BackupRecord $backupRecord -GuardSid $script:TestGuardSid
             [IO.File]::ReadAllText($statePaths.StateDb) | Should -Be 'custom-db'
             [IO.File]::ReadAllText("$($statePaths.StateDb)-wal") | Should -Be 'custom-wal'
             [IO.File]::ReadAllText($statePaths.AuthorityKey) | Should -Be 'custom-key'
@@ -1481,7 +1508,7 @@ Describe 'Guard Windows installer state and ACL contract' {
             [IO.File]::ReadAllText($defaultDb) | Should -Be 'default-decoy'
             [IO.File]::ReadAllText($defaultKey) | Should -Be 'default-decoy-key'
             Should -Invoke Set-ExactFileSystemAcl -Times 2 -Exactly -ParameterFilter {
-                $Path -eq $statePaths.AuthorityKey -and $OwnerSid -eq 'S-1-5-80-12345'
+                $Path -eq $statePaths.AuthorityKey -and $OwnerSid -eq $script:TestGuardSid
             }
             Should -Invoke Set-ServiceEnvironment -Times 1 -Exactly -ParameterFilter {
                 $Environment['KUBECONFIG'] -eq $KubeConfig
@@ -1489,7 +1516,7 @@ Describe 'Guard Windows installer state and ACL contract' {
 
             [IO.File]::WriteAllText($legacyKubeConfig, 'stale-legacy-context', [Text.UTF8Encoding]::new($false))
             $snapshot.Environment = @{ KUBECONFIG = $KubeConfig }
-            $activeBackupName = New-GuardBackup -Snapshot $snapshot -BeforeVersion '1.2.3' -GuardSid 'S-1-5-80-12345'
+            $activeBackupName = New-GuardBackup -Snapshot $snapshot -BeforeVersion '1.2.3' -GuardSid $script:TestGuardSid
             $activeBackupPath = Join-Path $BackupRoot $activeBackupName
             [IO.File]::ReadAllText((Join-Path $activeBackupPath 'config\kube\config')) | Should -Be 'legacy-context'
 
@@ -1501,7 +1528,7 @@ Describe 'Guard Windows installer state and ACL contract' {
                 KUBECONFIG = $legacyKubeConfig
                 GUARD_CHILD_ENV = 'KUBECONFIG'
             }
-            $releasedLayoutBackupName = New-GuardBackup -Snapshot $snapshot -BeforeVersion '1.2.3' -GuardSid 'S-1-5-80-12345'
+            $releasedLayoutBackupName = New-GuardBackup -Snapshot $snapshot -BeforeVersion '1.2.3' -GuardSid $script:TestGuardSid
             $releasedLayoutBackupPath = Join-Path $BackupRoot $releasedLayoutBackupName
             $releasedLayoutMetadataPath = Join-Path $releasedLayoutBackupPath 'metadata.json'
             $releasedLayoutMetadata = Get-Content -LiteralPath $releasedLayoutMetadataPath -Raw | ConvertFrom-Json
@@ -1525,7 +1552,7 @@ Describe 'Guard Windows installer state and ACL contract' {
             $releasedLayoutRecord.StatePaths.AuthorityKey | Should -Be $statePaths.AuthorityKey
 
             [IO.File]::WriteAllText($statePaths.AuthorityKey, 'replacement-key', [Text.UTF8Encoding]::new($false))
-            Restore-GuardInstallation -BackupRecord $releasedLayoutRecord -GuardSid 'S-1-5-80-12345'
+            Restore-GuardInstallation -BackupRecord $releasedLayoutRecord -GuardSid $script:TestGuardSid
             Test-Path -LiteralPath $statePaths.AuthorityKey | Should -BeFalse
             Test-Path -LiteralPath $KubeConfig | Should -BeFalse
             $script:lastRestoredServiceEnvironment.ContainsKey('KUBECONFIG') | Should -BeFalse
@@ -1545,26 +1572,28 @@ Describe 'Guard Windows installer state and ACL contract' {
 
     It 'retries and verifies operator artifact cleanup' {
         $script:cleanupAttempts = 0
+        $taskName = New-GuardTestTaskName
         Mock Get-ScheduledTask {
             if ($script:cleanupAttempts -ge 3) { return $null }
-            return [pscustomobject]@{ TaskName = 'guard-op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; State = 'Ready' }
+            return [pscustomobject]@{ TaskName = $taskName; State = 'Ready' }
         }
         Mock Unregister-ScheduledTask {
             $script:cleanupAttempts++
             if ($script:cleanupAttempts -lt 3) { throw 'fixture cleanup failure' }
         }
         Mock Start-Sleep { return }
-        $output = Join-Path $TaskOutDir 'guard-op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.out'
-        { Remove-GuardOperatorArtifacts -TaskName 'guard-op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -OutputFile $output } | Should -Not -Throw
+        $output = Join-Path $TaskOutDir "$taskName.out"
+        { Remove-GuardOperatorArtifacts -TaskName $taskName -OutputFile $output } | Should -Not -Throw
         Should -Invoke Unregister-ScheduledTask -Times 3 -Exactly
     }
 
     It 'surfaces operator artifact cleanup that remains incomplete' {
-        Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'guard-op-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; State = 'Ready' } }
+        $taskName = New-GuardTestTaskName
+        Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = $taskName; State = 'Ready' } }
         Mock Unregister-ScheduledTask { throw 'fixture cleanup failure' }
         Mock Start-Sleep { return }
-        $output = Join-Path $TaskOutDir 'guard-op-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.out'
-        { Remove-GuardOperatorArtifacts -TaskName 'guard-op-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -OutputFile $output } | Should -Throw '*after 3 attempts*'
+        $output = Join-Path $TaskOutDir "$taskName.out"
+        { Remove-GuardOperatorArtifacts -TaskName $taskName -OutputFile $output } | Should -Throw '*after 3 attempts*'
     }
 
     It 'retries output deletion and verifies absence' {
@@ -1582,8 +1611,9 @@ Describe 'Guard Windows installer state and ACL contract' {
             $script:outputPresent = $false
         }
         Mock Start-Sleep { return }
-        $output = Join-Path $TaskOutDir 'guard-op-cccccccccccccccccccccccccccccccc.out'
-        { Remove-GuardOperatorArtifacts -TaskName 'guard-op-cccccccccccccccccccccccccccccccc' -OutputFile $output } | Should -Not -Throw
+        $taskName = New-GuardTestTaskName
+        $output = Join-Path $TaskOutDir "$taskName.out"
+        { Remove-GuardOperatorArtifacts -TaskName $taskName -OutputFile $output } | Should -Not -Throw
         Should -Invoke Remove-Item -Times 3 -Exactly
     }
 
@@ -1591,14 +1621,15 @@ Describe 'Guard Windows installer state and ACL contract' {
         $oldTaskOutDir = $TaskOutDir
         $TaskOutDir = Join-Path $TestDrive 'normal-output'
         New-Item -ItemType Directory -Path $TaskOutDir | Out-Null
-        $output = Join-Path $TaskOutDir 'guard-op-dddddddddddddddddddddddddddddddd.out'
+        $taskName = New-GuardTestTaskName
+        $output = Join-Path $TaskOutDir "$taskName.out"
         Set-Content -LiteralPath $output -Value 'diagnostic'
         Set-Content -LiteralPath "$output.status" -Value '125' -NoNewline
         $script:taskPresent = $true
-        Mock Get-ScheduledTask { if ($script:taskPresent) { return [pscustomobject]@{ TaskName = 'guard-op-dddddddddddddddddddddddddddddddd'; State = 'Ready' } } }
+        Mock Get-ScheduledTask { if ($script:taskPresent) { return [pscustomobject]@{ TaskName = $taskName; State = 'Ready' } } }
         Mock Unregister-ScheduledTask { $script:taskPresent = $false }
         try {
-            Remove-GuardOperatorArtifacts -TaskName 'guard-op-dddddddddddddddddddddddddddddddd' -OutputFile $output
+            Remove-GuardOperatorArtifacts -TaskName $taskName -OutputFile $output
             $script:taskPresent | Should -BeFalse
             Test-Path -LiteralPath $output | Should -BeFalse
             Test-Path -LiteralPath "$output.status" | Should -BeFalse
@@ -1611,14 +1642,15 @@ Describe 'Guard Windows installer state and ACL contract' {
         $oldTaskOutDir = $TaskOutDir
         $TaskOutDir = Join-Path $TestDrive 'preserved-output'
         New-Item -ItemType Directory -Path $TaskOutDir | Out-Null
-        $output = Join-Path $TaskOutDir 'guard-op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.out'
+        $taskName = New-GuardTestTaskName
+        $output = Join-Path $TaskOutDir "$taskName.out"
         Set-Content -LiteralPath $output -Value 'raw unsanitized output'
         Set-Content -LiteralPath "$output.status" -Value '1' -NoNewline
         $script:taskPresent = $true
-        Mock Get-ScheduledTask { if ($script:taskPresent) { return [pscustomobject]@{ TaskName = 'guard-op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'; State = 'Ready' } } }
+        Mock Get-ScheduledTask { if ($script:taskPresent) { return [pscustomobject]@{ TaskName = $taskName; State = 'Ready' } } }
         Mock Unregister-ScheduledTask { $script:taskPresent = $false }
         try {
-            Remove-GuardOperatorArtifacts -TaskName 'guard-op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' -OutputFile $output -PreserveOutput -DiagnosticOutput "token=visible`ncontrol`0value"
+            Remove-GuardOperatorArtifacts -TaskName $taskName -OutputFile $output -PreserveOutput -DiagnosticOutput "token=visible`ncontrol`0value"
             $preserved = Get-Content -LiteralPath $output -Raw
             $script:taskPresent | Should -BeFalse
             Test-Path -LiteralPath "$output.status" | Should -BeFalse
@@ -1641,7 +1673,7 @@ Describe 'Guard Windows installer state and ACL contract' {
             service_path_name = '"C:\Program Files\Guard\guard.exe" "server" "start" "--socket" "guard" "--state-db" "C:\ProgramData\Guard\state.db"'
             start_mode = 'Disabled'
             was_running = $false
-            binary_sha256 = 'ab' * 32
+            binary_sha256 = New-GuardTestDigest
             binary_version = '1.2.3'
         }
         Mock Set-GuardServiceConfiguration { return }
@@ -1651,7 +1683,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         Mock Verify-GuardService { return }
         Mock Assert-DeploymentAcls { return }
         Mock Wait-ServiceStopped { return }
-        Complete-RestoredServiceVerification -Metadata $metadata -Environment @{} -GuardSid 'S-1-5-80-12345' -AuthorityKeyPresent $false
+        Complete-RestoredServiceVerification -Metadata $metadata -Environment @{} -GuardSid $script:TestGuardSid -AuthorityKeyPresent $false
         Should -Invoke Set-GuardServiceConfiguration -Times 1 -Exactly -ParameterFilter { $StartMode -eq 'Manual' }
         Should -Invoke Start-Service -Times 1 -Exactly
         Should -Invoke Verify-GuardService -Times 1 -Exactly
@@ -1677,7 +1709,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         $source | Should -Match 'Verify-GuardService'
         $source | Should -Match 'Assert-DeploymentAcls'
         $source | Should -Match 'Set-ServiceRegistryAcl'
-        $source | Should -Match '\[IO\.File\]::Replace'
+        $source | Should -Match '\[IO\.File\]::Move\(\$temporary, \$TransactionJournal, \$true\)'
         $source | Should -Match '\$DeployedOperatorScript = Join-Path \$InstallRoot ''guard-operator\.ps1'''
         $source | Should -Match "RelativePath 'guard-operator\.ps1'"
         $source | Should -Match 'Install-FileAtomically -Source \$operatorScriptSource -Destination \$DeployedOperatorScript'
@@ -1688,7 +1720,7 @@ Describe 'Guard Windows installer state and ACL contract' {
 
     It 'persists absent-install recovery state before staging and service creation' {
         $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-guard.ps1') -Raw
-        $installSource = ($source -split 'function Invoke-Install', 2)[1] -split 'function Invoke-Rollback', 2 | Select-Object -First 1
+        $installSource = ($source -split '(?m)^function Invoke-Install\s*\{\s*', 2)[1] -split '(?m)^function Invoke-Rollback\s*\{\s*', 2 | Select-Object -First 1
         $startIndex = $installSource.IndexOf('$transaction = Start-NewInstallationTransaction')
         $stageIndex = $installSource.IndexOf('$candidate = Stage-VerifiedGuardCandidate')
         $mutatingIndex = $installSource.IndexOf('Set-NewInstallationTransactionMutating')
@@ -1702,7 +1734,7 @@ Describe 'Guard Windows installer state and ACL contract' {
 
     It 'journals a complete backup before deployment authority changes' {
         $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-guard.ps1') -Raw
-        $installSource = ($source -split 'function Invoke-Install', 2)[1] -split 'function Invoke-Rollback', 2 | Select-Object -First 1
+        $installSource = ($source -split '(?m)^function Invoke-Install\s*\{\s*', 2)[1] -split '(?m)^function Invoke-Rollback\s*\{\s*', 2 | Select-Object -First 1
         $backupIndex = $installSource.IndexOf('$backupName = New-GuardBackup')
         $mutatingIndex = $installSource.IndexOf('Set-GuardTransactionPhase -Transaction $transaction -Phase mutating')
         $aclIndex = $installSource.IndexOf('Set-DeploymentAcls -GuardSid $guardSid')
@@ -1716,7 +1748,7 @@ Describe 'Guard Windows installer state and ACL contract' {
 
     It 'discovers active kube authority before completing the managed environment' {
         $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-guard.ps1') -Raw
-        $installSource = ($source -split 'function Invoke-Install', 2)[1] -split 'function Invoke-Rollback', 2 | Select-Object -First 1
+        $installSource = ($source -split '(?m)^function Invoke-Install\s*\{\s*', 2)[1] -split '(?m)^function Invoke-Rollback\s*\{\s*', 2 | Select-Object -First 1
         $mergeIndex = $installSource.IndexOf('$serviceEnvironment = Merge-ServiceEnvironment')
         $copyIndex = $installSource.IndexOf('Copy-KubeConfigToAuthorityRoot')
         $convertIndex = $installSource.IndexOf('$serviceEnvironment = Convert-LegacyKubeEnvironment')
@@ -1743,7 +1775,7 @@ Describe 'Guard Windows installer state and ACL contract' {
 
     It 'uses release-version backup names and deployment metadata independent of the state schema' {
         $BackupMetadataSchema | Should -Be 5
-        'before-v1.2.3-20260727T010203Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' | Should -Match '^before-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{32}$'
+        (New-GuardTestBackupName) | Should -Match '^before-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{32}$'
     }
 
     It 'requires release smoke helpers to pass explicit state paths and expected state values' {
