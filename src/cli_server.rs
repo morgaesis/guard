@@ -1986,7 +1986,7 @@ fn write_protected_proxy_client_output(
         file.set_len(0)?;
         file.write_all(yaml.as_bytes())?;
         file.sync_all()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(windows)]

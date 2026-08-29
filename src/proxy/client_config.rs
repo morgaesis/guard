@@ -100,7 +100,7 @@ mod tests {
         let tls = ProxyTls::generate().expect("generate test proxy CA");
         brokered_client_config(
             "https://127.0.0.1:8443",
-            &tls.ca_pem(),
+            tls.ca_pem(),
             &format!("transport-{:016x}", rand::random::<u64>()),
         )
     }

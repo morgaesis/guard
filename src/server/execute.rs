@@ -4161,10 +4161,7 @@ fn current_process_supplementary_groups(primary_group_id: u32) -> Result<Vec<u32
             return Err(std::io::Error::last_os_error().into());
         }
     }
-    let mut groups = groups
-        .into_iter()
-        .map(|group| group as u32)
-        .collect::<Vec<_>>();
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
     if !groups.contains(&primary_group_id) {
         groups.push(primary_group_id);
     }

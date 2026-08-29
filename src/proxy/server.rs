@@ -1290,7 +1290,7 @@ impl ApiProxy {
     pub fn brokered_client_config(&self) -> String {
         super::client_config::brokered_client_config(
             &self.proxy_url,
-            &self.tls.ca_pem(),
+            self.tls.ca_pem(),
             &self.transport_bearer,
         )
     }
