@@ -590,6 +590,16 @@ jobs:
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --version 0.5.9 --locked
 
+      - name: Set reproducible SBOM epoch
+        shell: bash
+        run: |
+          source_date_epoch=$(git show -s --format=%ct HEAD)
+          [[ "$source_date_epoch" =~ ^[1-9][0-9]*$ ]] || {
+            echo "source commit has an invalid timestamp" >&2
+            exit 1
+          }
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
+
       # Cargo.toml declares cfg(unix)/cfg(windows) dependency sections, so the
       # dependency set differs per target. The archive builder owns the target
       # roster used by both the build matrix and these inventories.
@@ -649,8 +659,7 @@ jobs:
                 else
                   .
                 end;
-              del(.serialNumber, .metadata.timestamp)
-              | if (.metadata? | type) == "object"
+              if (.metadata? | type) == "object"
                 and (.metadata.component? | type) == "object"
                 then
                   .metadata.component |= canonicalize_component
@@ -679,14 +688,14 @@ jobs:
 
             jq -n --arg path 'path+file:///first-source#guard@1.2.3' --arg preserved "$preserved" \
               '{
-                serialNumber: "first",
+                serialNumber: "urn:uuid:6aaf6be9-d7ea-4d09-abcb-ee495a0f24ea",
                 metadata: {
-                  timestamp: "first",
+                  timestamp: "2023-11-14T22:13:20Z",
                   component: {
                     "bom-ref": $path,
                     components: [
-                      {name: "guard-main", "bom-ref": ($path + "#src/main.rs")},
-                      {name: "guard-lib", "bom-ref": ($path + "#src/lib.rs")}
+                      {name: "guard-main", "bom-ref": ($path + " bin-target-1")},
+                      {name: "guard-lib", "bom-ref": ($path + " bin-target-0")}
                     ]
                   }
                 },
@@ -725,14 +734,14 @@ jobs:
                 metadata: {
                   component: {
                     components: [
-                      {"bom-ref": ($path + "#src/lib.rs"), name: "guard-lib"},
-                      {"bom-ref": ($path + "#src/main.rs"), name: "guard-main"}
+                      {"bom-ref": ($path + " bin-target-0"), name: "guard-lib"},
+                      {"bom-ref": ($path + " bin-target-1"), name: "guard-main"}
                     ],
                     "bom-ref": $path
                   },
-                  timestamp: "second"
+                  timestamp: "2023-11-14T22:13:20Z"
                 },
-                serialNumber: "second"
+                serialNumber: "urn:uuid:6aaf6be9-d7ea-4d09-abcb-ee495a0f24ea"
               }' \
               > "$second"
             canonicalize_sbom "$first" > "$first_canonical"
@@ -744,6 +753,8 @@ jobs:
             jq -e --arg preserved "$preserved" '
               .metadata.component."bom-ref" == "pkg:cargo/guard@1.2.3"
               and ([.metadata.component.components[].name] == ["guard-lib", "guard-main"])
+              and ([.metadata.component.components[]."bom-ref"]
+                == ["pkg:cargo/guard@1.2.3 bin-target-0", "pkg:cargo/guard@1.2.3 bin-target-1"])
               and ([.components[].name] == ["alpha", "beta"])
               and ([.dependencies[].ref] == ["pkg:cargo/beta@2", "pkg:cargo/guard@1.2.3"])
               and ((.dependencies[] | select(.ref == "pkg:cargo/guard@1.2.3") | .dependsOn)
@@ -753,6 +764,8 @@ jobs:
               and (.unrelated."bom-ref" == $preserved)
               and (.unrelated.ref == $preserved)
               and (.unrelated.sequence == ["second", "first"])
+              and (.serialNumber == "urn:uuid:6aaf6be9-d7ea-4d09-abcb-ee495a0f24ea")
+              and (.metadata.timestamp == "2023-11-14T22:13:20Z")
             ' \
               "$first_canonical" > /dev/null || {
               echo "SBOM canonicalization changed ordered or unrelated data" >&2

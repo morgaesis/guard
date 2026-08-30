@@ -170,6 +170,21 @@ compare_release_archives() {
 test_archive_comparison() {
   local test_root bundle shell_binary diagnostic primary_source replica_source
   local primary_payload replica_payload
+  python3 - "$PWD/Cargo.toml" "$0" <<'PY'
+import pathlib
+import re
+import sys
+import tomllib
+
+manifest_path = pathlib.Path(sys.argv[1])
+script_path = pathlib.Path(sys.argv[2])
+manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+strip = manifest.get("profile", {}).get("release", {}).get("strip")
+if strip != "symbols":
+    raise SystemExit("release profile must strip symbols for every target")
+if re.search(r'^\s*strip "\$binary"$', script_path.read_text(encoding="utf-8"), re.MULTILINE):
+    raise SystemExit("release archive builder must use Cargo profile symbol stripping")
+PY
   test_root=$(mktemp -d "${TMPDIR:-/tmp}/guard-release-test.XXXXXX")
   bundle="$test_root/guard-fixture-aarch64-unknown-linux-gnu"
   shell_binary=$(readlink -f "/proc/$$/exe")
@@ -318,9 +333,6 @@ else
 fi
 
 binary="$CARGO_TARGET_DIR/$BUILD_TARGET/release/$ARTIFACT_NAME"
-if [ "$BUILD_TARGET" = x86_64-unknown-linux-gnu ]; then
-  strip "$binary"
-fi
 
 mkdir -p "$root/deployment/systemd" "$root/deployment/hardening" \
   "$root/deployment/windows" "$root/examples" "$root/docs" "$root/ctf"
