@@ -88,6 +88,41 @@ describe_binary() {
   fi
 }
 
+report_differing_binary_offsets() {
+  local primary="$1" replica="$2"
+  timeout 5s python3 - "$primary" "$replica" <<'PY'
+import sys
+
+limit = 32
+emitted = 0
+offset = 0
+
+with open(sys.argv[1], "rb") as primary, open(sys.argv[2], "rb") as replica:
+    while emitted < limit:
+        primary_chunk = primary.read(1024 * 1024)
+        replica_chunk = replica.read(1024 * 1024)
+        shared_length = min(len(primary_chunk), len(replica_chunk))
+
+        for index in range(shared_length):
+            if primary_chunk[index] != replica_chunk[index]:
+                print(offset + index + 1)
+                emitted += 1
+                if emitted == limit:
+                    break
+
+        if emitted == limit or len(primary_chunk) == len(replica_chunk):
+            if not primary_chunk:
+                break
+            offset += shared_length
+            continue
+
+        for index in range(shared_length, min(max(len(primary_chunk), len(replica_chunk)), shared_length + limit - emitted)):
+            print(offset + index + 1)
+            emitted += 1
+        break
+PY
+}
+
 compare_release_archives() {
   local primary="$1" replica="$2" artifact="$3" target="$4"
   local primary_source="$5" replica_source="$6" diagnostic_root
@@ -125,32 +160,38 @@ compare_release_archives() {
     "$primary_manifest" "$replica_manifest" | sed -n '1,200p' >&2 || true
   describe_binary primary "$primary_binary" "$primary_source"
   describe_binary replica "$replica_binary" "$replica_source"
-  echo "first differing packaged-binary bytes (offset, primary, replica; first 32 lines):" >&2
-  set +o pipefail
-  timeout 5s cmp -l "$primary_binary" "$replica_binary" | head -32 >&2
-  set -o pipefail
+  echo "first differing packaged-binary offsets (first 32 lines):" >&2
+  report_differing_binary_offsets "$primary_binary" "$replica_binary" >&2 || \
+    echo "packaged-binary offset reporting did not complete" >&2
   rm -rf -- "$diagnostic_root"
   return 1
 }
 
 test_archive_comparison() {
-  local test_root bundle shell_binary diagnostic
+  local test_root bundle shell_binary diagnostic primary_source replica_source
+  local primary_payload replica_payload
   test_root=$(mktemp -d "${TMPDIR:-/tmp}/guard-release-test.XXXXXX")
   bundle="$test_root/guard-fixture-aarch64-unknown-linux-gnu"
   shell_binary=$(readlink -f "/proc/$$/exe")
   diagnostic="$test_root/diagnostic.txt"
+  primary_source="$test_root/source-primary"
+  replica_source="$test_root/source-replica"
+  primary_payload="$primary_source/src/release-diagnostic-primary.bin"
+  replica_payload="$replica_source/src/release-diagnostic-replica.bin"
   mkdir -p "$bundle"
   cp "$shell_binary" "$bundle/guard"
-  printf 'primary fixture\n' > "$bundle/README.md"
+  printf '%s\0\x01\xfe\x02' "$primary_payload" >> "$bundle/guard"
+  printf 'binary diagnostic fixture\n' > "$bundle/README.md"
   tar -C "$test_root" -czf "$test_root/primary.tar.gz" "$(basename "$bundle")"
   compare_release_archives \
     "$test_root/primary.tar.gz" "$test_root/primary.tar.gz" guard fixture-target \
-    "$test_root/source-primary" "$test_root/source-replica"
-  printf 'replica fixture\n' > "$bundle/README.md"
+    "$primary_source" "$replica_source"
+  cp "$shell_binary" "$bundle/guard"
+  printf '%s\0\x03\xfd\x04' "$replica_payload" >> "$bundle/guard"
   tar -C "$test_root" -czf "$test_root/replica.tar.gz" "$(basename "$bundle")"
   if compare_release_archives \
     "$test_root/primary.tar.gz" "$test_root/replica.tar.gz" guard fixture-target \
-    "$test_root/source-primary" "$test_root/source-replica" \
+    "$primary_source" "$replica_source" \
     > "$diagnostic" 2>&1; then
     echo "release archive comparison accepted different archives" >&2
     rm -rf -- "$test_root"
@@ -158,7 +199,18 @@ test_archive_comparison() {
   fi
   grep -Fq 'archive member digest differences' "$diagnostic"
   grep -Fq 'primary ELF sections' "$diagnostic"
-  grep -Fq 'first differing packaged-binary bytes' "$diagnostic"
+  grep -Fq 'first differing packaged-binary offsets' "$diagnostic"
+  awk '
+    /^first differing packaged-binary offsets \(first 32 lines\):$/ { in_offsets = 1; next }
+    in_offsets && /^[0-9]+$/ { count += 1; next }
+    in_offsets { invalid = 1 }
+    END { exit !in_offsets || !count || invalid }
+  ' "$diagnostic"
+  if grep -Fq "$primary_payload" "$diagnostic" || grep -Fq "$replica_payload" "$diagnostic"; then
+    echo "release archive diagnostics exposed fixture payload content" >&2
+    rm -rf -- "$test_root"
+    return 1
+  fi
   rm -rf -- "$test_root"
   echo "release archive comparison tests passed"
 }
