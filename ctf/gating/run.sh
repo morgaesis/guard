@@ -48,11 +48,162 @@ RUN_FLAGS=(
   --pids-limit "$CONTAINER_PIDS_LIMIT"
 )
 
+ATTACK_RUN_FLAGS=(
+  --read-only
+  --network none
+  --cap-drop ALL
+  --cap-add CHOWN
+  --cap-add SETGID
+  --cap-add SETUID
+  --security-opt no-new-privileges
+  --tmpfs "/tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777"
+  --tmpfs "/work:rw,nosuid,nodev,noexec,size=16m,mode=0755"
+  --tmpfs "/fakebin:rw,exec,nosuid,nodev,size=16m,mode=0755"
+  --tmpfs "/shim:rw,exec,nosuid,nodev,size=16m,mode=0755"
+  --tmpfs "/run:rw,nosuid,nodev,noexec,size=16m,mode=0755"
+  --tmpfs "/var/lib/guard:rw,nosuid,nodev,noexec,size=16m,mode=0755"
+  --tmpfs "/var/log:rw,nosuid,nodev,noexec,size=16m,mode=0755"
+  --tmpfs "/home/guarddaemon:rw,nosuid,nodev,noexec,size=1m,mode=0700"
+  --tmpfs "/home/agent:rw,nosuid,nodev,noexec,size=1m,mode=0700"
+)
+if [ "$ENGINE" = podman ]; then
+  # Disable Podman's implicit writable /var/tmp and other scratch mounts.
+  ATTACK_RUN_FLAGS+=(--read-only-tmpfs=false)
+fi
+ATTACK_CONTAINER_ARGUMENTS=(--rm "${RUN_FLAGS[@]}" "${ATTACK_RUN_FLAGS[@]}" "$IMAGE")
+
+validate_attack_container_arguments() {
+  local -a arguments=("$@")
+  local -a expected_capabilities=(CHOWN SETGID SETUID)
+  local -a observed_capabilities=()
+  local -a expected_tmpfs=(
+    "/tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777"
+    "/work:rw,nosuid,nodev,noexec,size=16m,mode=0755"
+    "/fakebin:rw,exec,nosuid,nodev,size=16m,mode=0755"
+    "/shim:rw,exec,nosuid,nodev,size=16m,mode=0755"
+    "/run:rw,nosuid,nodev,noexec,size=16m,mode=0755"
+    "/var/lib/guard:rw,nosuid,nodev,noexec,size=16m,mode=0755"
+    "/var/log:rw,nosuid,nodev,noexec,size=16m,mode=0755"
+    "/home/guarddaemon:rw,nosuid,nodev,noexec,size=1m,mode=0700"
+    "/home/agent:rw,nosuid,nodev,noexec,size=1m,mode=0700"
+  )
+  local -a observed_tmpfs=()
+  local read_only_count=0
+  local network_none_count=0
+  local cap_drop_all_count=0
+  local no_new_privileges_count=0
+  local podman_implicit_tmpfs_disabled_count=0
+  local index argument value
+
+  for ((index = 0; index < ${#arguments[@]}; index++)); do
+    argument="${arguments[index]}"
+    case "$argument" in
+      --read-only)
+        read_only_count=$((read_only_count + 1))
+        ;;
+      --read-only=false|--read-only=true|--read-write|--privileged)
+        echo "fixed attack contains a root-filesystem permission override: $argument" >&2
+        return 1
+        ;;
+      --read-only-tmpfs=false)
+        podman_implicit_tmpfs_disabled_count=$((podman_implicit_tmpfs_disabled_count + 1))
+        ;;
+      --read-only-tmpfs|--read-only-tmpfs=true|--read-only-tmpfs=*)
+        echo "fixed attack must not enable implicit writable scratch mounts: $argument" >&2
+        return 1
+        ;;
+      --network|--cap-drop|--cap-add|--security-opt|--tmpfs)
+        index=$((index + 1))
+        if ((index >= ${#arguments[@]})); then
+          echo "fixed attack argument $argument has no value" >&2
+          return 1
+        fi
+        value="${arguments[index]}"
+        case "$argument" in
+          --network)
+            if [ "$value" != none ]; then
+              echo "fixed attack must disable container networking" >&2
+              return 1
+            fi
+            network_none_count=$((network_none_count + 1))
+            ;;
+          --cap-drop)
+            if [ "$value" != ALL ]; then
+              echo "fixed attack must drop every capability before adding the required set" >&2
+              return 1
+            fi
+            cap_drop_all_count=$((cap_drop_all_count + 1))
+            ;;
+          --cap-add)
+            observed_capabilities+=("$value")
+            ;;
+          --security-opt)
+            if [ "$value" != no-new-privileges ]; then
+              echo "fixed attack contains an unexpected security option: $value" >&2
+              return 1
+            fi
+            no_new_privileges_count=$((no_new_privileges_count + 1))
+            ;;
+          --tmpfs)
+            observed_tmpfs+=("$value")
+            ;;
+        esac
+        ;;
+      --network=*|--cap-drop=*|--cap-add=*|--security-opt=*|--tmpfs=*)
+        echo "fixed attack hardening arguments must use separately parsed values: $argument" >&2
+        return 1
+        ;;
+      --volume|--volume=*|-v|--mount|--mount=*|--device|--device=*)
+        echo "fixed attack may not attach host storage or devices: $argument" >&2
+        return 1
+        ;;
+    esac
+  done
+
+  if [ "$read_only_count" -ne 1 ]; then
+    echo "fixed attack must enable a read-only root filesystem exactly once" >&2
+    return 1
+  fi
+  if [ "$network_none_count" -ne 1 ]; then
+    echo "fixed attack must disable container networking exactly once" >&2
+    return 1
+  fi
+  if [ "$cap_drop_all_count" -ne 1 ] \
+    || [ "$no_new_privileges_count" -ne 1 ]; then
+    echo "fixed attack must apply one complete capability drop and one no-new-privileges boundary" >&2
+    return 1
+  fi
+  if [ "${observed_capabilities[*]}" != "${expected_capabilities[*]}" ]; then
+    echo "fixed attack capability additions differ from CHOWN, SETGID, and SETUID" >&2
+    return 1
+  fi
+  if [ "${observed_tmpfs[*]}" != "${expected_tmpfs[*]}" ]; then
+    echo "fixed attack writable tmpfs arguments differ from the bounded fixture set" >&2
+    return 1
+  fi
+  if [ "$ENGINE" = podman ]; then
+    if [ "$podman_implicit_tmpfs_disabled_count" -ne 1 ]; then
+      echo "fixed attack must disable Podman's implicit writable scratch mounts" >&2
+      return 1
+    fi
+  elif [ "$podman_implicit_tmpfs_disabled_count" -ne 0 ]; then
+    echo "fixed attack contains a Podman-only option for a different container engine" >&2
+    return 1
+  fi
+}
+
+run_attack_container() {
+  validate_attack_container_arguments "$@"
+  "$ENGINE" run "$@"
+}
+
 static_validate() {
   local shell_file
   while IFS= read -r shell_file; do
     bash -n "$shell_file"
   done < <(find "$REPO_ROOT/ctf" -type f -name '*.sh' -print | LC_ALL=C sort)
+  validate_attack_container_arguments "${ATTACK_CONTAINER_ARGUMENTS[@]}"
+  echo "PASS: fixed attack uses a read-only root, no network, and bounded writable tmpfs mounts"
   python3 - "$REPO_ROOT" <<'PY'
 from pathlib import Path
 import re
@@ -65,7 +216,6 @@ proxy_server = (root / "src/proxy/server.rs").read_text(encoding="utf-8")
 proxy_kubeconfig = (root / "src/proxy/kubeconfig.rs").read_text(encoding="utf-8")
 cli_server = (root / "src/cli_server.rs").read_text(encoding="utf-8")
 attack = (root / "ctf/gating/attack.sh").read_text(encoding="utf-8")
-gating_runner = (root / "ctf/gating/run.sh").read_text(encoding="utf-8")
 synthetic = (root / "ctf/gating/synthetic-user.sh").read_text(encoding="utf-8")
 runner = (root / "ctf/gating/synthetic-user-runner.sh").read_text(encoding="utf-8")
 adversary = (root / "ctf/entrypoint-adversary.sh").read_text(encoding="utf-8")
@@ -92,17 +242,6 @@ checks = {
     ),
     "daemon capability mask is checked": "= c0" in attack and "= c0" in runner and "= c0" in synthetic,
     "daemon launch strips the bounding set to SETGID and SETUID": "--bounding-set=-all,+setgid,+setuid" in attack and "--bounding-set=-all,+setgid,+setuid" in synthetic,
-    "fixed attack uses only bounded writable fixture mounts": all(
-        mount in gating_runner
-        for mount in (
-            "--tmpfs /work:rw,nosuid,nodev,size=16m,mode=0755",
-            "--tmpfs /fakebin:rw,exec,nosuid,nodev,size=16m,mode=0755",
-            "--tmpfs /shim:rw,exec,nosuid,nodev,size=16m,mode=0755",
-            "--tmpfs /run:rw,nosuid,nodev,size=16m,mode=0755",
-            "--tmpfs /var/lib/guard:rw,nosuid,nodev,size=16m,mode=0755",
-            "--tmpfs /var/log:rw,nosuid,nodev,size=16m,mode=0755",
-        )
-    ),
     "children prove zero effective capabilities": "child-capability-contract" in attack and "assert_child_capability_contract 1003" in synthetic and "assert_child_capability_contract 1001" in synthetic,
     "world-writable Guard sockets are absent": re.search(r"chmod\s+0?666\s+[^\n]*guard(?:\.sock|/guard\.sock)", ctf_text) is None,
     "production socket group and mode are checked": "660:guard-clients" in attack and "660:guard-clients" in runner and "--socket-group guard-clients" in synthetic,
@@ -149,19 +288,7 @@ echo "=== Building $IMAGE (compiles guard for Linux) ==="
 case "$mode" in
   attack)
     echo "=== Running adversarial gating attack ==="
-    "$ENGINE" run --rm "${RUN_FLAGS[@]}" \
-      --cap-drop ALL \
-      --cap-add CHOWN \
-      --cap-add SETGID \
-      --cap-add SETUID \
-      --security-opt no-new-privileges \
-      --tmpfs /work:rw,nosuid,nodev,size=16m,mode=0755 \
-      --tmpfs /fakebin:rw,exec,nosuid,nodev,size=16m,mode=0755 \
-      --tmpfs /shim:rw,exec,nosuid,nodev,size=16m,mode=0755 \
-      --tmpfs /run:rw,nosuid,nodev,size=16m,mode=0755 \
-      --tmpfs /var/lib/guard:rw,nosuid,nodev,size=16m,mode=0755 \
-      --tmpfs /var/log:rw,nosuid,nodev,size=16m,mode=0755 \
-      "$IMAGE"
+    run_attack_container "${ATTACK_CONTAINER_ARGUMENTS[@]}"
     ;;
   test)
     echo "=== Running full cargo test suite in Linux ==="
