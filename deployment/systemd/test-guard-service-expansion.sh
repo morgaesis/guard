@@ -582,21 +582,35 @@ run_isolated_contract() {
 
 assert_timeout_kills_descendants() {
   local process_token="guard-systemd-timeout-$$-$RANDOM"
-  local process_listing surviving_processes
+  local process_directory process_fifo process_listing surviving_processes
   local timeout_status=0
 
+  if ! process_directory="$(mktemp -d)"; then
+    echo 'could not create a temporary directory for the timeout cleanup contract' >&2
+    return 1
+  fi
+  process_fifo="$process_directory/block"
+  if ! mkfifo "$process_fifo"; then
+    rm -r -- "$process_directory"
+    echo 'could not create a blocking pipe for the timeout cleanup contract' >&2
+    return 1
+  fi
+
   # The positional parameters expand only inside the isolated Bash process.
+  # Each blocked child carries process_token in its argument list, so the
+  # process sweep proves that no test-owned Bash descendant survives.
   # shellcheck disable=SC2016
   { timeout --signal=TERM --kill-after=1s 1s bash -c '
       trap "" TERM
-      bash -c "$1" "$2-bash" &
+      bash -c "$1" bash "$2" "$3-bash" &
       (
-        exec -a "$2-systemctl" bash -c "$1"
+        exec -a "$3-systemctl" bash -c "$1" bash "$2" "$3-systemctl"
       ) &
       wait
-    ' bash 'trap "" TERM; while :; do sleep 10; done' "$process_token"; } \
+    ' bash 'trap "" TERM; read -r < "$1"' "$process_fifo" "$process_token"; } \
     >/dev/null 2>&1 || timeout_status=$?
   if [ "$timeout_status" -ne 137 ]; then
+    rm -r -- "$process_directory"
     printf 'timeout cleanup regression returned %s instead of 137\n' "$timeout_status" >&2
     return 1
   fi
@@ -609,13 +623,15 @@ assert_timeout_kills_descendants() {
     while read -r descendant_pid _; do
       kill -KILL "$descendant_pid" >/dev/null 2>&1 || true
     done <<< "$surviving_processes"
+    rm -r -- "$process_directory"
     return 1
   fi
+  rm -r -- "$process_directory"
 }
 
 run_contract_self_tests() (
   if ! check_required_commands \
-    'systemd integration contract self-test' bash grep mktemp ps rm sleep timeout; then
+    'systemd integration contract self-test' bash grep mkfifo mktemp ps rm timeout; then
     return 1
   fi
 
