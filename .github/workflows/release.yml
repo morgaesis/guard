@@ -590,6 +590,58 @@ jobs:
       - name: Generate CycloneDX SBOMs
         shell: bash
         run: |
+          canonicalize_sbom() {
+            jq -S '
+              def canonicalize_reference:
+                sub("^path\\+file://[^#]*#guard@"; "pkg:cargo/guard@");
+              del(.serialNumber, .metadata.timestamp)
+              | walk(
+                  if type == "object" then
+                    with_entries(
+                      if ((.key == "bom-ref" or .key == "ref") and (.value | type == "string")) then
+                        .value |= canonicalize_reference
+                      else
+                        .
+                      end
+                    )
+                  else
+                    .
+                  end
+                )
+            ' "$1"
+          }
+
+          verify_sbom_canonicalization() {
+            local first="$RUNNER_TEMP/sbom-canonicalization-first.json"
+            local second="$RUNNER_TEMP/sbom-canonicalization-second.json"
+            local first_canonical="$RUNNER_TEMP/sbom-canonicalization-first.canonical.json"
+            local second_canonical="$RUNNER_TEMP/sbom-canonicalization-second.canonical.json"
+            local preserved='path+file:///stable-metadata#guard@1.2.3'
+
+            jq -n --arg path 'path+file:///first-source#guard@1.2.3' --arg preserved "$preserved" \
+              '{serialNumber: "first", metadata: {timestamp: "first"}, "bom-ref": $path, ref: $path, unrelated: $preserved}' \
+              > "$first"
+            jq -n --arg path 'path+file:///second-source#guard@1.2.3' --arg preserved "$preserved" \
+              '{serialNumber: "second", metadata: {timestamp: "second"}, "bom-ref": $path, ref: $path, unrelated: $preserved}' \
+              > "$second"
+            canonicalize_sbom "$first" > "$first_canonical"
+            canonicalize_sbom "$second" > "$second_canonical"
+            cmp --silent "$first_canonical" "$second_canonical" || {
+              echo "SBOM reference canonicalization is not path-independent" >&2
+              exit 1
+            }
+            jq -e --arg preserved "$preserved" \
+              '.["bom-ref"] == "pkg:cargo/guard@1.2.3"
+               and .ref == "pkg:cargo/guard@1.2.3"
+               and .unrelated == $preserved' \
+              "$first_canonical" > /dev/null || {
+              echo "SBOM reference canonicalization changed an unrelated value" >&2
+              exit 1
+            }
+          }
+
+          verify_sbom_canonicalization
+
           generate_sboms() {
             local source_root="$1" output_root="$2" target sbom canonical
             mkdir -p "$output_root"
@@ -606,16 +658,7 @@ jobs:
                   exit 1
                 }
                 canonical="$output_root/$sbom"
-                jq -S '
-                  del(.serialNumber, .metadata.timestamp)
-                  | walk(
-                      if type == "string" then
-                        sub("^path\\+file://[^#]*#guard@"; "pkg:cargo/guard@")
-                      else
-                        .
-                      end
-                    )
-                ' "$sbom" > "$canonical"
+                canonicalize_sbom "$sbom" > "$canonical"
               done < <(bash scripts/build-release-archive.sh --targets)
             )
           }
