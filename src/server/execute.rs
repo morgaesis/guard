@@ -4503,12 +4503,11 @@ fn resolve_primary_binary(server: &ServerContext, binary: &str) -> Result<PathBu
                 });
             }
         }
-        let qualifier = server
-            .config
-            .shim_dir
-            .is_some()
-            .then_some(" outside Guard's shim directory")
-            .unwrap_or_default();
+        let qualifier = if server.config.shim_dir.is_some() {
+            " outside Guard's shim directory"
+        } else {
+            ""
+        };
         bail!(
             "underlying executable '{}' is unavailable{qualifier}; install it or add its directory to the daemon PATH",
             binary

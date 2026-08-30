@@ -1,6 +1,8 @@
+#[cfg(unix)]
 use serde_json::json;
 use serde_yaml_ng::{Mapping, Value};
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::process::{Command, Output};
 
 const DEPENDABOT_CONFIG: &str = include_str!("../.github/dependabot.yml");
