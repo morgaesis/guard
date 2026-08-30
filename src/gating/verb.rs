@@ -8423,6 +8423,112 @@ verbs:
     }
 
     #[test]
+    fn immutable_catalog_lock_is_decoupled_from_catalog_storage() {
+        let yaml = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let catalog_directory = crate::learned_rules::authority_tempdir();
+        let runtime_directory = crate::learned_rules::authority_tempdir();
+        let path = catalog_directory.path().join("verbs.yaml");
+        let lock_path = runtime_directory.path().join("verbs.lock");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+
+        let mut catalog = VerbCatalog::load_immutable_with_lock(&path, &lock_path).unwrap();
+        assert!(catalog.get("safe").is_some());
+        assert_eq!(
+            std::fs::read_dir(catalog_directory.path()).unwrap().count(),
+            1
+        );
+        assert!(lock_path.is_file());
+        std::fs::write(&path, "verbs: []\n").unwrap();
+        assert!(!catalog.reload_if_stale().unwrap());
+        assert!(catalog.get("safe").is_some());
+    }
+
+    #[test]
+    fn immutable_catalog_rejects_lock_path_that_is_the_catalog_before_mutation() {
+        let yaml = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let original_mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+            let error = VerbCatalog::load_immutable_with_lock(&path, &path).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("aliases the immutable authority"));
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().mode() & 0o777,
+                original_mode
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let error = VerbCatalog::load_immutable_with_lock(&path, &path).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("aliases the immutable authority"));
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_catalog_rejects_hard_link_and_symbolic_link_lock_aliases() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let yaml = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let original_mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+
+        let hard_link = directory.path().join("verbs-hard-link.lock");
+        std::fs::hard_link(&path, &hard_link).unwrap();
+        let hard_link_error = VerbCatalog::load_immutable_with_lock(&path, &hard_link).unwrap_err();
+        assert!(hard_link_error
+            .to_string()
+            .contains("aliases the immutable authority"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().mode() & 0o777,
+            original_mode
+        );
+
+        std::fs::remove_file(&hard_link).unwrap();
+        let symbolic_link = directory.path().join("verbs-symbolic-link.lock");
+        symlink(&path, &symbolic_link).unwrap();
+        let symbolic_link_error =
+            VerbCatalog::load_immutable_with_lock(&path, &symbolic_link).unwrap_err();
+        assert!(symbolic_link_error
+            .to_string()
+            .contains("must not be a symbolic link"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().mode() & 0o777,
+            original_mode
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn immutable_catalog_rejects_hard_link_lock_alias_on_windows() {
+        let yaml = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        let lock_path = directory.path().join("verbs-hard-link.lock");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+        std::fs::hard_link(&path, &lock_path).unwrap();
+
+        let error = VerbCatalog::load_immutable_with_lock(&path, &lock_path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("aliases the immutable authority"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[test]
     fn immutable_catalog_rejects_required_repair_without_writing() {
         let value = ["q", "7"].concat();
         let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
