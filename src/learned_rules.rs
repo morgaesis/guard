@@ -124,6 +124,37 @@ pub(crate) fn pause_post_commit_adoption_for_test(
     (committed, release)
 }
 
+#[cfg(test)]
+type ImmutableLockPreopenHook = Box<dyn FnOnce(&Path) + Send>;
+
+#[cfg(test)]
+fn immutable_lock_preopen_hooks() -> &'static Mutex<BTreeMap<PathBuf, ImmutableLockPreopenHook>> {
+    static HOOKS: OnceLock<Mutex<BTreeMap<PathBuf, ImmutableLockPreopenHook>>> = OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn replace_immutable_lock_before_write_open_for_test(
+    path: &Path,
+    hook: impl FnOnce(&Path) + Send + 'static,
+) {
+    immutable_lock_preopen_hooks()
+        .lock()
+        .expect("immutable-lock pre-open hook lock")
+        .insert(path.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_immutable_lock_preopen_hook_for_test(path: &Path) {
+    let hook = immutable_lock_preopen_hooks()
+        .lock()
+        .expect("immutable-lock pre-open hook lock")
+        .remove(path);
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
 #[derive(Debug)]
 struct LearningSnapshotConflict;
 
@@ -793,10 +824,12 @@ impl ImmutableAuthorityLock {
         let parent = open_parent_directory(&canonical_parent)?;
         validate_trusted_parent(&parent, &canonical_parent)?;
         let bound_lock_path = bind_destination_to_parent(&parent, &canonical_lock_path)?;
-        let file = open_owner_only_new_or_existing_distinct(&bound_lock_path, immutable_authority)
-            .with_context(|| {
-                format!("failed to open immutable authority lock {}", path.display())
-            })?;
+        let file = open_owner_only_new_or_existing_distinct(
+            &bound_lock_path,
+            &canonical_lock_path,
+            immutable_authority,
+        )
+        .with_context(|| format!("failed to open immutable authority lock {}", path.display()))?;
         ensure_regular_file(&bound_lock_path)?;
         lock_file(&file, Instant::now() + AUTHORITY_LOCK_TIMEOUT, true)
             .with_context(|| format!("failed to lock immutable authority {}", path.display()))?;
@@ -2053,6 +2086,7 @@ fn open_owner_only_new_or_existing(path: &Path) -> Result<File> {
 /// opened immutable authority because creation is exclusive.
 fn open_owner_only_new_or_existing_distinct(
     path: &Path,
+    _canonical_path: &Path,
     immutable_authority: &File,
 ) -> Result<File> {
     match open_owner_only_new(path) {
@@ -2061,11 +2095,13 @@ fn open_owner_only_new_or_existing_distinct(
             verify_open_file_binding(&file, path)?;
             return Ok(file);
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
+        Err(error) if anyhow_error_has_io_kind(&error, std::io::ErrorKind::AlreadyExists) => {}
+        Err(error) => return Err(error),
     }
 
     reject_immutable_lock_path_alias(path, immutable_authority)?;
+    #[cfg(test)]
+    run_immutable_lock_preopen_hook_for_test(_canonical_path);
     let mut options = owner_only_options();
     let file = options.read(true).write(true).open(path)?;
     ensure_regular_file(path)?;
@@ -2075,6 +2111,14 @@ fn open_owner_only_new_or_existing_distinct(
     }
     set_owner_only_permissions(&file)?;
     Ok(file)
+}
+
+fn anyhow_error_has_io_kind(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|source| source.kind() == kind)
+    })
 }
 
 fn set_owner_only_permissions(file: &File) -> Result<()> {
@@ -2090,8 +2134,8 @@ fn set_owner_only_permissions(file: &File) -> Result<()> {
 
 /// Reject a direct path, hard link, symlink, or Windows reparse point before
 /// any write-capable lock handle is opened. The repeated handle check above
-/// closes the path-to-open race; both parents are pinned and trusted before
-/// this helper is reached.
+/// closes the path-to-open race. The lock parent remains pinned and trusted,
+/// and the immutable authority remains pinned by its read-only file handle.
 fn reject_immutable_lock_path_alias(path: &Path, immutable_authority: &File) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path).with_context(|| {
         format!(
@@ -2164,14 +2208,9 @@ fn same_path_and_file_identity(path: &Path, immutable_authority: &File) -> Resul
 
 #[cfg(windows)]
 fn same_path_and_file_identity(path: &Path, immutable_authority: &File) -> Result<bool> {
-    use std::os::windows::fs::MetadataExt;
-    let candidate = std::fs::metadata(path)?;
-    let authority = immutable_authority.metadata()?;
-    Ok(
-        candidate.volume_serial_number() == authority.volume_serial_number()
-            && candidate.file_index_high() == authority.file_index_high()
-            && candidate.file_index_low() == authority.file_index_low(),
-    )
+    let mut options = owner_only_options();
+    let candidate = options.read(true).open(path)?;
+    same_file_identity(&candidate, immutable_authority)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3493,6 +3532,11 @@ fn windows_dacl_digest(path: &Path) -> Result<String> {
         return Err(std::io::Error::last_os_error()).context("failed to read the Windows DACL");
     }
     Ok(content_digest(&descriptor))
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn authority_dacl_digest_for_test(path: &Path) -> Result<String> {
+    windows_dacl_digest(path)
 }
 
 #[cfg(windows)]
@@ -5149,6 +5193,23 @@ pub(crate) fn looks_dangerous_for_learned_allow(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_io_error_kind_preserves_already_exists_classification() {
+        let already_exists = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "fixture already exists",
+        ))
+        .context("wrapped fixture error");
+        assert!(anyhow_error_has_io_kind(
+            &already_exists,
+            std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(!anyhow_error_has_io_kind(
+            &already_exists,
+            std::io::ErrorKind::PermissionDenied
+        ));
+    }
 
     #[cfg(unix)]
     #[test]

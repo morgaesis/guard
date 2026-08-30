@@ -8455,9 +8455,7 @@ verbs:
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
             let original_mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
             let error = VerbCatalog::load_immutable_with_lock(&path, &path).unwrap_err();
-            assert!(error
-                .to_string()
-                .contains("aliases the immutable authority"));
+            assert!(format!("{error:#}").contains("aliases the immutable authority"));
             assert_eq!(
                 std::fs::metadata(&path).unwrap().mode() & 0o777,
                 original_mode
@@ -8466,9 +8464,7 @@ verbs:
         #[cfg(not(unix))]
         {
             let error = VerbCatalog::load_immutable_with_lock(&path, &path).unwrap_err();
-            assert!(error
-                .to_string()
-                .contains("aliases the immutable authority"));
+            assert!(format!("{error:#}").contains("aliases the immutable authority"));
         }
         assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
     }
@@ -8488,9 +8484,7 @@ verbs:
         let hard_link = directory.path().join("verbs-hard-link.lock");
         std::fs::hard_link(&path, &hard_link).unwrap();
         let hard_link_error = VerbCatalog::load_immutable_with_lock(&path, &hard_link).unwrap_err();
-        assert!(hard_link_error
-            .to_string()
-            .contains("aliases the immutable authority"));
+        assert!(format!("{hard_link_error:#}").contains("aliases the immutable authority"));
         assert_eq!(
             std::fs::metadata(&path).unwrap().mode() & 0o777,
             original_mode
@@ -8501,12 +8495,53 @@ verbs:
         symlink(&path, &symbolic_link).unwrap();
         let symbolic_link_error =
             VerbCatalog::load_immutable_with_lock(&path, &symbolic_link).unwrap_err();
-        assert!(symbolic_link_error
-            .to_string()
-            .contains("must not be a symbolic link"));
+        assert!(format!("{symbolic_link_error:#}").contains("must not be a symbolic link"));
         assert_eq!(
             std::fs::metadata(&path).unwrap().mode() & 0o777,
             original_mode
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn immutable_catalog_rechecks_lock_identity_after_preopen_replacement() {
+        let yaml = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        let lock_path = directory.path().join("verbs.lock");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+        crate::learned_rules::write_authority_file(&lock_path, "lock").unwrap();
+        #[cfg(unix)]
+        let original_mode = {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            std::fs::metadata(&path).unwrap().mode() & 0o777
+        };
+        #[cfg(windows)]
+        let original_dacl = crate::learned_rules::authority_dacl_digest_for_test(&path).unwrap();
+        let authority_for_hook = path.clone();
+        crate::learned_rules::replace_immutable_lock_before_write_open_for_test(
+            &lock_path,
+            move |lock_path| {
+                std::fs::remove_file(lock_path).unwrap();
+                std::fs::hard_link(&authority_for_hook, lock_path).unwrap();
+            },
+        );
+
+        let error = VerbCatalog::load_immutable_with_lock(&path, &lock_path).unwrap_err();
+        assert!(format!("{error:#}").contains("aliases the immutable authority"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().mode() & 0o777,
+                original_mode
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            crate::learned_rules::authority_dacl_digest_for_test(&path).unwrap(),
+            original_dacl
         );
         assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
     }
@@ -8522,9 +8557,7 @@ verbs:
         std::fs::hard_link(&path, &lock_path).unwrap();
 
         let error = VerbCatalog::load_immutable_with_lock(&path, &lock_path).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("aliases the immutable authority"));
+        assert!(format!("{error:#}").contains("aliases the immutable authority"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
     }
 
