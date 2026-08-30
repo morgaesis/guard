@@ -468,7 +468,32 @@ checks = {
         )
     ),
     "caller daemon paths and token are explicitly prepared": "assert_daemon_path_contract" in synthetic and "1000:0:440" in synthetic and "chown 0:guard-clients /scenario/run" in synthetic,
-    "both daemon modes are outside the protected catalog ownership boundary": "NEUTRAL_FIXTURE_UID=65534" in synthetic and "chmod 0444" in synthetic and "expected_lock=0:0:600" in synthetic,
+    "synthetic catalog uses an exact read-only bind beside its writable lock": all(
+        marker in runner
+        for marker in (
+            'CATALOG_DESTINATION=/scenario/journey/protected-catalog/verbs.yaml',
+            '--volume "$CATALOG_SOURCE:$CATALOG_DESTINATION:ro"',
+            'validate_container_mounts',
+            "a writable catalog bind",
+            "an additional host bind",
+        )
+    ) and "expected_lock=0:0:600" in synthetic,
+    "catalog mutation remains blocked after reachable owner transitions": all(
+        marker in synthetic
+        for marker in (
+            "assert_catalog_mutation_rejected_after_identity_transition",
+            '"$NEUTRAL_FIXTURE_UID" "$NEUTRAL_FIXTURE_GID" neutral-owner',
+            '"$catalog_owner" "$catalog_group" mounted-file-owner',
+            "protected catalog is not on a read-only mount",
+        )
+    ),
+    "synthetic evidence is private and omits local worktree metadata": (
+        "umask 077" in runner
+        and "ensure_private_directory" in runner
+        and "ensure_private_file" in runner
+        and 'echo "- Worktree:' not in runner
+        and 'echo "- Branch:' not in runner
+    ),
     "synthetic readiness failures retain bounded sanitized startup diagnostics": "collect_startup_diagnostics" in runner and "sanitize_startup_diagnostics" in runner and "timeout --kill-after=1s 5s podman logs" in runner and "timeout --kill-after=1s 5s podman exec" in runner,
     "loopback API proxy requires authenticated client context": "a proxy transport or session bearer is required" in proxy_server and "ProxyTransportAuth" in proxy_server,
     "brokered proxy bearer is generated instead of hardcoded": "guard-anonymous" not in proxy_kubeconfig and "transport_bearer_bytes" in proxy_server,

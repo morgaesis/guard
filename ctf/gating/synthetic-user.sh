@@ -157,13 +157,23 @@ EOF
 }
 
 assert_protected_catalog_as_daemon() {
-  local expected_lock replacement marker
+  local catalog_group catalog_mount_options catalog_owner expected_lock marker replacement
   [ "$(stat -c '%u:%g:%a' /scenario/journey)" = \
     "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:1777" ]
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_DIR")" = \
     "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:555" ]
-  [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG")" = \
-    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:444" ]
+  [ -f "$PROTECTED_CATALOG" ]
+  [ -r "$PROTECTED_CATALOG" ]
+  [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
+    "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
+  catalog_mount_options="$(findmnt -n -o OPTIONS --target "$PROTECTED_CATALOG")"
+  case ",$catalog_mount_options," in
+    *,ro,*) ;;
+    *)
+      echo 'protected catalog is not on a read-only mount' >&2
+      return 1
+      ;;
+  esac
 
   if caller_identity_scenario; then
     [ "$(id -u)" -eq 0 ]
@@ -196,6 +206,52 @@ assert_protected_catalog_as_daemon() {
   [ "$(cat "$marker")" = lock-opened ]
   exec 9>&-
   rm -f "$replacement" "$marker"
+
+  # CAP_SETUID makes the former neutral owner and the mounted file owner
+  # reachable. The read-only mount, rather than ownership, enforces immutability.
+  assert_catalog_mutation_rejected_after_identity_transition \
+    "$NEUTRAL_FIXTURE_UID" "$NEUTRAL_FIXTURE_GID" neutral-owner
+  catalog_owner="$(stat -c '%u' "$PROTECTED_CATALOG")"
+  catalog_group="$(stat -c '%g' "$PROTECTED_CATALOG")"
+  assert_catalog_mutation_rejected_after_identity_transition \
+    "$catalog_owner" "$catalog_group" mounted-file-owner
+  [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
+    "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
+}
+
+assert_catalog_mutation_rejected_after_identity_transition() {
+  local target_uid="$1" target_gid="$2" label="$3" marker replacement status
+  marker="/tmp/catalog-owner-transition-$label"
+  replacement="/tmp/catalog-owner-replacement-$label"
+  rm -f "$marker" "$replacement"
+  set +e
+  # The child expands these expressions after changing identity.
+  # shellcheck disable=SC2016
+  setpriv \
+    --reuid "$target_uid" \
+    --regid "$target_gid" \
+    --clear-groups \
+    /bin/sh -c '
+      marker=$1
+      replacement=$2
+      catalog=$3
+      printf "%s:%s\n" "$(id -u)" "$(id -g)" > "$marker" || exit 90
+      printf "replacement must not install\n" > "$replacement" || exit 90
+      if printf "blocked\n" > "$catalog" \
+        || chmod 0600 "$catalog" \
+        || rm -f "$catalog" \
+        || mv "$replacement" "$catalog"; then
+        exit 91
+      fi
+      exit 73
+    ' synthetic-catalog-owner "$marker" "$replacement" "$PROTECTED_CATALOG" \
+    2>/dev/null
+  status=$?
+  set -e
+  [ "$status" -eq 73 ]
+  [ "$(cat "$marker")" = "$target_uid:$target_gid" ]
+  [ -f "$PROTECTED_CATALOG" ]
+  rm -f "$marker" "$replacement"
 }
 
 assert_daemon_path_contract() {
@@ -1728,9 +1784,9 @@ prepare_principals() {
     chown 1000:guard-clients /scenario/run
   fi
 
-  # A neutral owner keeps both daemon identities outside the protected
-  # catalog's ownership boundary. DestinationLock receives only its precreated,
-  # scenario-specific writable sidecar.
+  # The daemon container overlays the catalog file with a read-only bind mount.
+  # This underlying placeholder supplies the destination and the only writable
+  # sibling required by DestinationLock.
   mkdir -p "$PROTECTED_CATALOG_DIR"
   cp /etc/guard/verbs.yaml "$PROTECTED_CATALOG"
   chmod 0444 "$PROTECTED_CATALOG"

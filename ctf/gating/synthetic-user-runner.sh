@@ -1,10 +1,13 @@
 #!/bin/bash
 # Run each synthetic-user contract in a separate rootless Podman container.
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IMAGE="${GUARD_SU_IMAGE:-localhost/guard-gating}"
+CATALOG_SOURCE="$REPO_ROOT/ctf/gating/verbs.yaml"
+CATALOG_DESTINATION=/scenario/journey/protected-catalog/verbs.yaml
 EVIDENCE_ROOT="$REPO_ROOT/.cache/synthetic-user"
 RESULTS_DIR="$EVIDENCE_ROOT/scenarios"
 STATUS_FILE="$EVIDENCE_ROOT/status.md"
@@ -23,13 +26,20 @@ HOST_FAILURE_CATEGORY=""
 HOST_FAILURE_EXEC_STATUS=""
 HOST_FAILURE_EVIDENCE=""
 
+ensure_private_directory() {
+  mkdir -p "$1"
+  chmod 0700 "$1"
+}
+
+ensure_private_file() {
+  chmod 0600 "$1"
+}
+
 write_status() {
   local scenario="$1" container="$2" volume="$3" result="$4" issue="$5" next="$6"
   {
     echo "# Synthetic-user status"
     echo
-    echo "- Worktree: \`$REPO_ROOT\`"
-    echo "- Branch: \`$(git -C "$REPO_ROOT" branch --show-current)\`"
     if [ -n "$RUN_DIR" ]; then
       echo "- Run evidence: \`${RUN_DIR#"$REPO_ROOT/"}\`"
     fi
@@ -45,13 +55,16 @@ write_status() {
       echo "- Host-side failure evidence: \`$HOST_FAILURE_EVIDENCE\`"
     fi
   } >"$STATUS_FILE"
+  ensure_private_file "$STATUS_FILE"
 }
 
 finalize_manifest_status() {
   local status="$1" outcomes="$2" temporary="${MANIFEST}.tmp"
   sed "s/^- Status: running$/- Status: $status/" "$MANIFEST" > "$temporary"
   cat "$outcomes" >> "$temporary"
+  ensure_private_file "$temporary"
   mv "$temporary" "$MANIFEST"
+  ensure_private_file "$MANIFEST"
 }
 
 redact_host_field() {
@@ -79,6 +92,7 @@ record_host_failure() {
     echo "- Command category: \`$HOST_FAILURE_CATEGORY\`"
     echo "- Podman exec status: \`$HOST_FAILURE_EXEC_STATUS\`"
   } >"$evidence"
+  ensure_private_file "$evidence"
 }
 
 command_category_for_phase() {
@@ -96,6 +110,7 @@ copy_scenario_result() {
     return 1
   fi
   podman cp "$container:/scenario/collector/results/$scenario.md" "$RESULTS_DIR/$scenario.md"
+  ensure_private_file "$RESULTS_DIR/$scenario.md"
 }
 
 write_missing_result_evidence() {
@@ -109,10 +124,34 @@ write_missing_result_evidence() {
     echo "- Isolation: rootless container, private daemon/socket/database/fixtures/principal/network namespace, network disabled"
     echo "- Raw transcript: retained only in the ephemeral scenario volume"
   } >"$RESULTS_DIR/$scenario.md"
+  ensure_private_file "$RESULTS_DIR/$scenario.md"
+}
+
+expected_container_mounts() {
+  printf 'bind\t%s\tfalse\nvolume\t/scenario\ttrue\n' "$CATALOG_DESTINATION"
+}
+
+normalize_container_mounts() {
+  LC_ALL=C sort
+}
+
+validate_container_mounts() {
+  local observed="$1" normalized expected
+  normalized="$(printf '%s\n' "$observed" | normalize_container_mounts)"
+  expected="$(expected_container_mounts | normalize_container_mounts)"
+  [ "$normalized" = "$expected" ]
+}
+
+reject_mount_mutation() {
+  local description="$1" observed="$2"
+  if validate_container_mounts "$observed"; then
+    echo "synthetic-user mount mutation was accepted: $description" >&2
+    return 1
+  fi
 }
 
 assert_isolated_container() {
-  local container="$1" scenario="$2" expected_user mounts capabilities groups
+  local container="$1" scenario="$2" expected_user mounts capabilities groups catalog_source
   if caller_identity_scenario "$scenario"; then
     expected_user=0:0
   else
@@ -128,8 +167,10 @@ assert_isolated_container() {
     || [ "$capabilities" = '["CAP_SETUID","CAP_SETGID"]' ]
   groups="$(podman inspect --format '{{range .HostConfig.GroupAdd}}{{println .}}{{end}}' "$container")"
   validate_supplementary_groups "$scenario" "$groups"
-  mounts="$(podman inspect --format '{{range .Mounts}}{{printf "%s %s\n" .Type .Destination}}{{end}}' "$container")"
-  [ "$mounts" = 'volume /scenario' ]
+  mounts="$(podman inspect --format '{{range .Mounts}}{{printf "%s\t%s\t%t\n" .Type .Destination .RW}}{{end}}' "$container")"
+  validate_container_mounts "$mounts"
+  catalog_source="$(podman inspect --format '{{range .Mounts}}{{if eq .Destination "/scenario/journey/protected-catalog/verbs.yaml"}}{{.Source}}{{end}}{{end}}' "$container")"
+  [ "$(readlink -f "$catalog_source")" = "$(readlink -f "$CATALOG_SOURCE")" ]
 }
 
 caller_identity_scenario() {
@@ -265,6 +306,7 @@ collect_startup_diagnostics() {
       fi
     ' 9>&- 2>&1 || echo '[daemon log collection unavailable]'
   } | sanitize_startup_diagnostics > "$evidence"
+  ensure_private_file "$evidence"
 }
 
 resource_exists() {
@@ -438,7 +480,7 @@ assert_cleanup_invariants() {
 }
 
 self_test() {
-  local test_dir test_evidence generated groups
+  local test_dir test_evidence generated groups mount_contract
   case "$IMAGE" in
     localhost/*) ;;
     *)
@@ -447,9 +489,20 @@ self_test() {
       ;;
   esac
   test_dir="$(mktemp -d)"
+  [ "$(stat -c '%a' "$test_dir")" = 700 ]
   RESULTS_DIR="$test_dir"
+  STATUS_FILE="$test_dir/status.md"
+  RUN_DIR="$REPO_ROOT/.cache/synthetic-user/runs/self-test"
+  write_status SU-TEST none none testing none verify
+  [ "$(stat -c '%a' "$STATUS_FILE")" = 600 ]
+  grep -Fq -- "- Run evidence: \`.cache/synthetic-user/runs/self-test\`" "$STATUS_FILE"
+  if grep -Eq '^- (Worktree|Branch):' "$STATUS_FILE" \
+    || grep -Fq "$REPO_ROOT" "$STATUS_FILE"; then
+    return 1
+  fi
   record_host_failure SU-TEST 'phase-gr-test-handle /scenario/private' access 125
   test_evidence="$RESULTS_DIR/SU-TEST.host-failure.md"
+  [ "$(stat -c '%a' "$test_evidence")" = 600 ]
   grep -Fq "Phase: \`phase-[redacted-handle] [redacted-path]\`" "$test_evidence"
   grep -Fq "Command category: \`access\`" "$test_evidence"
   grep -Fq "Podman exec status: \`125\`" "$test_evidence"
@@ -466,6 +519,13 @@ self_test() {
   [ "$groups" = $'--group-add\n2000\n--group-add\n1003' ]
   groups="$(daemon_group_arguments SU-12-api)"
   [ "$groups" = $'--group-add\n2000' ]
+  mount_contract="$(expected_container_mounts)"
+  validate_container_mounts "$mount_contract"
+  reject_mount_mutation 'a writable catalog bind' \
+    $'bind\t/scenario/journey/protected-catalog/verbs.yaml\ttrue\nvolume\t/scenario\ttrue'
+  reject_mount_mutation 'a missing catalog bind' $'volume\t/scenario\ttrue'
+  reject_mount_mutation 'an additional host bind' \
+    "$mount_contract"$'\nbind\t/host\tfalse'
   validate_supplementary_groups SU-01 $'2000\n1003'
   validate_supplementary_groups SU-12-api 2000
   reject_group_mutation 'missing fixed private group' SU-01 2000
@@ -482,6 +542,8 @@ self_test() {
   test_evidence="$test_dir/startup-diagnostics.md"
   printf 'FIXTURE_API_TOKEN=%s /scenario/private gr-%s\n' "$generated" "$generated" |
     sanitize_startup_diagnostics > "$test_evidence"
+  ensure_private_file "$test_evidence"
+  [ "$(stat -c '%a' "$test_evidence")" = 600 ]
   grep -Fq 'FIXTURE_API_TOKEN=[redacted-value]' "$test_evidence"
   grep -Fq '[redacted-path]' "$test_evidence"
   grep -Fq '[redacted-handle]' "$test_evidence"
@@ -498,7 +560,9 @@ self_test() {
   MANIFEST="$test_dir/manifest.md"
   local outcomes="$test_dir/outcomes.md"
   printf '%s\n' '# Synthetic-user run manifest' '- Status: running' > "$MANIFEST"
+  ensure_private_file "$MANIFEST"
   printf '%s\n' '' '## Outcomes' '- Status: complete catalog passed' > "$outcomes"
+  ensure_private_file "$outcomes"
   finalize_manifest_status complete "$outcomes"
   grep -Fq -- '- Status: complete' "$MANIFEST"
   grep -Fq -- '- Status: complete catalog passed' "$MANIFEST"
@@ -507,6 +571,7 @@ self_test() {
   fi
   CLEANUP_MANIFEST="$test_dir/cleanup.manifest"
   printf 'resource\tcontainer\tguard-su-test\tSU-TEST\n' > "$CLEANUP_MANIFEST"
+  ensure_private_file "$CLEANUP_MANIFEST"
   manifest_has_resource container guard-su-test SU-TEST
   if manifest_has_resource volume guard-su-test SU-TEST; then
     return 1
@@ -547,8 +612,10 @@ fi
 podman() {
   command podman "$@" 9>&-
 }
-mkdir -p "$EVIDENCE_ROOT"
+ensure_private_directory "$EVIDENCE_ROOT"
+ensure_private_directory "$EVIDENCE_ROOT/runs"
 exec 9>"$EVIDENCE_ROOT/runner.lock"
+ensure_private_file "$EVIDENCE_ROOT/runner.lock"
 if ! flock -n 9; then
   echo "another synthetic-user run is active in this worktree" >&2
   exit 2
@@ -585,12 +652,14 @@ RUN_DIR="$EVIDENCE_ROOT/runs/$RUN_ID"
 RESULTS_DIR="$RUN_DIR/scenarios"
 MANIFEST="$RUN_DIR/manifest.md"
 CLEANUP_MANIFEST="$RUN_DIR/cleanup.manifest"
-mkdir -p "$RESULTS_DIR"
+ensure_private_directory "$RUN_DIR"
+ensure_private_directory "$RESULTS_DIR"
 if ! recover_interrupted_run; then
   echo "synthetic-user could not recover interrupted resources for run $RUN_ID" >&2
   exit 1
 fi
 touch "$CLEANUP_MANIFEST"
+ensure_private_file "$CLEANUP_MANIFEST"
 SOURCE_MANIFEST="$RUN_DIR/source-files.sha256"
 (
   cd "$REPO_ROOT"
@@ -602,8 +671,10 @@ SOURCE_MANIFEST="$RUN_DIR/source-files.sha256"
     LC_ALL=C sort -z |
     xargs -0 sha256sum
 ) > "$SOURCE_MANIFEST"
+ensure_private_file "$SOURCE_MANIFEST"
 SOURCE_DIGEST="$(sha256sum "$SOURCE_MANIFEST" | cut -d ' ' -f 1)"
 printf '%s\n' "runs/$RUN_ID" > "$EVIDENCE_ROOT/latest-run"
+ensure_private_file "$EVIDENCE_ROOT/latest-run"
 {
   echo "# Synthetic-user run manifest"
   echo
@@ -617,6 +688,7 @@ printf '%s\n' "runs/$RUN_ID" > "$EVIDENCE_ROOT/latest-run"
   echo "- Selected scenarios: \`${SELECTED[*]}\`"
   echo "- Status: running"
 } > "$MANIFEST"
+ensure_private_file "$MANIFEST"
 
 # This callback is invoked indirectly by the EXIT trap below.
 # shellcheck disable=SC2317
@@ -726,6 +798,7 @@ run_one() {
     --tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777 \
     --tmpfs /var/log:rw,nosuid,nodev,size=32m,mode=0700 \
     --volume "$volume:/scenario:rw" \
+    --volume "$CATALOG_SOURCE:$CATALOG_DESTINATION:ro" \
     "${scenario_environment[@]}" \
     --entrypoint /synthetic-user.sh \
     "$IMAGE" daemon "$scenario" >/dev/null; then
@@ -1030,6 +1103,7 @@ OUTCOMES_FILE="${MANIFEST}.outcomes"
     echo "- Status: incomplete or failed catalog"
   fi
 } > "$OUTCOMES_FILE"
+ensure_private_file "$OUTCOMES_FILE"
 finalize_manifest_status "$manifest_status" "$OUTCOMES_FILE"
 cat "$OUTCOMES_FILE"
 if [ "$failures" -ne 0 ]; then
