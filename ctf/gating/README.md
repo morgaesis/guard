@@ -8,6 +8,7 @@ credentials.
 ```bash
 ./ctf/gating/run.sh          # adversarial attack (deterministic, offline)
 ./ctf/gating/run.sh static   # shell syntax and source-contract checks
+./ctf/gating/run.sh mutation # fixed-attack argv mutation checks
 ./ctf/gating/run.sh test     # full cargo test suite, in Linux
 ./ctf/gating/run.sh synthetic-user
 ./ctf/gating/synthetic-user-runner.sh --self-test  # runner evidence self-test, no container

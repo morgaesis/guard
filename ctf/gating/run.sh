@@ -4,12 +4,14 @@
 #   ./ctf/gating/run.sh            # adversarial attack
 #   ./ctf/gating/run.sh test       # full cargo test suite (authoritative, Linux)
 #   ./ctf/gating/run.sh static     # shell and cross-file boundary validation
+#   ./ctf/gating/run.sh mutation   # fixed-attack argv mutation validation
 #   ./ctf/gating/run.sh synthetic-user [SU-01 ...]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IMAGE="guard-gating-run-$$"
+ATTACK_CONTAINER="guard-gating-attack-$$"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 CONTAINER_MEMORY="${CTF_CONTAINER_MEMORY:-8g}"
 CONTAINER_MEMORY_SWAP="${CTF_CONTAINER_MEMORY_SWAP:-8g}"
@@ -25,10 +27,13 @@ if [ -z "$ENGINE" ]; then
     ENGINE=docker
   fi
 fi
-cleanup_image() {
+cleanup() {
+  if [ -n "${ATTACK_CONTAINER:-}" ]; then
+    "$ENGINE" container rm "$ATTACK_CONTAINER" >/dev/null 2>&1 || true
+  fi
   "$ENGINE" image rm "$IMAGE" >/dev/null 2>&1 || true
 }
-trap cleanup_image EXIT
+trap cleanup EXIT
 
 BUILD_FLAGS=(
   --memory "$CONTAINER_MEMORY"
@@ -70,7 +75,7 @@ if [ "$ENGINE" = podman ]; then
   # Disable Podman's implicit writable /var/tmp and other scratch mounts.
   ATTACK_RUN_FLAGS+=(--read-only-tmpfs=false)
 fi
-ATTACK_CONTAINER_ARGUMENTS=(--rm "${RUN_FLAGS[@]}" "${ATTACK_RUN_FLAGS[@]}" "$IMAGE")
+ATTACK_CONTAINER_ARGUMENTS=(--name "$ATTACK_CONTAINER" "${RUN_FLAGS[@]}" "${ATTACK_RUN_FLAGS[@]}" "$IMAGE")
 
 validate_attack_container_arguments() {
   local -a arguments=("$@")
@@ -88,91 +93,106 @@ validate_attack_container_arguments() {
     "/home/agent:rw,nosuid,nodev,noexec,size=1m,mode=0700"
   )
   local -a observed_tmpfs=()
-  local read_only_count=0
-  local network_none_count=0
-  local cap_drop_all_count=0
-  local no_new_privileges_count=0
+  local -A option_counts=()
+  local -a required_single_options=(
+    --name
+    --memory
+    --memory-swap
+    --cpus
+    --pids-limit
+    --read-only
+    --network
+    --cap-drop
+    --security-opt
+  )
+  local image_count=0
   local podman_implicit_tmpfs_disabled_count=0
-  local index argument value
+  local index argument value expected_value required_option
 
   for ((index = 0; index < ${#arguments[@]}; index++)); do
     argument="${arguments[index]}"
     case "$argument" in
       --read-only)
-        read_only_count=$((read_only_count + 1))
-        ;;
-      --read-only=false|--read-only=true|--read-write|--privileged)
-        echo "fixed attack contains a root-filesystem permission override: $argument" >&2
-        return 1
+        option_counts["$argument"]=$(( ${option_counts[$argument]:-0} + 1 ))
         ;;
       --read-only-tmpfs=false)
+        if [ "$ENGINE" != podman ]; then
+          echo "fixed attack contains the Podman-only option $argument for $ENGINE" >&2
+          return 1
+        fi
         podman_implicit_tmpfs_disabled_count=$((podman_implicit_tmpfs_disabled_count + 1))
         ;;
-      --read-only-tmpfs|--read-only-tmpfs=true|--read-only-tmpfs=*)
-        echo "fixed attack must not enable implicit writable scratch mounts: $argument" >&2
-        return 1
-        ;;
-      --network|--cap-drop|--cap-add|--security-opt|--tmpfs)
+      --name|--memory|--memory-swap|--cpus|--pids-limit|--network|--cap-drop|--cap-add|--security-opt|--tmpfs)
         index=$((index + 1))
         if ((index >= ${#arguments[@]})); then
           echo "fixed attack argument $argument has no value" >&2
           return 1
         fi
         value="${arguments[index]}"
+        option_counts["$argument"]=$(( ${option_counts[$argument]:-0} + 1 ))
         case "$argument" in
+          --name)
+            expected_value="$ATTACK_CONTAINER"
+            ;;
+          --memory)
+            expected_value="$CONTAINER_MEMORY"
+            ;;
+          --memory-swap)
+            expected_value="$CONTAINER_MEMORY_SWAP"
+            ;;
+          --cpus)
+            expected_value="$CONTAINER_CPUS"
+            ;;
+          --pids-limit)
+            expected_value="$CONTAINER_PIDS_LIMIT"
+            ;;
           --network)
-            if [ "$value" != none ]; then
-              echo "fixed attack must disable container networking" >&2
-              return 1
-            fi
-            network_none_count=$((network_none_count + 1))
+            expected_value=none
             ;;
           --cap-drop)
-            if [ "$value" != ALL ]; then
-              echo "fixed attack must drop every capability before adding the required set" >&2
-              return 1
-            fi
-            cap_drop_all_count=$((cap_drop_all_count + 1))
+            expected_value=ALL
             ;;
           --cap-add)
             observed_capabilities+=("$value")
+            continue
             ;;
           --security-opt)
-            if [ "$value" != no-new-privileges ]; then
-              echo "fixed attack contains an unexpected security option: $value" >&2
-              return 1
-            fi
-            no_new_privileges_count=$((no_new_privileges_count + 1))
+            expected_value=no-new-privileges
             ;;
           --tmpfs)
             observed_tmpfs+=("$value")
+            continue
             ;;
         esac
+        if [ "$value" != "$expected_value" ]; then
+          echo "fixed attack argument $argument must equal $expected_value" >&2
+          return 1
+        fi
         ;;
-      --network=*|--cap-drop=*|--cap-add=*|--security-opt=*|--tmpfs=*)
-        echo "fixed attack hardening arguments must use separately parsed values: $argument" >&2
+      --*)
+        echo "fixed attack contains an unknown option: $argument" >&2
         return 1
         ;;
-      --volume|--volume=*|-v|--mount|--mount=*|--device|--device=*)
-        echo "fixed attack may not attach host storage or devices: $argument" >&2
-        return 1
+      *)
+        if [ "$argument" != "$IMAGE" ]; then
+          echo "fixed attack contains an unexpected positional argument: $argument" >&2
+          return 1
+        fi
+        image_count=$((image_count + 1))
+        if ((index != ${#arguments[@]} - 1)); then
+          echo "fixed attack image must be the final argument with no command override" >&2
+          return 1
+        fi
         ;;
     esac
   done
 
-  if [ "$read_only_count" -ne 1 ]; then
-    echo "fixed attack must enable a read-only root filesystem exactly once" >&2
-    return 1
-  fi
-  if [ "$network_none_count" -ne 1 ]; then
-    echo "fixed attack must disable container networking exactly once" >&2
-    return 1
-  fi
-  if [ "$cap_drop_all_count" -ne 1 ] \
-    || [ "$no_new_privileges_count" -ne 1 ]; then
-    echo "fixed attack must apply one complete capability drop and one no-new-privileges boundary" >&2
-    return 1
-  fi
+  for required_option in "${required_single_options[@]}"; do
+    if [ "${option_counts[$required_option]:-0}" -ne 1 ]; then
+      echo "fixed attack must contain $required_option exactly once" >&2
+      return 1
+    fi
+  done
   if [ "${observed_capabilities[*]}" != "${expected_capabilities[*]}" ]; then
     echo "fixed attack capability additions differ from CHOWN, SETGID, and SETUID" >&2
     return 1
@@ -181,20 +201,177 @@ validate_attack_container_arguments() {
     echo "fixed attack writable tmpfs arguments differ from the bounded fixture set" >&2
     return 1
   fi
-  if [ "$ENGINE" = podman ]; then
-    if [ "$podman_implicit_tmpfs_disabled_count" -ne 1 ]; then
-      echo "fixed attack must disable Podman's implicit writable scratch mounts" >&2
-      return 1
-    fi
-  elif [ "$podman_implicit_tmpfs_disabled_count" -ne 0 ]; then
-    echo "fixed attack contains a Podman-only option for a different container engine" >&2
+  if [ "$image_count" -ne 1 ]; then
+    echo "fixed attack must contain exactly one expected image argument" >&2
+    return 1
+  fi
+  if [ "$ENGINE" = podman ] && [ "$podman_implicit_tmpfs_disabled_count" -ne 1 ]; then
+    echo "fixed attack must disable Podman's implicit writable scratch mounts" >&2
     return 1
   fi
 }
 
+expect_attack_argument_rejection() {
+  local mutation="$1"
+  shift
+  if validate_attack_container_arguments "$@" >/dev/null 2>&1; then
+    echo "FAIL: fixed attack argv mutation was accepted: $mutation" >&2
+    return 1
+  fi
+  echo "PASS: fixed attack argv rejected $mutation"
+}
+
+run_attack_argument_mutation_tests() {
+  local image_index=$(( ${#ATTACK_CONTAINER_ARGUMENTS[@]} - 1 ))
+  local -a before_image=("${ATTACK_CONTAINER_ARGUMENTS[@]:0:image_index}")
+  local -a without_read_only=()
+  local argument
+
+  for argument in "${ATTACK_CONTAINER_ARGUMENTS[@]}"; do
+    if [ "$argument" != --read-only ]; then
+      without_read_only+=("$argument")
+    fi
+  done
+
+  validate_attack_container_arguments "${ATTACK_CONTAINER_ARGUMENTS[@]}"
+  echo "PASS: fixed attack argv accepted the real invocation"
+
+  expect_attack_argument_rejection "a missing read-only root" \
+    "${without_read_only[@]}"
+  expect_attack_argument_rejection "an entrypoint override" \
+    "${before_image[@]}" --entrypoint /bin/true "$IMAGE"
+  expect_attack_argument_rejection "privileged mode" \
+    "${before_image[@]}" --privileged "$IMAGE"
+  expect_attack_argument_rejection "a privileged boolean override" \
+    "${before_image[@]}" --privileged=true "$IMAGE"
+  expect_attack_argument_rejection "a host-network alias" \
+    "${before_image[@]}" --net host "$IMAGE"
+  expect_attack_argument_rejection "host networking" \
+    "${before_image[@]}" --network host "$IMAGE"
+  expect_attack_argument_rejection "a changed security option" \
+    "${before_image[@]}" --security-opt no-new-privileges=false "$IMAGE"
+  expect_attack_argument_rejection "a host volume" \
+    "${before_image[@]}" --volume /:/host:ro "$IMAGE"
+  expect_attack_argument_rejection "a host storage mount" \
+    "${before_image[@]}" --mount type=bind,source=/,target=/host,readonly "$IMAGE"
+  expect_attack_argument_rejection "a host device" \
+    "${before_image[@]}" --device /dev/null "$IMAGE"
+  expect_attack_argument_rejection "inherited container volumes" \
+    "${before_image[@]}" --volumes-from fixture "$IMAGE"
+  expect_attack_argument_rejection "an extra positional before the image" \
+    "${before_image[@]}" unexpected-positional "$IMAGE"
+  expect_attack_argument_rejection "a command after the image" \
+    "${ATTACK_CONTAINER_ARGUMENTS[@]}" /bin/true
+  expect_attack_argument_rejection "a missing image" \
+    "${before_image[@]}"
+  expect_attack_argument_rejection "a duplicate image" \
+    "${ATTACK_CONTAINER_ARGUMENTS[@]}" "$IMAGE"
+  expect_attack_argument_rejection "an unknown option" \
+    "${before_image[@]}" --future-unsafe-option "$IMAGE"
+  expect_attack_argument_rejection "a changed memory limit" \
+    "${before_image[@]}" --memory 16g "$IMAGE"
+  expect_attack_argument_rejection "an additional capability" \
+    "${before_image[@]}" --cap-add SYS_ADMIN "$IMAGE"
+  expect_attack_argument_rejection "an additional writable tmpfs" \
+    "${before_image[@]}" --tmpfs /extra:rw,size=1m "$IMAGE"
+}
+
+validate_attack_container_config() {
+  python3 - "$ENGINE" "$1" <<'PY'
+import json
+import subprocess
+import sys
+
+
+engine, container_name = sys.argv[1:]
+container = json.loads(
+    subprocess.check_output([engine, "container", "inspect", container_name], text=True)
+)[0]
+host = container.get("HostConfig", {})
+config = container.get("Config", {})
+expected_caps = {"CHOWN", "SETGID", "SETUID"}
+expected_tmpfs = {
+    "/tmp": {"rw", "nosuid", "nodev", "noexec", "size=32m", "mode=1777"},
+    "/work": {"rw", "nosuid", "nodev", "noexec", "size=16m", "mode=0755"},
+    "/fakebin": {"rw", "exec", "nosuid", "nodev", "size=16m", "mode=0755"},
+    "/shim": {"rw", "exec", "nosuid", "nodev", "size=16m", "mode=0755"},
+    "/run": {"rw", "nosuid", "nodev", "noexec", "size=16m", "mode=0755"},
+    "/var/lib/guard": {"rw", "nosuid", "nodev", "noexec", "size=16m", "mode=0755"},
+    "/var/log": {"rw", "nosuid", "nodev", "noexec", "size=16m", "mode=0755"},
+    "/home/guarddaemon": {"rw", "nosuid", "nodev", "noexec", "size=1m", "mode=0700"},
+    "/home/agent": {"rw", "nosuid", "nodev", "noexec", "size=1m", "mode=0700"},
+}
+
+
+def fail(message):
+    raise SystemExit(f"FAIL: fixed attack container configuration: {message}")
+
+
+def caps(values):
+    return {str(value).upper().removeprefix("CAP_") for value in values}
+
+
+if host.get("ReadonlyRootfs") is not True:
+    fail("root filesystem is writable")
+if host.get("NetworkMode") != "none":
+    fail(f"network mode is {host.get('NetworkMode')!r}, not 'none'")
+if host.get("Privileged"):
+    fail("container is privileged")
+if host.get("Binds"):
+    fail("container has host bind mounts")
+if host.get("Devices"):
+    fail("container has host devices")
+
+effective_caps = container.get("EffectiveCaps")
+if effective_caps is not None:
+    if caps(effective_caps) != expected_caps:
+        fail(f"effective capabilities are {sorted(caps(effective_caps))}, not {sorted(expected_caps)}")
+else:
+    if caps(host.get("CapAdd", [])) != expected_caps or "ALL" not in caps(host.get("CapDrop", [])):
+        fail("capability drop/add configuration is not the minimal fixed set")
+
+security_options = {str(value).split(":", 1)[0] for value in host.get("SecurityOpt", [])}
+if "no-new-privileges" not in security_options:
+    fail("no-new-privileges is absent")
+
+tmpfs = host.get("Tmpfs") or {}
+if set(tmpfs) != set(expected_tmpfs):
+    fail(f"tmpfs targets are {sorted(tmpfs)}, not {sorted(expected_tmpfs)}")
+for target, required_options in expected_tmpfs.items():
+    actual_options = {option for option in str(tmpfs[target]).split(",") if option}
+    if "exec" in required_options:
+        # Engines may omit the default executable flag, but must not make the
+        # fixture directories non-executable.
+        required_options = required_options - {"exec"}
+        if "noexec" in actual_options:
+            fail(f"{target} is unexpectedly noexec")
+    if not required_options <= actual_options:
+        fail(f"{target} lacks {sorted(required_options - actual_options)}")
+
+create_command = config.get("CreateCommand")
+if create_command:
+    for flag, value in (("--network", "none"), ("--cap-drop", "ALL"), ("--security-opt", "no-new-privileges")):
+        if not any(create_command[index:index + 2] == [flag, value] for index in range(len(create_command) - 1)):
+            fail(f"engine create command omits {flag} {value}")
+    if create_command.count("--read-only") != 1:
+        fail("engine create command does not contain exactly one --read-only")
+
+print("PASS: engine inspection confirmed fixed attack root, network, capabilities, and bounded tmpfs")
+PY
+}
+
 run_attack_container() {
+  local attack_status=0
   validate_attack_container_arguments "$@"
-  "$ENGINE" run "$@"
+  if "$ENGINE" run "$@"; then
+    :
+  else
+    attack_status=$?
+  fi
+  validate_attack_container_config "$ATTACK_CONTAINER"
+  "$ENGINE" container rm "$ATTACK_CONTAINER" >/dev/null
+  ATTACK_CONTAINER=""
+  return "$attack_status"
 }
 
 static_validate() {
@@ -203,7 +380,8 @@ static_validate() {
     bash -n "$shell_file"
   done < <(find "$REPO_ROOT/ctf" -type f -name '*.sh' -print | LC_ALL=C sort)
   validate_attack_container_arguments "${ATTACK_CONTAINER_ARGUMENTS[@]}"
-  echo "PASS: fixed attack uses a read-only root, no network, and bounded writable tmpfs mounts"
+  echo "PASS: fixed attack invocation uses a read-only root, no network, and bounded writable tmpfs mounts"
+  run_attack_argument_mutation_tests
   python3 - "$REPO_ROOT" <<'PY'
 from pathlib import Path
 import re
@@ -281,6 +459,11 @@ if [ "$mode" = static ]; then
   echo "CTF static validation passed"
   exit 0
 fi
+if [ "$mode" = mutation ]; then
+  run_attack_argument_mutation_tests
+  echo "CTF fixed-attack argv mutation validation passed"
+  exit 0
+fi
 
 echo "=== Building $IMAGE (compiles guard for Linux) ==="
 "$ENGINE" build "${BUILD_FLAGS[@]}" -t "$IMAGE" -f "$SCRIPT_DIR/Containerfile" "$REPO_ROOT"
@@ -303,7 +486,7 @@ case "$mode" in
     ;;
   static) ;;
   *)
-    echo "usage: $0 [attack|test|static|synthetic-user [SCENARIO...]]" >&2
+    echo "usage: $0 [attack|test|static|mutation|synthetic-user [SCENARIO...]]" >&2
     exit 2
     ;;
 esac
