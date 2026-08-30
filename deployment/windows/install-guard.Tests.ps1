@@ -37,6 +37,28 @@ BeforeAll {
     function script:New-GuardTestTaskName {
         return "guard-op-$(New-GuardTestIdentifier)"
     }
+
+    function script:New-GuardTestServiceController {
+        param(
+            [Parameter(Mandatory)][string]$Status,
+            [Parameter(Mandatory)][string]$StatusAfterWait
+        )
+        $controller = [pscustomobject]@{
+            Status = $Status
+            StatusAfterWait = $StatusAfterWait
+            WaitCalls = 0
+            RefreshCalls = 0
+        }
+        $controller | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
+            param($DesiredStatus, $Timeout)
+            $this.WaitCalls++
+            $this.Status = $this.StatusAfterWait
+        }
+        $controller | Add-Member -MemberType ScriptMethod -Name Refresh -Value {
+            $this.RefreshCalls++
+        }
+        return $controller
+    }
 }
 
 AfterAll {
@@ -1174,9 +1196,6 @@ Describe 'Guard Windows installer state and ACL contract' {
     }
 
     It 'recovers the completed rollback state instead of the pre-rollback snapshot' {
-        if (-not (Get-Command Start-Service -ErrorAction SilentlyContinue)) {
-            function Start-Service { param([string]$Name) }
-        }
         $initialPathName = ('"' + $DeployedExe + '" "server" "start" "--socket" "guard" "--state-db" "C:\ProgramData\Guard\state.db"')
         $initialStatePaths = Get-GuardStatePaths -ServicePathName $initialPathName
         $initial = [pscustomobject]@{
@@ -1213,7 +1232,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         Mock Get-ServiceSnapshot { return $completed }
         Mock Wait-ServiceStopped { return }
         Mock Set-GuardServiceConfiguration { return }
-        Mock Start-Service { return }
+        Mock Start-GuardService { return }
         Mock Verify-GuardService { return }
         Mock Assert-DeploymentAcls { return }
         Mock Get-GuardSid { return $script:TestGuardSid }
@@ -1222,7 +1241,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         Recover-GuardTransaction
 
         Should -Invoke Wait-ServiceStopped -Times 1 -Exactly
-        Should -Invoke Start-Service -Times 0 -Exactly
+        Should -Invoke Start-GuardService -Times 0 -Exactly
         Should -Invoke Set-GuardServiceConfiguration -Times 1 -Exactly -ParameterFilter {
             $PathName -eq $completed.PathName -and $StartMode -eq 'Disabled'
         }
@@ -1469,7 +1488,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         Mock Assert-ExactFileSystemAcl { return }
         Mock Set-ExactFileSystemAcl { return }
         Mock Reset-TreeForAdministrativeMaintenance { return }
-        Mock Start-Service { return }
+        Mock Start-GuardService { return }
         Mock Verify-GuardService { return }
         Mock Assert-DeploymentAcls { return }
         try {
@@ -1691,6 +1710,19 @@ Describe 'Guard Windows installer state and ACL contract' {
         $sanitized | Should -Match '\[output truncated\]$'
     }
 
+    It 'waits through a transient service-controller start transition' {
+        $service = New-GuardTestServiceController -Status 'Stopped' -StatusAfterWait 'Running'
+        $name = "guard-$(New-GuardTestIdentifier)"
+        Mock Get-Service { return $service }
+        Mock Start-Service { $service.Status = 'StartPending' }
+
+        Start-GuardService -Name $name
+
+        $service.Status | Should -Be 'Running'
+        $service.WaitCalls | Should -Be 1
+        Should -Invoke Start-Service -Times 1 -Exactly
+    }
+
     It 'temporarily enables a disabled service for verification and restores disabled stopped state' {
         $metadata = [pscustomobject]@{
             service_path_name = '"C:\Program Files\Guard\guard.exe" "server" "start" "--socket" "guard" "--state-db" "C:\ProgramData\Guard\state.db"'
@@ -1702,13 +1734,13 @@ Describe 'Guard Windows installer state and ACL contract' {
         Mock Set-GuardServiceConfiguration { return }
         Mock Set-ServiceEnvironment { return }
         Mock Set-DeploymentAcls { return }
-        Mock Start-Service { return }
+        Mock Start-GuardService { return }
         Mock Verify-GuardService { return }
         Mock Assert-DeploymentAcls { return }
         Mock Wait-ServiceStopped { return }
         Complete-RestoredServiceVerification -Metadata $metadata -Environment @{} -GuardSid $script:TestGuardSid -AuthorityKeyPresent $false
         Should -Invoke Set-GuardServiceConfiguration -Times 1 -Exactly -ParameterFilter { $StartMode -eq 'Manual' }
-        Should -Invoke Start-Service -Times 1 -Exactly
+        Should -Invoke Start-GuardService -Times 1 -Exactly
         Should -Invoke Verify-GuardService -Times 1 -Exactly
         Should -Invoke Wait-ServiceStopped -Times 1 -Exactly
         Should -Invoke Set-GuardServiceConfiguration -Times 1 -Exactly -ParameterFilter { $StartMode -eq 'Disabled' }
@@ -1787,7 +1819,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-guard.ps1') -Raw
         $recoverySource = ($source -split 'function Recover-UnmutatedGuardTransaction', 2)[1] -split 'function Recover-GuardTransaction', 2 | Select-Object -First 1
         $repairIndex = $recoverySource.IndexOf('Restore-SnapshotPrivateServiceAcls')
-        $startIndex = $recoverySource.IndexOf('Start-Service -Name $ServiceName')
+        $startIndex = $recoverySource.IndexOf('Start-GuardService -Name $ServiceName')
         $helperSource = ($source -split 'function Restore-SnapshotPrivateServiceAcls', 2)[1] -split 'function Recover-UnmutatedGuardTransaction', 2 | Select-Object -First 1
 
         $repairIndex | Should -BeGreaterThan -1

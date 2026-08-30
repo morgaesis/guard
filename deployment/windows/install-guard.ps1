@@ -1280,6 +1280,54 @@ function Wait-ServiceStopped {
     $service.WaitForStatus('Stopped', (New-TimeSpan -Seconds 30))
 }
 
+function Start-GuardService {
+    param([Parameter(Mandatory)][string]$Name)
+    $lastStatus = 'Unavailable'
+    $lastError = 'the service controller did not expose the service'
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if ($service) {
+            $service.Refresh()
+            $lastStatus = [string]$service.Status
+            if ($service.Status -eq 'Running') { return }
+        }
+
+        $startFailed = $false
+        if ($service -and $service.Status -eq 'Stopped') {
+            try {
+                Start-Service -Name $Name -ErrorAction Stop
+            }
+            catch {
+                $startFailed = $true
+                $lastError = $_.Exception.Message
+            }
+            $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+            if ($service) {
+                $service.Refresh()
+                $lastStatus = [string]$service.Status
+                if ($service.Status -eq 'Running') { return }
+            }
+        }
+
+        if ($service -and ($service.Status -eq 'StartPending' -or -not $startFailed)) {
+            try {
+                $service.WaitForStatus('Running', (New-TimeSpan -Seconds 10))
+                $service.Refresh()
+                $lastStatus = [string]$service.Status
+                if ($service.Status -eq 'Running') { return }
+                $lastError = "the bounded transition completed in state '$lastStatus'"
+            }
+            catch {
+                $service.Refresh()
+                $lastStatus = [string]$service.Status
+                $lastError = $_.Exception.Message
+            }
+        }
+        if ($attempt -lt 3) { Start-Sleep -Milliseconds 200 }
+    }
+    throw "Guard service '$Name' did not reach Running after 3 bounded state-transition attempts. Last observed status: '$lastStatus'. Last transition error: $lastError"
+}
+
 function Assert-ServicePathName {
     param([Parameter(Mandatory)][string]$PathName)
     if ([string]::IsNullOrWhiteSpace($PathName) -or $PathName -match '[\x00-\x1f\x7f]') {
@@ -1908,7 +1956,7 @@ function Recover-UnmutatedGuardTransaction {
     Restore-SnapshotPrivateServiceAcls -StatePaths $TransactionRecord.StatePaths -GuardSid (Get-GuardSid) -AuthorityKeyPresent ([bool]$transaction.authority_key_present)
     if ([bool]$transaction.was_running) {
         Set-GuardServiceConfiguration -PathName $snapshot.PathName -StartMode 'Manual'
-        Start-Service -Name $ServiceName
+        Start-GuardService -Name $ServiceName
         Verify-GuardService -ExpectedHash $transaction.binary_sha256 -ExpectedVersion $transaction.binary_version -ExpectedStateDb $TransactionRecord.StatePaths.StateDb -ExpectedSocket $TransactionRecord.StatePaths.SocketName
     }
     else {
@@ -1999,7 +2047,7 @@ function Recover-GuardTransaction {
         }
         if ([bool]$transactionRecord.Document.completed_was_running) {
             Set-GuardServiceConfiguration -PathName $snapshot.PathName -StartMode 'Manual'
-            Start-Service -Name $ServiceName
+            Start-GuardService -Name $ServiceName
             Verify-GuardService -ExpectedHash $transactionRecord.Document.completed_binary_sha256 -ExpectedVersion $transactionRecord.Document.completed_binary_version -ExpectedStateDb $transactionRecord.CompletedStatePaths.StateDb -ExpectedSocket $transactionRecord.CompletedStatePaths.SocketName
         }
         else {
@@ -2580,7 +2628,7 @@ function Complete-RestoredServiceVerification {
     Set-GuardServiceConfiguration -PathName ([string]$Metadata.service_path_name) -StartMode 'Manual'
     Set-ServiceEnvironment -Environment $serviceEnvironment -GuardSid $GuardSid
     Set-DeploymentAcls -GuardSid $GuardSid -StatePaths $statePaths
-    Start-Service -Name $ServiceName
+    Start-GuardService -Name $ServiceName
     Verify-GuardService -ExpectedHash $Metadata.binary_sha256 -ExpectedVersion $Metadata.binary_version -ExpectedStateDb $statePaths.StateDb -ExpectedSocket $statePaths.SocketName
     Assert-DeploymentAcls -GuardSid $GuardSid -StatePaths $statePaths -AuthorityKeyPresent $AuthorityKeyPresent
     if (-not [bool]$Metadata.was_running) { Wait-ServiceStopped -Name $ServiceName }
@@ -2808,7 +2856,7 @@ function Invoke-Install {
             & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Could not configure Guard service failure recovery.' }
         }
-        Start-Service -Name $ServiceName
+        Start-GuardService -Name $ServiceName
         Invoke-InstallerTestFault -Point 'after-service-start'
         $expectedStatePaths = if ($snapshot) { $snapshot.StatePaths } else { Get-DeploymentStatePaths -StatePaths $null }
         Verify-GuardService -ExpectedHash $expectedHash -ExpectedVersion $expectedVersion -ExpectedStateDb $expectedStatePaths.StateDb -ExpectedSocket $expectedStatePaths.SocketName
@@ -2842,7 +2890,7 @@ function Invoke-Install {
             }
             elseif ($snapshot -and $snapshot.WasRunning) {
                 $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-                if ($service -and $service.Status -ne 'Running') { Start-Service -Name $ServiceName }
+                if ($service -and $service.Status -ne 'Running') { Start-GuardService -Name $ServiceName }
             }
         }
         catch {

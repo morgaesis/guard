@@ -1316,6 +1316,35 @@ fn open_parent_directory(path: &Path) -> Result<File> {
         .with_context(|| format!("failed to pin destination directory {}", path.display()))
 }
 
+/// Open a pinned directory handle with the minimum rights needed to replace
+/// its DACL. Ordinary parent pinning deliberately remains read-only.
+#[cfg(windows)]
+fn open_windows_directory_for_dacl_update(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+
+    OpenOptions::new()
+        // `access_mode` replaces the generic read/write flags. `WRITE_DAC`
+        // is required by SetSecurityInfo, while read attributes and control
+        // data let the retained handle undergo the existing authority checks.
+        .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "failed to open private directory for DACL update {}",
+                path.display()
+            )
+        })
+}
+
 #[cfg(target_os = "linux")]
 fn bind_destination_to_parent(parent: &File, destination: &Path) -> Result<PathBuf> {
     use std::os::fd::AsRawFd;
@@ -1682,18 +1711,42 @@ fn apply_security_descriptor_to_handle(
     information: u32,
 ) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Security::SetKernelObjectSecurity;
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+
     let mut descriptor = descriptor.to_vec();
+    let mut dacl_present = 0;
+    let mut dacl = std::ptr::null_mut();
+    let mut dacl_defaulted = 0;
     if unsafe {
-        SetKernelObjectSecurity(
-            file.as_raw_handle(),
-            information,
+        GetSecurityDescriptorDacl(
             descriptor.as_mut_ptr().cast(),
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
         )
     } == 0
+        || dacl_present == 0
+        || dacl.is_null()
     {
         return Err(std::io::Error::last_os_error())
-            .context("failed to apply a DACL through the held file handle");
+            .context("failed to read the replacement Windows DACL");
+    }
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .context("failed to apply a DACL through the pinned file-system handle");
     }
     Ok(())
 }
@@ -1701,12 +1754,13 @@ fn apply_security_descriptor_to_handle(
 #[cfg(windows)]
 fn apply_owner_only_windows_dacl_to_handle(file: &File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        SetKernelObjectSecurity, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
     let sddl = "D:P(A;;FA;;;OW)"
         .encode_utf16()
@@ -1725,17 +1779,39 @@ fn apply_owner_only_windows_dacl_to_handle(file: &File) -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .context("failed to create an owner-only Windows DACL");
     }
-    let applied = unsafe {
-        SetKernelObjectSecurity(
-            file.as_raw_handle(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+    let mut dacl_present = 0;
+    let mut dacl = std::ptr::null_mut();
+    let mut dacl_defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorDacl(
             descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    } == 0
+        || dacl_present == 0
+        || dacl.is_null()
+    {
+        unsafe { LocalFree(descriptor.cast()) };
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read the owner-only Windows DACL");
+    }
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
         )
     };
     unsafe { LocalFree(descriptor.cast()) };
-    if applied == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to apply an owner-only DACL through the held file handle");
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .context("failed to apply an owner-only DACL through the pinned file-system handle");
     }
     Ok(())
 }
@@ -1743,7 +1819,7 @@ fn apply_owner_only_windows_dacl_to_handle(file: &File) -> Result<()> {
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn protect_current_user_directory(path: &Path) -> Result<()> {
-    let directory = open_parent_directory(path)
+    let directory = open_windows_directory_for_dacl_update(path)
         .with_context(|| format!("cannot open private directory {}", path.display()))?;
     apply_owner_only_windows_dacl_to_handle(&directory)
         .with_context(|| format!("cannot protect private directory {}", path.display()))?;
