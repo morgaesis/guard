@@ -15,6 +15,15 @@ BeforeAll {
         return "gr-$(New-GuardTestIdentifier)"
     }
 
+    function script:New-GuardTestAgentReference {
+        $identifier = [guid]::NewGuid().ToByteArray()
+        $subAuthorities = @(0, 4, 8, 12 | ForEach-Object {
+            [BitConverter]::ToUInt32($identifier, $_)
+        })
+        $sid = [Security.Principal.SecurityIdentifier]("S-1-5-21-$($subAuthorities -join '-')")
+        return "agent:$($sid.Value)"
+    }
+
     function script:New-GuardTestBackupName {
         param([string]$Version = '1.2.3')
         return "before-v$Version-$(Get-Date -Format 'yyyyMMddTHHmmssZ')-$(New-GuardTestIdentifier)"
@@ -72,9 +81,10 @@ Describe 'Guard Windows operator command contract' {
         (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "access extend $SessionReference Inspect service health. --once --socket guard"
 
         $Action = 'access-revoke'
-        $Reference = @('agent:S-1-5-21-1000')
+        $agentReference = New-GuardTestAgentReference
+        $Reference = @($agentReference)
         $ApprovalMode = 'ordinary'
-        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be 'access revoke agent:S-1-5-21-1000 --socket guard'
+        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "access revoke $agentReference --socket guard"
 
         $Action = 'access-list'
         $Reference = @()
@@ -122,7 +132,8 @@ Describe 'Guard Windows operator command contract' {
         { Get-GuardActionArguments -Socket $SocketName } | Should -Throw
 
         $Action = 'access-revoke'
-        $Reference = @($SessionReference, 'agent:S-1-5-21-1000')
+        $agentReference = New-GuardTestAgentReference
+        $Reference = @($SessionReference, $agentReference)
         { Get-GuardActionArguments -Socket $SocketName } | Should -Throw
     }
 
