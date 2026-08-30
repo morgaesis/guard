@@ -40,10 +40,15 @@ jobs:
         shell: bash
         run: scripts/build-release-archive.sh --test-archive-comparison
 
-      - name: Exercise packaged systemd argument expansion
+      - name: Test systemd integration invocation contract
         if: runner.os == 'Linux'
         shell: bash
-        run: sudo ./deployment/systemd/test-guard-service-expansion.sh
+        run: ./deployment/systemd/test-guard-service-expansion.sh --self-test
+
+      - name: Verify systemd unit files
+        if: runner.os == 'Linux'
+        shell: bash
+        run: ./deployment/systemd/test-guard-service-expansion.sh --verify-only
 
       - name: Fault-inject Unix upgrade and rollback
         if: runner.os == 'Linux'

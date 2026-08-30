@@ -1,66 +1,133 @@
 #!/bin/bash
-# Exercise packaged ExecStart expansion and host /tmp visibility with systemd.
+# Verify packaged systemd units and exercise their privileged integration paths.
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "$0")" && pwd)"
+script_source="${BASH_SOURCE[0]}"
+case "$script_source" in
+  */*) script_parent="${script_source%/*}" ;;
+  *) script_parent=. ;;
+esac
+script_dir="$(cd -- "$script_parent" && pwd -P)"
 unit_sources=(
   "$script_dir/guard.service"
   "$script_dir/guard-exec-as-caller.service"
 )
 
-for unit_source in "${unit_sources[@]}"; do
-  if grep -Eqi '^[[:space:]]*PrivateTmp[[:space:]]*=[[:space:]]*(true|yes|on|1)[[:space:]]*$' "$unit_source"; then
-    grep -Eni '^[[:space:]]*PrivateTmp[[:space:]]*=[[:space:]]*(true|yes|on|1)[[:space:]]*$' "$unit_source" >&2
-    echo "$unit_source must share the host /tmp namespace with brokered children" >&2
-    exit 1
-  fi
-done
+static_required_commands=(basename grep mktemp rm sed systemd-analyze)
+full_required_commands=(
+  basename chmod cut env getent grep groupadd groupdel id install mktemp od paste ps
+  rm runuser sed seq sh sleep sort stat systemctl systemd-analyze timeout tr true useradd
+  userdel usermod
+)
 
-grep -Fxq 'AmbientCapabilities=CAP_SETUID CAP_SETGID' "$script_dir/guard.service"
-grep -Fxq 'SupplementaryGroups=guard-clients guard-exec' "$script_dir/guard.service"
-if grep -Eq '^AmbientCapabilities=.*CAP_(CHOWN|FOWNER|DAC_READ_SEARCH)' "$script_dir/guard.service"; then
-  echo 'the fixed-identity unit carries filesystem capabilities it does not need' >&2
-  exit 1
-fi
-
-verification_dir="$(mktemp -d)"
-cleanup_verification() {
-  if [ -n "$verification_dir" ] && [ -d "$verification_dir" ]; then
-    rm -r -- "$verification_dir"
-  fi
-}
-trap cleanup_verification EXIT
-verification_units=()
-for unit_source in "${unit_sources[@]}"; do
-  verification_unit="$verification_dir/$(basename "$unit_source")"
-  sed 's|^ExecStart=/usr/local/bin/guard |ExecStart=/bin/true |' \
-    "$unit_source" > "$verification_unit"
-  verification_units+=("$verification_unit")
-done
-systemd-analyze verify "${verification_units[@]}"
-cleanup_verification
-verification_dir=""
-trap - EXIT
-
-if [ "${1:-}" = "--verify-only" ]; then
-  exit 0
-fi
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "SKIP: privileged systemd expansion and Guard identity-switch integration require root."
-  exit 0
-fi
-test "$(ps -p 1 -o comm=)" = systemd || {
-  echo "actual systemd expansion test requires systemd as PID 1" >&2
-  exit 1
-}
-
+validated_guard_binary=""
 created_units=()
 created_paths=()
 created_users=()
 created_groups=()
 identity_daemon_pid=""
 identity_test_dir=""
+
+current_uid() {
+  printf '%s\n' "$EUID"
+}
+
+pid_one_command() {
+  ps -p 1 -o comm= | tr -d '[:space:]'
+}
+
+find_guard_binary() {
+  local candidate
+  for candidate in \
+    "$script_dir/../../guard" \
+    "$script_dir/../../target/debug/guard" \
+    "$script_dir/../../target/release/guard"; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+check_required_commands() {
+  local purpose="$1"
+  shift
+  local required_command
+  for required_command in "$@"; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+      printf '%s requires command %q; install it before running this mode.\n' \
+        "$purpose" "$required_command" >&2
+      return 1
+    fi
+  done
+}
+
+verify_unit_files() (
+  local unit_source verification_dir verification_unit
+  local verification_units=()
+
+  for unit_source in "${unit_sources[@]}"; do
+    if grep -Eqi '^[[:space:]]*PrivateTmp[[:space:]]*=[[:space:]]*(true|yes|on|1)[[:space:]]*$' "$unit_source"; then
+      grep -Eni '^[[:space:]]*PrivateTmp[[:space:]]*=[[:space:]]*(true|yes|on|1)[[:space:]]*$' "$unit_source" >&2
+      echo "$unit_source must share the host /tmp namespace with brokered children" >&2
+      return 1
+    fi
+  done
+
+  if ! grep -Fxq 'AmbientCapabilities=CAP_SETUID CAP_SETGID' "$script_dir/guard.service"; then
+    echo 'the fixed-identity unit must retain only the identity-switch capabilities' >&2
+    return 1
+  fi
+  if ! grep -Fxq 'SupplementaryGroups=guard-clients guard-exec' "$script_dir/guard.service"; then
+    echo 'the fixed-identity unit must retain its client and execution groups' >&2
+    return 1
+  fi
+  if grep -Eq '^AmbientCapabilities=.*CAP_(CHOWN|FOWNER|DAC_READ_SEARCH)' "$script_dir/guard.service"; then
+    echo 'the fixed-identity unit carries filesystem capabilities it does not need' >&2
+    return 1
+  fi
+
+  if ! verification_dir="$(mktemp -d)"; then
+    echo 'could not create a temporary directory for systemd unit verification' >&2
+    return 1
+  fi
+  trap 'rm -r -- "$verification_dir"' EXIT
+  for unit_source in "${unit_sources[@]}"; do
+    verification_unit="$verification_dir/$(basename "$unit_source")"
+    if ! sed 's|^ExecStart=/usr/local/bin/guard |ExecStart=/bin/true |' \
+      "$unit_source" > "$verification_unit"; then
+      echo "could not prepare $unit_source for systemd verification" >&2
+      return 1
+    fi
+    verification_units+=("$verification_unit")
+  done
+  if ! systemd-analyze verify "${verification_units[@]}"; then
+    echo 'systemd unit verification failed' >&2
+    return 1
+  fi
+)
+
+validate_full_prerequisites() {
+  if [ "$(current_uid)" -ne 0 ]; then
+    echo 'full systemd integration requires root; run with sudo or use --verify-only for unit verification' >&2
+    return 1
+  fi
+
+  if ! check_required_commands 'full systemd integration' "${full_required_commands[@]}"; then
+    return 1
+  fi
+
+  if [ "$(pid_one_command)" != systemd ]; then
+    echo 'full systemd integration requires systemd as PID 1; use --verify-only for unit verification' >&2
+    return 1
+  fi
+
+  if ! validated_guard_binary="$(find_guard_binary)"; then
+    echo 'full systemd integration requires an executable Guard binary in the package root or Cargo target directory; build Guard first or use --verify-only for unit verification' >&2
+    return 1
+  fi
+}
 
 stop_identity_daemon() {
   if [ -n "$identity_daemon_pid" ]; then
@@ -163,34 +230,38 @@ run_expansion_test() {
   test "$users_index" -ge 0
   test "${arguments[$((users_index + 1))]}" = "1001,1002"
   test "${arguments[$((users_index + 2))]:-}" != "1002"
-  if [ "$label" = standard ]; then
-    local exec_user_index=-1
-    for index in "${!arguments[@]}"; do
-      if [ "${arguments[$index]}" = "--exec-user" ]; then
-        exec_user_index=$index
-        break
+  case "$label" in
+    standard)
+      local exec_user_index=-1
+      for index in "${!arguments[@]}"; do
+        if [ "${arguments[$index]}" = "--exec-user" ]; then
+          exec_user_index=$index
+          break
+        fi
+      done
+      if [ "$exec_user_index" -lt 0 ] ||
+        [ "${arguments[$((exec_user_index + 1))]:-}" != guard-exec ]; then
+        echo 'fixed-identity unit did not expand --exec-user guard-exec' >&2
+        return 1
       fi
-    done
-    test "$exec_user_index" -ge 0
-    test "${arguments[$((exec_user_index + 1))]}" = guard-exec
-  fi
-}
-
-run_expansion_test "${unit_sources[0]}" standard
-run_expansion_test "${unit_sources[1]}" exec-as-caller
-
-find_guard_binary() {
-  local candidate
-  for candidate in \
-    "$script_dir/../../guard" \
-    "$script_dir/../../target/debug/guard" \
-    "$script_dir/../../target/release/guard"; do
-    if [ -x "$candidate" ]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
+      ;;
+    exec-as-caller)
+      local exec_as_caller_count=0
+      for index in "${!arguments[@]}"; do
+        if [ "${arguments[$index]}" = "--exec-as-caller" ]; then
+          exec_as_caller_count=$((exec_as_caller_count + 1))
+        fi
+      done
+      if [ "$exec_as_caller_count" -ne 1 ]; then
+        echo 'caller-identity unit did not expand exactly one --exec-as-caller flag' >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "unknown systemd expansion test label: $label" >&2
+      return 1
+      ;;
+  esac
 }
 
 normalize_group_list() {
@@ -230,19 +301,7 @@ assert_child_identity() {
 }
 
 run_identity_switch_integration() {
-  local guard_binary
-  if ! guard_binary="$(find_guard_binary)"; then
-    echo "SKIP: privileged Guard identity-switch integration requires a built Guard binary."
-    return 0
-  fi
-
-  local required_command
-  for required_command in groupadd groupdel useradd userdel usermod runuser getent od; do
-    command -v "$required_command" >/dev/null || {
-      echo "required identity-switch test command is unavailable: $required_command" >&2
-      return 1
-    }
-  done
+  local guard_binary="$1"
 
   identity_test_dir="$(mktemp -d /run/guard-identity-switch.XXXXXX)"
   chmod 0755 "$identity_test_dir"
@@ -477,4 +536,131 @@ run_identity_switch_integration() {
   stop_identity_daemon
 }
 
-run_identity_switch_integration
+run_privileged_integration() {
+  created_units=()
+  created_paths=()
+  created_users=()
+  created_groups=()
+  identity_daemon_pid=""
+  identity_test_dir=""
+  trap cleanup EXIT
+
+  run_expansion_test "${unit_sources[0]}" standard
+  run_expansion_test "${unit_sources[1]}" exec-as-caller
+  run_identity_switch_integration "$validated_guard_binary"
+}
+
+run_verify_only_mode() {
+  if ! check_required_commands 'systemd unit verification' "${static_required_commands[@]}"; then
+    return 1
+  fi
+  if ! verify_unit_files; then
+    return 1
+  fi
+}
+
+run_full_mode() {
+  if ! validate_full_prerequisites; then
+    return 1
+  fi
+  if ! verify_unit_files; then
+    return 1
+  fi
+  run_privileged_integration
+}
+
+run_contract_self_tests() (
+  if ! check_required_commands 'systemd integration contract self-test' grep mktemp rm; then
+    return 1
+  fi
+
+  local test_directory marker output_file error_file
+  test_directory="$(mktemp -d)"
+  trap 'rm -r -- "$test_directory"' EXIT
+  marker="$test_directory/mutation"
+  output_file="$test_directory/output"
+  error_file="$test_directory/error"
+
+  # These test-only overrides are invoked indirectly through dispatch_mode.
+  # shellcheck disable=SC2317
+  if (
+    current_uid() { printf '%s\n' 1000; }
+    verify_unit_files() { : > "$marker"; }
+    run_privileged_integration() { : > "$marker"; }
+    dispatch_mode
+  ) > "$output_file" 2> "$error_file"; then
+    echo 'default invocation unexpectedly succeeded without root' >&2
+    return 1
+  fi
+  grep -Fq 'full systemd integration requires root' "$error_file"
+  if [ -e "$marker" ]; then
+    echo 'default invocation mutated state before rejecting a non-root caller' >&2
+    return 1
+  fi
+
+  # These test-only overrides are invoked indirectly through dispatch_mode.
+  # shellcheck disable=SC2317
+  if (
+    current_uid() { printf '%s\n' 0; }
+    check_required_commands() { return 0; }
+    pid_one_command() { printf '%s\n' systemd; }
+    find_guard_binary() { return 1; }
+    verify_unit_files() { : > "$marker"; }
+    run_privileged_integration() { : > "$marker"; }
+    dispatch_mode
+  ) > "$output_file" 2> "$error_file"; then
+    echo 'default invocation unexpectedly succeeded without a Guard binary' >&2
+    return 1
+  fi
+  grep -Fq 'full systemd integration requires an executable Guard binary' "$error_file"
+  if [ -e "$marker" ]; then
+    echo 'default invocation mutated state before rejecting a missing Guard binary' >&2
+    return 1
+  fi
+
+  (
+    check_required_commands() { printf '%s\n' prerequisites >> "$marker"; }
+    verify_unit_files() { printf '%s\n' verification >> "$marker"; }
+    run_verify_only_mode
+  )
+  if [ "$(< "$marker")" != $'prerequisites\nverification' ]; then
+    echo '--verify-only did not complete prerequisite and unit checks in order' >&2
+    return 1
+  fi
+
+  if (
+    check_required_commands() { return 0; }
+    verify_unit_files() { return 1; }
+    run_verify_only_mode
+  ); then
+    echo '--verify-only unexpectedly succeeded after a failed unit check' >&2
+    return 1
+  fi
+
+  echo 'PASS: systemd integration invocation contracts'
+)
+
+usage() {
+  echo 'usage: test-guard-service-expansion.sh [--verify-only|--self-test]' >&2
+}
+
+dispatch_mode() {
+  if [ "$#" -eq 0 ]; then
+    run_full_mode
+    return
+  fi
+  if [ "$#" -ne 1 ]; then
+    usage
+    return 2
+  fi
+  case "$1" in
+    --verify-only) run_verify_only_mode ;;
+    --self-test) run_contract_self_tests ;;
+    *)
+      usage
+      return 2
+      ;;
+  esac
+}
+
+dispatch_mode "$@"
