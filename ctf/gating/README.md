@@ -108,9 +108,9 @@ A non-root daemon authenticates the agent as uid 1001 and uses only `SETUID` and
 `SETGID` to execute approved fixed-identity commands as the dedicated
 `guardexec` uid 1003. Operator actions carry a separate admin bearer that
 brokered children cannot read. The child cannot read or mutate daemon state,
-operator authority, or the admin bearer. A real closed
-The closed `whoami` executable profile proves that fixed and caller children
-have zero effective capabilities. The harness also checks that the daemon and
+operator authority, or the admin bearer. The closed `whoami` executable
+profile validates that fixed and caller children have zero effective
+capabilities. The harness also checks that the daemon and
 child identities cannot approve, deny, confirm, or revert by identity alone.
 
 The `--exec-as-caller` variant drops each command to its authenticated
