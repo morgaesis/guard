@@ -67,7 +67,7 @@ start_daemon() {
       --gate consequence \
       --socket "$SOCK" \
       --socket-group guard-clients \
-      --verbs /etc/guard/verbs.yaml \
+      --verbs /run/guard/verbs.yaml \
       --state-db /var/lib/guard/state.db \
       --shim-dir /shim \
       --users 1001 \
@@ -84,6 +84,10 @@ start_daemon() {
 echo "=== Setup ==="
 mkdir -p /work /run/guard /var/lib/guard
 mkdir -p /fakebin /shim
+install -m 0600 /etc/guard/verbs.yaml /run/guard/verbs.yaml
+generate_fixture_value > "$ADMIN_TOKEN_FILE"
+printf '\n' >> "$ADMIN_TOKEN_FILE"
+chmod 0400 "$ADMIN_TOKEN_FILE"
 cat >"$UPSTREAM_KUBECONFIG" <<'EOF'
 apiVersion: v1
 kind: Config
@@ -201,12 +205,15 @@ EOF
 chmod 0755 /fakebin/ssh /fakebin/kubectl /fakebin/helm /fakebin/ansible /fakebin/ansible-playbook /fakebin/whoami
 # The child owns only its fixture work tree. Daemon state and operator
 # configuration remain under identities the child cannot mutate.
-chown -R guardexec:guardexec /work
-chown guarddaemon:guarddaemon /run/guard /var/lib/guard "$UPSTREAM_KUBECONFIG"
-chown -R guarddaemon:guarddaemon /shim
-chmod 0755 /run/guard
+chmod 0755 /run/guard /fakebin /shim
 chmod 0400 "$UPSTREAM_KUBECONFIG"
-chmod 0755 /fakebin /shim
+chown -R guardexec:guardexec /work
+chown guarddaemon:guarddaemon \
+  /run/guard /var/lib/guard "$UPSTREAM_KUBECONFIG" \
+  /run/guard/verbs.yaml
+chown -R guarddaemon:guarddaemon /shim
+chown guarddaemon:guarddaemon /home/guarddaemon
+chown agent:agent /home/agent
 runuser -u agent       -- guard config set-server "$SOCK" >/dev/null 2>&1 || true
 runuser -u guarddaemon -- guard config set-server "$SOCK" >/dev/null 2>&1 || true
 runuser -u guarddaemon -- guard shim kubectl,helm,ansible,ansible-playbook --path /shim >/tmp/shim-install.out 2>&1 \
@@ -240,11 +247,9 @@ else
 fi
 
 echo "=== Start daemon with distinct child identity (gate=consequence, no LLM) ==="
-install -o guarddaemon -g guarddaemon -m 0400 /dev/null "$ADMIN_TOKEN_FILE"
-generate_fixture_value > "$ADMIN_TOKEN_FILE"
-printf '\n' >> "$ADMIN_TOKEN_FILE"
 : > /var/log/guard.log
 start_daemon
+chown guarddaemon:guarddaemon "$ADMIN_TOKEN_FILE"
 
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
 if [ -S "$SOCK" ]; then
