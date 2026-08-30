@@ -1,8 +1,7 @@
 name: Dependabot review gate
 
-# This read-only workflow is the sole auto-merge eligibility classifier.
-# Dependabot metadata verification covers the pull request author and commits.
-# Missing, inconsistent, or unsupported metadata requires manual review.
+# The required classifier succeeds for valid pull requests that need manual
+# review. A separate job records the narrower auto-merge eligibility signal.
 
 "on":
   pull_request:
@@ -25,8 +24,11 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      eligible: ${{ steps.policy.outputs.eligible }}
     steps:
-      - name: Validate pull request source
+      - name: Classify pull request source
+        id: source
         run: |
           set -euo pipefail
 
@@ -36,36 +38,50 @@ jobs:
           pull_state="$(jq -er '.pull_request.state | strings' "$GITHUB_EVENT_PATH")"
           base_ref="$(jq -er '.pull_request.base.ref | strings' "$GITHUB_EVENT_PATH")"
           head_sha="$(jq -er '.pull_request.head.sha | strings' "$GITHUB_EVENT_PATH")"
-          head_repository="$(jq -er '.pull_request.head.repo.full_name | strings' "$GITHUB_EVENT_PATH")"
 
           if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
-            echo "Manual review required: the runtime repository is malformed."
+            echo "Classification failed: the runtime repository is malformed."
             exit 1
           fi
-          if [ "$event_repository" != "$GITHUB_REPOSITORY" ] || [ "$head_repository" != "$GITHUB_REPOSITORY" ]; then
-            echo "Manual review required: the pull request repository is unexpected."
+          if [ "$event_repository" != "$GITHUB_REPOSITORY" ]; then
+            echo "Classification failed: the event repository is unexpected."
             exit 1
           fi
           if ! [[ "$pull_number" =~ ^[1-9][0-9]*$ ]] || ! [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Manual review required: the pull request identity is malformed."
+            echo "Classification failed: the pull request identity is malformed."
             exit 1
           fi
           if [ "$pull_state" != "open" ] || [ "$base_ref" != "main" ]; then
-            echo "Manual review required: the pull request is not open against main."
-            exit 1
-          fi
-          if [ "$pull_author" != "dependabot[bot]" ]; then
-            echo "Manual review required: the pull request author is not Dependabot."
+            echo "Classification failed: the pull request is not open against main."
             exit 1
           fi
 
+          if [ "$pull_author" != "dependabot[bot]" ]; then
+            echo "is_dependabot=false" >> "$GITHUB_OUTPUT"
+            echo "Manual review required: the pull request is not a Dependabot update."
+            exit 0
+          fi
+
+          head_repository="$(jq -er '.pull_request.head.repo.full_name | strings' "$GITHUB_EVENT_PATH")"
+          if [ "$head_repository" != "$GITHUB_REPOSITORY" ]; then
+            echo "Classification failed: the Dependabot head repository is unexpected."
+            exit 1
+          fi
+
+          echo "is_dependabot=true" >> "$GITHUB_OUTPUT"
+
       - name: Resolve verified Dependabot metadata
+        if: steps.source.outputs.is_dependabot == 'true'
         id: metadata
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
-      - name: Enforce auto-merge policy
+      - name: Classify auto-merge eligibility
+        if: always()
+        id: policy
         env:
           DIRECTORY: ${{ steps.metadata.outputs.directory }}
+          IS_DEPENDABOT: ${{ steps.source.outputs.is_dependabot }}
+          METADATA_OUTCOME: ${{ steps.metadata.outcome }}
           PACKAGE_ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
           TARGET_BRANCH: ${{ steps.metadata.outputs.target-branch }}
           UPDATED_DEPENDENCIES_JSON: ${{ steps.metadata.outputs.updated-dependencies-json }}
@@ -73,10 +89,39 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "eligible=false" >> "$GITHUB_OUTPUT"
+
+          if [ "$IS_DEPENDABOT" != "true" ]; then
+            echo "Manual review required: auto-merge applies only to verified Dependabot updates."
+            exit 0
+          fi
+          if [ "$METADATA_OUTCOME" != "success" ]; then
+            echo "Classification failed: verified Dependabot metadata is unavailable."
+            exit 1
+          fi
+          if [ -z "$PACKAGE_ECOSYSTEM" ] || [ -z "$DIRECTORY" ] || [ -z "$TARGET_BRANCH" ]; then
+            echo "Classification failed: aggregate Dependabot metadata is incomplete."
+            exit 1
+          fi
+
+          if ! jq -e '
+            type == "array" and length > 0 and all(.[ ];
+              (.dependencyName | type == "string" and length > 0) and
+              (.updateType == "version-update:semver-patch" or
+               .updateType == "version-update:semver-minor" or
+               .updateType == "version-update:semver-major") and
+              (.packageEcosystem | type == "string" and length > 0) and
+              (.directory | type == "string" and length > 0) and
+              (.targetBranch | type == "string" and length > 0)
+            )' <<< "$UPDATED_DEPENDENCIES_JSON" >/dev/null; then
+            echo "Classification failed: Dependabot metadata is missing or malformed."
+            exit 1
+          fi
+
           case "$UPDATE_TYPE" in
-            version-update:semver-patch|version-update:semver-minor) ;;
+            version-update:semver-patch|version-update:semver-minor|version-update:semver-major) ;;
             *)
-              echo "Manual review required: the update is major or unclassified."
+              echo "Classification failed: the aggregate update type is unavailable."
               exit 1
               ;;
           esac
@@ -85,29 +130,26 @@ jobs:
             cargo:/|cargo:/fuzz|github_actions:/) ;;
             *)
               echo "Manual review required: the package ecosystem or directory is not eligible."
-              exit 1
+              exit 0
               ;;
           esac
 
           if [ "$TARGET_BRANCH" != "main" ]; then
             echo "Manual review required: the metadata target branch is not main."
-            exit 1
+            exit 0
           fi
 
           if ! jq -e \
             --arg ecosystem "$PACKAGE_ECOSYSTEM" \
             --arg directory "$DIRECTORY" \
             --arg target "$TARGET_BRANCH" \
-            'type == "array" and length > 0 and all(.[ ];
-              (.dependencyName | type == "string" and length > 0) and
-              (.updateType == "version-update:semver-patch" or
-               .updateType == "version-update:semver-minor") and
+            'all(.[ ];
               .packageEcosystem == $ecosystem and
               .directory == $directory and
               .targetBranch == $target
             )' <<< "$UPDATED_DEPENDENCIES_JSON" >/dev/null; then
-            echo "Manual review required: grouped update metadata is missing, mixed, or ineligible."
-            exit 1
+            echo "Manual review required: grouped dependency metadata is mixed."
+            exit 0
           fi
 
           highest_update_type="$(jq -er '
@@ -115,16 +157,29 @@ jobs:
               "version-update:semver-major"
             elif any(.[ ]; .updateType == "version-update:semver-minor") then
               "version-update:semver-minor"
-            elif any(.[ ]; .updateType == "version-update:semver-patch") then
-              "version-update:semver-patch"
             else
-              empty
+              "version-update:semver-patch"
             end
           ' <<< "$UPDATED_DEPENDENCIES_JSON")"
 
           if [ "$highest_update_type" != "$UPDATE_TYPE" ]; then
-            echo "Manual review required: aggregate and per-dependency update types disagree."
-            exit 1
+            echo "Manual review required: aggregate and dependency update types disagree."
+            exit 0
+          fi
+          if [ "$highest_update_type" = "version-update:semver-major" ]; then
+            echo "Manual review required: major updates are not eligible."
+            exit 0
           fi
 
-          echo "Eligible for native auto-merge after all repository requirements pass."
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+          echo "Verified Dependabot metadata satisfies the auto-merge policy."
+
+  eligibility:
+    name: Auto-merge eligible
+    needs: review-gate
+    if: needs.review-gate.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Record eligibility
+        run: echo "Auto-merge eligibility is verified."
