@@ -568,8 +568,54 @@ run_full_mode() {
   run_privileged_integration
 }
 
+run_isolated_contract() {
+  local marker="$1"
+  local contract_status=0
+
+  GUARD_SYSTEMD_TEST_MARKER="$marker" \
+    timeout --signal=TERM --kill-after=1s 5s bash -s -- "$script_source" || contract_status=$?
+  if [ "$contract_status" -eq 124 ] || [ "$contract_status" -eq 137 ]; then
+    echo 'isolated systemd invocation contract exceeded its five-second timeout' >&2
+  fi
+  return "$contract_status"
+}
+
+assert_timeout_kills_descendants() {
+  local process_token="guard-systemd-timeout-$$-$RANDOM"
+  local process_listing surviving_processes
+  local timeout_status=0
+
+  # The positional parameters expand only inside the isolated Bash process.
+  # shellcheck disable=SC2016
+  { timeout --signal=TERM --kill-after=1s 1s bash -c '
+      trap "" TERM
+      bash -c "$1" "$2-bash" &
+      (
+        exec -a "$2-systemctl" bash -c "$1"
+      ) &
+      wait
+    ' bash 'trap "" TERM; while :; do sleep 10; done' "$process_token"; } \
+    >/dev/null 2>&1 || timeout_status=$?
+  if [ "$timeout_status" -ne 137 ]; then
+    printf 'timeout cleanup regression returned %s instead of 137\n' "$timeout_status" >&2
+    return 1
+  fi
+
+  process_listing="$(ps -eo pid=,ppid=,comm=,args=)"
+  surviving_processes="$(printf '%s\n' "$process_listing" | grep -F "$process_token" || true)"
+  if [ -n "$surviving_processes" ]; then
+    echo 'hard timeout left a descendant Bash or systemctl process running' >&2
+    printf '%s\n' "$surviving_processes" >&2
+    while read -r descendant_pid _; do
+      kill -KILL "$descendant_pid" >/dev/null 2>&1 || true
+    done <<< "$surviving_processes"
+    return 1
+  fi
+}
+
 run_contract_self_tests() (
-  if ! check_required_commands 'systemd integration contract self-test' bash grep mktemp rm; then
+  if ! check_required_commands \
+    'systemd integration contract self-test' bash grep mktemp ps rm sleep timeout; then
     return 1
   fi
 
@@ -580,7 +626,7 @@ run_contract_self_tests() (
   output_file="$test_directory/output"
   error_file="$test_directory/error"
 
-  if GUARD_SYSTEMD_TEST_MARKER="$marker" bash -s -- "$script_source" <<'SELF_TEST' \
+  if run_isolated_contract "$marker" <<'SELF_TEST' \
     > "$output_file" 2> "$error_file"; then
 set -euo pipefail
 source "$1"
@@ -602,17 +648,22 @@ SELF_TEST
     return 1
   fi
 
-  # These test-only overrides are invoked indirectly through dispatch_mode.
-  # shellcheck disable=SC2317
-  if (
-    current_uid() { printf '%s\n' 0; }
-    check_required_commands() { return 0; }
-    pid_one_command() { printf '%s\n' systemd; }
-    find_guard_binary() { return 1; }
-    verify_unit_files() { : > "$marker"; }
-    run_privileged_integration() { : > "$marker"; }
-    dispatch_mode
-  ) > "$output_file" 2> "$error_file"; then
+  if run_isolated_contract "$marker" <<'SELF_TEST' \
+    > "$output_file" 2> "$error_file"; then
+set -euo pipefail
+source "$1"
+record_host_mutation() {
+  printf '%s\n' "$1" >> "$GUARD_SYSTEMD_TEST_MARKER"
+}
+systemctl() { record_host_mutation systemctl; }
+current_uid() { printf '%s\n' 0; }
+check_required_commands() { return 0; }
+pid_one_command() { printf '%s\n' systemd; }
+find_guard_binary() { return 1; }
+verify_unit_files() { record_host_mutation verify-unit-files; }
+run_privileged_integration() { record_host_mutation privileged-integration; }
+dispatch_mode
+SELF_TEST
     echo 'default invocation unexpectedly succeeded without a Guard binary' >&2
     return 1
   fi
@@ -622,7 +673,7 @@ SELF_TEST
     return 1
   fi
 
-  if ! GUARD_SYSTEMD_TEST_MARKER="$marker" bash -s -- "$script_source" <<'SELF_TEST' \
+  if ! run_isolated_contract "$marker" <<'SELF_TEST' \
     > "$output_file" 2> "$error_file"; then
 set -euo pipefail
 source "$1"
@@ -644,35 +695,51 @@ SELF_TEST
   fi
 
   : > "$marker"
-  if ! GUARD_SYSTEMD_TEST_MARKER="$marker" bash -s -- "$script_source" <<'SELF_TEST' \
+  if run_isolated_contract "$marker" <<'SELF_TEST' \
     > "$output_file" 2> "$error_file"; then
 set -euo pipefail
 source "$1"
-record_host_mutation() {
+record_event() {
   printf '%s\n' "$1" >> "$GUARD_SYSTEMD_TEST_MARKER"
 }
-systemctl() { record_host_mutation systemctl; }
-run_contract_self_tests
+systemctl() { record_event "systemctl $*"; }
+check_required_commands() { record_event prerequisites; }
+verify_unit_files() { record_event verification; return 1; }
+run_privileged_integration() { record_event privileged-integration; }
+dispatch_mode --verify-only
 SELF_TEST
-    echo '--self-test unexpectedly failed' >&2
-    return 1
-  fi
-  if [ -s "$marker" ]; then
-    echo '--self-test invoked systemctl or mutated host state' >&2
-    return 1
-  fi
-
-  if (
-    check_required_commands() { return 0; }
-    verify_unit_files() { return 1; }
-    run_verify_only_mode
-  ); then
     echo '--verify-only unexpectedly succeeded after a failed unit check' >&2
+    return 1
+  fi
+  if [ "$(< "$marker")" != $'prerequisites\nverification' ]; then
+    echo '--verify-only did not stop after a failed unit check' >&2
     return 1
   fi
 
   : > "$marker"
-  if GUARD_SYSTEMD_TEST_MARKER="$marker" bash -s -- "$script_source" <<'SELF_TEST' \
+  if ! run_isolated_contract "$marker" <<'SELF_TEST' \
+    > "$output_file" 2> "$error_file"; then
+set -euo pipefail
+source "$1"
+record_event() {
+  printf '%s\n' "$1" >> "$GUARD_SYSTEMD_TEST_MARKER"
+}
+systemctl() { record_event "systemctl $*"; }
+run_full_mode() { record_event full-mode; }
+run_verify_only_mode() { record_event verify-only; }
+run_contract_self_tests() { record_event self-test; }
+dispatch_mode --self-test
+SELF_TEST
+    echo '--self-test dispatch unexpectedly failed' >&2
+    return 1
+  fi
+  if [ "$(< "$marker")" != self-test ]; then
+    echo '--self-test did not dispatch exactly once to the contract runner' >&2
+    return 1
+  fi
+
+  : > "$marker"
+  if run_isolated_contract "$marker" <<'SELF_TEST' \
     > "$output_file" 2> "$error_file"; then
 set -euo pipefail
 source "$1"
@@ -686,7 +753,7 @@ pid_one_command() { printf '%s\n' systemd; }
 find_guard_binary() { printf '%s\n' /mock/guard; }
 verify_unit_files() { record_event verification; }
 run_expansion_test() { record_event mutation; return 1; }
-run_full_mode
+dispatch_mode
 SELF_TEST
     echo 'privileged integration unexpectedly succeeded after a simulated mutation failure' >&2
     return 1
@@ -695,6 +762,8 @@ SELF_TEST
     echo 'privileged integration did not own cleanup after a mutation failure' >&2
     return 1
   fi
+
+  assert_timeout_kills_descendants
 
   echo 'PASS: systemd integration invocation contracts'
 )
