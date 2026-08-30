@@ -33,6 +33,7 @@ RUN groupadd -g 2000 guard-clients \
     && useradd -m -u 1002 other-agent \
     && useradd -m -u 1003 guardexec \
     && usermod -aG guard-clients guarddaemon \
+    && usermod -aG guardexec guarddaemon \
     && usermod -aG guard-clients agent \
     && usermod -aG guard-clients other-agent
 
