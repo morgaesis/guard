@@ -1,38 +1,21 @@
 name: Dependabot review gate
 
-# Gate Dependabot PRs that need human review while staying quiet for updates
-# that normal CI can cover:
-#
-#   - patch and minor cargo updates
-#   - all GitHub Actions updates (we already SHA-pin them, so the bump
-#     is functionally a vetted-tag → vetted-tag move)
-#
-# Major and unclassified version bumps fail closed for human review. The gate
-# does not execute pull request code, use external model credentials, post
-# comments, approve reviews, or merge changes. Major security updates follow
-# the same fail-closed policy because alert lookup requires a separate
-# privileged token.
+# This read-only workflow is the sole auto-merge eligibility classifier.
+# Dependabot metadata verification covers the pull request author and commits.
+# Missing, inconsistent, or unsupported metadata requires manual review.
 
-on:
-  push:
-    branches: [main]
+"on":
   pull_request:
+    branches: [main]
     types:
       - opened
       - reopened
       - synchronize
-  workflow_dispatch:
-    inputs:
-      pr_number:
-        description: "Dependabot pull request number to process"
-        required: true
-        type: number
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: dependabot-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  group: dependabot-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -41,108 +24,107 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read  # Reads Dependabot PR metadata and changed-file names.
+      pull-requests: read
     steps:
-      - name: Resolve pull request
-        id: pr
-        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
-          DISPATCH_PR_NUMBER: ${{ inputs.pr_number }}
+      - name: Validate pull request source
         run: |
           set -euo pipefail
 
-          pr_number="${DISPATCH_PR_NUMBER:-${EVENT_PR_NUMBER:-}}"
-          if [ -z "$pr_number" ]; then
-            echo "No pull request number was provided."
+          event_repository="$(jq -er '.repository.full_name | strings' "$GITHUB_EVENT_PATH")"
+          pull_number="$(jq -er '.pull_request.number | numbers' "$GITHUB_EVENT_PATH")"
+          pull_author="$(jq -er '.pull_request.user.login | strings' "$GITHUB_EVENT_PATH")"
+          pull_state="$(jq -er '.pull_request.state | strings' "$GITHUB_EVENT_PATH")"
+          base_ref="$(jq -er '.pull_request.base.ref | strings' "$GITHUB_EVENT_PATH")"
+          head_sha="$(jq -er '.pull_request.head.sha | strings' "$GITHUB_EVENT_PATH")"
+          head_repository="$(jq -er '.pull_request.head.repo.full_name | strings' "$GITHUB_EVENT_PATH")"
+
+          if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+            echo "Manual review required: the runtime repository is malformed."
+            exit 1
+          fi
+          if [ "$event_repository" != "$GITHUB_REPOSITORY" ] || [ "$head_repository" != "$GITHUB_REPOSITORY" ]; then
+            echo "Manual review required: the pull request repository is unexpected."
+            exit 1
+          fi
+          if ! [[ "$pull_number" =~ ^[1-9][0-9]*$ ]] || ! [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Manual review required: the pull request identity is malformed."
+            exit 1
+          fi
+          if [ "$pull_state" != "open" ] || [ "$base_ref" != "main" ]; then
+            echo "Manual review required: the pull request is not open against main."
+            exit 1
+          fi
+          if [ "$pull_author" != "dependabot[bot]" ]; then
+            echo "Manual review required: the pull request author is not Dependabot."
             exit 1
           fi
 
-          author="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.user.login')"
-          if [ "$author" != "dependabot[bot]" ]; then
-            echo "PR #${pr_number} was opened by ${author}, not dependabot[bot]."
-            exit 1
-          fi
-
-          {
-            echo "number=${pr_number}"
-            echo "url=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.html_url')"
-            echo "head_sha=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.head.sha')"
-            echo "head_ref=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.head.ref')"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Resolve update metadata
-        id: fetch_meta
-        if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+      - name: Resolve verified Dependabot metadata
+        id: metadata
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
-      - name: Resolve dispatched update metadata
-        id: meta
-        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
+      - name: Enforce auto-merge policy
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          FETCH_UPDATE_TYPE: ${{ steps.fetch_meta.outputs.update-type }}
-          FETCH_PACKAGE_ECOSYSTEM: ${{ steps.fetch_meta.outputs.package-ecosystem }}
-          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
-        run: |
-          set -euo pipefail
-
-          update_type="$FETCH_UPDATE_TYPE"
-          package_ecosystem="$FETCH_PACKAGE_ECOSYSTEM"
-
-          if [ -z "$update_type" ]; then
-            body="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""')"
-            update_type="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*-[[:space:]]*update-type:[[:space:]]*//p' | head -1)"
-          fi
-          if [ -z "$update_type" ]; then
-            case "$HEAD_REF" in
-              *major*) update_type="version-update:semver-major" ;;
-              *minor*) update_type="version-update:semver-minor" ;;
-              *patch*) update_type="version-update:semver-patch" ;;
-            esac
-          fi
-
-          if [ -z "$package_ecosystem" ]; then
-            files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')"
-            if printf '%s\n' "$files" | grep -Eq '^\.github/workflows/'; then
-              package_ecosystem="github_actions"
-            elif printf '%s\n' "$files" | grep -Eq '(^|/)Cargo\.(toml|lock)$'; then
-              package_ecosystem="cargo"
-            else
-              package_ecosystem="unknown"
-            fi
-          fi
-
-          {
-            echo "update-type=${update_type}"
-            echo "package-ecosystem=${package_ecosystem}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Enforce review policy
-        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
-        env:
-          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
-          PACKAGE_ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+          DIRECTORY: ${{ steps.metadata.outputs.directory }}
+          PACKAGE_ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+          TARGET_BRANCH: ${{ steps.metadata.outputs.target-branch }}
+          UPDATED_DEPENDENCIES_JSON: ${{ steps.metadata.outputs.updated-dependencies-json }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
         run: |
           set -euo pipefail
 
           case "$UPDATE_TYPE" in
-            version-update:semver-patch|version-update:semver-minor)
-              echo "Routine update; normal CI is sufficient."
-              exit 0
+            version-update:semver-patch|version-update:semver-minor) ;;
+            *)
+              echo "Manual review required: the update is major or unclassified."
+              exit 1
               ;;
           esac
 
-          if [ "$PACKAGE_ECOSYSTEM" = "github_actions" ]; then
-            echo "SHA-pinned GitHub Actions update; normal CI is sufficient."
-            exit 0
+          case "$PACKAGE_ECOSYSTEM:$DIRECTORY" in
+            cargo:/|cargo:/fuzz|github_actions:/) ;;
+            *)
+              echo "Manual review required: the package ecosystem or directory is not eligible."
+              exit 1
+              ;;
+          esac
+
+          if [ "$TARGET_BRANCH" != "main" ]; then
+            echo "Manual review required: the metadata target branch is not main."
+            exit 1
           fi
 
-          echo "Major or unclassified dependency update requires human review."
-          exit 1
+          if ! jq -e \
+            --arg ecosystem "$PACKAGE_ECOSYSTEM" \
+            --arg directory "$DIRECTORY" \
+            --arg target "$TARGET_BRANCH" \
+            'type == "array" and length > 0 and all(.[ ];
+              (.dependencyName | type == "string" and length > 0) and
+              (.updateType == "version-update:semver-patch" or
+               .updateType == "version-update:semver-minor") and
+              .packageEcosystem == $ecosystem and
+              .directory == $directory and
+              .targetBranch == $target
+            )' <<< "$UPDATED_DEPENDENCIES_JSON" >/dev/null; then
+            echo "Manual review required: grouped update metadata is missing, mixed, or ineligible."
+            exit 1
+          fi
 
-      - name: Record non-dependency change
-        if: github.event_name == 'push' || github.event.pull_request.user.login != 'dependabot[bot]'
-        run: echo "Dependency update classification applies only to Dependabot pull requests."
+          highest_update_type="$(jq -er '
+            if any(.[ ]; .updateType == "version-update:semver-major") then
+              "version-update:semver-major"
+            elif any(.[ ]; .updateType == "version-update:semver-minor") then
+              "version-update:semver-minor"
+            elif any(.[ ]; .updateType == "version-update:semver-patch") then
+              "version-update:semver-patch"
+            else
+              empty
+            end
+          ' <<< "$UPDATED_DEPENDENCIES_JSON")"
+
+          if [ "$highest_update_type" != "$UPDATE_TYPE" ]; then
+            echo "Manual review required: aggregate and per-dependency update types disagree."
+            exit 1
+          fi
+
+          echo "Eligible for native auto-merge after all repository requirements pass."
