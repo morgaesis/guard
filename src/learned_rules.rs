@@ -1719,19 +1719,23 @@ fn apply_security_descriptor_to_handle(
     let mut dacl_present = 0;
     let mut dacl = std::ptr::null_mut();
     let mut dacl_defaulted = 0;
-    if unsafe {
+    let dacl_result = unsafe {
         GetSecurityDescriptorDacl(
             descriptor.as_mut_ptr().cast(),
             &mut dacl_present,
             &mut dacl,
             &mut dacl_defaulted,
         )
-    } == 0
-        || dacl_present == 0
-        || dacl.is_null()
-    {
+    };
+    if dacl_result == 0 {
         return Err(std::io::Error::last_os_error())
             .context("failed to read the replacement Windows DACL");
+    }
+    if dacl_present == 0 {
+        anyhow::bail!("replacement Windows security descriptor does not contain a DACL");
+    }
+    if dacl.is_null() {
+        anyhow::bail!("replacement Windows security descriptor contains a null DACL");
     }
     let status = unsafe {
         SetSecurityInfo(
@@ -1782,20 +1786,26 @@ fn apply_owner_only_windows_dacl_to_handle(file: &File) -> Result<()> {
     let mut dacl_present = 0;
     let mut dacl = std::ptr::null_mut();
     let mut dacl_defaulted = 0;
-    if unsafe {
+    let dacl_result = unsafe {
         GetSecurityDescriptorDacl(
             descriptor,
             &mut dacl_present,
             &mut dacl,
             &mut dacl_defaulted,
         )
-    } == 0
-        || dacl_present == 0
-        || dacl.is_null()
-    {
+    };
+    if dacl_result == 0 {
+        let error = std::io::Error::last_os_error();
         unsafe { LocalFree(descriptor.cast()) };
-        return Err(std::io::Error::last_os_error())
-            .context("failed to read the owner-only Windows DACL");
+        return Err(error).context("failed to read the owner-only Windows DACL");
+    }
+    if dacl_present == 0 {
+        unsafe { LocalFree(descriptor.cast()) };
+        anyhow::bail!("owner-only Windows security descriptor does not contain a DACL");
+    }
+    if dacl.is_null() {
+        unsafe { LocalFree(descriptor.cast()) };
+        anyhow::bail!("owner-only Windows security descriptor contains a null DACL");
     }
     let status = unsafe {
         SetSecurityInfo(

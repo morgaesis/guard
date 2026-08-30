@@ -1723,6 +1723,49 @@ Describe 'Guard Windows installer state and ACL contract' {
         Should -Invoke Start-Service -Times 1 -Exactly
     }
 
+    It 're-queries and waits when Start-Service reports a pending transition as an error' {
+        $service = New-GuardTestServiceController -Status 'Stopped' -StatusAfterWait 'Running'
+        $name = "guard-$(New-GuardTestIdentifier)"
+        $diagnostic = "start-pending-$(New-GuardTestIdentifier)"
+        Mock Get-Service { return $service }
+        Mock Start-Service {
+            $service.Status = 'StartPending'
+            throw $diagnostic
+        }
+        Mock Start-Sleep { return }
+
+        Start-GuardService -Name $name
+
+        $service.Status | Should -Be 'Running'
+        $service.WaitCalls | Should -Be 1
+        Should -Invoke Get-Service -Times 2 -Exactly
+        Should -Invoke Start-Service -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+    }
+
+    It 'bounds failed service starts and reports the final status and error' {
+        $service = New-GuardTestServiceController -Status 'Stopped' -StatusAfterWait 'Stopped'
+        $name = "guard-$(New-GuardTestIdentifier)"
+        $diagnostic = "start-failed-$(New-GuardTestIdentifier)"
+        Mock Get-Service { return $service }
+        Mock Start-Service { throw $diagnostic }
+        Mock Start-Sleep { return }
+        $caught = $null
+
+        try {
+            Start-GuardService -Name $name
+        }
+        catch {
+            $caught = $_.Exception.Message
+        }
+
+        $caught | Should -Be "Guard service '$name' did not reach Running after 3 bounded state-transition attempts. Last observed status: 'Stopped'. Last transition error: $diagnostic"
+        $service.WaitCalls | Should -Be 0
+        Should -Invoke Get-Service -Times 6 -Exactly
+        Should -Invoke Start-Service -Times 3 -Exactly
+        Should -Invoke Start-Sleep -Times 2 -Exactly
+    }
+
     It 'temporarily enables a disabled service for verification and restores disabled stopped state' {
         $metadata = [pscustomobject]@{
             service_path_name = '"C:\Program Files\Guard\guard.exe" "server" "start" "--socket" "guard" "--state-db" "C:\ProgramData\Guard\state.db"'
