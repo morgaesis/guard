@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-IMAGE="${GUARD_SU_IMAGE:-guard-gating}"
+IMAGE="${GUARD_SU_IMAGE:-localhost/guard-gating}"
 EVIDENCE_ROOT="$REPO_ROOT/.cache/synthetic-user"
 RESULTS_DIR="$EVIDENCE_ROOT/scenarios"
 STATUS_FILE="$EVIDENCE_ROOT/status.md"
@@ -319,6 +319,13 @@ assert_cleanup_invariants() {
 
 self_test() {
   local test_dir test_evidence
+  case "$IMAGE" in
+    localhost/*) ;;
+    *)
+      echo "synthetic-user image must use a localhost-qualified local reference" >&2
+      return 1
+      ;;
+  esac
   test_dir="$(mktemp -d)"
   RESULTS_DIR="$test_dir"
   record_host_failure SU-TEST 'phase-gr-test-handle /scenario/private' access 125

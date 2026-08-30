@@ -10,7 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-IMAGE="guard-gating-run-$$"
+IMAGE="localhost/guard-gating-run-$$"
 ATTACK_CONTAINER="guard-gating-attack-$$"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 CONTAINER_MEMORY="${CTF_CONTAINER_MEMORY:-8g}"
@@ -203,6 +203,10 @@ validate_attack_container_arguments() {
   fi
   if [ "$image_count" -ne 1 ]; then
     echo "fixed attack must contain exactly one expected image argument" >&2
+    return 1
+  fi
+  if [[ "$IMAGE" != localhost/* ]]; then
+    echo "fixed attack image must use a localhost-qualified local reference" >&2
     return 1
   fi
   if [ "$ENGINE" = podman ] && [ "$podman_implicit_tmpfs_disabled_count" -ne 1 ]; then

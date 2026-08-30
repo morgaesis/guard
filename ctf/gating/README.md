@@ -19,6 +19,9 @@ with `CTF_CONTAINER_MEMORY`, `CTF_CONTAINER_MEMORY_SWAP`,
 `CTF_CONTAINER_CPUS`, `CTF_CONTAINER_PIDS_LIMIT`, or `CARGO_BUILD_JOBS` when a
 host needs different limits.
 
+Generated harness images use `localhost/`-qualified tags to avoid short-name
+registry resolution.
+
 ## Synthetic-user mode
 
 `synthetic-user` runs SU-01 through SU-11, seven SU-12 workload journeys, and
