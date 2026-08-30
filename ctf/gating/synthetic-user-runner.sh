@@ -7,7 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IMAGE="${GUARD_SU_IMAGE:-localhost/guard-gating}"
 CATALOG_SOURCE="$REPO_ROOT/ctf/gating/verbs.yaml"
-CATALOG_DESTINATION=/scenario/journey/protected-catalog/verbs.yaml
+CATALOG_DIRECTORY_DESTINATION=/scenario/journey/protected-catalog
+CATALOG_LOCK_DESTINATION="$CATALOG_DIRECTORY_DESTINATION/.verbs.yaml.learning-lock"
 EVIDENCE_ROOT="$REPO_ROOT/.cache/synthetic-user"
 RESULTS_DIR="$EVIDENCE_ROOT/scenarios"
 STATUS_FILE="$EVIDENCE_ROOT/status.md"
@@ -128,7 +129,12 @@ write_missing_result_evidence() {
 }
 
 expected_container_mounts() {
-  printf 'bind\t%s\tfalse\nvolume\t/scenario\ttrue\n' "$CATALOG_DESTINATION"
+  local volume_source="$1" catalog_directory_source="$2" catalog_lock_source="$3"
+  printf 'bind\t%s\tfalse\t%s\n' \
+    "$CATALOG_DIRECTORY_DESTINATION" "$catalog_directory_source"
+  printf 'bind\t%s\ttrue\t%s\n' \
+    "$CATALOG_LOCK_DESTINATION" "$catalog_lock_source"
+  printf 'volume\t/scenario\ttrue\t%s\n' "$volume_source"
 }
 
 normalize_container_mounts() {
@@ -136,22 +142,29 @@ normalize_container_mounts() {
 }
 
 validate_container_mounts() {
-  local observed="$1" normalized expected
+  local observed="$1" volume_source="$2" catalog_directory_source="$3" catalog_lock_source="$4"
+  local normalized expected
   normalized="$(printf '%s\n' "$observed" | normalize_container_mounts)"
-  expected="$(expected_container_mounts | normalize_container_mounts)"
+  expected="$(expected_container_mounts \
+    "$volume_source" "$catalog_directory_source" "$catalog_lock_source" |
+    normalize_container_mounts)"
   [ "$normalized" = "$expected" ]
 }
 
 reject_mount_mutation() {
-  local description="$1" observed="$2"
-  if validate_container_mounts "$observed"; then
+  local description="$1" observed="$2" volume_source="$3"
+  local catalog_directory_source="$4" catalog_lock_source="$5"
+  if validate_container_mounts "$observed" \
+    "$volume_source" "$catalog_directory_source" "$catalog_lock_source"; then
     echo "synthetic-user mount mutation was accepted: $description" >&2
     return 1
   fi
 }
 
 assert_isolated_container() {
-  local container="$1" scenario="$2" expected_user mounts capabilities groups catalog_source
+  local container="$1" scenario="$2" volume_source="$3"
+  local catalog_directory_source="$4" catalog_lock_source="$5"
+  local expected_user mounts capabilities groups observed_catalog_source observed_lock_source
   if caller_identity_scenario "$scenario"; then
     expected_user=0:0
   else
@@ -167,10 +180,17 @@ assert_isolated_container() {
     || [ "$capabilities" = '["CAP_SETUID","CAP_SETGID"]' ]
   groups="$(podman inspect --format '{{range .HostConfig.GroupAdd}}{{println .}}{{end}}' "$container")"
   validate_supplementary_groups "$scenario" "$groups"
-  mounts="$(podman inspect --format '{{range .Mounts}}{{printf "%s\t%s\t%t\n" .Type .Destination .RW}}{{end}}' "$container")"
-  validate_container_mounts "$mounts"
-  catalog_source="$(podman inspect --format '{{range .Mounts}}{{if eq .Destination "/scenario/journey/protected-catalog/verbs.yaml"}}{{.Source}}{{end}}{{end}}' "$container")"
-  [ "$(readlink -f "$catalog_source")" = "$(readlink -f "$CATALOG_SOURCE")" ]
+  mounts="$(podman inspect --format '{{range .Mounts}}{{printf "%s\t%s\t%t\t%s\n" .Type .Destination .RW .Source}}{{end}}' "$container")"
+  validate_container_mounts "$mounts" \
+    "$volume_source" "$catalog_directory_source" "$catalog_lock_source"
+  observed_catalog_source="$(podman inspect --format '{{range .Mounts}}{{if eq .Destination "/scenario/journey/protected-catalog"}}{{.Source}}{{end}}{{end}}' "$container")"
+  observed_lock_source="$(podman inspect --format '{{range .Mounts}}{{if eq .Destination "/scenario/journey/protected-catalog/.verbs.yaml.learning-lock"}}{{.Source}}{{end}}{{end}}' "$container")"
+  [ "$(readlink -f "$observed_catalog_source")" = \
+    "$(readlink -f "$catalog_directory_source")" ]
+  [ "$(readlink -f "$observed_lock_source")" = \
+    "$(readlink -f "$catalog_lock_source")" ]
+  [ "$(sha256sum "$catalog_directory_source/verbs.yaml" | awk '{print $1}')" = \
+    "$(sha256sum "$CATALOG_SOURCE" | awk '{print $1}')" ]
 }
 
 caller_identity_scenario() {
@@ -481,6 +501,9 @@ assert_cleanup_invariants() {
 
 self_test() {
   local test_dir test_evidence generated groups mount_contract
+  local test_volume_source=/fixture/volume
+  local test_catalog_directory_source=/fixture/volume/journey/protected-catalog
+  local test_catalog_lock_source=/fixture/volume/journey/protected-catalog/.verbs.yaml.learning-lock
   case "$IMAGE" in
     localhost/*) ;;
     *)
@@ -519,13 +542,34 @@ self_test() {
   [ "$groups" = $'--group-add\n2000\n--group-add\n1003' ]
   groups="$(daemon_group_arguments SU-12-api)"
   [ "$groups" = $'--group-add\n2000' ]
-  mount_contract="$(expected_container_mounts)"
-  validate_container_mounts "$mount_contract"
-  reject_mount_mutation 'a writable catalog bind' \
-    $'bind\t/scenario/journey/protected-catalog/verbs.yaml\ttrue\nvolume\t/scenario\ttrue'
-  reject_mount_mutation 'a missing catalog bind' $'volume\t/scenario\ttrue'
+  mount_contract="$(expected_container_mounts \
+    "$test_volume_source" "$test_catalog_directory_source" "$test_catalog_lock_source")"
+  validate_container_mounts "$mount_contract" \
+    "$test_volume_source" "$test_catalog_directory_source" "$test_catalog_lock_source"
+  reject_mount_mutation 'a writable catalog-directory bind' \
+    $'bind\t/scenario/journey/protected-catalog\ttrue\t/fixture/volume/journey/protected-catalog\nbind\t/scenario/journey/protected-catalog/.verbs.yaml.learning-lock\ttrue\t/fixture/volume/journey/protected-catalog/.verbs.yaml.learning-lock\nvolume\t/scenario\ttrue\t/fixture/volume' \
+    "$test_volume_source" "$test_catalog_directory_source" "$test_catalog_lock_source"
+  reject_mount_mutation 'a read-only learning-lock bind' \
+    $'bind\t/scenario/journey/protected-catalog\tfalse\t/fixture/volume/journey/protected-catalog\nbind\t/scenario/journey/protected-catalog/.verbs.yaml.learning-lock\tfalse\t/fixture/volume/journey/protected-catalog/.verbs.yaml.learning-lock\nvolume\t/scenario\ttrue\t/fixture/volume' \
+    "$test_volume_source" "$test_catalog_directory_source" "$test_catalog_lock_source"
+  reject_mount_mutation 'a missing catalog-directory bind' \
+    $'bind\t/scenario/journey/protected-catalog/.verbs.yaml.learning-lock\ttrue\t/fixture/volume/journey/protected-catalog/.verbs.yaml.learning-lock\nvolume\t/scenario\ttrue\t/fixture/volume' \
+    "$test_volume_source" "$test_catalog_directory_source" "$test_catalog_lock_source"
+  reject_mount_mutation 'a missing learning-lock bind' \
+    $'bind\t/scenario/journey/protected-catalog\tfalse\t/fixture/volume/journey/protected-catalog\nvolume\t/scenario\ttrue\t/fixture/volume' \
+    "$test_volume_source" "$test_catalog_directory_source" "$test_catalog_lock_source"
+  reject_mount_mutation 'a redirected catalog-directory source' \
+    $'bind\t/scenario/journey/protected-catalog\tfalse\t/fixture/redirected\nbind\t/scenario/journey/protected-catalog/.verbs.yaml.learning-lock\ttrue\t/fixture/volume/journey/protected-catalog/.verbs.yaml.learning-lock\nvolume\t/scenario\ttrue\t/fixture/volume' \
+    "$test_volume_source" "$test_catalog_directory_source" "$test_catalog_lock_source"
+  reject_mount_mutation 'a redirected learning-lock source' \
+    $'bind\t/scenario/journey/protected-catalog\tfalse\t/fixture/volume/journey/protected-catalog\nbind\t/scenario/journey/protected-catalog/.verbs.yaml.learning-lock\ttrue\t/fixture/redirected-lock\nvolume\t/scenario\ttrue\t/fixture/volume' \
+    "$test_volume_source" "$test_catalog_directory_source" "$test_catalog_lock_source"
+  reject_mount_mutation 'an additional writable catalog child' \
+    "$mount_contract"$'\nbind\t/scenario/journey/protected-catalog/extra\ttrue\t/fixture/extra' \
+    "$test_volume_source" "$test_catalog_directory_source" "$test_catalog_lock_source"
   reject_mount_mutation 'an additional host bind' \
-    "$mount_contract"$'\nbind\t/host\tfalse'
+    "$mount_contract"$'\nbind\t/host\tfalse\t/host' \
+    "$test_volume_source" "$test_catalog_directory_source" "$test_catalog_lock_source"
   validate_supplementary_groups SU-01 $'2000\n1003'
   validate_supplementary_groups SU-12-api 2000
   reject_group_mutation 'missing fixed private group' SU-01 2000
@@ -708,7 +752,8 @@ trap 'exit 130' INT TERM
 
 run_one() {
   local scenario="$1"
-  local slug container init_container volume result exec_status daemon_user
+  local slug container init_container volume result exec_status daemon_user volume_source
+  local catalog_directory_source catalog_lock_source
   local -a scenario_environment=(--env GUARD_SWEEPER_GRACE_SECS=1) daemon_groups=()
   HOST_FAILURE_PHASE=""
   HOST_FAILURE_CATEGORY=""
@@ -778,6 +823,18 @@ run_one() {
     record_host_failure "$scenario" principal-output-cleanup cleanup 1
     return 1
   fi
+  volume_source="$(podman volume inspect --format '{{.Mountpoint}}' "$volume")"
+  volume_source="$(readlink -f "$volume_source")"
+  catalog_directory_source="$volume_source/journey/protected-catalog"
+  catalog_lock_source="$catalog_directory_source/.verbs.yaml.learning-lock"
+  if [ ! -d "$catalog_directory_source" ] \
+    || [ ! -f "$catalog_directory_source/verbs.yaml" ] \
+    || [ ! -f "$catalog_lock_source" ] \
+    || [ "$(sha256sum "$catalog_directory_source/verbs.yaml" | awk '{print $1}')" != \
+      "$(sha256sum "$CATALOG_SOURCE" | awk '{print $1}')" ]; then
+    record_host_failure "$scenario" protected-catalog-source fixture-setup 1
+    return 1
+  fi
   register_pending_resource container "$container" "$scenario"
   if podman create \
     --name "$container" \
@@ -798,7 +855,8 @@ run_one() {
     --tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777 \
     --tmpfs /var/log:rw,nosuid,nodev,size=32m,mode=0700 \
     --volume "$volume:/scenario:rw" \
-    --volume "$CATALOG_SOURCE:$CATALOG_DESTINATION:ro" \
+    --volume "$catalog_directory_source:$CATALOG_DIRECTORY_DESTINATION:ro" \
+    --volume "$catalog_lock_source:$CATALOG_LOCK_DESTINATION:rw" \
     "${scenario_environment[@]}" \
     --entrypoint /synthetic-user.sh \
     "$IMAGE" daemon "$scenario" >/dev/null; then
@@ -813,7 +871,8 @@ run_one() {
     return 1
   fi
 
-  if assert_isolated_container "$container" "$scenario"; then
+  if assert_isolated_container "$container" "$scenario" \
+    "$volume_source" "$catalog_directory_source" "$catalog_lock_source"; then
     :
   else
     record_host_failure "$scenario" container-hardening container-create 1

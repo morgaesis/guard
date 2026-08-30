@@ -157,7 +157,8 @@ EOF
 }
 
 assert_protected_catalog_as_daemon() {
-  local catalog_group catalog_mount_options catalog_owner expected_lock marker replacement
+  local catalog_group catalog_mount_identity catalog_owner expected_lock
+  local lock_mount_identity marker replacement lock_replacement mounted_targets
   [ "$(stat -c '%u:%g:%a' /scenario/journey)" = \
     "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:1777" ]
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_DIR")" = \
@@ -166,14 +167,15 @@ assert_protected_catalog_as_daemon() {
   [ -r "$PROTECTED_CATALOG" ]
   [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
     "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
-  catalog_mount_options="$(findmnt -n -o OPTIONS --target "$PROTECTED_CATALOG")"
-  case ",$catalog_mount_options," in
-    *,ro,*) ;;
-    *)
-      echo 'protected catalog is not on a read-only mount' >&2
-      return 1
-      ;;
-  esac
+  catalog_mount_identity="$(capture_exact_mount_identity "$PROTECTED_CATALOG_DIR" ro)" \
+    || return 1
+  lock_mount_identity="$(capture_exact_mount_identity "$PROTECTED_CATALOG_LOCK" rw)" \
+    || return 1
+  mounted_targets="$(findmnt -rn -o TARGET | awk -v directory="$PROTECTED_CATALOG_DIR" '
+    $0 == directory || index($0, directory "/") == 1 { print }
+  ' | LC_ALL=C sort)"
+  [ "$mounted_targets" = "$(printf '%s\n%s\n' \
+    "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG_LOCK" | LC_ALL=C sort)" ]
 
   if caller_identity_scenario; then
     [ "$(id -u)" -eq 0 ]
@@ -185,45 +187,84 @@ assert_protected_catalog_as_daemon() {
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_LOCK")" = "$expected_lock" ]
 
   replacement=/tmp/protected-catalog-replacement
+  lock_replacement=/tmp/protected-catalog-lock-replacement
   marker=/tmp/protected-catalog-lock-marker
   printf 'replacement must not install\n' > "$replacement"
+  printf 'lock replacement must not install\n' > "$lock_replacement"
   rm -f "$marker"
   if printf blocked > "$PROTECTED_CATALOG" \
     || chmod 0600 "$PROTECTED_CATALOG" \
     || rm -f "$PROTECTED_CATALOG" \
     || mv "$replacement" "$PROTECTED_CATALOG" \
+    || chmod 0700 "$PROTECTED_CATALOG_DIR" \
     || mkdir "$PROTECTED_CATALOG_DIR/unauthorized" \
     || rmdir "$PROTECTED_CATALOG_DIR" \
-    || mv "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG_DIR-replaced"; then
-    rm -f "$replacement" "$marker"
+    || mv "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG_DIR-replaced" \
+    || mkdir "$PROTECTED_CATALOG_DIR" \
+    || rm -f "$PROTECTED_CATALOG_LOCK" \
+    || mv "$PROTECTED_CATALOG_LOCK" "$PROTECTED_CATALOG_LOCK-replaced" \
+    || mv "$lock_replacement" "$PROTECTED_CATALOG_LOCK"; then
+    rm -f "$replacement" "$lock_replacement" "$marker"
     echo 'protected catalog preflight accepted an unauthorized mutation' >&2
     return 1
   fi
   [ -f "$PROTECTED_CATALOG" ]
-  exec 9>"$PROTECTED_CATALOG_LOCK"
+  exec 9<>"$PROTECTED_CATALOG_LOCK"
   flock -n 9
+  printf 'fixture-lock-contract\n' >&9
+  grep -qx fixture-lock-contract "$PROTECTED_CATALOG_LOCK"
+  : > "$PROTECTED_CATALOG_LOCK"
   printf lock-opened > "$marker"
   [ "$(cat "$marker")" = lock-opened ]
   exec 9>&-
-  rm -f "$replacement" "$marker"
+  rm -f "$replacement" "$lock_replacement" "$marker"
+  [ -f "$PROTECTED_CATALOG_LOCK" ]
+  [ ! -s "$PROTECTED_CATALOG_LOCK" ]
+  [ "$(capture_exact_mount_identity "$PROTECTED_CATALOG_DIR" ro)" = \
+    "$catalog_mount_identity" ]
+  [ "$(capture_exact_mount_identity "$PROTECTED_CATALOG_LOCK" rw)" = \
+    "$lock_mount_identity" ]
 
   # CAP_SETUID makes the former neutral owner and the mounted file owner
   # reachable. The read-only mount, rather than ownership, enforces immutability.
   assert_catalog_mutation_rejected_after_identity_transition \
-    "$NEUTRAL_FIXTURE_UID" "$NEUTRAL_FIXTURE_GID" neutral-owner
+    "$NEUTRAL_FIXTURE_UID" "$NEUTRAL_FIXTURE_GID" neutral-owner \
+    "$catalog_mount_identity" "$lock_mount_identity"
   catalog_owner="$(stat -c '%u' "$PROTECTED_CATALOG")"
   catalog_group="$(stat -c '%g' "$PROTECTED_CATALOG")"
   assert_catalog_mutation_rejected_after_identity_transition \
-    "$catalog_owner" "$catalog_group" mounted-file-owner
+    "$catalog_owner" "$catalog_group" mounted-file-owner \
+    "$catalog_mount_identity" "$lock_mount_identity"
   [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
     "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
 }
 
+capture_exact_mount_identity() {
+  local target="$1" expected_access="$2" observed_target options
+  observed_target="$(findmnt -n -o TARGET --target "$target")"
+  [ "$observed_target" = "$target" ] || {
+    echo 'protected catalog mount target is not exact' >&2
+    return 1
+  }
+  options="$(findmnt -n -o OPTIONS --target "$target")"
+  case ",$options," in
+    *",$expected_access,"*) ;;
+    *)
+      echo 'protected catalog mount access is incorrect' >&2
+      return 1
+      ;;
+  esac
+  findmnt -n -o SOURCE,TARGET,OPTIONS --target "$target"
+}
+
 assert_catalog_mutation_rejected_after_identity_transition() {
-  local target_uid="$1" target_gid="$2" label="$3" marker replacement status
+  local target_uid="$1" target_gid="$2" label="$3"
+  local expected_catalog_mount="$4" expected_lock_mount="$5"
+  local marker replacement lock_replacement status
   marker="/tmp/catalog-owner-transition-$label"
   replacement="/tmp/catalog-owner-replacement-$label"
-  rm -f "$marker" "$replacement"
+  lock_replacement="/tmp/catalog-lock-owner-replacement-$label"
+  rm -f "$marker" "$replacement" "$lock_replacement"
   set +e
   # The child expands these expressions after changing identity.
   # shellcheck disable=SC2016
@@ -234,24 +275,51 @@ assert_catalog_mutation_rejected_after_identity_transition() {
     /bin/sh -c '
       marker=$1
       replacement=$2
-      catalog=$3
-      printf "%s:%s\n" "$(id -u)" "$(id -g)" > "$marker" || exit 90
+      lock_replacement=$3
+      catalog=$4
+      directory=$5
+      lock=$6
+      expected_catalog_mount=$7
+      expected_lock_mount=$8
+      target_uid=$9
+      fsuid=$(awk "/^Uid:/ { print \$5 }" /proc/self/status)
+      printf "%s:%s:%s\n" "$(id -u)" "$(id -g)" "$fsuid" > "$marker" || exit 90
+      [ "$(id -u)" = "$target_uid" ] && [ "$fsuid" = "$target_uid" ] || exit 90
       printf "replacement must not install\n" > "$replacement" || exit 90
+      printf "lock replacement must not install\n" > "$lock_replacement" || exit 90
       if printf "blocked\n" > "$catalog" \
         || chmod 0600 "$catalog" \
         || rm -f "$catalog" \
-        || mv "$replacement" "$catalog"; then
+        || mv "$replacement" "$catalog" \
+        || chmod 0700 "$directory" \
+        || mkdir "$directory/unauthorized" \
+        || rmdir "$directory" \
+        || mv "$directory" "$directory-replaced" \
+        || mkdir "$directory" \
+        || printf "blocked\n" > "$lock" \
+        || chmod 0644 "$lock" \
+        || rm -f "$lock" \
+        || mv "$lock" "$lock-replaced" \
+        || mv "$lock_replacement" "$lock"; then
         exit 91
       fi
+      [ -d "$directory" ] && [ -f "$catalog" ] && [ -f "$lock" ] || exit 92
+      [ "$(findmnt -n -o SOURCE,TARGET,OPTIONS --target "$directory")" = \
+        "$expected_catalog_mount" ] || exit 93
+      [ "$(findmnt -n -o SOURCE,TARGET,OPTIONS --target "$lock")" = \
+        "$expected_lock_mount" ] || exit 94
       exit 73
-    ' synthetic-catalog-owner "$marker" "$replacement" "$PROTECTED_CATALOG" \
+    ' synthetic-catalog-owner "$marker" "$replacement" "$lock_replacement" \
+    "$PROTECTED_CATALOG" "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG_LOCK" \
+    "$expected_catalog_mount" "$expected_lock_mount" "$target_uid" \
     2>/dev/null
   status=$?
   set -e
   [ "$status" -eq 73 ]
-  [ "$(cat "$marker")" = "$target_uid:$target_gid" ]
+  [ "$(cat "$marker")" = "$target_uid:$target_gid:$target_uid" ]
   [ -f "$PROTECTED_CATALOG" ]
-  rm -f "$marker" "$replacement"
+  [ -f "$PROTECTED_CATALOG_LOCK" ]
+  rm -f "$marker" "$replacement" "$lock_replacement"
 }
 
 assert_daemon_path_contract() {
@@ -1784,9 +1852,9 @@ prepare_principals() {
     chown 1000:guard-clients /scenario/run
   fi
 
-  # The daemon container overlays the catalog file with a read-only bind mount.
-  # This underlying placeholder supplies the destination and the only writable
-  # sibling required by DestinationLock.
+  # The daemon container bind-mounts this directory read-only at the same path,
+  # then overlays only this pre-created lock inode as writable. Making the
+  # directory itself a mountpoint prevents owner-reachable pathname redirection.
   mkdir -p "$PROTECTED_CATALOG_DIR"
   cp /etc/guard/verbs.yaml "$PROTECTED_CATALOG"
   chmod 0444 "$PROTECTED_CATALOG"

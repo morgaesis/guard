@@ -468,13 +468,19 @@ checks = {
         )
     ),
     "caller daemon paths and token are explicitly prepared": "assert_daemon_path_contract" in synthetic and "1000:0:440" in synthetic and "chown 0:guard-clients /scenario/run" in synthetic,
-    "synthetic catalog uses an exact read-only bind beside its writable lock": all(
+    "synthetic catalog uses an anchored read-only directory and one writable lock bind": all(
         marker in runner
         for marker in (
-            'CATALOG_DESTINATION=/scenario/journey/protected-catalog/verbs.yaml',
-            '--volume "$CATALOG_SOURCE:$CATALOG_DESTINATION:ro"',
+            'CATALOG_DIRECTORY_DESTINATION=/scenario/journey/protected-catalog',
+            '--volume "$catalog_directory_source:$CATALOG_DIRECTORY_DESTINATION:ro"',
+            '--volume "$catalog_lock_source:$CATALOG_LOCK_DESTINATION:rw"',
             'validate_container_mounts',
-            "a writable catalog bind",
+            "a writable catalog-directory bind",
+            "a read-only learning-lock bind",
+            "a missing learning-lock bind",
+            "a redirected catalog-directory source",
+            "a redirected learning-lock source",
+            "an additional writable catalog child",
             "an additional host bind",
         )
     ) and "expected_lock=0:0:600" in synthetic,
@@ -484,7 +490,12 @@ checks = {
             "assert_catalog_mutation_rejected_after_identity_transition",
             '"$NEUTRAL_FIXTURE_UID" "$NEUTRAL_FIXTURE_GID" neutral-owner',
             '"$catalog_owner" "$catalog_group" mounted-file-owner',
-            "protected catalog is not on a read-only mount",
+            "capture_exact_mount_identity",
+            'chmod 0700 "$directory"',
+            'mv "$directory" "$directory-replaced"',
+            'mv "$lock" "$lock-replaced"',
+            'expected_catalog_mount',
+            'expected_lock_mount',
         )
     ),
     "synthetic evidence is private and omits local worktree metadata": (
