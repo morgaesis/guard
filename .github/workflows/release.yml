@@ -269,12 +269,32 @@ jobs:
       - name: Exercise packaged systemd argument expansion
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
-        run: sudo "dist/smoke/guard-${RELEASE_LABEL}-${{ matrix.target }}/deployment/systemd/test-guard-service-expansion.sh"
+        env:
+          RELEASE_SMOKE_TARGET: ${{ matrix.target }}
+        run: |
+          case "$RELEASE_SMOKE_TARGET" in
+            x86_64-unknown-linux-gnu) ;;
+            *)
+              echo "unexpected Unix smoke target" >&2
+              exit 1
+              ;;
+          esac
+          sudo "dist/smoke/guard-${RELEASE_LABEL}-${RELEASE_SMOKE_TARGET}/deployment/systemd/test-guard-service-expansion.sh"
 
       - name: Fault-inject packaged Unix upgrade and rollback
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
-        run: "dist/smoke/guard-${RELEASE_LABEL}-${{ matrix.target }}/deployment/systemd/test-upgrade-guard.sh"
+        env:
+          RELEASE_SMOKE_TARGET: ${{ matrix.target }}
+        run: |
+          case "$RELEASE_SMOKE_TARGET" in
+            x86_64-unknown-linux-gnu) ;;
+            *)
+              echo "unexpected Unix smoke target" >&2
+              exit 1
+              ;;
+          esac
+          "dist/smoke/guard-${RELEASE_LABEL}-${RELEASE_SMOKE_TARGET}/deployment/systemd/test-upgrade-guard.sh"
 
       - name: Test packaged Windows installer contract
         if: runner.os == 'Windows'

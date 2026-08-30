@@ -150,6 +150,8 @@ pub(crate) struct ServerConfig {
     #[cfg_attr(windows, allow(dead_code))]
     pub(crate) allowed_uids: Option<Vec<u32>>,
     pub(crate) shim_dir: Option<PathBuf>,
+    #[cfg(test)]
+    pub(crate) test_daemon_path: Option<std::ffi::OsString>,
     pub(crate) dry_run: bool,
     /// Internal non-executing admission preview. It shares evaluator cache
     /// reads/writes but suppresses every other learned or durable side effect.
@@ -252,6 +254,8 @@ impl Default for ServerConfig {
             socket_group: None,
             allowed_uids: None,
             shim_dir: None,
+            #[cfg(test)]
+            test_daemon_path: None,
             dry_run: false,
             admission_preview: false,
             redact_secrets: Vec::new(),

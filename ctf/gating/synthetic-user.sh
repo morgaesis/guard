@@ -1659,14 +1659,19 @@ prepare_principals() {
   chown -R 0:0 "$COLLECTOR_ROOT"
   chmod 0700 "$COLLECTOR_ROOT" "$COLLECTOR_RESULTS" "$COLLECTOR_PHASES"
   chown -R 1000:1000 /scenario/home /scenario/config /scenario/data /scenario/raw \
-    /scenario/fixtures /scenario/bin /scenario/ansible /scenario/run
+    /scenario/fixtures /scenario/bin /scenario/ansible
+  mkdir -p "$PRIVATE_ROOT/run"
   chown 1000:1000 /scenario
-  chgrp guard-clients /scenario/run
-  chmod 0755 /scenario/run
-  install -o 1000 -g guardexec -m 0640 /dev/null "$BROKERED_KUBECONFIG"
-  install -d -o 1000 -g guard-clients -m 0755 "$PRIVATE_ROOT/run"
-  install -o 1000 -g guardexec -m 0640 /dev/null \
+  : > "$BROKERED_KUBECONFIG"
+  : > "$PRIVATE_ROOT/run/brokered.kubeconfig"
+  chmod 0640 "$BROKERED_KUBECONFIG" "$PRIVATE_ROOT/run/brokered.kubeconfig"
+  chown 1000:guardexec "$BROKERED_KUBECONFIG" \
     "$PRIVATE_ROOT/run/brokered.kubeconfig"
+  chmod 0755 "$PRIVATE_ROOT" "$PRIVATE_ROOT/run"
+  chown 1000:1000 "$PRIVATE_ROOT"
+  chown 1000:guard-clients "$PRIVATE_ROOT/run"
+  chmod 0755 /scenario/run
+  chown 1000:guard-clients /scenario/run
 
   # Keep the operator catalog immutable while giving DestinationLock a
   # daemon-owned writable sidecar on the mounted scenario volume.

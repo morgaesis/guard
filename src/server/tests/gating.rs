@@ -6155,14 +6155,9 @@ async fn typed_ansible_secret_file_approval_is_bound_then_refused_for_fixed_iden
         .unwrap();
 
     let authority = trusted_artifact_tempdir();
-    let _environment_lock = TEST_ENV_LOCK.lock().await;
-    let _path_restore = EnvRestore::capture("PATH");
-    std::env::set_var(
-        "PATH",
-        format!("{}:/usr/bin:/bin", authority.path().display()),
-    );
     let secret_file_authority = trusted_artifact_tempdir();
     cfg.config.secret_file_root = Some(secret_file_authority.path().to_path_buf());
+    cfg.config.test_daemon_path = Some(authority.path().as_os_str().to_os_string());
     let executable = authority.path().join("ansible-playbook");
     let playbook = authority.path().join("site.yml");
     std::fs::write(
@@ -6174,7 +6169,7 @@ async fn typed_ansible_secret_file_approval_is_bound_then_refused_for_fixed_iden
     std::fs::write(&playbook, "---\n- hosts: all\n  gather_facts: false\n").unwrap();
     std::fs::set_permissions(&playbook, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let executable_yaml = serde_json::to_string(&executable).unwrap();
+    let executable_yaml = serde_json::to_string("ansible-playbook").unwrap();
     let playbook_yaml = serde_json::to_string(&playbook).unwrap();
     let catalog = VerbCatalog::from_yaml(&format!(
         "verbs:\n  - name: held-ansible-check\n    binary: {executable_yaml}\n    args: [{playbook_yaml}, \"--check\"]\n    consequence: irreversible\n    trusted: true\n    coverage:\n      - name: check\n        action: preauthorized\n        required_args: [\"--check\"]\n        target:\n          position: 0\n          values: [{playbook_yaml}]\n        environment:\n          - name: ANSIBLE_PRIVATE_KEY_FILE\n            source: secret-file\n            values: [\"ansible/private-key\"]\n          - name: ANSIBLE_STDOUT_CALLBACK\n            values: [\"default\"]\n"
@@ -6189,7 +6184,7 @@ async fn typed_ansible_secret_file_approval_is_bound_then_refused_for_fixed_iden
         "ansible/private-key".to_string(),
     )]);
     let mut matches = catalog.match_command_all_with_environment(
-        executable.to_str().unwrap(),
+        "ansible-playbook",
         &args,
         &BTreeMap::from([("ANSIBLE_STDOUT_CALLBACK".to_string(), "default".to_string())]),
         &BTreeMap::new(),
@@ -6201,7 +6196,7 @@ async fn typed_ansible_secret_file_approval_is_bound_then_refused_for_fixed_iden
     let verb_digest = catalog.verb_definition_digest(&matched.rendered.name);
     *cfg.state.verbs.write().await = catalog;
     let request = ExecuteRequest {
-        binary: executable.to_string_lossy().into_owned(),
+        binary: "ansible-playbook".to_string(),
         args,
         auth_token: None,
         env: HashMap::from([("ANSIBLE_STDOUT_CALLBACK".to_string(), "default".to_string())]),
@@ -8171,8 +8166,8 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
 #[cfg(unix)]
 #[tokio::test]
 async fn approved_snapshot_executes_in_snapshotted_cwd() {
-    let (cfg, _, agent) = gating_config(7016, 1001);
     let directory = trusted_artifact_tempdir();
+    let (cfg, _, agent) = gating_config(7016, 70_016);
     let cwd = directory.path().canonicalize().unwrap();
     let mut snapshot = ApprovalSnapshot {
         binary: "pwd".to_string(),
@@ -8323,16 +8318,13 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
 #[cfg(unix)]
 #[tokio::test]
 async fn provisional_revert_executes_in_snapshotted_cwd() {
-    let _environment_lock = TEST_ENV_LOCK.lock().await;
-    let _path_restore = EnvRestore::capture("PATH");
-    std::env::set_var("PATH", "/usr/bin:/bin");
     let state = tempfile::tempdir().unwrap();
     let store = SessionStore::open(state.path().join("state.db"), 3_600)
         .await
         .unwrap();
-    let (mut cfg, _operator, agent) = gating_config(7017, 1001);
-    cfg.state.session_store = Some(store);
     let directory = trusted_artifact_tempdir();
+    let (mut cfg, _operator, agent) = gating_config(7017, 70_017);
+    cfg.state.session_store = Some(store);
     let cwd = directory.path().canonicalize().unwrap();
     let revert = RevertSpec::new("pwd".to_string(), vec!["-P".to_string()]);
     let mut request = contain_request("true", &[], revert);

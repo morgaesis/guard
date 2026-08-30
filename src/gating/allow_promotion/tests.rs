@@ -640,8 +640,7 @@ fn resolved_bucket_never_becomes_ready_again() {
             .unwrap();
         assert!(
             !outcome.ready_to_synthesize,
-            "a resolved bucket must never re-fire, got approvals={}",
-            outcome.approvals
+            "a resolved bucket must never re-fire"
         );
     }
 }

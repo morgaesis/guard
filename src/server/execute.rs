@@ -1593,6 +1593,11 @@ fn effective_child_environment(
         }
     }
     insert_child_environment_binding(&mut environment, "GUARD_DEPTH", (depth + 1).to_string());
+    #[cfg(test)]
+    if let Some(path) = &server.config.test_daemon_path {
+        insert_child_environment_binding(&mut environment, "PATH", path.to_string_lossy());
+        return environment;
+    }
     #[cfg(unix)]
     if let Some(shim_dir) = &server.config.shim_dir {
         if let Some(path) = path_with_shim_dir(shim_dir) {
@@ -2069,6 +2074,7 @@ struct ProcessAuthorityBindingInputs<'a> {
     request: &'a ExecuteRequest,
     authorization: &'a CommandAuthorization,
     primary_binary: &'a Path,
+    daemon_path: Option<std::ffi::OsString>,
     effective_child_env: &'a HashMap<String, String>,
     approved_environment: &'a ApprovedEnvironmentSnapshot,
     tool_registry_fingerprint: String,
@@ -2084,6 +2090,7 @@ fn process_authority_binding_from_effective_environment(
         request,
         authorization,
         primary_binary,
+        daemon_path,
         effective_child_env,
         approved_environment,
         tool_registry_fingerprint,
@@ -2142,7 +2149,7 @@ fn process_authority_binding_from_effective_environment(
         execution_identity: Some(execution_identity),
         executable: primary_binary.to_path_buf(),
         daemon_path: secondary_path_search
-            .then(|| std::env::var_os("PATH"))
+            .then_some(daemon_path)
             .flatten()
             .map(|path| path.to_string_lossy().into_owned()),
         tool_registry_fingerprint,
@@ -2217,6 +2224,7 @@ pub(super) fn capture_approval_process_authority(
         request,
         authorization: &authorization,
         primary_binary: &primary_binary,
+        daemon_path: daemon_executable_search_path(server),
         effective_child_env: &effective_child_env,
         approved_environment,
         tool_registry_fingerprint,
@@ -4388,6 +4396,14 @@ fn daemon_executable_search_directories(
     directories
 }
 
+fn daemon_executable_search_path(_server: &ServerContext) -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    if let Some(path) = &_server.config.test_daemon_path {
+        return Some(path.clone());
+    }
+    std::env::var_os("PATH")
+}
+
 #[cfg(unix)]
 fn resolve_primary_binary(server: &ServerContext, binary: &str) -> Result<PathBuf> {
     let requested = Path::new(binary);
@@ -4412,7 +4428,7 @@ fn resolve_primary_binary(server: &ServerContext, binary: &str) -> Result<PathBu
             binary
         );
     }
-    let Some(path) = std::env::var_os("PATH") else {
+    let Some(path) = daemon_executable_search_path(server) else {
         bail!(
             "daemon executable search path is unavailable for '{}'",
             binary
@@ -4466,7 +4482,7 @@ fn resolve_primary_binary(server: &ServerContext, binary: &str) -> Result<PathBu
                 binary
             );
         }
-        let Some(path) = std::env::var_os("PATH") else {
+        let Some(path) = daemon_executable_search_path(server) else {
             bail!(
                 "daemon executable search path is unavailable for '{}'",
                 binary
@@ -5317,6 +5333,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                 request: &request,
                 authorization,
                 primary_binary: &exec_binary,
+                daemon_path: daemon_executable_search_path(server),
                 effective_child_env: &effective_child_env,
                 approved_environment,
                 tool_registry_fingerprint: tool_authority.authority_fingerprint(),

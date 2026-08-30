@@ -410,10 +410,7 @@ fn provisional_human_output_includes_secret_names_when_present() {
     };
 
     let line = provisional_human_line(&provisional, false);
-    assert!(
-        line.contains("secret_names: service/read,service/write"),
-        "{line}"
-    );
+    assert!(line.contains("secret_names: service/read,service/write"));
 }
 
 #[test]

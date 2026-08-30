@@ -65,6 +65,7 @@ proxy_server = (root / "src/proxy/server.rs").read_text(encoding="utf-8")
 proxy_kubeconfig = (root / "src/proxy/kubeconfig.rs").read_text(encoding="utf-8")
 cli_server = (root / "src/cli_server.rs").read_text(encoding="utf-8")
 attack = (root / "ctf/gating/attack.sh").read_text(encoding="utf-8")
+gating_runner = (root / "ctf/gating/run.sh").read_text(encoding="utf-8")
 synthetic = (root / "ctf/gating/synthetic-user.sh").read_text(encoding="utf-8")
 runner = (root / "ctf/gating/synthetic-user-runner.sh").read_text(encoding="utf-8")
 adversary = (root / "ctf/entrypoint-adversary.sh").read_text(encoding="utf-8")
@@ -91,6 +92,17 @@ checks = {
     ),
     "daemon capability mask is checked": "= c0" in attack and "= c0" in runner and "= c0" in synthetic,
     "daemon launch strips the bounding set to SETGID and SETUID": "--bounding-set=-all,+setgid,+setuid" in attack and "--bounding-set=-all,+setgid,+setuid" in synthetic,
+    "fixed attack uses only bounded writable fixture mounts": all(
+        mount in gating_runner
+        for mount in (
+            "--tmpfs /work:rw,nosuid,nodev,size=16m,mode=0755",
+            "--tmpfs /fakebin:rw,exec,nosuid,nodev,size=16m,mode=0755",
+            "--tmpfs /shim:rw,exec,nosuid,nodev,size=16m,mode=0755",
+            "--tmpfs /run:rw,nosuid,nodev,size=16m,mode=0755",
+            "--tmpfs /var/lib/guard:rw,nosuid,nodev,size=16m,mode=0755",
+            "--tmpfs /var/log:rw,nosuid,nodev,size=16m,mode=0755",
+        )
+    ),
     "children prove zero effective capabilities": "child-capability-contract" in attack and "assert_child_capability_contract 1003" in synthetic and "assert_child_capability_contract 1001" in synthetic,
     "world-writable Guard sockets are absent": re.search(r"chmod\s+0?666\s+[^\n]*guard(?:\.sock|/guard\.sock)", ctf_text) is None,
     "production socket group and mode are checked": "660:guard-clients" in attack and "660:guard-clients" in runner and "--socket-group guard-clients" in synthetic,
@@ -143,6 +155,12 @@ case "$mode" in
       --cap-add SETGID \
       --cap-add SETUID \
       --security-opt no-new-privileges \
+      --tmpfs /work:rw,nosuid,nodev,size=16m,mode=0755 \
+      --tmpfs /fakebin:rw,exec,nosuid,nodev,size=16m,mode=0755 \
+      --tmpfs /shim:rw,exec,nosuid,nodev,size=16m,mode=0755 \
+      --tmpfs /run:rw,nosuid,nodev,size=16m,mode=0755 \
+      --tmpfs /var/lib/guard:rw,nosuid,nodev,size=16m,mode=0755 \
+      --tmpfs /var/log:rw,nosuid,nodev,size=16m,mode=0755 \
       "$IMAGE"
     ;;
   test)
