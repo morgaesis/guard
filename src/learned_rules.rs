@@ -5211,6 +5211,29 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_matches_read_compatible_hard_link_handles() {
+        let directory = authority_tempdir();
+        let authority = directory.path().join("authority.yaml");
+        let alias = directory.path().join("authority-alias.yaml");
+        let distinct = directory.path().join("distinct.lock");
+        write_authority_file(&authority, "authority").unwrap();
+        write_authority_file(&distinct, "lock").unwrap();
+        std::fs::hard_link(&authority, &alias).unwrap();
+
+        let read_handle = |path: &Path| {
+            let mut options = owner_only_options();
+            options.read(true).open(path).unwrap()
+        };
+        let authority_handle = read_handle(&authority);
+        let alias_handle = read_handle(&alias);
+        let distinct_handle = read_handle(&distinct);
+
+        assert!(same_file_identity(&authority_handle, &alias_handle).unwrap());
+        assert!(!same_file_identity(&authority_handle, &distinct_handle).unwrap());
+    }
+
     #[cfg(unix)]
     #[test]
     fn operator_authority_artifact_lease_rejects_replaceable_paths() {

@@ -8505,6 +8505,16 @@ verbs:
 
     #[test]
     fn immutable_catalog_rechecks_lock_identity_after_preopen_replacement() {
+        #[derive(Debug)]
+        enum ReplacementOutcome {
+            Pending,
+            Replaced,
+            Denied {
+                #[cfg(windows)]
+                raw_os_error: Option<i32>,
+            },
+        }
+
         let yaml = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
         let directory = crate::learned_rules::authority_tempdir();
         let path = directory.path().join("verbs.yaml");
@@ -8519,30 +8529,76 @@ verbs:
         };
         #[cfg(windows)]
         let original_dacl = crate::learned_rules::authority_dacl_digest_for_test(&path).unwrap();
+        let replacement_outcome =
+            std::sync::Arc::new(std::sync::Mutex::new(ReplacementOutcome::Pending));
+        let outcome_for_hook = replacement_outcome.clone();
         let authority_for_hook = path.clone();
         crate::learned_rules::replace_immutable_lock_before_write_open_for_test(
             &lock_path,
             move |lock_path| {
-                std::fs::remove_file(lock_path).unwrap();
-                std::fs::hard_link(&authority_for_hook, lock_path).unwrap();
+                let replacement = std::fs::remove_file(lock_path)
+                    .and_then(|()| std::fs::hard_link(&authority_for_hook, lock_path));
+                *outcome_for_hook.lock().expect("replacement outcome lock") = match replacement {
+                    Ok(()) => ReplacementOutcome::Replaced,
+                    Err(error) => {
+                        #[cfg(not(windows))]
+                        let _ = error;
+                        ReplacementOutcome::Denied {
+                            #[cfg(windows)]
+                            raw_os_error: error.raw_os_error(),
+                        }
+                    }
+                };
             },
         );
 
         let error = VerbCatalog::load_immutable_with_lock(&path, &lock_path).unwrap_err();
-        assert!(format!("{error:#}").contains("aliases the immutable authority"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            assert!(matches!(
+                *replacement_outcome
+                    .lock()
+                    .expect("replacement outcome lock"),
+                ReplacementOutcome::Replaced
+            ));
+            assert!(format!("{error:#}").contains("aliases the immutable authority"));
             assert_eq!(
                 std::fs::metadata(&path).unwrap().mode() & 0o777,
                 original_mode
             );
         }
         #[cfg(windows)]
-        assert_eq!(
-            crate::learned_rules::authority_dacl_digest_for_test(&path).unwrap(),
-            original_dacl
-        );
+        {
+            use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+            match *replacement_outcome
+                .lock()
+                .expect("replacement outcome lock")
+            {
+                ReplacementOutcome::Replaced => {
+                    let alias_rejection =
+                        format!("{error:#}").contains("aliases the immutable authority");
+                    let sharing_rejection = error.chain().any(|source| {
+                        source
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|source| {
+                                source.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
+                            })
+                    });
+                    assert!(alias_rejection || sharing_rejection);
+                }
+                ReplacementOutcome::Denied {
+                    raw_os_error: Some(code),
+                } => {
+                    assert_eq!(code, ERROR_SHARING_VIOLATION as i32)
+                }
+                ref outcome => panic!("unexpected lock replacement outcome: {outcome:?}"),
+            }
+            assert_eq!(
+                crate::learned_rules::authority_dacl_digest_for_test(&path).unwrap(),
+                original_dacl
+            );
+        }
         assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
     }
 
