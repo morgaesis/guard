@@ -2,6 +2,27 @@ BeforeAll {
     $InstallerTestModeBeforeTests = $env:GUARD_INSTALLER_TEST_MODE
     $env:GUARD_INSTALLER_TEST_MODE = '1'
     $script:TestGuardSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+
+    function New-GuardTestIdentifier {
+        return [guid]::NewGuid().ToString('N')
+    }
+
+    function New-GuardTestDigest {
+        return (New-GuardTestIdentifier) + (New-GuardTestIdentifier)
+    }
+
+    function New-GuardTestGrantReference {
+        return "gr-$(New-GuardTestIdentifier)"
+    }
+
+    function New-GuardTestBackupName {
+        param([string]$Version = '1.2.3')
+        return "before-v$Version-$(Get-Date -Format 'yyyyMMddTHHmmssZ')-$(New-GuardTestIdentifier)"
+    }
+
+    function New-GuardTestTaskName {
+        return "guard-op-$(New-GuardTestIdentifier)"
+    }
 }
 
 AfterAll {
@@ -11,27 +32,6 @@ AfterAll {
     else {
         $env:GUARD_INSTALLER_TEST_MODE = $InstallerTestModeBeforeTests
     }
-}
-
-function New-GuardTestIdentifier {
-    return [guid]::NewGuid().ToString('N')
-}
-
-function New-GuardTestDigest {
-    return (New-GuardTestIdentifier) + (New-GuardTestIdentifier)
-}
-
-function New-GuardTestGrantReference {
-    return "gr-$(New-GuardTestIdentifier)"
-}
-
-function New-GuardTestBackupName {
-    param([string]$Version = '1.2.3')
-    return "before-v$Version-$(Get-Date -Format 'yyyyMMddTHHmmssZ')-$(New-GuardTestIdentifier)"
-}
-
-function New-GuardTestTaskName {
-    return "guard-op-$(New-GuardTestIdentifier)"
 }
 
 Describe 'Guard Windows operator command contract' {
@@ -490,7 +490,7 @@ Describe 'Guard Windows installer state and ACL contract' {
     }
 
     It 'requires a dedicated custom state directory before changing its ACL tree' {
-        $stateRoot = Join-Path $TestDrive 'custom-state'
+        $stateRoot = Join-Path $TestDrive "custom-state-$(New-GuardTestIdentifier)"
         $stateDb = Join-Path $stateRoot 'primary.sqlite'
         New-Item -ItemType Directory -Force -Path $stateRoot | Out-Null
         New-Item -ItemType File -Force -Path (Join-Path $stateRoot 'unrelated.txt') | Out-Null
@@ -792,7 +792,7 @@ Describe 'Guard Windows installer state and ACL contract' {
             $DeployedExe = Join-Path $InstallRoot 'guard.exe'
             $DeployedOperatorScript = Join-Path $InstallRoot 'guard-operator.ps1'
             $VerbsPath = Join-Path $ConfigRoot 'verbs.yaml'
-            $customStateDirectory = Join-Path $TestDrive 'custom-state'
+            $customStateDirectory = Join-Path $TestDrive "custom-state-$(New-GuardTestIdentifier)"
             $statePaths = [pscustomobject]@{
                 StateDb = Join-Path $customStateDirectory 'primary.sqlite'
                 AuthorityKey = Join-Path $customStateDirectory 'authority.hmac'
@@ -1330,7 +1330,7 @@ Describe 'Guard Windows installer state and ACL contract' {
 
     It 'uses destination-local temporary files through the atomic replacement seam for custom state' {
         $source = Join-Path $TestDrive 'candidate-authority.hmac'
-        $stateDirectory = Join-Path $TestDrive 'custom-state'
+        $stateDirectory = Join-Path $TestDrive "custom-state-$(New-GuardTestIdentifier)"
         $destination = Join-Path $stateDirectory 'authority.hmac'
         New-Item -ItemType Directory -Path $stateDirectory | Out-Null
         [IO.File]::WriteAllText($source, 'replacement', [Text.UTF8Encoding]::new($false))
@@ -1364,7 +1364,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         $DataDir = Join-Path $TestDrive 'default-data-decoy'
         $StagingDir = Join-Path $TestDrive 'staging-api'
         New-Item -ItemType Directory -Path $StagingDir | Out-Null
-        $customDb = Join-Path $TestDrive 'custom-state\primary.sqlite'
+        $customDb = Join-Path (Join-Path $TestDrive "custom-state-$(New-GuardTestIdentifier)") 'primary.sqlite'
         $statePaths = Get-GuardStatePaths -ServicePathName ('"' + $DeployedExe + '" "server" "start" "--socket" "guard" "--state-db" "' + $customDb + '"')
         $apiRoot = Get-ApiRevertRoot -StatePaths $statePaths
         $defaultDecoy = Join-Path $DataDir 'api-proxy-reverts\decoy.body'
@@ -1409,7 +1409,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         $VerbsPath = Join-Path $TestDrive 'config\verbs.yaml'
         New-Item -ItemType Directory -Force -Path $BackupRoot, $StagingDir, $KubeDir, (Split-Path -Parent $DeployedExe) | Out-Null
         [IO.File]::WriteAllText($DeployedExe, 'baseline-binary', [Text.UTF8Encoding]::new($false))
-        $customDb = Join-Path $TestDrive 'custom-state\primary.sqlite'
+        $customDb = Join-Path (Join-Path $TestDrive "custom-state-$(New-GuardTestIdentifier)") 'primary.sqlite'
         $servicePath = '"' + $DeployedExe + '" "server" "start" "--socket" "guard-custom" "--state-db" "' + $customDb + '"'
         $statePaths = Get-GuardStatePaths -ServicePathName $servicePath
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $statePaths.StateDb) | Out-Null
