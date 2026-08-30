@@ -123,6 +123,26 @@ with open(sys.argv[1], "rb") as primary, open(sys.argv[2], "rb") as replica:
 PY
 }
 
+verify_linux_release_binary_stripped() {
+  local target="$1" binary="$2" sections
+  case "$target" in
+    *-unknown-linux-gnu) ;;
+    *) return 0 ;;
+  esac
+  command -v readelf >/dev/null 2>&1 || {
+    echo "Linux release symbol verification requires readelf" >&2
+    return 1
+  }
+  sections=$(LC_ALL=C readelf -SW "$binary") || {
+    echo "Linux release symbol verification could not inspect the binary" >&2
+    return 1
+  }
+  if grep -Eq '^[[:space:]]*\[[[:space:]]*[0-9]+\][[:space:]]+\.symtab[[:space:]]' <<< "$sections"; then
+    echo "Linux release binary retains a .symtab section" >&2
+    return 1
+  fi
+}
+
 compare_release_archives() {
   local primary="$1" replica="$2" artifact="$3" target="$4"
   local primary_source="$5" replica_source="$6" diagnostic_root
@@ -169,22 +189,7 @@ compare_release_archives() {
 
 test_archive_comparison() {
   local test_root bundle shell_binary diagnostic primary_source replica_source
-  local primary_payload replica_payload
-  python3 - "$PWD/Cargo.toml" "$0" <<'PY'
-import pathlib
-import re
-import sys
-import tomllib
-
-manifest_path = pathlib.Path(sys.argv[1])
-script_path = pathlib.Path(sys.argv[2])
-manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-strip = manifest.get("profile", {}).get("release", {}).get("strip")
-if strip != "symbols":
-    raise SystemExit("release profile must strip symbols for every target")
-if re.search(r'^\s*strip "\$binary"$', script_path.read_text(encoding="utf-8"), re.MULTILINE):
-    raise SystemExit("release archive builder must use Cargo profile symbol stripping")
-PY
+  local primary_payload replica_payload unstripped_binary symbol_diagnostic
   test_root=$(mktemp -d "${TMPDIR:-/tmp}/guard-release-test.XXXXXX")
   bundle="$test_root/guard-fixture-aarch64-unknown-linux-gnu"
   shell_binary=$(readlink -f "/proc/$$/exe")
@@ -193,6 +198,23 @@ PY
   replica_source="$test_root/source-replica"
   primary_payload="$primary_source/src/release-diagnostic-primary.bin"
   replica_payload="$replica_source/src/release-diagnostic-replica.bin"
+  unstripped_binary="$test_root/unstripped-elf"
+  symbol_diagnostic="$test_root/symbol-diagnostic.txt"
+  command -v cc >/dev/null 2>&1 || {
+    echo "release symbol verification fixture requires a C compiler" >&2
+    rm -rf -- "$test_root"
+    return 1
+  }
+  printf 'int main(void) { return 0; }\n' | cc -x c -o "$unstripped_binary" -
+  if verify_linux_release_binary_stripped \
+    x86_64-unknown-linux-gnu "$unstripped_binary" \
+    > "$symbol_diagnostic" 2>&1; then
+    echo "release symbol verification accepted an unstripped ELF binary" >&2
+    rm -rf -- "$test_root"
+    return 1
+  fi
+  grep -Fq 'Linux release binary retains a .symtab section' "$symbol_diagnostic"
+  verify_linux_release_binary_stripped x86_64-pc-windows-msvc "$unstripped_binary"
   mkdir -p "$bundle"
   cp "$shell_binary" "$bundle/guard"
   printf '%s\0\x01\xfe\x02' "$primary_payload" >> "$bundle/guard"
@@ -318,21 +340,30 @@ if [ -e "$root" ] || [ -e "$archive" ]; then
 fi
 
 cd "$source_root"
+release_build=()
 if [ "${USE_CROSS:-false}" = true ]; then
   [ "$BUILD_TARGET" = aarch64-unknown-linux-gnu ] || {
     echo "cross compilation selected for an unexpected target" >&2
     exit 1
   }
-  cross build --locked --release --target "$BUILD_TARGET"
+  release_build=(cross build --locked --release --target "$BUILD_TARGET")
 else
   [ "$BUILD_TARGET" != aarch64-unknown-linux-gnu ] || {
     echo "aarch64 Linux release requires cross compilation" >&2
     exit 1
   }
-  cargo build --locked --release --target "$BUILD_TARGET"
+  release_build=(cargo build --locked --release --target "$BUILD_TARGET")
 fi
+(
+  case "$BUILD_TARGET" in
+    *-unknown-linux-gnu) export CARGO_PROFILE_RELEASE_STRIP=symbols ;;
+    *) unset CARGO_PROFILE_RELEASE_STRIP ;;
+  esac
+  "${release_build[@]}"
+)
 
 binary="$CARGO_TARGET_DIR/$BUILD_TARGET/release/$ARTIFACT_NAME"
+verify_linux_release_binary_stripped "$BUILD_TARGET" "$binary"
 
 mkdir -p "$root/deployment/systemd" "$root/deployment/hardening" \
   "$root/deployment/windows" "$root/examples" "$root/docs" "$root/ctf"

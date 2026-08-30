@@ -58,8 +58,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 [dev-dependencies]
 proptest = "1.11.0"
 
-[profile.release]
-strip = "symbols"
-
 [workspace]
 exclude = ["fuzz"]
