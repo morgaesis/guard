@@ -20,6 +20,8 @@ COPY src ./src
 COPY config ./config
 COPY tests ./tests
 COPY examples ./examples
+COPY .github/dependabot.yml ./.github/dependabot.yml
+COPY .github/workflows/dependabot-automerge.yml .github/workflows/dependabot-enable-automerge.yml ./.github/workflows/
 
 RUN cargo test --release --locked --quiet --no-run \
     && install -m 0755 target/release/guard /usr/local/bin/guard

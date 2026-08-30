@@ -393,6 +393,12 @@ import sys
 
 root = Path(sys.argv[1])
 catalog = (root / "ctf/gating/verbs.yaml").read_text(encoding="utf-8")
+containerfile = (root / "ctf/gating/Containerfile").read_text(encoding="utf-8")
+dockerignore_rules = {
+    line.strip()
+    for line in (root / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+}
 profiles = (root / "src/gating/verb.rs").read_text(encoding="utf-8")
 proxy_server = (root / "src/proxy/server.rs").read_text(encoding="utf-8")
 proxy_kubeconfig = (root / "src/proxy/kubeconfig.rs").read_text(encoding="utf-8")
@@ -406,6 +412,29 @@ ctf_text = "\n".join(
     for path in sorted((root / "ctf").rglob("*"))
     if path.is_file()
 )
+
+workflow_fixtures = {
+    ".github/dependabot.yml",
+    ".github/workflows/dependabot-automerge.yml",
+    ".github/workflows/dependabot-enable-automerge.yml",
+}
+workflow_copy_sources = {
+    source
+    for line in containerfile.splitlines()
+    if line.startswith("COPY ")
+    for source in line.split()[1:-1]
+    if source.startswith(".github/")
+}
+workflow_ignore_rules = {
+    "!.github/",
+    "!.github/dependabot.yml",
+    "!.github/workflows/",
+    "!.github/workflows/dependabot-automerge.yml",
+    "!.github/workflows/dependabot-enable-automerge.yml",
+}
+workflow_context_rules = {
+    rule for rule in dockerignore_rules if rule.startswith("!.github")
+}
 
 checks = {
     "capability contract uses the closed whoami profile": "binary: whoami\n    args: [child-contract]" in catalog and '"whoami"' in profiles,
@@ -447,6 +476,11 @@ checks = {
             ('guard secrets add OPNSENSE_API_KEY <<< "$(generated_fixture_value)"', adversary),
             ('guard secrets add OPN_KEY_PAIR <<< "$(generated_fixture_value)"', adversary),
         )
+    ),
+    "container build context includes only Dependabot workflow fixtures": (
+        workflow_context_rules == workflow_ignore_rules
+        and workflow_copy_sources == workflow_fixtures
+        and all((root / fixture).is_file() for fixture in workflow_fixtures)
     ),
 }
 failed = [name for name, passed in checks.items() if not passed]
