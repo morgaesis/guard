@@ -7649,7 +7649,7 @@ impl AsyncDurableStore for VerbCatalog {
 mod tests {
     use super::*;
 
-    const YAML: &str = r#"
+    const FIXTURE_CATALOG_YAML: &str = r#"
 verbs:
   - name: scale-deployment
     description: Scale a Kubernetes deployment
@@ -7665,9 +7665,40 @@ verbs:
     args: ["-n", "{lines}", "{path}"]
     params:
       lines: { pattern: "^[0-9]{1,5}$" }
-      path: { pattern: "^(/var/log/messages|/var/log/syslog)$" }
+      path: { pattern: __NATIVE_LOG_PATH_PATTERN__ }
     consequence: reversible
 "#;
+
+    fn native_absolute_fixture_path(name: &str) -> String {
+        let path = std::env::temp_dir().join("guard-verb-fixtures").join(name);
+        assert!(
+            path.is_absolute(),
+            "fixture path must be host-native and absolute"
+        );
+        path.to_string_lossy().into_owned()
+    }
+
+    fn serialized_yaml_inline<T: serde::Serialize + ?Sized>(value: &T) -> String {
+        serde_json::to_string(value).expect("serialize fixture value as inline YAML")
+    }
+
+    fn fixture_catalog_yaml() -> String {
+        let messages = native_absolute_fixture_path("messages.log");
+        let system = native_absolute_fixture_path("system.log");
+        let pattern = format!(
+            "^({}|{})$",
+            regex::escape(&messages),
+            regex::escape(&system)
+        );
+        FIXTURE_CATALOG_YAML.replace(
+            "__NATIVE_LOG_PATH_PATTERN__",
+            &serialized_yaml_inline(&pattern),
+        )
+    }
+
+    fn fixture_catalog() -> VerbCatalog {
+        VerbCatalog::from_yaml(&fixture_catalog_yaml()).expect("host-native fixture catalog loads")
+    }
 
     fn params(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -7778,8 +7809,9 @@ verbs:
 
     #[test]
     fn catalog_status_hash_is_short_and_content_sensitive() {
-        let first = VerbCatalog::from_yaml(YAML).unwrap();
-        let changed = VerbCatalog::from_yaml(&YAML.replace("tail-log", "show-log")).unwrap();
+        let yaml = fixture_catalog_yaml();
+        let first = VerbCatalog::from_yaml(&yaml).unwrap();
+        let changed = VerbCatalog::from_yaml(&yaml.replace("tail-log", "show-log")).unwrap();
 
         assert_eq!(first.short_hash().len(), 12);
         assert_ne!(first.short_hash(), changed.short_hash());
@@ -7788,7 +7820,7 @@ verbs:
 
     #[test]
     fn loads_and_renders_a_verb() {
-        let cat = VerbCatalog::from_yaml(YAML).unwrap();
+        let cat = fixture_catalog();
         assert_eq!(cat.names(), vec!["scale-deployment", "tail-log"]);
         let r = cat
             .render("scale-deployment", &params(&[("name", "web")]))
@@ -7819,7 +7851,7 @@ verbs:
     fn shell_metacharacters_are_inert_single_argv() {
         // A param that somehow matched would still render as ONE argv element.
         // Here the pattern rejects it outright.
-        let cat = VerbCatalog::from_yaml(YAML).unwrap();
+        let cat = fixture_catalog();
         let err = cat
             .render("scale-deployment", &params(&[("name", "web; invalid")]))
             .unwrap_err();
@@ -7895,7 +7927,7 @@ verbs:
 
     #[test]
     fn unknown_param_rejected_at_render() {
-        let cat = VerbCatalog::from_yaml(YAML).unwrap();
+        let cat = fixture_catalog();
         let err = cat
             .render("tail-log", &params(&[("lines", "10"), ("bogus", "x")]))
             .unwrap_err();
@@ -7904,15 +7936,16 @@ verbs:
 
     #[test]
     fn missing_required_param_rejected() {
-        let cat = VerbCatalog::from_yaml(YAML).unwrap();
+        let cat = fixture_catalog();
         let err = cat.render("scale-deployment", &params(&[])).unwrap_err();
         assert!(err.to_string().contains("requires parameter"));
     }
 
     #[test]
     fn version_changes_with_content() {
-        let a = VerbCatalog::from_yaml(YAML).unwrap();
-        let b = VerbCatalog::from_yaml(&format!("{}\n# edit", YAML)).unwrap();
+        let yaml = fixture_catalog_yaml();
+        let a = VerbCatalog::from_yaml(&yaml).unwrap();
+        let b = VerbCatalog::from_yaml(&format!("{yaml}\n# edit")).unwrap();
         assert_ne!(a.version(), b.version());
     }
 
@@ -8702,18 +8735,24 @@ verbs:
 
     #[test]
     fn file_paths_use_daemon_host_semantics() {
+        let native = native_absolute_fixture_path("manifest.yaml");
+        let native_modules = native_absolute_fixture_path("modules");
+        let native_shared_modules = native_absolute_fixture_path("shared-modules");
+        let native_list =
+            std::env::join_paths([native_modules.as_str(), native_shared_modules.as_str()])
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+        let native = native.as_str();
+        let native_list = native_list.as_str();
         #[cfg(unix)]
-        let (native, foreign, native_list, foreign_list) = (
-            "/srv/automation/manifest.yaml",
+        let (foreign, foreign_list) = (
             r"C:\caller\manifest.yaml",
-            "/srv/automation/modules:/opt/ansible/modules",
             r"C:\caller\modules;D:\shared\modules",
         );
         #[cfg(windows)]
-        let (native, foreign, native_list, foreign_list) = (
-            r"C:\automation\manifest.yaml",
+        let (foreign, foreign_list) = (
             "/srv/automation/manifest.yaml",
-            r"C:\automation\modules;D:\shared\modules",
             "/srv/automation/modules:/opt/ansible/modules",
         );
 
@@ -8774,8 +8813,9 @@ verbs:
             )
             .is_empty());
         let native_pattern = regex::escape(native);
+        let native_pattern_yaml = serialized_yaml_inline(&format!("^{native_pattern}$"));
         let rendered_kubeconfig = VerbCatalog::from_yaml(&format!(
-            "verbs:\n  - name: inspect-rendered-kubeconfig\n    binary: kubectl\n    args: [\"--kubeconfig\", \"{{path}}\", \"get\", \"pods\"]\n    params:\n      path: {{ pattern: '^{native_pattern}$' }}\n    consequence: reversible\n"
+            "verbs:\n  - name: inspect-rendered-kubeconfig\n    binary: kubectl\n    args: [\"--kubeconfig\", \"{{path}}\", \"get\", \"pods\"]\n    params:\n      path: {{ pattern: {native_pattern_yaml} }}\n    consequence: reversible\n"
         ))
         .unwrap();
         assert!(rendered_kubeconfig
@@ -8840,25 +8880,37 @@ verbs:
                 .match_command_all("kubectl", &args_vec(&["proxy", option, foreign]))
                 .is_empty());
         }
+        let fixed_www_args = vec!["proxy".to_string(), format!("--www={native}")];
         let fixed_www = format!(
-            "verbs:\n  - name: fixed-proxy-root\n    binary: kubectl\n    args: [\"proxy\", \"--www={native}\"]\n    consequence: reversible\n"
+            "verbs:\n  - name: fixed-proxy-root\n    binary: kubectl\n    args: {}\n    consequence: reversible\n",
+            serialized_yaml_inline(&fixed_www_args)
         );
         VerbCatalog::from_yaml(&fixed_www)
             .expect("a fixed proxy content root remains explicit operator authority");
+        let fixed_socket_args = vec!["proxy".to_string(), format!("--unix-socket={native}")];
         let fixed_socket = format!(
-            "verbs:\n  - name: reject-proxy-socket-output\n    binary: kubectl\n    args: [\"proxy\", \"--unix-socket={native}\"]\n    consequence: reversible\n"
+            "verbs:\n  - name: reject-proxy-socket-output\n    binary: kubectl\n    args: {}\n    consequence: reversible\n",
+            serialized_yaml_inline(&fixed_socket_args)
         );
         assert!(VerbCatalog::from_yaml(&fixed_socket).is_err());
 
+        let exact_ansible_args = vec![
+            format!("--inventory={native}"),
+            format!("--module-path={native_list}"),
+            format!("--vault-id=production@{native}"),
+            native.to_string(),
+            "--check".to_string(),
+        ];
         let exact_ansible_yaml = format!(
             r#"
 verbs:
   - name: check-file-boundaries
     binary: ansible-playbook
-    args: ['--inventory={native}', '--module-path={native_list}', '--vault-id=production@{native}', '{native}', '--check']
+    args: {}
     consequence: reversible
     trusted: true
 "#,
+            serialized_yaml_inline(&exact_ansible_args)
         );
         let exact_ansible = VerbCatalog::from_yaml(&exact_ansible_yaml).unwrap();
         let inventory = format!("--inventory={native}");
@@ -8870,14 +8922,20 @@ verbs:
                 &args_vec(&[&inventory, &modules, &vault, native, "--check"]),
             )
             .is_empty());
+        let foreign_ansible_args = vec![
+            format!("--inventory={foreign}"),
+            native.to_string(),
+            "--check".to_string(),
+        ];
         let foreign_ansible_yaml = format!(
             r#"
 verbs:
   - name: reject-foreign-file-boundaries
     binary: ansible-playbook
-    args: ['--inventory={foreign}', '{native}', '--check']
+    args: {}
     consequence: reversible
 "#,
+            serialized_yaml_inline(&foreign_ansible_args)
         );
         assert!(VerbCatalog::from_yaml(&foreign_ansible_yaml).is_err());
 
@@ -8904,15 +8962,22 @@ verbs:
             )
             .is_empty());
 
+        let exact_helm_args = vec![
+            "template".to_string(),
+            "fixture".to_string(),
+            "repo/chart".to_string(),
+            format!("--set-file=payload={native}"),
+        ];
         let exact_helm_yaml = format!(
             r#"
 verbs:
   - name: render-values
     binary: helm
-    args: ["template", "fixture", "repo/chart", "--set-file=payload={native}"]
+    args: {}
     consequence: reversible
     trusted: true
 "#,
+            serialized_yaml_inline(&exact_helm_args)
         );
         let exact_helm = VerbCatalog::from_yaml(&exact_helm_yaml).unwrap();
         let set_file = format!("--set-file=payload={native}");
@@ -8922,14 +8987,21 @@ verbs:
                 &args_vec(&["template", "fixture", "repo/chart", &set_file]),
             )
             .is_empty());
+        let foreign_helm_args = vec![
+            "template".to_string(),
+            "fixture".to_string(),
+            "repo/chart".to_string(),
+            format!("--set-file=payload={foreign}"),
+        ];
         let foreign_helm_yaml = format!(
             r#"
 verbs:
   - name: reject-foreign-values
     binary: helm
-    args: ["template", "fixture", "repo/chart", "--set-file=payload={foreign}"]
+    args: {}
     consequence: reversible
 "#,
+            serialized_yaml_inline(&foreign_helm_args)
         );
         assert!(VerbCatalog::from_yaml(&foreign_helm_yaml).is_err());
     }
@@ -9390,23 +9462,26 @@ verbs:
             &args_vec(&["apply", "-f", "-"]),
         ));
 
-        let constrained = VerbCatalog::from_yaml(
+        let playbook = native_absolute_fixture_path("site.yml");
+        let playbook_yaml = serialized_yaml_inline(&playbook);
+        let constrained = VerbCatalog::from_yaml(&format!(
             r#"
 verbs:
   - name: inspect-fixed-playbook
     binary: ansible-playbook
-    args: ["--syntax-check", "/srv/automation/site.yml"]
+    args: ["--syntax-check", {}]
     consequence: reversible
     coverage:
       - name: syntax
         action: evaluate
         required_args: ["--syntax-check"]
 "#,
-        )
+            playbook_yaml
+        ))
         .unwrap();
         let matches = constrained.match_command_all(
             "ansible-playbook",
-            &args_vec(&["--syntax-check", "/srv/automation/site.yml"]),
+            &args_vec(&["--syntax-check", &playbook]),
         );
         assert!(matches[0].local_file_authorized);
     }
@@ -12114,7 +12189,9 @@ verbs:
 
     #[test]
     fn caller_environment_requires_explicit_typed_cell_authority() {
-        let cat = VerbCatalog::from_yaml(
+        let approved_config = native_absolute_fixture_path("ansible.cfg");
+        let approved_config_yaml = serialized_yaml_inline(&approved_config);
+        let cat = VerbCatalog::from_yaml(&format!(
             r#"
 verbs:
   - name: ansible-check
@@ -12127,16 +12204,14 @@ verbs:
         required_args: ["--check"]
         environment:
           - name: ANSIBLE_CONFIG
-            values: ["/srv/automation/ansible.cfg"]
+            values: [{}]
 "#,
-        )
+            approved_config_yaml
+        ))
         .unwrap();
         let command = args_vec(&["all", "--check"]);
         let mut plain = BTreeMap::new();
-        plain.insert(
-            "ANSIBLE_CONFIG".to_string(),
-            "/srv/automation/ansible.cfg".to_string(),
-        );
+        plain.insert("ANSIBLE_CONFIG".to_string(), approved_config);
         let matches = cat.match_command_all_with_environment(
             "ansible",
             &command,
@@ -12148,7 +12223,7 @@ verbs:
 
         plain.insert(
             "ANSIBLE_CONFIG".to_string(),
-            "/tmp/caller-controlled.cfg".to_string(),
+            native_absolute_fixture_path("caller-controlled.cfg"),
         );
         let matches = cat.match_command_all_with_environment(
             "ansible",
@@ -12252,11 +12327,8 @@ verbs:
         )
         .expect("a fixed daemon-created private-key file is typed credential authority");
 
-        let ssh_executable = if cfg!(windows) {
-            r"C:\guard\ssh.exe"
-        } else {
-            "/srv/automation/ssh"
-        };
+        let ssh_executable = native_absolute_fixture_path("ssh");
+        let ssh_executable_yaml = serialized_yaml_inline(&ssh_executable);
         VerbCatalog::from_yaml(&format!(
             r#"
 verbs:
@@ -12270,18 +12342,20 @@ verbs:
         required_args: ["--check"]
         environment:
           - name: ANSIBLE_SSH_EXECUTABLE
-            values: ["{ssh_executable}"]
+            values: [{}]
 "#,
+            ssh_executable_yaml
         ))
         .expect("an exact Ansible executable path is typed authority");
 
+        let tool_path = serialized_yaml_inline(&native_absolute_fixture_path("tool"));
         for name in [
             "ANSIBLE_SSH_ARGS",
             "ANSIBLE_UNKNOWN_PLUGIN_SELECTOR",
             "UNCLASSIFIED_TOOL_SETTING",
         ] {
             let yaml = format!(
-                "verbs:\n  - name: unsafe-ansible-env\n    binary: ansible\n    consequence: reversible\n    trusted: true\n    coverage:\n      - name: check\n        action: preauthorized\n        required_args: [\"--check\"]\n        environment:\n          - name: {name}\n            values: [\"/srv/automation/tool\"]\n"
+                "verbs:\n  - name: unsafe-ansible-env\n    binary: ansible\n    consequence: reversible\n    trusted: true\n    coverage:\n      - name: check\n        action: preauthorized\n        required_args: [\"--check\"]\n        environment:\n          - name: {name}\n            values: [{tool_path}]\n"
             );
             let error = VerbCatalog::from_yaml(&yaml).unwrap_err();
             assert!(error.to_string().contains("cannot be preauthorized"));
@@ -12371,7 +12445,8 @@ verbs:
 
     #[test]
     fn auto_promoted_verb_cannot_authorize_caller_environment() {
-        let error = VerbCatalog::from_yaml(
+        let approved_config = serialized_yaml_inline(&native_absolute_fixture_path("ansible.cfg"));
+        let error = VerbCatalog::from_yaml(&format!(
             r#"
 verbs:
   - name: generated-check
@@ -12385,9 +12460,10 @@ verbs:
         required_args: ["--check"]
         environment:
           - name: ANSIBLE_CONFIG
-            values: ["/srv/automation/ansible.cfg"]
+            values: [{}]
 "#,
-        )
+            approved_config
+        ))
         .unwrap_err();
         assert!(error
             .to_string()

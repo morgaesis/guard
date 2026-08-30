@@ -19,6 +19,7 @@
 #   guard server start --verbs examples/verbs-readonly.yaml \
 #     --socket .cache/guard.sock --exec-user guard-exec
 
+platform: unix
 verbs:
   - name: whoami
     description: Print the effective user

@@ -6130,20 +6130,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_operator_artifacts_reject_daemon_owned_files_and_reparse_points() {
+    fn windows_operator_artifacts_reject_untrusted_mutation_and_reparse_points() {
         use std::os::windows::fs::{symlink_dir, symlink_file};
 
         let temp = authority_tempdir();
         let artifact = temp.path().join("credential");
         write_authority_file(&artifact, "credential").unwrap();
-        apply_windows_test_dacl(&artifact, "D:P(A;;FA;;;OW)(A;ID;GR;;;AU)");
-
-        let error = open_operator_authority_file(&artifact, None).unwrap_err();
-        assert!(format!("{error:#}").contains("not owned by a trusted Windows principal"));
-
+        let file = owner_only_options()
+            .read(true)
+            .write(true)
+            .open(&artifact)
+            .unwrap();
         apply_windows_test_dacl(&artifact, "D:P(A;;FA;;;OW)(A;ID;GW;;;AU)");
+        let error =
+            validate_windows_authority_handle_with_current_user(&file, false, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("grants mutation rights to an untrusted principal"));
         assert!(open_operator_authority_file(&artifact, None).is_err());
         apply_windows_test_dacl(&artifact, "D:P(A;;FA;;;OW)(A;ID;GR;;;AU)");
+        validate_windows_authority_handle_with_current_user(&file, false, true).unwrap();
+        drop(file);
 
         let link = temp.path().join("credential-link");
         symlink_file(&artifact, &link).unwrap();
