@@ -3,11 +3,9 @@
 set -euo pipefail
 
 SOCKET=/scenario/run/guard.sock
-PROTECTED_CATALOG_DIR=/scenario/journey/protected-catalog
+PROTECTED_CATALOG_DIR=/authority
 PROTECTED_CATALOG="$PROTECTED_CATALOG_DIR/verbs.yaml"
 PROTECTED_CATALOG_LOCK="$PROTECTED_CATALOG_DIR/.verbs.yaml.learning-lock"
-NEUTRAL_FIXTURE_UID=65534
-NEUTRAL_FIXTURE_GID=65534
 SCENARIO="${2:-}"
 RAW="/scenario/raw/$SCENARIO.log"
 PRINCIPAL_ROOT="/scenario/principals/$(id -u)"
@@ -157,12 +155,9 @@ EOF
 }
 
 assert_protected_catalog_as_daemon() {
-  local catalog_group catalog_mount_identity catalog_owner expected_lock
+  local authority_owner catalog_mount_identity expected_lock root_mount_identity
   local lock_mount_identity marker replacement lock_replacement mounted_targets
-  [ "$(stat -c '%u:%g:%a' /scenario/journey)" = \
-    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:1777" ]
-  [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_DIR")" = \
-    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:555" ]
+  [ "$(stat -c '%u:%g:%a' /)" = 0:0:755 ]
   [ -f "$PROTECTED_CATALOG" ]
   [ -r "$PROTECTED_CATALOG" ]
   [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
@@ -171,6 +166,7 @@ assert_protected_catalog_as_daemon() {
     || return 1
   lock_mount_identity="$(capture_exact_mount_identity "$PROTECTED_CATALOG_LOCK" rw)" \
     || return 1
+  root_mount_identity="$(capture_exact_mount_identity / ro)" || return 1
   mounted_targets="$(findmnt -rn -o TARGET | awk -v directory="$PROTECTED_CATALOG_DIR" '
     $0 == directory || index($0, directory "/") == 1 { print }
   ' | LC_ALL=C sort)"
@@ -179,11 +175,17 @@ assert_protected_catalog_as_daemon() {
 
   if caller_identity_scenario; then
     [ "$(id -u)" -eq 0 ]
+    authority_owner=0:0
     expected_lock=0:0:600
   else
     [ "$(id -u)" -eq 1000 ]
+    authority_owner=1000:1000
     expected_lock=1000:1000:600
   fi
+  [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_DIR")" = \
+    "$authority_owner:555" ]
+  [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG")" = \
+    "$authority_owner:444" ]
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_LOCK")" = "$expected_lock" ]
 
   replacement=/tmp/protected-catalog-replacement
@@ -201,6 +203,9 @@ assert_protected_catalog_as_daemon() {
     || rmdir "$PROTECTED_CATALOG_DIR" \
     || mv "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG_DIR-replaced" \
     || mkdir "$PROTECTED_CATALOG_DIR" \
+    || chmod 0700 / \
+    || mkdir /authority-sibling \
+    || mv / /tmp/root-replaced \
     || rm -f "$PROTECTED_CATALOG_LOCK" \
     || mv "$PROTECTED_CATALOG_LOCK" "$PROTECTED_CATALOG_LOCK-replaced" \
     || mv "$lock_replacement" "$PROTECTED_CATALOG_LOCK"; then
@@ -224,17 +229,20 @@ assert_protected_catalog_as_daemon() {
     "$catalog_mount_identity" ]
   [ "$(capture_exact_mount_identity "$PROTECTED_CATALOG_LOCK" rw)" = \
     "$lock_mount_identity" ]
+  [ "$(capture_exact_mount_identity / ro)" = "$root_mount_identity" ]
 
-  # CAP_SETUID makes the former neutral owner and the mounted file owner
-  # reachable. The read-only mount, rather than ownership, enforces immutability.
+  # The rootfs-backed mountpoint remains immutable under every representative
+  # identity reachable through CAP_SETUID. Ownership satisfies Guard's trust
+  # checks; the read-only mount enforces catalog immutability.
   assert_catalog_mutation_rejected_after_identity_transition \
-    "$NEUTRAL_FIXTURE_UID" "$NEUTRAL_FIXTURE_GID" neutral-owner \
-    "$catalog_mount_identity" "$lock_mount_identity"
-  catalog_owner="$(stat -c '%u' "$PROTECTED_CATALOG")"
-  catalog_group="$(stat -c '%g' "$PROTECTED_CATALOG")"
+    0 0 root-identity "$catalog_mount_identity" "$lock_mount_identity" \
+    "$root_mount_identity"
   assert_catalog_mutation_rejected_after_identity_transition \
-    "$catalog_owner" "$catalog_group" mounted-file-owner \
-    "$catalog_mount_identity" "$lock_mount_identity"
+    1000 1000 fixed-daemon-identity "$catalog_mount_identity" \
+    "$lock_mount_identity" "$root_mount_identity"
+  assert_catalog_mutation_rejected_after_identity_transition \
+    65534 65534 alternate-identity "$catalog_mount_identity" \
+    "$lock_mount_identity" "$root_mount_identity"
   [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
     "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
 }
@@ -259,7 +267,7 @@ capture_exact_mount_identity() {
 
 assert_catalog_mutation_rejected_after_identity_transition() {
   local target_uid="$1" target_gid="$2" label="$3"
-  local expected_catalog_mount="$4" expected_lock_mount="$5"
+  local expected_catalog_mount="$4" expected_lock_mount="$5" expected_root_mount="$6"
   local marker replacement lock_replacement status
   marker="/tmp/catalog-owner-transition-$label"
   replacement="/tmp/catalog-owner-replacement-$label"
@@ -282,6 +290,7 @@ assert_catalog_mutation_rejected_after_identity_transition() {
       expected_catalog_mount=$7
       expected_lock_mount=$8
       target_uid=$9
+      expected_root_mount=${10}
       fsuid=$(awk "/^Uid:/ { print \$5 }" /proc/self/status)
       printf "%s:%s:%s\n" "$(id -u)" "$(id -g)" "$fsuid" > "$marker" || exit 90
       [ "$(id -u)" = "$target_uid" ] && [ "$fsuid" = "$target_uid" ] || exit 90
@@ -296,8 +305,9 @@ assert_catalog_mutation_rejected_after_identity_transition() {
         || rmdir "$directory" \
         || mv "$directory" "$directory-replaced" \
         || mkdir "$directory" \
-        || printf "blocked\n" > "$lock" \
-        || chmod 0644 "$lock" \
+        || chmod 0700 / \
+        || mkdir /authority-sibling \
+        || mv / /tmp/root-replaced \
         || rm -f "$lock" \
         || mv "$lock" "$lock-replaced" \
         || mv "$lock_replacement" "$lock"; then
@@ -308,10 +318,13 @@ assert_catalog_mutation_rejected_after_identity_transition() {
         "$expected_catalog_mount" ] || exit 93
       [ "$(findmnt -n -o SOURCE,TARGET,OPTIONS --target "$lock")" = \
         "$expected_lock_mount" ] || exit 94
+      [ "$(findmnt -n -o SOURCE,TARGET,OPTIONS --target /)" = \
+        "$expected_root_mount" ] || exit 95
       exit 73
     ' synthetic-catalog-owner "$marker" "$replacement" "$lock_replacement" \
     "$PROTECTED_CATALOG" "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG_LOCK" \
     "$expected_catalog_mount" "$expected_lock_mount" "$target_uid" \
+    "$expected_root_mount" \
     2>/dev/null
   status=$?
   set -e
@@ -1805,7 +1818,7 @@ prepare_principal_output() {
 }
 
 prepare_principals() {
-  local daemon_owner lock_owner token_mode uid root
+  local daemon_owner token_mode uid root
   [ "$(id -u)" -eq 0 ]
   setup_fixture
   for uid in 1000 1001 1002; do
@@ -1822,11 +1835,9 @@ prepare_principals() {
   write_generated_fixture_value /scenario/run/admin.token
   if caller_identity_scenario; then
     daemon_owner=0:0
-    lock_owner=0:0
     token_mode=0440
   else
     daemon_owner=1000:1000
-    lock_owner=1000:1000
     token_mode=0400
   fi
   chmod "$token_mode" /scenario/run/admin.token
@@ -1852,26 +1863,24 @@ prepare_principals() {
     chown 1000:guard-clients /scenario/run
   fi
 
-  # The daemon container bind-mounts this directory read-only at the same path,
-  # then overlays only this pre-created lock inode as writable. Making the
-  # directory itself a mountpoint prevents owner-reachable pathname redirection.
+  # A separate authority volume prepares trusted source ownership without
+  # exposing its writable source path to the daemon. The daemon sees this
+  # directory only at the rootfs-backed read-only /authority mountpoint, with
+  # the pre-created lock inode layered writable.
   mkdir -p "$PROTECTED_CATALOG_DIR"
   cp /etc/guard/verbs.yaml "$PROTECTED_CATALOG"
   chmod 0444 "$PROTECTED_CATALOG"
   install -m 0600 /dev/null "$PROTECTED_CATALOG_LOCK"
-  chown "$lock_owner" "$PROTECTED_CATALOG_LOCK"
   chmod 0555 "$PROTECTED_CATALOG_DIR"
-  chown "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID" \
-    /scenario/journey "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG"
+  chown "$daemon_owner" \
+    "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG" "$PROTECTED_CATALOG_LOCK"
 
-  [ "$(stat -c '%u:%g:%a' /scenario/journey)" = \
-    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:1777" ]
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_DIR")" = \
-    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:555" ]
+    "$daemon_owner:555" ]
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG")" = \
-    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:444" ]
+    "$daemon_owner:444" ]
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_LOCK")" = \
-    "$lock_owner:600" ]
+    "$daemon_owner:600" ]
   [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
     "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
 }

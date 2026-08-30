@@ -471,7 +471,8 @@ checks = {
     "synthetic catalog uses an anchored read-only directory and one writable lock bind": all(
         marker in runner
         for marker in (
-            'CATALOG_DIRECTORY_DESTINATION=/scenario/journey/protected-catalog',
+            'CATALOG_DIRECTORY_DESTINATION=/authority',
+            '--volume "$authority_volume:/authority:rw"',
             '--volume "$catalog_directory_source:$CATALOG_DIRECTORY_DESTINATION:ro"',
             '--volume "$catalog_lock_source:$CATALOG_LOCK_DESTINATION:rw"',
             'validate_container_mounts',
@@ -483,21 +484,25 @@ checks = {
             "an additional writable catalog child",
             "an additional host bind",
         )
-    ) and "expected_lock=0:0:600" in synthetic,
+    ) and "expected_lock=0:0:600" in synthetic and "0555 /authority" in containerfile,
     "catalog mutation remains blocked after reachable owner transitions": all(
         marker in synthetic
         for marker in (
             "assert_catalog_mutation_rejected_after_identity_transition",
-            '"$NEUTRAL_FIXTURE_UID" "$NEUTRAL_FIXTURE_GID" neutral-owner',
-            '"$catalog_owner" "$catalog_group" mounted-file-owner',
+            "0 0 root-identity",
+            "1000 1000 fixed-daemon-identity",
+            "65534 65534 alternate-identity",
             "capture_exact_mount_identity",
             'chmod 0700 "$directory"',
             'mv "$directory" "$directory-replaced"',
+            "mkdir /authority-sibling",
+            "mv / /tmp/root-replaced",
             'mv "$lock" "$lock-replaced"',
             'expected_catalog_mount',
             'expected_lock_mount',
+            'expected_root_mount',
         )
-    ),
+    ) and "/scenario/journey/protected-catalog" not in runner and "/scenario/journey/protected-catalog" not in synthetic,
     "synthetic evidence is private and omits local worktree metadata": (
         "umask 077" in runner
         and "ensure_private_directory" in runner

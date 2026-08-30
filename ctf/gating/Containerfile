@@ -39,6 +39,10 @@ RUN groupadd -g 2000 guard-clients \
     && usermod -aG guard-clients agent \
     && usermod -aG guard-clients other-agent
 
+# The daemon's immutable authority mountpoint is anchored directly under the
+# read-only container rootfs, outside every daemon-writable ancestor.
+RUN install -d -o root -g root -m 0555 /authority
+
 COPY ctf/gating/verbs.yaml /etc/guard/verbs.yaml
 RUN chmod 0644 /etc/guard/verbs.yaml \
     && install -o guarddaemon -g guarddaemon -m 0600 \
