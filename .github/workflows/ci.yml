@@ -35,6 +35,11 @@ jobs:
         shell: bash
         run: scripts/test-publish-release.sh
 
+      - name: Test release archive comparison diagnostics
+        if: runner.os == 'Linux'
+        shell: bash
+        run: scripts/build-release-archive.sh --test-archive-comparison
+
       - name: Exercise packaged systemd argument expansion
         if: runner.os == 'Linux'
         shell: bash
@@ -137,9 +142,9 @@ jobs:
     name: Required release package validation
     uses: ./.github/workflows/release.yml
     permissions:
-      actions: read
-      checks: read
-      contents: read
+      actions: read  # Let release validation inspect mainline workflow runs.
+      checks: read  # Let release validation verify required check results.
+      contents: read  # Let release validation inspect signed refs and commits.
 
   # Branch protection requires a status check literally named "Test & Lint".
   # The matrix job above reports as "Test & Lint (ubuntu-latest)" / "Test &

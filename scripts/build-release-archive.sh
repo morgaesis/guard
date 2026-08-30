@@ -12,6 +12,157 @@ release_target_rows() {
     x86_64-pc-windows-msvc windows-latest guard.exe false
 }
 
+write_archive_evidence() {
+  local archive="$1" artifact="$2" manifest="$3" binary="$4"
+  python3 - "$archive" "$artifact" "$binary" > "$manifest" <<'PY'
+import hashlib
+import pathlib
+import sys
+import tarfile
+
+archive_path = pathlib.Path(sys.argv[1])
+artifact_name = sys.argv[2]
+binary_path = pathlib.Path(sys.argv[3])
+binary_count = 0
+file_count = 0
+
+try:
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        for member in sorted(archive.getmembers(), key=lambda entry: entry.name):
+            path = pathlib.PurePosixPath(member.name)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("archive contains an unsafe member name")
+            if not member.isfile():
+                continue
+            file_count += 1
+            if file_count > 200:
+                raise ValueError("archive contains more than 200 files")
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError("archive file member is unreadable")
+            is_binary = len(path.parts) == 2 and path.name == artifact_name
+            if is_binary:
+                binary_count += 1
+                output = binary_path.open("wb")
+            else:
+                output = None
+            digest = hashlib.sha256()
+            try:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+                    if output is not None:
+                        output.write(chunk)
+            finally:
+                source.close()
+                if output is not None:
+                    output.close()
+            print(f"{digest.hexdigest()}  {member.name}")
+except (OSError, tarfile.TarError, ValueError) as error:
+    raise SystemExit(f"release archive diagnostics failed: {error}") from None
+
+if binary_count != 1:
+    raise SystemExit("release archive diagnostics require exactly one packaged binary")
+PY
+}
+
+binary_contains_literal() {
+  local binary="$1" literal="$2"
+  if strings -a "$binary" | grep -F -- "$literal" >/dev/null; then
+    printf 'yes'
+  else
+    printf 'no'
+  fi
+}
+
+describe_binary() {
+  local label="$1" binary="$2" source_root="$3" format build_id
+  format=$(file -b "$binary")
+  printf '%s binary format: %s\n' "$label" "$format" >&2
+  printf '%s binary contains its source root: %s\n' \
+    "$label" "$(binary_contains_literal "$binary" "$source_root")" >&2
+  if [[ "$format" == ELF* ]]; then
+    build_id=$(readelf -n "$binary" | sed -n 's/^[[:space:]]*Build ID: /Build ID: /p' | sed -n '1p')
+    printf '%s %s\n' "$label" "${build_id:-Build ID: unavailable}" >&2
+    printf '%s ELF sections (first 80 lines):\n' "$label" >&2
+    readelf -SW "$binary" | sed -n '1,80p' | sed "s/^/${label} /" >&2
+  fi
+}
+
+compare_release_archives() {
+  local primary="$1" replica="$2" artifact="$3" target="$4"
+  local primary_source="$5" replica_source="$6" diagnostic_root
+  local primary_manifest replica_manifest primary_binary replica_binary
+  if [ ! -f "$primary" ] || [ ! -f "$replica" ]; then
+    echo "release archive comparison requires two regular files" >&2
+    return 2
+  fi
+  case "$artifact" in
+    guard|guard.exe) ;;
+    *)
+      echo "release archive comparison received an unexpected artifact name" >&2
+      return 2
+      ;;
+  esac
+  if [ -z "$primary_source" ] || [ -z "$replica_source" ]; then
+    echo "release archive comparison requires both source roots" >&2
+    return 2
+  fi
+  if cmp --silent "$primary" "$replica"; then
+    return 0
+  fi
+
+  diagnostic_root=$(mktemp -d "${TMPDIR:-/tmp}/guard-release-compare.XXXXXX")
+  primary_manifest="$diagnostic_root/primary.manifest"
+  replica_manifest="$diagnostic_root/replica.manifest"
+  primary_binary="$diagnostic_root/primary.binary"
+  replica_binary="$diagnostic_root/replica.binary"
+  write_archive_evidence "$primary" "$artifact" "$primary_manifest" "$primary_binary"
+  write_archive_evidence "$replica" "$artifact" "$replica_manifest" "$replica_binary"
+
+  echo "independent release builds produced different archives for $target" >&2
+  echo "archive member digest differences (first 200 lines):" >&2
+  diff -u --label primary-members --label replica-members \
+    "$primary_manifest" "$replica_manifest" | sed -n '1,200p' >&2 || true
+  describe_binary primary "$primary_binary" "$primary_source"
+  describe_binary replica "$replica_binary" "$replica_source"
+  echo "first differing packaged-binary bytes (offset, primary, replica; first 32 lines):" >&2
+  set +o pipefail
+  timeout 5s cmp -l "$primary_binary" "$replica_binary" | head -32 >&2
+  set -o pipefail
+  rm -rf -- "$diagnostic_root"
+  return 1
+}
+
+test_archive_comparison() {
+  local test_root bundle shell_binary diagnostic
+  test_root=$(mktemp -d "${TMPDIR:-/tmp}/guard-release-test.XXXXXX")
+  bundle="$test_root/guard-fixture-aarch64-unknown-linux-gnu"
+  shell_binary=$(readlink -f "/proc/$$/exe")
+  diagnostic="$test_root/diagnostic.txt"
+  mkdir -p "$bundle"
+  cp "$shell_binary" "$bundle/guard"
+  printf 'primary fixture\n' > "$bundle/README.md"
+  tar -C "$test_root" -czf "$test_root/primary.tar.gz" "$(basename "$bundle")"
+  compare_release_archives \
+    "$test_root/primary.tar.gz" "$test_root/primary.tar.gz" guard fixture-target \
+    "$test_root/source-primary" "$test_root/source-replica"
+  printf 'replica fixture\n' > "$bundle/README.md"
+  tar -C "$test_root" -czf "$test_root/replica.tar.gz" "$(basename "$bundle")"
+  if compare_release_archives \
+    "$test_root/primary.tar.gz" "$test_root/replica.tar.gz" guard fixture-target \
+    "$test_root/source-primary" "$test_root/source-replica" \
+    > "$diagnostic" 2>&1; then
+    echo "release archive comparison accepted different archives" >&2
+    rm -rf -- "$test_root"
+    return 1
+  fi
+  grep -Fq 'archive member digest differences' "$diagnostic"
+  grep -Fq 'primary ELF sections' "$diagnostic"
+  grep -Fq 'first differing packaged-binary bytes' "$diagnostic"
+  rm -rf -- "$test_root"
+  echo "release archive comparison tests passed"
+}
+
 case "${1:-}" in
   --matrix-json)
     release_target_rows | python3 -c '
@@ -35,9 +186,25 @@ print(json.dumps({"include": rows}, separators=(",", ":")))
     release_target_rows | cut -f1
     exit 0
     ;;
+  --compare-archives)
+    [ "$#" -eq 7 ] || {
+      echo "usage: $0 --compare-archives PRIMARY REPLICA ARTIFACT TARGET PRIMARY_SOURCE REPLICA_SOURCE" >&2
+      exit 2
+    }
+    compare_release_archives "$2" "$3" "$4" "$5" "$6" "$7"
+    exit $?
+    ;;
+  --test-archive-comparison)
+    [ "$#" -eq 1 ] || {
+      echo "usage: $0 --test-archive-comparison" >&2
+      exit 2
+    }
+    test_archive_comparison
+    exit 0
+    ;;
   "") ;;
   *)
-    echo "usage: $0 [--matrix-json|--targets]" >&2
+    echo "usage: $0 [--matrix-json|--targets|--test-archive-comparison]" >&2
     exit 2
     ;;
 esac

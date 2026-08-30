@@ -5,9 +5,9 @@ name: Release Validation
   workflow_call:
 
 permissions:
-  actions: read
-  checks: read
-  contents: read
+  actions: read  # Inspect mainline workflow runs before accepting a release tag.
+  checks: read  # Validate required check results for the release commit.
+  contents: read  # Inspect signed refs and the release commit.
 
 concurrency:
   group: release-validation-${{ github.ref }}
@@ -136,6 +136,7 @@ jobs:
     needs: [test, release_targets]
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix: ${{ fromJSON(needs.release_targets.outputs.matrix) }}
 
     steps:
@@ -556,10 +557,13 @@ jobs:
               bash scripts/build-release-archive.sh
           )
           archive="guard-${RELEASE_LABEL}-${BUILD_TARGET}.tar.gz"
-          cmp --silent "dist/$archive" "$replica_dist/$archive" || {
-            echo "independent release builds produced different archives for $BUILD_TARGET" >&2
-            exit 1
-          }
+          bash scripts/build-release-archive.sh --compare-archives \
+            "dist/$archive" \
+            "$replica_dist/$archive" \
+            "$ARTIFACT_NAME" \
+            "$BUILD_TARGET" \
+            "$GITHUB_WORKSPACE" \
+            "$replica_source"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -595,21 +599,74 @@ jobs:
           canonicalize_sbom() {
             jq -S '
               def canonicalize_reference:
-                sub("^path\\+file://[^#]*#guard@"; "pkg:cargo/guard@");
-              del(.serialNumber, .metadata.timestamp)
-              | walk(
-                  if type == "object" then
-                    with_entries(
-                      if ((.key == "bom-ref" or .key == "ref") and (.value | type == "string")) then
-                        .value |= canonicalize_reference
-                      else
-                        .
-                      end
-                    )
+                if type == "string" then
+                  sub("^path\\+file://[^#]*#guard@"; "pkg:cargo/guard@")
+                else
+                  .
+                end;
+              def stable_value:
+                if type == "object" then
+                  to_entries
+                  | map(.value |= stable_value)
+                  | sort_by(.key)
+                  | from_entries
+                elif type == "array" then
+                  map(stable_value)
+                else
+                  .
+                end;
+              def sort_unordered:
+                map(stable_value)
+                | sort_by(stable_value | tojson);
+              def canonicalize_bom_reference:
+                if type == "object"
+                  and has("bom-ref")
+                  and (."bom-ref" | type) == "string"
+                then
+                  ."bom-ref" |= canonicalize_reference
+                else
+                  .
+                end;
+              def canonicalize_component:
+                canonicalize_bom_reference
+                | if (.components? | type) == "array" then
+                    .components |= (map(canonicalize_component) | sort_unordered)
+                  else
+                    .
+                  end;
+              def canonicalize_dependency:
+                if type == "object" then
+                  if has("ref") and (.ref | type) == "string" then
+                    .ref |= canonicalize_reference
                   else
                     .
                   end
-                )
+                  | if (.dependsOn? | type) == "array" then
+                      .dependsOn |= (map(canonicalize_reference) | sort)
+                    else
+                      .
+                    end
+                else
+                  .
+                end;
+              del(.serialNumber, .metadata.timestamp)
+              | if (.metadata? | type) == "object"
+                and (.metadata.component? | type) == "object"
+                then
+                  .metadata.component |= canonicalize_component
+                else
+                  .
+                end
+              | if (.components? | type) == "array" then
+                  .components |= (map(canonicalize_component) | sort_unordered)
+                else
+                  .
+                end
+              | if (.dependencies? | type) == "array" then
+                  .dependencies |= (map(canonicalize_dependency) | sort_by(.ref))
+                  else
+                    .
+                  end
             ' "$1"
           }
 
@@ -621,10 +678,62 @@ jobs:
             local preserved='path+file:///stable-metadata#guard@1.2.3'
 
             jq -n --arg path 'path+file:///first-source#guard@1.2.3' --arg preserved "$preserved" \
-              '{serialNumber: "first", metadata: {timestamp: "first"}, "bom-ref": $path, ref: $path, unrelated: $preserved}' \
+              '{
+                serialNumber: "first",
+                metadata: {
+                  timestamp: "first",
+                  component: {
+                    "bom-ref": $path,
+                    components: [
+                      {name: "guard-main", "bom-ref": ($path + "#src/main.rs")},
+                      {name: "guard-lib", "bom-ref": ($path + "#src/lib.rs")}
+                    ]
+                  }
+                },
+                components: [
+                  {name: "beta", version: "2", "bom-ref": "pkg:cargo/beta@2"},
+                  {name: "alpha", version: "1", "bom-ref": "pkg:cargo/alpha@1"}
+                ],
+                dependencies: [
+                  {ref: $path, dependsOn: ["pkg:cargo/beta@2", "pkg:cargo/alpha@1"]},
+                  {ref: "pkg:cargo/beta@2", dependsOn: []}
+                ],
+                formulation: [{
+                  workflows: [{tasks: [{steps: [{
+                    commands: [{executed: "second"}, {executed: "first"}]
+                  }]}]}]
+                }],
+                unrelated: {"bom-ref": $preserved, ref: $preserved, sequence: ["second", "first"]}
+              }' \
               > "$first"
             jq -n --arg path 'path+file:///second-source#guard@1.2.3' --arg preserved "$preserved" \
-              '{serialNumber: "second", metadata: {timestamp: "second"}, "bom-ref": $path, ref: $path, unrelated: $preserved}' \
+              '{
+                unrelated: {sequence: ["second", "first"], ref: $preserved, "bom-ref": $preserved},
+                formulation: [{
+                  workflows: [{tasks: [{steps: [{
+                    commands: [{executed: "second"}, {executed: "first"}]
+                  }]}]}]
+                }],
+                dependencies: [
+                  {dependsOn: [], ref: "pkg:cargo/beta@2"},
+                  {dependsOn: ["pkg:cargo/alpha@1", "pkg:cargo/beta@2"], ref: $path}
+                ],
+                components: [
+                  {"bom-ref": "pkg:cargo/alpha@1", version: "1", name: "alpha"},
+                  {"bom-ref": "pkg:cargo/beta@2", version: "2", name: "beta"}
+                ],
+                metadata: {
+                  component: {
+                    components: [
+                      {"bom-ref": ($path + "#src/lib.rs"), name: "guard-lib"},
+                      {"bom-ref": ($path + "#src/main.rs"), name: "guard-main"}
+                    ],
+                    "bom-ref": $path
+                  },
+                  timestamp: "second"
+                },
+                serialNumber: "second"
+              }' \
               > "$second"
             canonicalize_sbom "$first" > "$first_canonical"
             canonicalize_sbom "$second" > "$second_canonical"
@@ -632,12 +741,21 @@ jobs:
               echo "SBOM reference canonicalization is not path-independent" >&2
               exit 1
             }
-            jq -e --arg preserved "$preserved" \
-              '.["bom-ref"] == "pkg:cargo/guard@1.2.3"
-               and .ref == "pkg:cargo/guard@1.2.3"
-               and .unrelated == $preserved' \
+            jq -e --arg preserved "$preserved" '
+              .metadata.component."bom-ref" == "pkg:cargo/guard@1.2.3"
+              and ([.metadata.component.components[].name] == ["guard-lib", "guard-main"])
+              and ([.components[].name] == ["alpha", "beta"])
+              and ([.dependencies[].ref] == ["pkg:cargo/beta@2", "pkg:cargo/guard@1.2.3"])
+              and ((.dependencies[] | select(.ref == "pkg:cargo/guard@1.2.3") | .dependsOn)
+                == ["pkg:cargo/alpha@1", "pkg:cargo/beta@2"])
+              and ([.formulation[0].workflows[0].tasks[0].steps[0].commands[].executed]
+                == ["second", "first"])
+              and (.unrelated."bom-ref" == $preserved)
+              and (.unrelated.ref == $preserved)
+              and (.unrelated.sequence == ["second", "first"])
+            ' \
               "$first_canonical" > /dev/null || {
-              echo "SBOM reference canonicalization changed an unrelated value" >&2
+              echo "SBOM canonicalization changed ordered or unrelated data" >&2
               exit 1
             }
           }
