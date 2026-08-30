@@ -82,6 +82,8 @@ jobs:
           }
           wait_for_mainline_workflow() {
             local workflow="$1" label="$2" run_id
+            # Positional parameters in the single-quoted script belong to the nested shell.
+            # shellcheck disable=SC2016
             if ! run_id=$(timeout 120s bash -c '
               while :; do
                 run_id=$(gh run list --workflow "$1" --commit "$2" --event push --limit 10 \

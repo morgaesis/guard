@@ -105,7 +105,8 @@ users:
   - name: fixture
     user: {}
 EOF
-install -o guarddaemon -g guardexec -m 0640 /dev/null "$BROKERED_KUBECONFIG"
+install -m 0640 /dev/null "$BROKERED_KUBECONFIG"
+chown guarddaemon:guardexec "$BROKERED_KUBECONFIG"
 echo "hello" > /work/seed.txt
 printf '%s\n' '---' '- hosts: web' '  gather_facts: false' '  tasks: []' > /work/site.yml
 mkdir -p /work/ansible-project

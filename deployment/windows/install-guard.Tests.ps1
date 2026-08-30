@@ -3,24 +3,38 @@ BeforeAll {
     $env:GUARD_INSTALLER_TEST_MODE = '1'
     $script:TestGuardSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
-    function New-GuardTestIdentifier {
+    function script:New-GuardTestIdentifier {
         return [guid]::NewGuid().ToString('N')
     }
 
-    function New-GuardTestDigest {
+    function script:New-GuardTestDigest {
         return (New-GuardTestIdentifier) + (New-GuardTestIdentifier)
     }
 
-    function New-GuardTestGrantReference {
+    function script:New-GuardTestGrantReference {
         return "gr-$(New-GuardTestIdentifier)"
     }
 
-    function New-GuardTestBackupName {
+    function script:New-GuardTestSessionReference {
+        $identifier = New-GuardTestIdentifier
+        return "session:$($identifier.Substring(0, 16))"
+    }
+
+    function script:New-GuardTestAgentReference {
+        $identifier = [guid]::NewGuid().ToByteArray()
+        $subAuthorities = @(0, 4, 8, 12 | ForEach-Object {
+            [BitConverter]::ToUInt32($identifier, $_)
+        })
+        $sid = [Security.Principal.SecurityIdentifier]("S-1-5-21-$($subAuthorities -join '-')")
+        return "agent:$($sid.Value)"
+    }
+
+    function script:New-GuardTestBackupName {
         param([string]$Version = '1.2.3')
         return "before-v$Version-$(Get-Date -Format 'yyyyMMddTHHmmssZ')-$(New-GuardTestIdentifier)"
     }
 
-    function New-GuardTestTaskName {
+    function script:New-GuardTestTaskName {
         return "guard-op-$(New-GuardTestIdentifier)"
     }
 }
@@ -43,7 +57,7 @@ Describe 'Guard Windows operator command contract' {
         $Intent = $null
         $Reason = $null
         $Json = $false
-        $SessionReference = 'session:' + (New-GuardTestIdentifier)
+        $SessionReference = New-GuardTestSessionReference
     }
 
     It 'maps ordinary, once, N-use, and batch approvals' {
@@ -72,9 +86,10 @@ Describe 'Guard Windows operator command contract' {
         (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "access extend $SessionReference Inspect service health. --once --socket guard"
 
         $Action = 'access-revoke'
-        $Reference = @('agent:S-1-5-21-1000')
+        $agentReference = New-GuardTestAgentReference
+        $Reference = @($agentReference)
         $ApprovalMode = 'ordinary'
-        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be 'access revoke agent:S-1-5-21-1000 --socket guard'
+        (Get-GuardActionArguments -Socket $SocketName) -join ' ' | Should -Be "access revoke $agentReference --socket guard"
 
         $Action = 'access-list'
         $Reference = @()
@@ -122,7 +137,8 @@ Describe 'Guard Windows operator command contract' {
         { Get-GuardActionArguments -Socket $SocketName } | Should -Throw
 
         $Action = 'access-revoke'
-        $Reference = @($SessionReference, 'agent:S-1-5-21-1000')
+        $agentReference = New-GuardTestAgentReference
+        $Reference = @($SessionReference, $agentReference)
         { Get-GuardActionArguments -Socket $SocketName } | Should -Throw
     }
 
@@ -152,7 +168,8 @@ Describe 'Guard Windows operator command contract' {
     }
 
     It 'preserves valid JSON for mixed decisions and propagates its native status' {
-        $body = '{"schema_version":1,"items":[{"success":true},{"success":false}],"message":"token=synthetic-fixture"}'
+        $token = New-GuardTestIdentifier
+        $body = '{"schema_version":1,"items":[{"success":true},{"success":false}],"message":"token=' + $token + '"}'
         $result = Resolve-GuardOperatorResult -RawOutput $body -NativeStatus 1 -JsonOutput
         $result.Output | Should -Be $body
         $result.ExitCode | Should -Be 1
@@ -175,7 +192,8 @@ Describe 'Guard Windows operator command contract' {
     }
 
     It 'rejects malformed structured output without echoing it' {
-        { Resolve-GuardOperatorResult -RawOutput '{fixture-token=do-not-echo' -NativeStatus 1 -JsonOutput } |
+        $token = New-GuardTestIdentifier
+        { Resolve-GuardOperatorResult -RawOutput "{token=$token" -NativeStatus 1 -JsonOutput } |
             Should -Throw '*invalid JSON; native_status=1*'
     }
 }
@@ -1573,9 +1591,10 @@ Describe 'Guard Windows installer state and ACL contract' {
     It 'retries and verifies operator artifact cleanup' {
         $script:cleanupAttempts = 0
         $taskName = New-GuardTestTaskName
+        $script:operatorTaskFixture = [pscustomobject]@{ TaskName = $taskName; State = 'Ready' }
         Mock Get-ScheduledTask {
             if ($script:cleanupAttempts -ge 3) { return $null }
-            return [pscustomobject]@{ TaskName = $taskName; State = 'Ready' }
+            return $script:operatorTaskFixture
         }
         Mock Unregister-ScheduledTask {
             $script:cleanupAttempts++
@@ -1589,7 +1608,8 @@ Describe 'Guard Windows installer state and ACL contract' {
 
     It 'surfaces operator artifact cleanup that remains incomplete' {
         $taskName = New-GuardTestTaskName
-        Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = $taskName; State = 'Ready' } }
+        $script:operatorTaskFixture = [pscustomobject]@{ TaskName = $taskName; State = 'Ready' }
+        Mock Get-ScheduledTask { return $script:operatorTaskFixture }
         Mock Unregister-ScheduledTask { throw 'fixture cleanup failure' }
         Mock Start-Sleep { return }
         $output = Join-Path $TaskOutDir "$taskName.out"
@@ -1626,7 +1646,8 @@ Describe 'Guard Windows installer state and ACL contract' {
         Set-Content -LiteralPath $output -Value 'diagnostic'
         Set-Content -LiteralPath "$output.status" -Value '125' -NoNewline
         $script:taskPresent = $true
-        Mock Get-ScheduledTask { if ($script:taskPresent) { return [pscustomobject]@{ TaskName = $taskName; State = 'Ready' } } }
+        $script:operatorTaskFixture = [pscustomobject]@{ TaskName = $taskName; State = 'Ready' }
+        Mock Get-ScheduledTask { if ($script:taskPresent) { return $script:operatorTaskFixture } }
         Mock Unregister-ScheduledTask { $script:taskPresent = $false }
         try {
             Remove-GuardOperatorArtifacts -TaskName $taskName -OutputFile $output
@@ -1647,16 +1668,18 @@ Describe 'Guard Windows installer state and ACL contract' {
         Set-Content -LiteralPath $output -Value 'raw unsanitized output'
         Set-Content -LiteralPath "$output.status" -Value '1' -NoNewline
         $script:taskPresent = $true
-        Mock Get-ScheduledTask { if ($script:taskPresent) { return [pscustomobject]@{ TaskName = $taskName; State = 'Ready' } } }
+        $script:operatorTaskFixture = [pscustomobject]@{ TaskName = $taskName; State = 'Ready' }
+        Mock Get-ScheduledTask { if ($script:taskPresent) { return $script:operatorTaskFixture } }
         Mock Unregister-ScheduledTask { $script:taskPresent = $false }
+        $token = New-GuardTestIdentifier
         try {
-            Remove-GuardOperatorArtifacts -TaskName $taskName -OutputFile $output -PreserveOutput -DiagnosticOutput "token=visible`ncontrol`0value"
+            Remove-GuardOperatorArtifacts -TaskName $taskName -OutputFile $output -PreserveOutput -DiagnosticOutput "token=$token`ncontrol`0value"
             $preserved = Get-Content -LiteralPath $output -Raw
             $script:taskPresent | Should -BeFalse
             Test-Path -LiteralPath "$output.status" | Should -BeFalse
             $preserved | Should -Match 'token=\[redacted\]'
             $preserved | Should -Match 'control\?value'
-            $preserved | Should -Not -Match 'visible'
+            $preserved | Should -Not -Match ([regex]::Escape($token))
             Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly
         }
         finally { $TaskOutDir = $oldTaskOutDir }

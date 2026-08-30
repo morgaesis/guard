@@ -104,9 +104,18 @@ jobs:
             echo "gitleaks configuration must extend only the default rules" >&2
             exit 1
           }
+          fingerprint_snapshot="$RUNNER_TEMP/gitleaksignore-fingerprints"
           saved_ignore="$RUNNER_TEMP/gitleaksignore"
+          cp .gitleaksignore "$fingerprint_snapshot"
+          restore_ignore() {
+            if [[ -f "$saved_ignore" ]]; then
+              mv "$saved_ignore" .gitleaksignore
+            fi
+          }
+          trap restore_ignore EXIT
+          # Gitleaks 8.30.1 combines the repository-local ignore file with an
+          # explicit --gitleaks-ignore-path, so the unignored scan moves it away.
           mv .gitleaksignore "$saved_ignore"
-          trap 'mv "$saved_ignore" .gitleaksignore' EXIT
           empty_ignore="$RUNNER_TEMP/empty-gitleaksignore"
           findings="$RUNNER_TEMP/gitleaks-unignored.json"
           : > "$empty_ignore"
@@ -155,7 +164,13 @@ jobs:
               echo "gitleaks fingerprint does not identify a finding from the pinned scanner" >&2
               exit 1
             }
-          done < .gitleaksignore
+          done < "$fingerprint_snapshot"
+          restore_ignore
+          trap - EXIT
+          cmp --silent "$fingerprint_snapshot" .gitleaksignore || {
+            echo "gitleaks fingerprint file changed while validating history" >&2
+            exit 1
+          }
 
       - name: Prove merge-parent coverage
         shell: bash
