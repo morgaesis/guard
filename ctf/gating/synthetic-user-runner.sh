@@ -112,17 +112,77 @@ write_missing_result_evidence() {
 }
 
 assert_isolated_container() {
-  local container="$1" mounts capabilities
+  local container="$1" scenario="$2" expected_user mounts capabilities groups
+  if caller_identity_scenario "$scenario"; then
+    expected_user=0:0
+  else
+    expected_user=1000:1000
+  fi
   [ "$(podman inspect --format '{{.HostConfig.NetworkMode}}' "$container")" = none ]
   [ "$(podman inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container")" = true ]
-  [ "$(podman inspect --format '{{.Config.User}}' "$container")" = 1000:1000 ]
+  [ "$(podman inspect --format '{{.Config.User}}' "$container")" = "$expected_user" ]
   podman inspect --format '{{json .HostConfig.SecurityOpt}}' "$container" | grep -Fq 'no-new-privileges'
   podman inspect --format '{{json .HostConfig.CapDrop}}' "$container" | grep -Fq 'ALL'
   capabilities="$(podman inspect --format '{{json .HostConfig.CapAdd}}' "$container")"
   [ "$capabilities" = '["CAP_SETGID","CAP_SETUID"]' ] \
     || [ "$capabilities" = '["CAP_SETUID","CAP_SETGID"]' ]
+  groups="$(podman inspect --format '{{range .HostConfig.GroupAdd}}{{println .}}{{end}}' "$container")"
+  validate_supplementary_groups "$scenario" "$groups"
   mounts="$(podman inspect --format '{{range .Mounts}}{{printf "%s %s\n" .Type .Destination}}{{end}}' "$container")"
   [ "$mounts" = 'volume /scenario' ]
+}
+
+caller_identity_scenario() {
+  case "$1" in
+    SU-12-api|SU-12-ansible) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+daemon_container_user() {
+  if caller_identity_scenario "$1"; then
+    printf '%s\n' 0:0
+  else
+    printf '%s\n' 1000:1000
+  fi
+}
+
+daemon_group_arguments() {
+  printf '%s\n' --group-add 2000
+  if ! caller_identity_scenario "$1"; then
+    printf '%s\n' --group-add 1003
+  fi
+}
+
+expected_supplementary_groups() {
+  if caller_identity_scenario "$1"; then
+    printf '%s\n' 2000
+  else
+    printf '%s\n' 1003,2000
+  fi
+}
+
+normalize_supplementary_groups() {
+  awk '
+    NF == 0 { next }
+    NF != 1 || $1 !~ /^[0-9]+$/ { invalid = 1; next }
+    { print $1 }
+    END { if (invalid) exit 1 }
+  ' | LC_ALL=C sort -n | paste -sd, -
+}
+
+validate_supplementary_groups() {
+  local scenario="$1" observed="$2" normalized
+  normalized="$(printf '%s\n' "$observed" | normalize_supplementary_groups)" || return 1
+  [ "$normalized" = "$(expected_supplementary_groups "$scenario")" ]
+}
+
+reject_group_mutation() {
+  local description="$1" scenario="$2" observed="$3"
+  if validate_supplementary_groups "$scenario" "$observed"; then
+    echo "synthetic-user group mutation was accepted: $description" >&2
+    return 1
+  fi
 }
 
 principal_name_for_uid() {
@@ -135,16 +195,76 @@ principal_name_for_uid() {
 }
 
 assert_daemon_runtime_boundary() {
-  local container="$1"
-  podman exec --user 0:0 "$container" /bin/sh -c '
-    pids=$(pgrep -u 1000 -x guard)
+  local container="$1" scenario="$2" daemon_uid mode expected_groups
+  if caller_identity_scenario "$scenario"; then
+    daemon_uid=0
+    mode=caller
+  else
+    daemon_uid=1000
+    mode=fixed
+  fi
+  expected_groups="$(expected_supplementary_groups "$scenario")"
+  podman exec --user 0:0 \
+    --env "GUARD_SU_DAEMON_UID=$daemon_uid" \
+    --env "GUARD_SU_DAEMON_MODE=$mode" \
+    --env "GUARD_SU_EXPECTED_GROUPS=$expected_groups" \
+    "$container" /bin/sh -c '
+    pids=$(pgrep -u "$GUARD_SU_DAEMON_UID" -x guard)
     [ "$(printf "%s\n" "$pids" | sed "/^$/d" | wc -l)" -eq 1 ] || exit 1
     cap_eff=$(awk "/^CapEff:/ { value = tolower(\$2); sub(/^0+/, \"\", value); print value == \"\" ? \"0\" : value }" /proc/$pids/status)
     [ "$cap_eff" = c0 ]
+    groups=$(awk "/^Groups:/ { for (index = 2; index <= NF; index++) print \$index }" /proc/$pids/status |
+      LC_ALL=C sort -n | paste -sd, -)
+    [ "$groups" = "$GUARD_SU_EXPECTED_GROUPS" ]
+    if [ "$GUARD_SU_DAEMON_MODE" = caller ]; then
+      [ "$(stat -c "%u:%g:%a" /scenario/run/admin.token)" = 1000:0:440 ]
+    else
+      [ "$(stat -c "%u:%g:%a" /scenario/run/admin.token)" = 1000:0:400 ]
+    fi
     [ "$(stat -c "%a:%G" /scenario/run/guard.sock)" = 660:guard-clients ]
   '
   podman exec --user agent "$container" test -S /scenario/run/guard.sock
   podman exec --user other-agent "$container" test -S /scenario/run/guard.sock
+  podman exec --user guarddaemon "$container" test -r /scenario/run/admin.token
+  if podman exec --user agent "$container" test -r /scenario/run/admin.token; then
+    return 1
+  fi
+  if podman exec --user other-agent "$container" test -r /scenario/run/admin.token; then
+    return 1
+  fi
+}
+
+sanitize_startup_diagnostics() {
+  sed -E \
+    -e 's/[[:cntrl:]]/ /g' \
+    -e 's/([A-Za-z_][A-Za-z0-9_]*(TOKEN|KEY|SECRET|PASS(WORD)?|CRED(ENTIAL)?)[A-Za-z0-9_]*)=[^[:space:]]+/\1=[redacted-value]/g' \
+    -e 's/((Bearer|token|key|secret|password|credential)[[:space:]:=]+)[^[:space:]]+/\1[redacted-value]/gI' \
+    -e 's/gr-[A-Za-z0-9_-]+/[redacted-handle]/g' \
+    -e 's/[0-9A-Fa-f]{24,}/[redacted-value]/g' \
+    -e 's/[A-Za-z0-9+/_-]{32,}={0,2}/[redacted-value]/g' \
+    -e 's#/(scenario|tmp)/[^[:space:]]*#[redacted-path]#g' |
+    cut -c 1-240
+}
+
+collect_startup_diagnostics() {
+  local container="$1" scenario="$2" evidence
+  evidence="$RESULTS_DIR/$scenario.startup-diagnostics.md"
+  {
+    echo "# $scenario daemon startup diagnostics"
+    echo
+    echo '## Container output'
+    timeout --kill-after=1s 5s podman logs --tail 120 "$container" 9>&- 2>&1 \
+      || echo '[container log unavailable]'
+    echo
+    echo '## Daemon log'
+    timeout --kill-after=1s 5s podman exec --user 0:0 "$container" /bin/sh -c '
+      if [ -f /scenario/raw/daemon.log ]; then
+        tail -n 160 /scenario/raw/daemon.log
+      else
+        echo "[daemon log unavailable]"
+      fi
+    ' 9>&- 2>&1 || echo '[daemon log collection unavailable]'
+  } | sanitize_startup_diagnostics > "$evidence"
 }
 
 resource_exists() {
@@ -318,7 +438,7 @@ assert_cleanup_invariants() {
 }
 
 self_test() {
-  local test_dir test_evidence
+  local test_dir test_evidence generated groups
   case "$IMAGE" in
     localhost/*) ;;
     *)
@@ -337,6 +457,35 @@ self_test() {
     return 1
   fi
   if grep -Fq '/scenario/private' "$test_evidence"; then
+    return 1
+  fi
+  [ "$(daemon_container_user SU-01)" = 1000:1000 ]
+  [ "$(daemon_container_user SU-12-api)" = 0:0 ]
+  [ "$(daemon_container_user SU-12-ansible)" = 0:0 ]
+  groups="$(daemon_group_arguments SU-01)"
+  [ "$groups" = $'--group-add\n2000\n--group-add\n1003' ]
+  groups="$(daemon_group_arguments SU-12-api)"
+  [ "$groups" = $'--group-add\n2000' ]
+  validate_supplementary_groups SU-01 $'2000\n1003'
+  validate_supplementary_groups SU-12-api 2000
+  reject_group_mutation 'missing fixed private group' SU-01 2000
+  reject_group_mutation 'unexpected fixed root group' SU-01 $'0\n1003\n2000'
+  reject_group_mutation 'unexpected fixed group' SU-01 $'1002\n1003\n2000'
+  reject_group_mutation 'duplicate fixed group' SU-01 $'1003\n2000\n2000'
+  reject_group_mutation 'missing caller client group' SU-12-api ''
+  reject_group_mutation 'unexpected caller root group' SU-12-api $'0\n2000'
+  reject_group_mutation 'unexpected caller private group' SU-12-api $'1003\n2000'
+  if caller_identity_scenario SU-01; then
+    return 1
+  fi
+  generated="$(printf '%032x' 0)"
+  test_evidence="$test_dir/startup-diagnostics.md"
+  printf 'FIXTURE_API_TOKEN=%s /scenario/private gr-%s\n' "$generated" "$generated" |
+    sanitize_startup_diagnostics > "$test_evidence"
+  grep -Fq 'FIXTURE_API_TOKEN=[redacted-value]' "$test_evidence"
+  grep -Fq '[redacted-path]' "$test_evidence"
+  grep -Fq '[redacted-handle]' "$test_evidence"
+  if grep -Fq "$generated" "$test_evidence"; then
     return 1
   fi
   [ "$(command_category_for_phase hold)" = access ]
@@ -487,8 +636,8 @@ trap 'exit 130' INT TERM
 
 run_one() {
   local scenario="$1"
-  local slug container init_container volume result exec_status
-  local -a scenario_environment=(--env GUARD_SWEEPER_GRACE_SECS=1)
+  local slug container init_container volume result exec_status daemon_user
+  local -a scenario_environment=(--env GUARD_SWEEPER_GRACE_SECS=1) daemon_groups=()
   HOST_FAILURE_PHASE=""
   HOST_FAILURE_CATEGORY=""
   HOST_FAILURE_EXEC_STATUS=""
@@ -521,6 +670,8 @@ run_one() {
   if [ "$scenario" = SU-18 ]; then
     scenario_environment+=(--env GUARD_ACCESS_TTL_SECS=3)
   fi
+  daemon_user="$(daemon_container_user "$scenario")"
+  mapfile -t daemon_groups < <(daemon_group_arguments "$scenario")
   register_pending_resource container "$init_container" "$scenario"
   if ! podman create \
     --name "$init_container" \
@@ -539,7 +690,7 @@ run_one() {
     --tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777 \
     --volume "$volume:/scenario:rw" \
     --entrypoint /synthetic-user.sh \
-    "$IMAGE" prepare-principals >/dev/null; then
+    "$IMAGE" prepare-principals "$scenario" >/dev/null; then
     record_host_failure "$scenario" principal-output-create container-create 1
     return 1
   fi
@@ -560,13 +711,13 @@ run_one() {
     --name "$container" \
     --label "guard.synthetic-user.run=$RUN_ID" \
     --label "guard.synthetic-user.scenario=$scenario" \
-    --user 1000:1000 \
+    --user "$daemon_user" \
     --network none \
     --read-only \
     --cap-drop ALL \
     --cap-add SETUID \
     --cap-add SETGID \
-    --group-add 2000 \
+    "${daemon_groups[@]}" \
     --security-opt no-new-privileges \
     --memory "$MEMORY" \
     --memory-swap "$MEMORY" \
@@ -589,7 +740,7 @@ run_one() {
     return 1
   fi
 
-  if assert_isolated_container "$container"; then
+  if assert_isolated_container "$container" "$scenario"; then
     :
   else
     record_host_failure "$scenario" container-hardening container-create 1
@@ -612,11 +763,12 @@ run_one() {
     sleep 0.1
   done
   if [ "$ready" != true ]; then
+    collect_startup_diagnostics "$container" "$scenario"
     record_host_failure "$scenario" daemon-readiness container-readiness 1
     echo "$scenario: isolated Guard daemon did not become ready" >&2
     return 1
   fi
-  if ! assert_daemon_runtime_boundary "$container"; then
+  if ! assert_daemon_runtime_boundary "$container" "$scenario"; then
     record_host_failure "$scenario" daemon-socket-permissions container-setup 1
     return 1
   fi
@@ -711,10 +863,11 @@ restart_daemon() {
     sleep 0.1
   done
   if [ "$ready" != true ]; then
+    collect_startup_diagnostics "$container" "$scenario"
     record_host_failure "$scenario" restart-readiness container-readiness 1
     return 1
   fi
-  if ! assert_daemon_runtime_boundary "$container"; then
+  if ! assert_daemon_runtime_boundary "$container" "$scenario"; then
     record_host_failure "$scenario" restart-socket-permissions container-setup 1
     return 1
   fi

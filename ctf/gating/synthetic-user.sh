@@ -6,6 +6,8 @@ SOCKET=/scenario/run/guard.sock
 PROTECTED_CATALOG_DIR=/scenario/journey/protected-catalog
 PROTECTED_CATALOG="$PROTECTED_CATALOG_DIR/verbs.yaml"
 PROTECTED_CATALOG_LOCK="$PROTECTED_CATALOG_DIR/.verbs.yaml.learning-lock"
+NEUTRAL_FIXTURE_UID=65534
+NEUTRAL_FIXTURE_GID=65534
 SCENARIO="${2:-}"
 RAW="/scenario/raw/$SCENARIO.log"
 PRINCIPAL_ROOT="/scenario/principals/$(id -u)"
@@ -19,6 +21,10 @@ FIXTURE_API_TOKEN_FILE=/scenario/fixtures/api-token
 UPSTREAM_KUBECONFIG=/scenario/fixtures/upstream.kubeconfig
 BROKERED_KUBECONFIG=/scenario/run/brokered.kubeconfig
 KUBE_PROXY=127.0.0.1:18443
+
+caller_identity_scenario() {
+  [ "$SCENARIO" = SU-12-api ] || [ "$SCENARIO" = SU-12-ansible ]
+}
 
 generate_fixture_value() {
   od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
@@ -151,17 +157,29 @@ EOF
 }
 
 assert_protected_catalog_as_daemon() {
-  local replacement marker
-  [ "$(id -u)" -eq 1000 ]
-  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_DIR")" = '0:555' ]
-  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG")" = '0:644' ]
-  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_LOCK")" = '1000:600' ]
+  local expected_lock replacement marker
+  [ "$(stat -c '%u:%g:%a' /scenario/journey)" = \
+    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:1777" ]
+  [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_DIR")" = \
+    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:555" ]
+  [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG")" = \
+    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:444" ]
+
+  if caller_identity_scenario; then
+    [ "$(id -u)" -eq 0 ]
+    expected_lock=0:0:600
+  else
+    [ "$(id -u)" -eq 1000 ]
+    expected_lock=1000:1000:600
+  fi
+  [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_LOCK")" = "$expected_lock" ]
 
   replacement=/tmp/protected-catalog-replacement
   marker=/tmp/protected-catalog-lock-marker
   printf 'replacement must not install\n' > "$replacement"
   rm -f "$marker"
   if printf blocked > "$PROTECTED_CATALOG" \
+    || chmod 0600 "$PROTECTED_CATALOG" \
     || rm -f "$PROTECTED_CATALOG" \
     || mv "$replacement" "$PROTECTED_CATALOG" \
     || mkdir "$PROTECTED_CATALOG_DIR/unauthorized" \
@@ -180,8 +198,32 @@ assert_protected_catalog_as_daemon() {
   rm -f "$replacement" "$marker"
 }
 
+assert_daemon_path_contract() {
+  if caller_identity_scenario; then
+    [ "$(id -u)" -eq 0 ]
+    [ "$(stat -c '%u:%g:%a' /scenario)" = 0:0:711 ]
+    [ "$(stat -c '%u:%g:%a' /scenario/home)" = 0:0:755 ]
+    [ "$(stat -c '%u:%g:%a' /scenario/config)" = 0:0:755 ]
+    [ "$(stat -c '%u:%g:%a' /scenario/data)" = 0:0:755 ]
+    [ "$(stat -c '%u:%g:%a' /scenario/run)" = 0:2000:755 ]
+    [ "$(stat -c '%u:%g:%a' /scenario/run/admin.token)" = 1000:0:440 ]
+  else
+    [ "$(id -u)" -eq 1000 ]
+    [ "$(stat -c '%u:%g:%a' /scenario)" = 1000:1000:711 ]
+    [ "$(stat -c '%u:%g:%a' /scenario/home)" = 1000:1000:755 ]
+    [ "$(stat -c '%u:%g:%a' /scenario/config)" = 1000:1000:755 ]
+    [ "$(stat -c '%u:%g:%a' /scenario/data)" = 1000:1000:755 ]
+    [ "$(stat -c '%u:%g:%a' /scenario/run)" = 1000:2000:755 ]
+    [ "$(stat -c '%u:%g:%a' /scenario/run/admin.token)" = 1000:0:400 ]
+  fi
+  [ -r /scenario/run/admin.token ]
+  [ -w /scenario/data ]
+  [ -w /scenario/raw ]
+}
+
 daemon() {
   setup_fixture
+  assert_daemon_path_contract
   assert_protected_catalog_as_daemon
   export HOME=/scenario/home
   export XDG_CONFIG_HOME=/scenario/config
@@ -196,7 +238,7 @@ daemon() {
     --brokered-kubeconfig-out "$BROKERED_KUBECONFIG"
   )
   export KUBECONFIG="$BROKERED_KUBECONFIG"
-  if [ "$SCENARIO" = SU-12-api ] || [ "$SCENARIO" = SU-12-ansible ]; then
+  if caller_identity_scenario; then
     identity_args=(--exec-as-caller)
     profile_args=()
     unset KUBECONFIG
@@ -1639,7 +1681,7 @@ prepare_principal_output() {
 }
 
 prepare_principals() {
-  local uid root
+  local daemon_owner lock_owner token_mode uid root
   [ "$(id -u)" -eq 0 ]
   setup_fixture
   for uid in 1000 1001 1002; do
@@ -1650,18 +1692,27 @@ prepare_principals() {
     chown -R "$uid:0" "$root"
   done
   mkdir -p "$COLLECTOR_RESULTS" "$COLLECTOR_PHASES"
-  # The operator persona (uid 1000) is the only principal that can read the
-  # admin token; the daemon receives it through stdin, and uids 1001/1002
-  # hold neither the file nor the value.
+  # The operator persona retains token access. Caller mode grants the
+  # capability-bounded daemon group-read access for its startup redirection;
+  # uids 1001/1002 hold neither the file nor the value.
   write_generated_fixture_value /scenario/run/admin.token
-  chmod 0400 /scenario/run/admin.token
+  if caller_identity_scenario; then
+    daemon_owner=0:0
+    lock_owner=0:0
+    token_mode=0440
+  else
+    daemon_owner=1000:1000
+    lock_owner=1000:1000
+    token_mode=0400
+  fi
+  chmod "$token_mode" /scenario/run/admin.token
   chown 1000:0 /scenario/run/admin.token
   chown -R 0:0 "$COLLECTOR_ROOT"
   chmod 0700 "$COLLECTOR_ROOT" "$COLLECTOR_RESULTS" "$COLLECTOR_PHASES"
-  chown -R 1000:1000 /scenario/home /scenario/config /scenario/data /scenario/raw \
+  chown -R "$daemon_owner" /scenario/home /scenario/config /scenario/data /scenario/raw \
     /scenario/fixtures /scenario/bin /scenario/ansible
   mkdir -p "$PRIVATE_ROOT/run"
-  chown 1000:1000 /scenario
+  chown "$daemon_owner" /scenario
   : > "$BROKERED_KUBECONFIG"
   : > "$PRIVATE_ROOT/run/brokered.kubeconfig"
   chmod 0640 "$BROKERED_KUBECONFIG" "$PRIVATE_ROOT/run/brokered.kubeconfig"
@@ -1671,22 +1722,32 @@ prepare_principals() {
   chown 1000:1000 "$PRIVATE_ROOT"
   chown 1000:guard-clients "$PRIVATE_ROOT/run"
   chmod 0755 /scenario/run
-  chown 1000:guard-clients /scenario/run
+  if caller_identity_scenario; then
+    chown 0:guard-clients /scenario/run
+  else
+    chown 1000:guard-clients /scenario/run
+  fi
 
-  # Keep the operator catalog immutable while giving DestinationLock a
-  # daemon-owned writable sidecar on the mounted scenario volume.
+  # A neutral owner keeps both daemon identities outside the protected
+  # catalog's ownership boundary. DestinationLock receives only its precreated,
+  # scenario-specific writable sidecar.
   mkdir -p "$PROTECTED_CATALOG_DIR"
   cp /etc/guard/verbs.yaml "$PROTECTED_CATALOG"
-  chown 0:0 "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG"
-  chmod 0644 "$PROTECTED_CATALOG"
+  chmod 0444 "$PROTECTED_CATALOG"
   install -m 0600 /dev/null "$PROTECTED_CATALOG_LOCK"
-  chown 1000:1000 "$PROTECTED_CATALOG_LOCK"
+  chown "$lock_owner" "$PROTECTED_CATALOG_LOCK"
   chmod 0555 "$PROTECTED_CATALOG_DIR"
+  chown "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID" \
+    /scenario/journey "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG"
 
-  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_DIR")" = '0:555' ]
-  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG")" = '0:644' ]
-  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_LOCK")" = '1000:600' ]
-  [ "$(stat -c '%u:%a' /scenario/journey)" = '0:1777' ]
+  [ "$(stat -c '%u:%g:%a' /scenario/journey)" = \
+    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:1777" ]
+  [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_DIR")" = \
+    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:555" ]
+  [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG")" = \
+    "$NEUTRAL_FIXTURE_UID:$NEUTRAL_FIXTURE_GID:444" ]
+  [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_LOCK")" = \
+    "$lock_owner:600" ]
   [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
     "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
 }

@@ -456,6 +456,20 @@ checks = {
     "children prove zero effective capabilities": "child-capability-contract" in attack and "assert_child_capability_contract 1003" in synthetic and "assert_child_capability_contract 1001" in synthetic,
     "world-writable Guard sockets are absent": re.search(r"chmod\s+0?666\s+[^\n]*guard(?:\.sock|/guard\.sock)", ctf_text) is None,
     "production socket group and mode are checked": "660:guard-clients" in attack and "660:guard-clients" in runner and "--socket-group guard-clients" in synthetic,
+    "fixed synthetic daemons carry the child private group": "--group-add 1003" in runner and "daemon_group_arguments" in runner and 'GUARD_SU_DAEMON_MODE' in runner,
+    "caller synthetic scenarios start the daemon as root": "SU-12-api|SU-12-ansible) return 0" in runner and '--user "$daemon_user"' in runner and '"$(id -u)" -eq 0' in synthetic,
+    "synthetic daemon groups are exact in inspection and runtime and mutation-tested": "HostConfig.GroupAdd" in runner and "GUARD_SU_EXPECTED_GROUPS" in runner and all(
+        marker in runner
+        for marker in (
+            "validate_supplementary_groups",
+            "missing fixed private group",
+            "unexpected fixed root group",
+            "unexpected caller root group",
+        )
+    ),
+    "caller daemon paths and token are explicitly prepared": "assert_daemon_path_contract" in synthetic and "1000:0:440" in synthetic and "chown 0:guard-clients /scenario/run" in synthetic,
+    "both daemon modes are outside the protected catalog ownership boundary": "NEUTRAL_FIXTURE_UID=65534" in synthetic and "chmod 0444" in synthetic and "expected_lock=0:0:600" in synthetic,
+    "synthetic readiness failures retain bounded sanitized startup diagnostics": "collect_startup_diagnostics" in runner and "sanitize_startup_diagnostics" in runner and "timeout --kill-after=1s 5s podman logs" in runner and "timeout --kill-after=1s 5s podman exec" in runner,
     "loopback API proxy requires authenticated client context": "a proxy transport or session bearer is required" in proxy_server and "ProxyTransportAuth" in proxy_server,
     "brokered proxy bearer is generated instead of hardcoded": "guard-anonymous" not in proxy_kubeconfig and "transport_bearer_bytes" in proxy_server,
     "brokered kubeconfig is restricted to one safe fixed-worker file": "mode != 0o640" in cli_server and "metadata.nlink() != 1" in cli_server and "output parent must be a daemon-owned directory" in cli_server,
