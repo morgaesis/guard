@@ -157,7 +157,6 @@ cleanup() {
   fi
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
 
 run_expansion_test() {
   local unit_source="$1"
@@ -570,7 +569,7 @@ run_full_mode() {
 }
 
 run_contract_self_tests() (
-  if ! check_required_commands 'systemd integration contract self-test' grep mktemp rm; then
+  if ! check_required_commands 'systemd integration contract self-test' bash grep mktemp rm; then
     return 1
   fi
 
@@ -581,20 +580,25 @@ run_contract_self_tests() (
   output_file="$test_directory/output"
   error_file="$test_directory/error"
 
-  # These test-only overrides are invoked indirectly through dispatch_mode.
-  # shellcheck disable=SC2317
-  if (
-    current_uid() { printf '%s\n' 1000; }
-    verify_unit_files() { : > "$marker"; }
-    run_privileged_integration() { : > "$marker"; }
-    dispatch_mode
-  ) > "$output_file" 2> "$error_file"; then
+  if GUARD_SYSTEMD_TEST_MARKER="$marker" bash -s -- "$script_source" <<'SELF_TEST' \
+    > "$output_file" 2> "$error_file"; then
+set -euo pipefail
+source "$1"
+record_host_mutation() {
+  printf '%s\n' "$1" >> "$GUARD_SYSTEMD_TEST_MARKER"
+}
+systemctl() { record_host_mutation systemctl; }
+current_uid() { printf '%s\n' 1000; }
+verify_unit_files() { record_host_mutation verify-unit-files; }
+run_privileged_integration() { record_host_mutation privileged-integration; }
+dispatch_mode
+SELF_TEST
     echo 'default invocation unexpectedly succeeded without root' >&2
     return 1
   fi
   grep -Fq 'full systemd integration requires root' "$error_file"
   if [ -e "$marker" ]; then
-    echo 'default invocation mutated state before rejecting a non-root caller' >&2
+    echo 'default invocation invoked systemctl or mutated host state before rejecting a non-root caller' >&2
     return 1
   fi
 
@@ -618,13 +622,43 @@ run_contract_self_tests() (
     return 1
   fi
 
-  (
-    check_required_commands() { printf '%s\n' prerequisites >> "$marker"; }
-    verify_unit_files() { printf '%s\n' verification >> "$marker"; }
-    run_verify_only_mode
-  )
+  if ! GUARD_SYSTEMD_TEST_MARKER="$marker" bash -s -- "$script_source" <<'SELF_TEST' \
+    > "$output_file" 2> "$error_file"; then
+set -euo pipefail
+source "$1"
+record_host_mutation() {
+  printf '%s\n' "$1" >> "$GUARD_SYSTEMD_TEST_MARKER"
+}
+systemctl() { record_host_mutation systemctl; }
+check_required_commands() { printf '%s\n' prerequisites >> "$GUARD_SYSTEMD_TEST_MARKER"; }
+verify_unit_files() { printf '%s\n' verification >> "$GUARD_SYSTEMD_TEST_MARKER"; }
+run_privileged_integration() { record_host_mutation privileged-integration; }
+dispatch_mode --verify-only
+SELF_TEST
+    echo '--verify-only unexpectedly failed' >&2
+    return 1
+  fi
   if [ "$(< "$marker")" != $'prerequisites\nverification' ]; then
     echo '--verify-only did not complete prerequisite and unit checks in order' >&2
+    return 1
+  fi
+
+  : > "$marker"
+  if ! GUARD_SYSTEMD_TEST_MARKER="$marker" bash -s -- "$script_source" <<'SELF_TEST' \
+    > "$output_file" 2> "$error_file"; then
+set -euo pipefail
+source "$1"
+record_host_mutation() {
+  printf '%s\n' "$1" >> "$GUARD_SYSTEMD_TEST_MARKER"
+}
+systemctl() { record_host_mutation systemctl; }
+run_contract_self_tests
+SELF_TEST
+    echo '--self-test unexpectedly failed' >&2
+    return 1
+  fi
+  if [ -s "$marker" ]; then
+    echo '--self-test invoked systemctl or mutated host state' >&2
     return 1
   fi
 
@@ -634,6 +668,31 @@ run_contract_self_tests() (
     run_verify_only_mode
   ); then
     echo '--verify-only unexpectedly succeeded after a failed unit check' >&2
+    return 1
+  fi
+
+  : > "$marker"
+  if GUARD_SYSTEMD_TEST_MARKER="$marker" bash -s -- "$script_source" <<'SELF_TEST' \
+    > "$output_file" 2> "$error_file"; then
+set -euo pipefail
+source "$1"
+record_event() {
+  printf '%s\n' "$1" >> "$GUARD_SYSTEMD_TEST_MARKER"
+}
+systemctl() { record_event "systemctl $*"; }
+current_uid() { printf '%s\n' 0; }
+check_required_commands() { return 0; }
+pid_one_command() { printf '%s\n' systemd; }
+find_guard_binary() { printf '%s\n' /mock/guard; }
+verify_unit_files() { record_event verification; }
+run_expansion_test() { record_event mutation; return 1; }
+run_full_mode
+SELF_TEST
+    echo 'privileged integration unexpectedly succeeded after a simulated mutation failure' >&2
+    return 1
+  fi
+  if [ "$(< "$marker")" != $'verification\nmutation\nsystemctl daemon-reload' ]; then
+    echo 'privileged integration did not own cleanup after a mutation failure' >&2
     return 1
   fi
 
@@ -663,4 +722,6 @@ dispatch_mode() {
   esac
 }
 
-dispatch_mode "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  dispatch_mode "$@"
+fi
