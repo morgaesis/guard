@@ -606,7 +606,16 @@ jobs:
                   exit 1
                 }
                 canonical="$output_root/$sbom"
-                jq -S 'del(.serialNumber, .metadata.timestamp)' "$sbom" > "$canonical"
+                jq -S '
+                  del(.serialNumber, .metadata.timestamp)
+                  | walk(
+                      if type == "string" then
+                        sub("^path\\+file://[^#]*#guard@"; "pkg:cargo/guard@")
+                      else
+                        .
+                      end
+                    )
+                ' "$sbom" > "$canonical"
               done < <(bash scripts/build-release-archive.sh --targets)
             )
           }

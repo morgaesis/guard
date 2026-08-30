@@ -104,6 +104,9 @@ jobs:
             echo "gitleaks configuration must extend only the default rules" >&2
             exit 1
           }
+          saved_ignore="$RUNNER_TEMP/gitleaksignore"
+          mv .gitleaksignore "$saved_ignore"
+          trap 'mv "$saved_ignore" .gitleaksignore' EXIT
           empty_ignore="$RUNNER_TEMP/empty-gitleaksignore"
           findings="$RUNNER_TEMP/gitleaks-unignored.json"
           : > "$empty_ignore"
