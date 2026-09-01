@@ -1902,6 +1902,7 @@ pub fn authorized_executable_profile(binary: &str) -> Option<DelayedAuthorityPro
     let key = executable_match_key(binary);
     match key.as_str() {
         "ansible" | "ansible-playbook" => Some(DelayedAuthorityProfile::TypedAnsible),
+        "fixture-api" => Some(DelayedAuthorityProfile::FixtureApi),
         "kubectl" => Some(DelayedAuthorityProfile::TypedKubectl),
         "helm" => Some(DelayedAuthorityProfile::TypedHelm),
         "systemctl" => Some(DelayedAuthorityProfile::SystemdControl),
@@ -2355,6 +2356,14 @@ fn validate_durable_systemctl_authority(args: &[String]) -> Result<()> {
     validate_systemctl_authority(args, false)
 }
 
+fn validate_fixture_api_authority(args: &[String]) -> Result<()> {
+    if matches!(args, [operation] if matches!(operation.as_str(), "status" | "access-status")) {
+        Ok(())
+    } else {
+        bail!("fixture-api delayed execution is limited to status and access-status")
+    }
+}
+
 fn validate_catalog_delayed_authority(
     binary: &str,
     args: &[String],
@@ -2430,6 +2439,14 @@ pub fn delayed_authority_plan(
             validate_durable_systemctl_authority(args)?;
             false
         }
+        DelayedAuthorityProfile::FixtureApi if typed => {
+            validate_fixture_api_authority(args)?;
+            false
+        }
+        DelayedAuthorityProfile::FixtureApi => bail!(
+            "binary '{}' requires typed operator authority before delayed execution",
+            binary
+        ),
         DelayedAuthorityProfile::PrimaryOnly if typed => false,
         DelayedAuthorityProfile::PrimaryOnly
             if matches!(key.as_str(), "true" | "false" | "echo" | "printf") =>
@@ -9425,6 +9442,35 @@ verbs:
                 "{binary} {args:?} must fail closed across an approval gap"
             );
         }
+    }
+
+    #[test]
+    fn fixture_api_authority_requires_a_typed_status_operation() {
+        assert_eq!(
+            authorized_executable_profile("fixture-api"),
+            Some(DelayedAuthorityProfile::FixtureApi)
+        );
+        for operation in ["status", "access-status"] {
+            assert!(delayed_authority_plan(
+                "fixture-api",
+                &args_vec(&[operation]),
+                DelayedAuthoritySource::TypedVerb,
+            )
+            .is_ok());
+        }
+        for args in [
+            args_vec(&[]),
+            args_vec(&["delete"]),
+            args_vec(&["status", "--verbose"]),
+        ] {
+            assert!(delayed_authority_plan(
+                "fixture-api",
+                &args,
+                DelayedAuthoritySource::TypedVerb,
+            )
+            .is_err());
+        }
+        assert!(validate_durable_process_authority("fixture-api", &args_vec(&["status"])).is_err());
     }
 
     #[test]

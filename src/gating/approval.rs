@@ -72,6 +72,7 @@ pub enum DelayedAuthoritySource {
 #[serde(rename_all = "snake_case")]
 pub enum DelayedAuthorityProfile {
     PrimaryOnly,
+    FixtureApi,
     SystemdControl,
     TypedAnsible,
     TypedKubectl,
@@ -86,7 +87,7 @@ impl DelayedAuthorityProfile {
     pub const fn discovers_profile_authority(self) -> bool {
         match self {
             Self::TypedAnsible | Self::TypedKubectl | Self::TypedHelm => true,
-            Self::PrimaryOnly | Self::SystemdControl => false,
+            Self::PrimaryOnly | Self::FixtureApi | Self::SystemdControl => false,
         }
     }
 }

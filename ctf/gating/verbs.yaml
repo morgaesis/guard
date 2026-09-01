@@ -135,8 +135,8 @@ verbs:
 
   - name: fixture-api-status
     description: Query a fake credential-bearing API
-    binary: whoami
-    args: ["api-status"]
+    binary: fixture-api
+    args: ["status"]
     consequence: reversible
     trusted: true
 
@@ -191,7 +191,7 @@ verbs:
 
   - name: access-api-status
     description: Query the fake credential-backed API
-    binary: whoami
+    binary: fixture-api
     args: ["access-status"]
     baseline: false
     consequence: reversible

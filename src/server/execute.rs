@@ -1354,7 +1354,9 @@ async fn validate_fixed_identity_profile_authority(
         return Err("fixed-identity execution requires a closed executable profile".to_string());
     };
     match profile {
-        DelayedAuthorityProfile::PrimaryOnly | DelayedAuthorityProfile::SystemdControl => Ok(()),
+        DelayedAuthorityProfile::PrimaryOnly
+        | DelayedAuthorityProfile::FixtureApi
+        | DelayedAuthorityProfile::SystemdControl => Ok(()),
         DelayedAuthorityProfile::TypedKubectl => {
             if request.args.iter().any(|argument| {
                 matches!(argument.as_str(), "--kubeconfig" | "--kuberc")

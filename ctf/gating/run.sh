@@ -439,6 +439,19 @@ workflow_context_rules = {
 checks = {
     "capability contract uses the closed whoami profile": "binary: whoami\n    args: [child-contract]" in catalog and '"whoami"' in profiles,
     "credential contract uses the closed true profile": "binary: true" in catalog and '"true"' in profiles,
+    "fixture API uses its credentialed client and asserts a redacted response": all(
+        marker in source
+        for marker, source in (
+            ('binary: fixture-api\n    args: ["status"]', catalog),
+            ('fixture-api:\n    secrets:\n      FIXTURE_API_TOKEN: fixture/api-token', synthetic),
+            ("printf 'fixture-api:healthy token=%s\\n' \"$FIXTURE_API_TOKEN\"", synthetic),
+            ('run_journey fixture-api-status fixture-api:healthy', synthetic),
+            ('grep -Fq \'[REDACTED]\' "$RAW"', synthetic),
+            ('! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" "$RAW"', synthetic),
+            ("fixture/api-token", synthetic),
+            ('"fixture-api" => Some(DelayedAuthorityProfile::FixtureApi)', profiles),
+        )
+    ),
     "fixed attack starts an active Kubernetes proxy": "--kube-proxy" in attack and "--brokered-kubeconfig-out" in attack,
     "synthetic fixed mode starts an active Kubernetes proxy": "--kube-proxy" in synthetic and "--brokered-kubeconfig-out" in synthetic,
     "fixed kubectl success requires the brokered kubeconfig": "guarded-kubectl" in attack and 'grep -q \'guard-proxy\' "$KUBECONFIG"' in attack,

@@ -81,7 +81,7 @@ EOF
   fi
   cat > /scenario/config/guard/tools.yaml <<'EOF'
 tools:
-  whoami:
+  fixture-api:
     secrets:
       FIXTURE_API_TOKEN: fixture/api-token
 EOF
@@ -141,10 +141,15 @@ if [ "$#" -eq 1 ] && [ "$1" = child-contract ]; then
   printf 'uid=%s\ncap_eff=%s\n' "$(id -u)" "$cap_eff"
   exit 0
 fi
-[ "$1" = api-status ] || [ "$1" = access-status ] || exit 48
+exec /usr/bin/whoami "$@"
+EOF
+  cat > /scenario/bin/fixture-api <<'EOF'
+#!/bin/sh
+[ "$#" -eq 1 ] || exit 48
+[ "$1" = status ] || [ "$1" = access-status ] || exit 48
 [ -r /scenario/fixtures/api-token ] || exit 49
 [ "${FIXTURE_API_TOKEN:-}" = "$(cat /scenario/fixtures/api-token)" ] || exit 49
-printf 'fixture-api:healthy\n'
+printf 'fixture-api:healthy token=%s\n' "$FIXTURE_API_TOKEN"
 EOF
   cat > /scenario/bin/novelctl <<'EOF'
 #!/bin/sh
@@ -1077,7 +1082,7 @@ phase_su16() {
       [ "$(response_handle /scenario/journey/cross-file.out)" = "$(read_handle file)" ]
       (cd /scenario/ansible && expect_failure cross-ansible guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
       [ "$(response_handle /scenario/journey/cross-ansible.out)" = "$(read_handle ansible)" ]
-      expect_failure cross-api guard run --json whoami access-status
+      expect_failure cross-api guard run --json fixture-api access-status
       [ "$(response_handle /scenario/journey/cross-api.out)" = "$(read_handle api)" ]
       assert_denied_without_execution /scenario/journey/cross-*.out
       ;;
@@ -1148,8 +1153,9 @@ phase_su16() {
       grep -Eq 'fixed-identity|shared child UID' /scenario/journey/ansible-use.out
       ! grep -q 'changed=0' /scenario/journey/ansible-use.out
       add_fixture_api_token >> "$RAW" 2>&1
-      capture_phase api-use guard run --json whoami access-status
+      capture_phase api-use guard run --json fixture-api access-status
       grep -q 'fixture-api:healthy' /scenario/journey/api-use.out
+      grep -Fq '[REDACTED]' /scenario/journey/api-use.out
       ! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" /scenario/journey/api-use.out
       ;;
     verify)
@@ -1769,6 +1775,7 @@ run_su12() {
       mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
       add_fixture_api_token >>"$RAW" 2>&1
       run_journey fixture-api-status fixture-api:healthy
+      grep -Fq '[REDACTED]' "$RAW"
       ! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" "$RAW"
       ;;
     *) return 2 ;;
