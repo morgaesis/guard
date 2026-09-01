@@ -15,7 +15,9 @@ FAILURE="$PRINCIPAL_ROOT/failure.txt"
 COLLECTOR_ROOT=/scenario/collector
 COLLECTOR_RESULTS="$COLLECTOR_ROOT/results"
 COLLECTOR_PHASES="$COLLECTOR_ROOT/phases"
-FIXTURE_API_TOKEN_FILE=/scenario/fixtures/api-token
+FIXTURE_API_AUTHORITY_DIR=/scenario/api-contract
+FIXTURE_API_TOKEN_FILE="$FIXTURE_API_AUTHORITY_DIR/token"
+FIXTURE_API_TOKEN_DIGEST_FILE="$FIXTURE_API_AUTHORITY_DIR/token.sha256"
 UPSTREAM_KUBECONFIG=/scenario/fixtures/upstream.kubeconfig
 BROKERED_KUBECONFIG=/scenario/run/brokered.kubeconfig
 KUBE_PROXY=127.0.0.1:18443
@@ -34,8 +36,15 @@ write_generated_fixture_value() {
   printf '\n' >> "$destination"
 }
 
-add_fixture_api_token() {
-  guard secrets add fixture/api-token < "$FIXTURE_API_TOKEN_FILE"
+provision_fixture_api_token() {
+  [ "$(id -u)" -eq 0 ]
+  runuser -u agent -- env -i \
+    HOME=/tmp/synthetic-home-1001 \
+    XDG_CONFIG_HOME=/tmp/synthetic-config-1001 \
+    XDG_DATA_HOME=/tmp/synthetic-data-1001 \
+    GUARD_SOCKET="$SOCKET" \
+    PATH=/usr/local/bin:/usr/bin:/bin \
+    guard secrets add fixture/api-token < "$FIXTURE_API_TOKEN_FILE"
 }
 
 setup_fixture() {
@@ -76,12 +85,9 @@ EOF
   printf '[fixture]\nlocalhost\n' > /scenario/ansible/inventory
   printf '[defaults]\ninventory = inventory\n' > /scenario/ansible/ansible.cfg
   printf '%s\n' '---' '- hosts: fixture' '  gather_facts: false' '  tasks: []' > /scenario/ansible/site.yml
-  if [ ! -s "$FIXTURE_API_TOKEN_FILE" ]; then
-    write_generated_fixture_value "$FIXTURE_API_TOKEN_FILE"
-  fi
   cat > /scenario/config/guard/tools.yaml <<'EOF'
 tools:
-  fixture-api:
+  systemctl:
     secrets:
       FIXTURE_API_TOKEN: fixture/api-token
 EOF
@@ -143,13 +149,17 @@ if [ "$#" -eq 1 ] && [ "$1" = child-contract ]; then
 fi
 exec /usr/bin/whoami "$@"
 EOF
-  cat > /scenario/bin/fixture-api <<'EOF'
+  cat > /scenario/bin/systemctl <<'EOF'
 #!/bin/sh
-[ "$#" -eq 1 ] || exit 48
-[ "$1" = status ] || [ "$1" = access-status ] || exit 48
-[ -r /scenario/fixtures/api-token ] || exit 49
-[ "${FIXTURE_API_TOKEN:-}" = "$(cat /scenario/fixtures/api-token)" ] || exit 49
-printf 'fixture-api:healthy token=%s\n' "$FIXTURE_API_TOKEN"
+[ "$#" -eq 2 ] || exit 48
+[ "$1" = status ] || exit 48
+[ "$2" = fixture-api.service ] || [ "$2" = access-api.service ] || exit 48
+[ -n "${FIXTURE_API_TOKEN:-}" ] || exit 49
+[ -r /scenario/api-contract/token.sha256 ] || exit 49
+observed_digest="$(printf '%s' "$FIXTURE_API_TOKEN" | sha256sum | awk '{print $1}')"
+expected_digest="$(cat /scenario/api-contract/token.sha256)"
+[ "$observed_digest" = "$expected_digest" ] || exit 49
+printf 'fixture-api:healthy uid=%s token=%s\n' "$(id -u)" "$FIXTURE_API_TOKEN"
 EOF
   cat > /scenario/bin/novelctl <<'EOF'
 #!/bin/sh
@@ -357,7 +367,12 @@ assert_daemon_path_contract() {
     [ "$(stat -c '%u:%g:%a' /scenario/data)" = 1000:1000:755 ]
     [ "$(stat -c '%u:%g:%a' /scenario/run)" = 1000:2000:755 ]
     [ "$(stat -c '%u:%g:%a' /scenario/run/admin.token)" = 1000:0:400 ]
+    [ ! -r "$FIXTURE_API_TOKEN_FILE" ]
   fi
+  [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_AUTHORITY_DIR")" = 0:0:755 ]
+  [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_TOKEN_FILE")" = 0:0:600 ]
+  [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_TOKEN_DIGEST_FILE")" = 0:0:444 ]
+  [ -r "$FIXTURE_API_TOKEN_DIGEST_FILE" ]
   [ -r /scenario/run/admin.token ]
   [ -w /scenario/data ]
   [ -w /scenario/raw ]
@@ -1057,7 +1072,6 @@ phase_su16() {
       save_request file 'Read the fake operator file'
       save_request ansible 'Check the fake Ansible project'
       save_request api 'Query the fake credential-backed API'
-      add_fixture_api_token >> "$RAW" 2>&1
       ;;
     request-secondary)
       [ "$(id -u)" -eq 1002 ]
@@ -1082,7 +1096,7 @@ phase_su16() {
       [ "$(response_handle /scenario/journey/cross-file.out)" = "$(read_handle file)" ]
       (cd /scenario/ansible && expect_failure cross-ansible guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
       [ "$(response_handle /scenario/journey/cross-ansible.out)" = "$(read_handle ansible)" ]
-      expect_failure cross-api guard run --json fixture-api access-status
+      expect_failure cross-api guard run --json systemctl status access-api.service
       [ "$(response_handle /scenario/journey/cross-api.out)" = "$(read_handle api)" ]
       assert_denied_without_execution /scenario/journey/cross-*.out
       ;;
@@ -1152,11 +1166,10 @@ phase_su16() {
       (cd /scenario/ansible && expect_failure ansible-use guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
       grep -Eq 'fixed-identity|shared child UID' /scenario/journey/ansible-use.out
       ! grep -q 'changed=0' /scenario/journey/ansible-use.out
-      add_fixture_api_token >> "$RAW" 2>&1
-      capture_phase api-use guard run --json fixture-api access-status
-      grep -q 'fixture-api:healthy' /scenario/journey/api-use.out
-      grep -Fq '[REDACTED]' /scenario/journey/api-use.out
-      ! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" /scenario/journey/api-use.out
+      expect_failure api-use guard run --json systemctl status access-api.service
+      grep -q 'fixed-identity execution cannot receive tool-config credentials' \
+        /scenario/journey/api-use.out
+      ! grep -q 'fixture-api:healthy' /scenario/journey/api-use.out
       ;;
     verify)
       [ "$(id -u)" -eq 1000 ]
@@ -1773,10 +1786,13 @@ run_su12() {
       ;;
     SU-12-api)
       mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
-      add_fixture_api_token >>"$RAW" 2>&1
-      run_journey fixture-api-status fixture-api:healthy
+      expect_failure fixture-api-raw guard run --json fixture-api status
+      ! grep -q 'fixture-api:healthy' /scenario/journey/fixture-api-raw.out
+      expect_failure fixture-api-extra guard run --json \
+        systemctl status fixture-api.service --output=json
+      ! grep -q 'fixture-api:healthy' /scenario/journey/fixture-api-extra.out
+      run_journey fixture-api-status 'fixture-api:healthy uid=1001'
       grep -Fq '[REDACTED]' "$RAW"
-      ! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" "$RAW"
       ;;
     *) return 2 ;;
   esac
@@ -1785,7 +1801,12 @@ run_su12() {
 postcheck() {
   case "$SCENARIO" in
     SU-12-api)
-      if ! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" /scenario/data/audit.jsonl \
+      if [ "$(id -u)" -eq 0 ] \
+        && [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_AUTHORITY_DIR")" = 0:0:755 ] \
+        && [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_TOKEN_FILE")" = 0:0:600 ] \
+        && [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_TOKEN_DIGEST_FILE")" = 0:0:444 ] \
+        && ! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" "$RAW" \
+        && ! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" /scenario/data/audit.jsonl \
         && grep -q 'fixture/api-token' /scenario/data/audit.jsonl; then
         return 0
       fi
@@ -1828,6 +1849,16 @@ prepare_principals() {
   local daemon_owner token_mode uid root
   [ "$(id -u)" -eq 0 ]
   setup_fixture
+  mkdir -p "$FIXTURE_API_AUTHORITY_DIR"
+  chmod 0755 "$FIXTURE_API_AUTHORITY_DIR"
+  generate_fixture_value > "$FIXTURE_API_TOKEN_FILE"
+  sha256sum "$FIXTURE_API_TOKEN_FILE" | awk '{print $1}' > "$FIXTURE_API_TOKEN_DIGEST_FILE"
+  chmod 0600 "$FIXTURE_API_TOKEN_FILE"
+  chmod 0444 "$FIXTURE_API_TOKEN_DIGEST_FILE"
+  chown -R 0:0 "$FIXTURE_API_AUTHORITY_DIR"
+  [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_AUTHORITY_DIR")" = 0:0:755 ]
+  [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_TOKEN_FILE")" = 0:0:600 ]
+  [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_TOKEN_DIGEST_FILE")" = 0:0:444 ]
   for uid in 1000 1001 1002; do
     root="/scenario/principals/$uid"
     mkdir -p "$root/phase-output" "$root/results"
@@ -1948,6 +1979,7 @@ case "${1:-}" in
   daemon) daemon ;;
   run) run ;;
   phase) run_phase "$@" ;;
+  provision-api-secret) provision_fixture_api_token ;;
   failure)
     record_result failed 'Guard defect, fixture defect, or underlying-tool failure pending reduction' \
       "$(sed -n '1p' "$FAILURE" 2>/dev/null || printf 'a live role-separated journey phase failed')"
@@ -1965,5 +1997,5 @@ case "${1:-}" in
     [ "$(id -u)" -eq 0 ] || { echo 'collect-result requires container root' >&2; exit 2; }
     collect_result "$@"
     ;;
-  *) echo "usage: synthetic-user.sh daemon|run|phase SCENARIO [PHASE]" >&2; exit 2 ;;
+  *) echo "usage: synthetic-user.sh daemon|run|phase SCENARIO [PHASE]|provision-api-secret" >&2; exit 2 ;;
 esac

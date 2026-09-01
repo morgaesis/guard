@@ -293,6 +293,14 @@ assert_daemon_runtime_boundary() {
   if podman exec --user other-agent "$container" test -r /scenario/run/admin.token; then
     return 1
   fi
+  podman exec --user agent "$container" test -r /scenario/api-contract/token.sha256
+  podman exec --user other-agent "$container" test -r /scenario/api-contract/token.sha256
+  if podman exec --user agent "$container" test -r /scenario/api-contract/token; then
+    return 1
+  fi
+  if podman exec --user other-agent "$container" test -r /scenario/api-contract/token; then
+    return 1
+  fi
 }
 
 sanitize_startup_diagnostics() {
@@ -919,6 +927,14 @@ run_one() {
     record_host_failure "$scenario" daemon-socket-permissions container-setup 1
     return 1
   fi
+  case "$scenario" in
+    SU-12-api|SU-16)
+      if ! podman exec --user 0:0 "$container" /synthetic-user.sh provision-api-secret; then
+        record_host_failure "$scenario" api-secret-provision fixture-setup 1
+        return 1
+      fi
+      ;;
+  esac
 
   write_status "$scenario" "$container" "$volume" "running" "under evaluation" "run the deterministic contract"
   if run_scenario "$container" "$scenario"; then
@@ -928,7 +944,7 @@ run_one() {
     podman exec --user 1000:1000 "$container" /synthetic-user.sh failure "$scenario" || true
   fi
   if [ "$result" = passed ] && [ "$scenario" = SU-12-api ]; then
-    if ! podman exec --user 1000:1000 "$container" /synthetic-user.sh postcheck "$scenario"; then
+    if ! podman exec --user 0:0 "$container" /synthetic-user.sh postcheck "$scenario"; then
       result="failed"
     fi
   fi

@@ -400,6 +400,8 @@ dockerignore_rules = {
     if line.strip() and not line.lstrip().startswith("#")
 }
 profiles = (root / "src/gating/verb.rs").read_text(encoding="utf-8")
+approval = (root / "src/gating/approval.rs").read_text(encoding="utf-8")
+execution = (root / "src/server/execute.rs").read_text(encoding="utf-8")
 proxy_server = (root / "src/proxy/server.rs").read_text(encoding="utf-8")
 proxy_kubeconfig = (root / "src/proxy/kubeconfig.rs").read_text(encoding="utf-8")
 cli_server = (root / "src/cli_server.rs").read_text(encoding="utf-8")
@@ -439,19 +441,28 @@ workflow_context_rules = {
 checks = {
     "capability contract uses the closed whoami profile": "binary: whoami\n    args: [child-contract]" in catalog and '"whoami"' in profiles,
     "credential contract uses the closed true profile": "binary: true" in catalog and '"true"' in profiles,
-    "fixture API uses its credentialed client and asserts a redacted response": all(
+    "fixture API reuses closed systemd authority under caller identity with protected credentials": all(
         marker in source
         for marker, source in (
-            ('binary: fixture-api\n    args: ["status"]', catalog),
-            ('fixture-api:\n    secrets:\n      FIXTURE_API_TOKEN: fixture/api-token', synthetic),
-            ("printf 'fixture-api:healthy token=%s\\n' \"$FIXTURE_API_TOKEN\"", synthetic),
-            ('run_journey fixture-api-status fixture-api:healthy', synthetic),
+            ('binary: systemctl\n    args: ["status", "fixture-api.service"]', catalog),
+            ('systemctl:\n    secrets:\n      FIXTURE_API_TOKEN: fixture/api-token', synthetic),
+            ('observed_digest="$(printf \'%s\' "$FIXTURE_API_TOKEN" | sha256sum', synthetic),
+            ("printf 'fixture-api:healthy uid=%s token=%s\\n'", synthetic),
+            ("run_journey fixture-api-status 'fixture-api:healthy uid=1001'", synthetic),
             ('grep -Fq \'[REDACTED]\' "$RAW"', synthetic),
             ('! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" "$RAW"', synthetic),
+            ('! grep -Fq -f "$FIXTURE_API_TOKEN_FILE" /scenario/data/audit.jsonl', synthetic),
             ("fixture/api-token", synthetic),
-            ('"fixture-api" => Some(DelayedAuthorityProfile::FixtureApi)', profiles),
+            ('"systemctl" => Some(DelayedAuthorityProfile::SystemdControl)', profiles),
+            ('expect_failure fixture-api-raw guard run --json fixture-api status', synthetic),
+            ('systemctl status fixture-api.service --output=json', synthetic),
+            ('chmod 0600 "$FIXTURE_API_TOKEN_FILE"', synthetic),
+            ('chmod 0444 "$FIXTURE_API_TOKEN_DIGEST_FILE"', synthetic),
+            ('/synthetic-user.sh provision-api-secret', runner),
         )
-    ),
+    ) and "FixtureApi" not in approval + profiles + execution
+      and "binary: fixture-api" not in catalog
+      and "/scenario/bin/fixture-api" not in synthetic,
     "fixed attack starts an active Kubernetes proxy": "--kube-proxy" in attack and "--brokered-kubeconfig-out" in attack,
     "synthetic fixed mode starts an active Kubernetes proxy": "--kube-proxy" in synthetic and "--brokered-kubeconfig-out" in synthetic,
     "fixed kubectl success requires the brokered kubeconfig": "guarded-kubectl" in attack and 'grep -q \'guard-proxy\' "$KUBECONFIG"' in attack,

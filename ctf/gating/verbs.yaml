@@ -135,8 +135,8 @@ verbs:
 
   - name: fixture-api-status
     description: Query a fake credential-bearing API
-    binary: fixture-api
-    args: ["status"]
+    binary: systemctl
+    args: ["status", "fixture-api.service"]
     consequence: reversible
     trusted: true
 
@@ -191,8 +191,8 @@ verbs:
 
   - name: access-api-status
     description: Query the fake credential-backed API
-    binary: fixture-api
-    args: ["access-status"]
+    binary: systemctl
+    args: ["status", "access-api.service"]
     baseline: false
     consequence: reversible
     trusted: true
