@@ -19,6 +19,11 @@ CONTAINER_CPU_PERIOD="${CTF_CONTAINER_CPU_PERIOD:-100000}"
 CONTAINER_CPU_QUOTA="${CTF_CONTAINER_CPU_QUOTA:-200000}"
 CONTAINER_CPUS="${CTF_CONTAINER_CPUS:-2}"
 CONTAINER_PIDS_LIMIT="${CTF_CONTAINER_PIDS_LIMIT:-512}"
+BUILD_TIMEOUT_SECS="${CTF_BUILD_TIMEOUT_SECS:-1200}"
+ATTACK_TIMEOUT_SECS="${CTF_ATTACK_TIMEOUT_SECS:-300}"
+CLEANUP_TIMEOUT_SECS="${CTF_CLEANUP_TIMEOUT_SECS:-20}"
+DIAGNOSTIC_TIMEOUT_SECS="${CTF_DIAGNOSTIC_TIMEOUT_SECS:-5}"
+KILL_GRACE_SECS="${CTF_KILL_GRACE_SECS:-5}"
 ENGINE="${CONTAINER_ENGINE:-}"
 if [ -z "$ENGINE" ]; then
   if command -v podman >/dev/null 2>&1; then
@@ -27,13 +32,159 @@ if [ -z "$ENGINE" ]; then
     ENGINE=docker
   fi
 fi
-cleanup() {
-  if [ -n "${ATTACK_CONTAINER:-}" ]; then
-    "$ENGINE" container rm "$ATTACK_CONTAINER" >/dev/null 2>&1 || true
+
+ACTIVE_PHASE=setup
+DIAGNOSTIC_DIR="${CTF_DIAGNOSTIC_DIR:-}"
+DIAGNOSTIC_FILE=""
+CLEANUP_STARTED=0
+BUILD_ATTEMPTED=0
+ATTACK_ATTEMPTED=0
+CONTAINER_STATE_RECORDED=0
+
+validate_timeout_seconds() {
+  local phase="$1" value="$2" maximum
+  case "$phase" in
+    build) maximum=1200 ;;
+    attack) maximum=300 ;;
+    cleanup) maximum=30 ;;
+    diagnostic) maximum=10 ;;
+    kill-grace) maximum=5 ;;
+    *)
+      echo "unknown fixed-identity timeout phase: $phase" >&2
+      return 1
+      ;;
+  esac
+  if ! [[ "$value" =~ ^[1-9][0-9]*$ ]] || ((value > maximum)); then
+    echo "fixed-identity $phase timeout must be a whole number from 1 through $maximum seconds" >&2
+    return 1
   fi
-  "$ENGINE" image rm "$IMAGE" >/dev/null 2>&1 || true
+}
+
+validate_timeout_configuration() {
+  validate_timeout_seconds build "$BUILD_TIMEOUT_SECS"
+  validate_timeout_seconds attack "$ATTACK_TIMEOUT_SECS"
+  validate_timeout_seconds cleanup "$CLEANUP_TIMEOUT_SECS"
+  validate_timeout_seconds diagnostic "$DIAGNOSTIC_TIMEOUT_SECS"
+  validate_timeout_seconds kill-grace "$KILL_GRACE_SECS"
+  command -v timeout >/dev/null 2>&1 || {
+    echo "fixed-identity adversarial gate requires GNU timeout for bounded execution" >&2
+    return 1
+  }
+}
+
+prepare_diagnostics() {
+  if [ -z "$DIAGNOSTIC_DIR" ]; then
+    DIAGNOSTIC_DIR="$(mktemp -d "${TMPDIR:-/tmp}/guard-adversarial-diagnostics.XXXXXX")"
+  else
+    mkdir -p -- "$DIAGNOSTIC_DIR"
+  fi
+  chmod 0700 "$DIAGNOSTIC_DIR"
+  DIAGNOSTIC_FILE="$DIAGNOSTIC_DIR/summary.txt"
+  umask 077
+  printf '%s\n' \
+    'format=guard-adversarial-diagnostic-v1' \
+    'content=controlled-phase-and-container-state-only' > "$DIAGNOSTIC_FILE"
+}
+
+record_phase_result() {
+  local phase="$1" outcome="$2" exit_status="$3" elapsed="$4"
+  [ -n "$DIAGNOSTIC_FILE" ] || return 0
+  printf 'phase=%s outcome=%s exit_status=%s elapsed_seconds=%s\n' \
+    "$phase" "$outcome" "$exit_status" "$elapsed" >> "$DIAGNOSTIC_FILE"
+}
+
+run_bounded_phase() {
+  local phase="$1" deadline="$2" started status outcome elapsed
+  shift 2
+  started=$SECONDS
+  # Keep GNU timeout's default process-group isolation so TERM and the
+  # follow-up KILL reach every descendant.
+  if timeout --signal=TERM --kill-after="$KILL_GRACE_SECS" "$deadline" "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  elapsed=$((SECONDS - started))
+  if [ "$status" -eq 0 ]; then
+    record_phase_result "$phase" success "$status" "$elapsed"
+    return 0
+  fi
+  if [ "$status" -eq 124 ]; then
+    outcome=timed-out
+  elif [ "$status" -eq 137 ]; then
+    outcome=killed-or-timed-out
+  else
+    outcome=failed
+  fi
+  record_phase_result "$phase" "$outcome" "$status" "$elapsed"
+  echo "FAIL: fixed-identity adversarial gate $phase phase $outcome after ${elapsed}s (exit $status)" >&2
+  return "$status"
+}
+
+record_sanitized_container_state() {
+  local state exit_code
+  [ -n "${ATTACK_CONTAINER:-}" ] || return 0
+  CONTAINER_STATE_RECORDED=1
+  state="$(timeout --signal=TERM --kill-after="$KILL_GRACE_SECS" "$DIAGNOSTIC_TIMEOUT_SECS" \
+    "$ENGINE" container inspect --format '{{.State.Status}}' "$ATTACK_CONTAINER" 2>/dev/null || true)"
+  case "$state" in
+    created|running|paused|restarting|removing|exited|dead) ;;
+    *) state=unavailable ;;
+  esac
+  exit_code="$(timeout --signal=TERM --kill-after="$KILL_GRACE_SECS" "$DIAGNOSTIC_TIMEOUT_SECS" \
+    "$ENGINE" container inspect --format '{{.State.ExitCode}}' "$ATTACK_CONTAINER" 2>/dev/null || true)"
+  if ! [[ "$exit_code" =~ ^[0-9]+$ ]]; then
+    exit_code=unavailable
+  fi
+  printf 'container_state=%s container_exit_code=%s\n' "$state" "$exit_code" >> "$DIAGNOSTIC_FILE"
+}
+
+bounded_engine_cleanup() {
+  timeout --signal=TERM --kill-after="$KILL_GRACE_SECS" "$CLEANUP_TIMEOUT_SECS" \
+    "$ENGINE" "$@" >/dev/null 2>&1
+}
+
+cleanup() {
+  local cleanup_status=0
+  if [ "$CLEANUP_STARTED" -ne 0 ]; then
+    return 0
+  fi
+  CLEANUP_STARTED=1
+  if [ "$ATTACK_ATTEMPTED" -ne 0 ] && [ -n "${ATTACK_CONTAINER:-}" ]; then
+    if [ "$CONTAINER_STATE_RECORDED" -eq 0 ]; then
+      record_sanitized_container_state
+    fi
+    if bounded_engine_cleanup container rm -f "$ATTACK_CONTAINER"; then
+      ATTACK_CONTAINER=""
+    else
+      cleanup_status=1
+    fi
+  fi
+  if [ "$BUILD_ATTEMPTED" -ne 0 ] && ! bounded_engine_cleanup image rm "$IMAGE"; then
+    cleanup_status=1
+  fi
+  if [ -n "$DIAGNOSTIC_FILE" ]; then
+    if [ "$cleanup_status" -eq 0 ]; then
+      printf '%s\n' 'cleanup=success' >> "$DIAGNOSTIC_FILE"
+    else
+      printf '%s\n' 'cleanup=failed-or-timed-out' >> "$DIAGNOSTIC_FILE"
+    fi
+  fi
+  return "$cleanup_status"
 }
 trap cleanup EXIT
+
+handle_signal() {
+  local signal="$1"
+  trap - INT TERM
+  if [ -n "$DIAGNOSTIC_FILE" ]; then
+    record_phase_result "$ACTIVE_PHASE" "interrupted-signal-$signal" 0 0
+  fi
+  cleanup || true
+  kill -s "$signal" "$$"
+}
+trap 'handle_signal INT' INT
+trap 'handle_signal TERM' TERM
 
 BUILD_FLAGS=(
   --memory "$CONTAINER_MEMORY"
@@ -225,6 +376,135 @@ expect_attack_argument_rejection() {
   echo "PASS: fixed attack argv rejected $mutation"
 }
 
+expect_timeout_rejection() {
+  local mutation="$1" phase="$2" value="$3"
+  if validate_timeout_seconds "$phase" "$value" >/dev/null 2>&1; then
+    echo "FAIL: fixed-identity timeout mutation was accepted: $mutation" >&2
+    return 1
+  fi
+  echo "PASS: fixed-identity timeout rejected $mutation"
+}
+
+process_identity_is_running() {
+  local process_id="$1" expected_start="$2"
+  local -a process_stat=()
+  if ! [[ "$process_id" =~ ^[1-9][0-9]*$ ]] || [ ! -r "/proc/$process_id/stat" ]; then
+    return 1
+  fi
+  IFS=' ' read -r -a process_stat < "/proc/$process_id/stat" || return 1
+  [ "${process_stat[21]:-}" = "$expected_start" ] \
+    && [ "${process_stat[2]:-}" != Z ]
+}
+
+cleanup_process_tree_probe() {
+  local probe_dir="$1" identity_file="$2" result_file="$3" process_id process_start
+  if [ -r "$identity_file" ] \
+    && read -r process_id process_start < "$identity_file" \
+    && [[ "$process_id" =~ ^[1-9][0-9]*$ ]] \
+    && [[ "$process_start" =~ ^[1-9][0-9]*$ ]] \
+    && process_identity_is_running "$process_id" "$process_start"; then
+    kill -KILL "$process_id" 2>/dev/null || true
+  fi
+  [ -e "$identity_file" ] && unlink "$identity_file"
+  [ -e "$result_file" ] && unlink "$result_file"
+  rmdir "$probe_dir"
+}
+
+run_timeout_mutation_tests() {
+  local status previous_kill previous_diagnostic probe_dir probe_identity_file phase_result_file
+  local descendant_id descendant_start descendant_survived=1
+  validate_timeout_configuration
+  expect_timeout_rejection "zero build deadline" build 0
+  expect_timeout_rejection "non-numeric attack deadline" attack forever
+  expect_timeout_rejection "unbounded build deadline" build 1201
+  expect_timeout_rejection "unbounded attack deadline" attack 301
+  expect_timeout_rejection "unbounded cleanup deadline" cleanup 31
+  expect_timeout_rejection "unbounded diagnostic deadline" diagnostic 11
+  expect_timeout_rejection "unbounded kill grace" kill-grace 6
+
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/guard-timeout-tree.XXXXXX")"
+  probe_identity_file="$probe_dir/descendant.identity"
+  phase_result_file="$probe_dir/phase-result"
+  previous_kill="$KILL_GRACE_SECS"
+  previous_diagnostic="$DIAGNOSTIC_FILE"
+  KILL_GRACE_SECS=1
+  DIAGNOSTIC_FILE="$phase_result_file"
+  # The probe script expands these expressions in the child shell.
+  # shellcheck disable=SC2016
+  if run_bounded_phase process-tree-probe 1 bash -c '
+    set -u
+    identity_file="$1"
+    trap "" TERM
+    (
+      trap "" TERM
+      process_stat=()
+      IFS=" " read -r -a process_stat < "/proc/$BASHPID/stat"
+      start_time="${process_stat[21]}"
+      printf "%s %s\n" "$BASHPID" "$start_time" > "$identity_file"
+      while :; do sleep 1; done
+    ) &
+    while [ ! -s "$identity_file" ]; do sleep 0.05; done
+    while :; do sleep 1; done
+  ' bash "$probe_identity_file" \
+    >/dev/null 2>&1; then
+    echo "FAIL: fixed-identity bounded phase accepted a process tree that ignored TERM" >&2
+    KILL_GRACE_SECS="$previous_kill"
+    DIAGNOSTIC_FILE="$previous_diagnostic"
+    cleanup_process_tree_probe "$probe_dir" "$probe_identity_file" "$phase_result_file"
+    return 1
+  else
+    status=$?
+  fi
+  KILL_GRACE_SECS="$previous_kill"
+  DIAGNOSTIC_FILE="$previous_diagnostic"
+  case "$status" in
+    124)
+      grep -Eq '^phase=process-tree-probe outcome=timed-out exit_status=124 ' "$phase_result_file" \
+        || {
+          echo "FAIL: fixed-identity timeout status was not classified as timed-out" >&2
+          cleanup_process_tree_probe "$probe_dir" "$probe_identity_file" "$phase_result_file"
+          return 1
+        }
+      ;;
+    137)
+      grep -Eq '^phase=process-tree-probe outcome=killed-or-timed-out exit_status=137 ' "$phase_result_file" \
+        || {
+          echo "FAIL: fixed-identity kill status was not classified as ambiguous" >&2
+          cleanup_process_tree_probe "$probe_dir" "$probe_identity_file" "$phase_result_file"
+          return 1
+        }
+      ;;
+    *)
+      echo "FAIL: fixed-identity bounded phase returned unexpected timeout status $status" >&2
+      cleanup_process_tree_probe "$probe_dir" "$probe_identity_file" "$phase_result_file"
+      return 1
+      ;;
+  esac
+  echo "PASS: fixed-identity bounded phase classified forced process-tree termination"
+  if ! read -r descendant_id descendant_start < "$probe_identity_file" \
+    || ! [[ "$descendant_id" =~ ^[1-9][0-9]*$ ]] \
+    || ! [[ "$descendant_start" =~ ^[1-9][0-9]*$ ]]; then
+    echo "FAIL: fixed-identity process-tree probe did not record a valid descendant identity" >&2
+    cleanup_process_tree_probe "$probe_dir" "$probe_identity_file" "$phase_result_file"
+    return 1
+  fi
+  for _ in $(seq 1 20); do
+    if process_identity_is_running "$descendant_id" "$descendant_start"; then
+      sleep 0.05
+    else
+      descendant_survived=0
+      break
+    fi
+  done
+  if [ "$descendant_survived" -ne 0 ]; then
+    echo "FAIL: fixed-identity timeout left a TERM-ignoring descendant running" >&2
+    cleanup_process_tree_probe "$probe_dir" "$probe_identity_file" "$phase_result_file"
+    return 1
+  fi
+  cleanup_process_tree_probe "$probe_dir" "$probe_identity_file" "$phase_result_file"
+  echo "PASS: fixed-identity timeout left no TERM-ignoring descendant alive"
+}
+
 run_attack_argument_mutation_tests() {
   local image_index=$(( ${#ATTACK_CONTAINER_ARGUMENTS[@]} - 1 ))
   local -a before_image=("${ATTACK_CONTAINER_ARGUMENTS[@]:0:image_index}")
@@ -278,18 +558,23 @@ run_attack_argument_mutation_tests() {
     "${before_image[@]}" --cap-add SYS_ADMIN "$IMAGE"
   expect_attack_argument_rejection "an additional writable tmpfs" \
     "${before_image[@]}" --tmpfs /extra:rw,size=1m "$IMAGE"
+  run_timeout_mutation_tests
 }
 
 validate_attack_container_config() {
-  python3 - "$ENGINE" "$1" <<'PY'
+  run_bounded_phase inspect "$DIAGNOSTIC_TIMEOUT_SECS" python3 - "$ENGINE" "$1" "$DIAGNOSTIC_TIMEOUT_SECS" <<'PY'
 import json
 import subprocess
 import sys
 
 
-engine, container_name = sys.argv[1:]
+engine, container_name, timeout_seconds = sys.argv[1:]
 container = json.loads(
-    subprocess.check_output([engine, "container", "inspect", container_name], text=True)
+    subprocess.check_output(
+        [engine, "container", "inspect", container_name],
+        text=True,
+        timeout=int(timeout_seconds),
+    )
 )[0]
 host = container.get("HostConfig", {})
 config = container.get("Config", {})
@@ -365,17 +650,31 @@ PY
 }
 
 run_attack_container() {
-  local attack_status=0
+  local attack_status=0 configuration_status=0 cleanup_status=0
   validate_attack_container_arguments "$@"
-  if "$ENGINE" run "$@"; then
+  ACTIVE_PHASE=attack
+  ATTACK_ATTEMPTED=1
+  if run_bounded_phase attack "$ATTACK_TIMEOUT_SECS" "$ENGINE" run "$@"; then
     :
   else
     attack_status=$?
   fi
-  validate_attack_container_config "$ATTACK_CONTAINER"
-  "$ENGINE" container rm "$ATTACK_CONTAINER" >/dev/null
-  ATTACK_CONTAINER=""
-  return "$attack_status"
+  record_sanitized_container_state
+  if validate_attack_container_config "$ATTACK_CONTAINER"; then
+    :
+  else
+    configuration_status=$?
+  fi
+  if ! cleanup; then
+    cleanup_status=1
+  fi
+  if [ "$attack_status" -ne 0 ]; then
+    return "$attack_status"
+  fi
+  if [ "$configuration_status" -ne 0 ]; then
+    return "$configuration_status"
+  fi
+  return "$cleanup_status"
 }
 
 static_validate() {
@@ -406,6 +705,8 @@ proxy_server = (root / "src/proxy/server.rs").read_text(encoding="utf-8")
 proxy_kubeconfig = (root / "src/proxy/kubeconfig.rs").read_text(encoding="utf-8")
 cli_server = (root / "src/cli_server.rs").read_text(encoding="utf-8")
 attack = (root / "ctf/gating/attack.sh").read_text(encoding="utf-8")
+runner_script = (root / "ctf/gating/run.sh").read_text(encoding="utf-8")
+ci_workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 synthetic = (root / "ctf/gating/synthetic-user.sh").read_text(encoding="utf-8")
 runner = (root / "ctf/gating/synthetic-user-runner.sh").read_text(encoding="utf-8")
 adversary = (root / "ctf/entrypoint-adversary.sh").read_text(encoding="utf-8")
@@ -556,6 +857,62 @@ checks = {
             ('guard secrets add OPN_KEY_PAIR <<< "$(generated_fixture_value)"', adversary),
         )
     ),
+    "fixed-identity workflow has cleanup and artifact headroom": bool(
+        re.search(r"adversarial_gate:.*?timeout-minutes:\s*45", ci_workflow, re.DOTALL)
+    ) and all(
+        marker in ci_workflow
+        for marker in (
+            'CTF_BUILD_TIMEOUT_SECS: "1200"',
+            'CTF_ATTACK_TIMEOUT_SECS: "300"',
+            'CTF_CLEANUP_TIMEOUT_SECS: "20"',
+            'CTF_DIAGNOSTIC_TIMEOUT_SECS: "5"',
+        )
+    ),
+    "fixed-identity workflow uploads only the controlled summary": (
+        "Upload sanitized adversarial diagnostics" in ci_workflow
+        and "path: ${{ runner.temp }}/guard-adversarial-diagnostics/summary.txt" in ci_workflow
+        and "path: ${{ runner.temp }}/guard-adversarial-diagnostics\n" not in ci_workflow
+    ),
+    "fixed attack bounds build, attack, inspection, and cleanup": all(
+        marker in runner_script
+        for marker in (
+            "run_bounded_phase build",
+            "run_bounded_phase attack",
+            "run_bounded_phase inspect",
+            "bounded_engine_cleanup",
+            "--kill-after=\"$KILL_GRACE_SECS\"",
+        )
+    ) and ("--" + "foreground") not in runner_script,
+    "fixed attack handles termination and records controlled diagnostics": all(
+        marker in runner_script
+        for marker in (
+            "trap 'handle_signal INT' INT",
+            "trap 'handle_signal TERM' TERM",
+            "record_sanitized_container_state",
+            "content=controlled-phase-and-container-state-only",
+        )
+    ),
+    "fixed attack cleanup is bounded, forceful, and idempotent": all(
+        marker in runner_script
+        for marker in (
+            "CLEANUP_STARTED",
+            "bounded_engine_cleanup container rm -f",
+            "bounded_engine_cleanup image rm",
+            "cleanup || true",
+        )
+    ),
+    "fixed attack mutation kills TERM-ignoring descendants": all(
+        marker in runner_script
+        for marker in (
+            "process-tree-probe",
+            "process_identity_is_running",
+            "left no TERM-ignoring descendant alive",
+        )
+    ),
+    "signal 137 remains an ambiguous forced termination": (
+        "outcome=killed-or-timed-out" in runner_script
+        and "elif [ \"$status\" -eq 137 ]" in runner_script
+    ),
     "container build context includes only Dependabot workflow fixtures": (
         workflow_context_rules == workflow_ignore_rules
         and workflow_copy_sources == workflow_fixtures
@@ -582,8 +939,15 @@ if [ "$mode" = mutation ]; then
   exit 0
 fi
 
+validate_timeout_configuration
+prepare_diagnostics
+echo "Sanitized fixed-identity diagnostics: $DIAGNOSTIC_FILE"
+
 echo "=== Building $IMAGE (compiles guard for Linux) ==="
-"$ENGINE" build "${BUILD_FLAGS[@]}" -t "$IMAGE" -f "$SCRIPT_DIR/Containerfile" "$REPO_ROOT"
+ACTIVE_PHASE=build
+BUILD_ATTEMPTED=1
+run_bounded_phase build "$BUILD_TIMEOUT_SECS" \
+  "$ENGINE" build "${BUILD_FLAGS[@]}" -t "$IMAGE" -f "$SCRIPT_DIR/Containerfile" "$REPO_ROOT"
 
 case "$mode" in
   attack)

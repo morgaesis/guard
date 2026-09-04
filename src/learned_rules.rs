@@ -124,6 +124,37 @@ pub(crate) fn pause_post_commit_adoption_for_test(
     (committed, release)
 }
 
+#[cfg(test)]
+type ImmutableLockPreopenHook = Box<dyn FnOnce(&Path) + Send>;
+
+#[cfg(test)]
+fn immutable_lock_preopen_hooks() -> &'static Mutex<BTreeMap<PathBuf, ImmutableLockPreopenHook>> {
+    static HOOKS: OnceLock<Mutex<BTreeMap<PathBuf, ImmutableLockPreopenHook>>> = OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn replace_immutable_lock_before_write_open_for_test(
+    path: &Path,
+    hook: impl FnOnce(&Path) + Send + 'static,
+) {
+    immutable_lock_preopen_hooks()
+        .lock()
+        .expect("immutable-lock pre-open hook lock")
+        .insert(path.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_immutable_lock_preopen_hook_for_test(path: &Path) {
+    let hook = immutable_lock_preopen_hooks()
+        .lock()
+        .expect("immutable-lock pre-open hook lock")
+        .remove(path);
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
 #[derive(Debug)]
 struct LearningSnapshotConflict;
 
@@ -775,6 +806,58 @@ struct DestinationLock {
     canonical_lock_path: PathBuf,
 }
 
+struct ImmutableAuthorityLock {
+    file: File,
+    parent: File,
+    canonical_parent: PathBuf,
+    canonical_lock_path: PathBuf,
+}
+
+impl ImmutableAuthorityLock {
+    fn acquire(path: &Path, immutable_authority: &File) -> Result<Self> {
+        ensure_destination_parent(path)?;
+        let canonical_lock_path = canonical_destination(path)?;
+        let canonical_parent = canonical_lock_path
+            .parent()
+            .context("immutable authority lock has no canonical parent")?
+            .to_path_buf();
+        let parent = open_parent_directory(&canonical_parent)?;
+        validate_trusted_parent(&parent, &canonical_parent)?;
+        let bound_lock_path = bind_destination_to_parent(&parent, &canonical_lock_path)?;
+        let file = open_owner_only_new_or_existing_distinct(
+            &bound_lock_path,
+            &canonical_lock_path,
+            immutable_authority,
+        )
+        .with_context(|| format!("failed to open immutable authority lock {}", path.display()))?;
+        ensure_regular_file(&bound_lock_path)?;
+        lock_file(&file, Instant::now() + AUTHORITY_LOCK_TIMEOUT, true)
+            .with_context(|| format!("failed to lock immutable authority {}", path.display()))?;
+        let lock = Self {
+            file,
+            parent,
+            canonical_parent,
+            canonical_lock_path,
+        };
+        lock.verify_parent_binding()?;
+        Ok(lock)
+    }
+
+    fn verify_parent_binding(&self) -> Result<()> {
+        let current = self.canonical_parent.canonicalize().with_context(|| {
+            format!(
+                "failed to verify immutable authority lock directory {}",
+                self.canonical_parent.display()
+            )
+        })?;
+        if current != self.canonical_parent {
+            anyhow::bail!("immutable authority lock directory binding changed")
+        }
+        parent_identity_matches(&self.parent, &self.canonical_parent)?;
+        validate_trusted_parent(&self.parent, &self.canonical_parent)?;
+        validate_lock_file(&self.file, &self.canonical_lock_path)
+    }
+}
 impl DestinationLock {
     fn acquire(path: &Path) -> Result<Self> {
         Self::acquire_with_mode(path, true)
@@ -1316,6 +1399,35 @@ fn open_parent_directory(path: &Path) -> Result<File> {
         .with_context(|| format!("failed to pin destination directory {}", path.display()))
 }
 
+/// Open a pinned directory handle with the minimum rights needed to replace
+/// its DACL. Ordinary parent pinning deliberately remains read-only.
+#[cfg(windows)]
+fn open_windows_directory_for_dacl_update(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+
+    OpenOptions::new()
+        // `access_mode` replaces the generic read/write flags. `WRITE_DAC`
+        // is required by SetSecurityInfo, while read attributes and control
+        // data let the retained handle undergo the existing authority checks.
+        .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "failed to open private directory for DACL update {}",
+                path.display()
+            )
+        })
+}
+
 #[cfg(target_os = "linux")]
 fn bind_destination_to_parent(parent: &File, destination: &Path) -> Result<PathBuf> {
     use std::os::fd::AsRawFd;
@@ -1682,18 +1794,46 @@ fn apply_security_descriptor_to_handle(
     information: u32,
 ) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Security::SetKernelObjectSecurity;
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+
     let mut descriptor = descriptor.to_vec();
-    if unsafe {
-        SetKernelObjectSecurity(
-            file.as_raw_handle(),
-            information,
+    let mut dacl_present = 0;
+    let mut dacl = std::ptr::null_mut();
+    let mut dacl_defaulted = 0;
+    let dacl_result = unsafe {
+        GetSecurityDescriptorDacl(
             descriptor.as_mut_ptr().cast(),
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
         )
-    } == 0
-    {
+    };
+    if dacl_result == 0 {
         return Err(std::io::Error::last_os_error())
-            .context("failed to apply a DACL through the held file handle");
+            .context("failed to read the replacement Windows DACL");
+    }
+    if dacl_present == 0 {
+        anyhow::bail!("replacement Windows security descriptor does not contain a DACL");
+    }
+    if dacl.is_null() {
+        anyhow::bail!("replacement Windows security descriptor contains a null DACL");
+    }
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .context("failed to apply a DACL through the pinned file-system handle");
     }
     Ok(())
 }
@@ -1701,12 +1841,13 @@ fn apply_security_descriptor_to_handle(
 #[cfg(windows)]
 fn apply_owner_only_windows_dacl_to_handle(file: &File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        SetKernelObjectSecurity, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
     let sddl = "D:P(A;;FA;;;OW)"
         .encode_utf16()
@@ -1725,17 +1866,45 @@ fn apply_owner_only_windows_dacl_to_handle(file: &File) -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .context("failed to create an owner-only Windows DACL");
     }
-    let applied = unsafe {
-        SetKernelObjectSecurity(
-            file.as_raw_handle(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+    let mut dacl_present = 0;
+    let mut dacl = std::ptr::null_mut();
+    let mut dacl_defaulted = 0;
+    let dacl_result = unsafe {
+        GetSecurityDescriptorDacl(
             descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    };
+    if dacl_result == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { LocalFree(descriptor.cast()) };
+        return Err(error).context("failed to read the owner-only Windows DACL");
+    }
+    if dacl_present == 0 {
+        unsafe { LocalFree(descriptor.cast()) };
+        anyhow::bail!("owner-only Windows security descriptor does not contain a DACL");
+    }
+    if dacl.is_null() {
+        unsafe { LocalFree(descriptor.cast()) };
+        anyhow::bail!("owner-only Windows security descriptor contains a null DACL");
+    }
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
         )
     };
     unsafe { LocalFree(descriptor.cast()) };
-    if applied == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to apply an owner-only DACL through the held file handle");
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .context("failed to apply an owner-only DACL through the pinned file-system handle");
     }
     Ok(())
 }
@@ -1743,7 +1912,7 @@ fn apply_owner_only_windows_dacl_to_handle(file: &File) -> Result<()> {
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn protect_current_user_directory(path: &Path) -> Result<()> {
-    let directory = open_parent_directory(path)
+    let directory = open_windows_directory_for_dacl_update(path)
         .with_context(|| format!("cannot open private directory {}", path.display()))?;
     apply_owner_only_windows_dacl_to_handle(&directory)
         .with_context(|| format!("cannot protect private directory {}", path.display()))?;
@@ -1910,11 +2079,158 @@ fn open_owner_only_new_or_existing(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Open a lock file without ever normalizing the permissions of an authority
+/// file. An existing lock is inspected through its directory entry before it
+/// is opened for write, then the pinned handle is compared again before any
+/// permission or ACL change. A newly created file cannot alias the already
+/// opened immutable authority because creation is exclusive.
+fn open_owner_only_new_or_existing_distinct(
+    path: &Path,
+    _canonical_path: &Path,
+    immutable_authority: &File,
+) -> Result<File> {
+    match open_owner_only_new(path) {
+        Ok(file) => {
+            ensure_regular_file(path)?;
+            verify_open_file_binding(&file, path)?;
+            return Ok(file);
+        }
+        Err(error) if anyhow_error_has_io_kind(&error, std::io::ErrorKind::AlreadyExists) => {}
+        Err(error) => return Err(error),
+    }
+
+    reject_immutable_lock_path_alias(path, immutable_authority)?;
+    #[cfg(test)]
+    run_immutable_lock_preopen_hook_for_test(_canonical_path);
+    let mut options = owner_only_options();
+    let file = options.read(true).write(true).open(path)?;
+    ensure_regular_file(path)?;
+    verify_open_file_binding(&file, path)?;
+    if same_file_identity(&file, immutable_authority)? {
+        anyhow::bail!("immutable authority lock aliases the immutable authority file")
+    }
+    set_owner_only_permissions(&file)?;
+    Ok(file)
+}
+
+fn anyhow_error_has_io_kind(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|source| source.kind() == kind)
+    })
+}
+
+fn set_owner_only_permissions(file: &File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    apply_owner_only_windows_dacl_to_handle(file)?;
+    Ok(())
+}
+
+/// Reject a direct path, hard link, symlink, or Windows reparse point before
+/// any write-capable lock handle is opened. The repeated handle check above
+/// closes the path-to-open race. The lock parent remains pinned and trusted,
+/// and the immutable authority remains pinned by its read-only file handle.
+fn reject_immutable_lock_path_alias(path: &Path, immutable_authority: &File) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect immutable authority lock {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("immutable authority lock must not be a symbolic link")
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            anyhow::bail!("immutable authority lock must not be a Windows reparse point")
+        }
+    }
+    if !metadata.is_file() {
+        anyhow::bail!("immutable authority lock is not a regular file")
+    }
+    if same_path_and_file_identity(path, immutable_authority)? {
+        anyhow::bail!("immutable authority lock aliases the immutable authority file")
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &File, right: &File) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &File, right: &File) -> Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    fn identity(file: &File) -> Result<(u32, u64)> {
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect immutable authority identity");
+        }
+        Ok((
+            information.dwVolumeSerialNumber,
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        ))
+    }
+
+    Ok(identity(left)? == identity(right)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_left: &File, _right: &File) -> Result<bool> {
+    anyhow::bail!("immutable authority lock identity checks are unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn same_path_and_file_identity(path: &Path, immutable_authority: &File) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let candidate = std::fs::metadata(path)?;
+    let authority = immutable_authority.metadata()?;
+    Ok(candidate.dev() == authority.dev() && candidate.ino() == authority.ino())
+}
+
+#[cfg(windows)]
+fn same_path_and_file_identity(path: &Path, immutable_authority: &File) -> Result<bool> {
+    let mut options = owner_only_options();
+    let candidate = options.read(true).open(path)?;
+    same_file_identity(&candidate, immutable_authority)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_path_and_file_identity(_path: &Path, _immutable_authority: &File) -> Result<bool> {
+    anyhow::bail!("immutable authority lock identity checks are unsupported on this platform")
+}
+
 fn ensure_regular_file(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         anyhow::bail!("learning transaction path is not a regular file")
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            anyhow::bail!("learning transaction path is a Windows reparse point")
+        }
     }
     Ok(())
 }
@@ -2656,6 +2972,58 @@ pub(crate) fn load_immutable_learning_file_snapshot(path: &Path) -> Result<Learn
     })
 }
 
+/// Pin the immutable authority only long enough to compare its stable identity
+/// with a proposed writable lock. This intentionally does not apply the full
+/// authority-file policy: a hard-link alias must be rejected as an alias
+/// before the normal immutable read reports its independently unsafe link
+/// count.
+fn pin_immutable_authority_for_lock_identity(path: &Path) -> Result<File> {
+    let destination = canonical_destination(path)?;
+    let canonical_parent = destination
+        .parent()
+        .context("immutable authority file has no canonical parent")?
+        .to_path_buf();
+    let parent = open_parent_directory(&canonical_parent)?;
+    validate_trusted_parent(&parent, &canonical_parent)?;
+    let destination = bind_destination_to_parent(&parent, &destination)?;
+    ensure_regular_file(&destination)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(&destination)
+        .with_context(|| format!("failed to pin immutable authority {}", path.display()))?;
+    verify_open_file_binding(&file, &destination)?;
+    Ok(file)
+}
+
+/// Read immutable authority while an independently located writable lock is
+/// held. The authority path remains immutable process input; the lock only
+/// coordinates startup readers and never grants a write path beside it.
+pub(crate) fn load_immutable_learning_file_snapshot_with_lock(
+    path: &Path,
+    lock_path: &Path,
+) -> Result<LearningFileSnapshot> {
+    let immutable_authority = pin_immutable_authority_for_lock_identity(path)?;
+    let lock = ImmutableAuthorityLock::acquire(lock_path, &immutable_authority)?;
+    let snapshot = load_immutable_learning_file_snapshot(path)?;
+    lock.verify_parent_binding()?;
+    Ok(snapshot)
+}
 fn read_learning_file_snapshot_locked(lock: &DestinationLock) -> Result<LearningFileSnapshot> {
     let path = lock.destination();
     let parent_identity = lock.parent_identity()?;
@@ -3164,6 +3532,11 @@ fn windows_dacl_digest(path: &Path) -> Result<String> {
         return Err(std::io::Error::last_os_error()).context("failed to read the Windows DACL");
     }
     Ok(content_digest(&descriptor))
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn authority_dacl_digest_for_test(path: &Path) -> Result<String> {
+    windows_dacl_digest(path)
 }
 
 #[cfg(windows)]
@@ -4820,6 +5193,46 @@ pub(crate) fn looks_dangerous_for_learned_allow(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_io_error_kind_preserves_already_exists_classification() {
+        let already_exists = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "fixture already exists",
+        ))
+        .context("wrapped fixture error");
+        assert!(anyhow_error_has_io_kind(
+            &already_exists,
+            std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(!anyhow_error_has_io_kind(
+            &already_exists,
+            std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_matches_read_compatible_hard_link_handles() {
+        let directory = authority_tempdir();
+        let authority = directory.path().join("authority.yaml");
+        let alias = directory.path().join("authority-alias.yaml");
+        let distinct = directory.path().join("distinct.lock");
+        write_authority_file(&authority, "authority").unwrap();
+        write_authority_file(&distinct, "lock").unwrap();
+        std::fs::hard_link(&authority, &alias).unwrap();
+
+        let read_handle = |path: &Path| {
+            let mut options = owner_only_options();
+            options.read(true).open(path).unwrap()
+        };
+        let authority_handle = read_handle(&authority);
+        let alias_handle = read_handle(&alias);
+        let distinct_handle = read_handle(&distinct);
+
+        assert!(same_file_identity(&authority_handle, &alias_handle).unwrap());
+        assert!(!same_file_identity(&authority_handle, &distinct_handle).unwrap());
+    }
 
     #[cfg(unix)]
     #[test]

@@ -100,16 +100,33 @@ jobs:
   adversarial_gate:
     name: Fixed-identity adversarial gate
     runs-on: ubuntu-latest
+    # The harness also bounds its build and attack phases so this remains a
+    # final containment boundary rather than the usual failure path.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Run isolated adversarial gate
         shell: bash
+        env:
+          CTF_BUILD_TIMEOUT_SECS: "1200"
+          CTF_ATTACK_TIMEOUT_SECS: "300"
+          CTF_CLEANUP_TIMEOUT_SECS: "20"
+          CTF_DIAGNOSTIC_TIMEOUT_SECS: "5"
+          CTF_DIAGNOSTIC_DIR: ${{ runner.temp }}/guard-adversarial-diagnostics
         run: |
           python3 ./ctf/egress-proxy.py --self-test
           ./ctf/gating/run.sh static
           ./ctf/gating/run.sh attack
+      - name: Upload sanitized adversarial diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: fixed-identity-adversarial-diagnostics
+          path: ${{ runner.temp }}/guard-adversarial-diagnostics/summary.txt
+          if-no-files-found: warn
+          retention-days: 7
 
   synthetic_user:
     name: Isolated synthetic-user catalog

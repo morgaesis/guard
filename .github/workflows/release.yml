@@ -445,7 +445,7 @@ jobs:
             # end-to-end rollback baseline empty; the Pester contract covers a
             # nonempty snapshot round trip through the backup helpers.
             $baselineApiReverts = Get-ApiRevertHashes -StatePaths $statePaths -GuardSid $guardSid
-            Start-Service -Name $ServiceName
+            Start-GuardService -Name $ServiceName
 
             $env:GUARD_INSTALLER_TEST_FAULT = 'after-environment'
             $faultObserved = $false
@@ -474,7 +474,7 @@ jobs:
             if ((Get-ServicePathName) -ne $baselinePathName) {
               throw 'Automatic rollback did not restore the exact service command line.'
             }
-            Start-Service -Name $ServiceName
+            Start-GuardService -Name $ServiceName
 
             $upgradeOutput = @(& $installer @faultInstall 6>&1 | ForEach-Object { [string]$_ })
             $backupLine = $upgradeOutput | Where-Object { $_ -match '^Rollback backup: (.+)$' } | Select-Object -Last 1
@@ -510,7 +510,7 @@ jobs:
               throw 'Post-success rollback did not restore the exact service command line.'
             }
             Assert-HashMapsEqual -Expected $baselineApiReverts -Actual (Get-ApiRevertHashes -StatePaths $statePaths -GuardSid $guardSid) -Label 'Post-success rollback API revert snapshot'
-            Start-Service -Name $ServiceName
+            Start-GuardService -Name $ServiceName
             Verify-GuardService -ExpectedHash $baselineBinary -ExpectedVersion (Get-GuardVersion -GuardExe $DeployedExe) -ExpectedStateDb $statePaths.StateDb -ExpectedSocket $statePaths.SocketName
             Assert-DeploymentAcls -GuardSid $guardSid -StatePaths $statePaths
             Set-ServiceRegistryAcl -GuardSid $guardSid
