@@ -1749,7 +1749,7 @@ run_phase() {
   export GUARD_SOCKET="$SOCKET"
   prepare_principal_output
   RAW="$PHASE_OUTPUT/$SCENARIO.log"
-  trap 'printf "phase=%s line=%s\n" "${3:-unknown}" "$LINENO" > "$FAILURE"' ERR
+  trap '[ -s "$FAILURE" ] || printf "phase=%s line=%s\n" "${3:-unknown}" "$LINENO" > "$FAILURE"' ERR
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
   cd /
   case "$SCENARIO" in

@@ -507,6 +507,35 @@ Describe 'Guard Windows installer state and ACL contract' {
         Resolve-InstallServicePath -ExistingPath $custom -DesiredPath $withKey | Should -Be $custom
     }
 
+    It 'removes the optional service environment when no managed values remain' {
+        Mock Set-ServiceRegistryAcl { return }
+        Mock New-ItemProperty { return }
+        Mock Remove-ItemProperty { return }
+
+        Set-ServiceEnvironment -Environment @{} -GuardSid $script:TestGuardSid
+
+        Should -Invoke Remove-ItemProperty -Times 1 -Exactly -ParameterFilter {
+            $Name -eq 'Environment'
+        }
+        Should -Invoke New-ItemProperty -Times 0 -Exactly
+        Should -Invoke Set-ServiceRegistryAcl -Times 2 -Exactly
+    }
+
+    It 'writes a non-empty service environment as a multi-string' {
+        Mock Set-ServiceRegistryAcl { return }
+        Mock New-ItemProperty { return }
+        Mock Remove-ItemProperty { return }
+
+        Set-ServiceEnvironment -Environment @{ GUARD_CHILD_ENV = 'KUBECONFIG' } -GuardSid $script:TestGuardSid
+
+        Should -Invoke New-ItemProperty -Times 1 -Exactly -ParameterFilter {
+            $Name -eq 'Environment' -and $PropertyType -eq 'MultiString' -and
+            @($Value).Count -eq 1 -and $Value[0] -eq 'GUARD_CHILD_ENV=KUBECONFIG'
+        }
+        Should -Invoke Remove-ItemProperty -Times 0 -Exactly
+        Should -Invoke Set-ServiceRegistryAcl -Times 2 -Exactly
+    }
+
     It 'derives custom state authority paths from exactly one service setting' {
         $pathName = '"C:\Program Files\Guard\guard.exe" "server" "start" "--socket" "guard-custom" "--state-db" "D:\Guard State\primary.sqlite" "--service"'
         $paths = Get-GuardStatePaths -ServicePathName $pathName

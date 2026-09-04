@@ -950,7 +950,12 @@ function Set-ServiceEnvironment {
     )
     Set-ServiceRegistryAcl -GuardSid $GuardSid
     $pairs = @($Environment.Keys | Sort-Object | ForEach-Object { "$_=$($Environment[$_])" })
-    New-ItemProperty -LiteralPath (Get-ServiceRegistryPath) -Name Environment -PropertyType MultiString -Value $pairs -Force | Out-Null
+    if ($pairs.Count -eq 0) {
+        Remove-ItemProperty -LiteralPath (Get-ServiceRegistryPath) -Name Environment -Force -ErrorAction SilentlyContinue
+    }
+    else {
+        New-ItemProperty -LiteralPath (Get-ServiceRegistryPath) -Name Environment -PropertyType MultiString -Value $pairs -Force | Out-Null
+    }
     Set-ServiceRegistryAcl -GuardSid $GuardSid
 }
 
