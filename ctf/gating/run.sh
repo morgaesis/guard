@@ -835,7 +835,16 @@ checks = {
         and 'echo "- Worktree:' not in runner
         and 'echo "- Branch:' not in runner
     ),
-    "synthetic readiness failures retain bounded sanitized startup diagnostics": "collect_startup_diagnostics" in runner and "sanitize_startup_diagnostics" in runner and "timeout --kill-after=1s 5s podman logs" in runner and "timeout --kill-after=1s 5s podman exec" in runner,
+    "synthetic readiness failures retain bounded sanitized startup diagnostics": all(
+        marker in runner
+        for marker in (
+            "collect_startup_diagnostics",
+            "sanitize_startup_diagnostics",
+            "timeout --kill-after=1s 5s podman logs",
+            "timeout --kill-after=1s 5s podman cp",
+            "| tar -xO",
+        )
+    ) and "timeout --kill-after=1s 5s podman exec" not in runner,
     "loopback API proxy requires authenticated client context": "a proxy transport or session bearer is required" in proxy_server and "ProxyTransportAuth" in proxy_server,
     "brokered proxy bearer is generated instead of hardcoded": "guard-anonymous" not in proxy_kubeconfig and "transport_bearer_bytes" in proxy_server,
     "brokered kubeconfig is restricted to one safe fixed-worker file": "mode != 0o640" in cli_server and "metadata.nlink() != 1" in cli_server and "output parent must be a daemon-owned directory" in cli_server,
