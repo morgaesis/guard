@@ -48,6 +48,11 @@ RUN install -d -o root -g root -m 0755 /work /work/ansible-project
 # read-only container rootfs, outside every daemon-writable ancestor.
 RUN install -d -o root -g root -m 0555 /authority
 
+# The shared catalog also binds synthetic Ansible coverage to this canonical
+# project directory. Synthetic runs replace `/scenario` with their private
+# fixture volume; the fixed run only needs the trusted path to exist at load.
+RUN install -d -o root -g root -m 0755 /scenario /scenario/ansible
+
 COPY ctf/gating/verbs.yaml /etc/guard/verbs.yaml
 RUN chmod 0644 /etc/guard/verbs.yaml
 COPY ctf/gating/attack.sh /attack.sh

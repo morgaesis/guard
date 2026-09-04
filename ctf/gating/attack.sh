@@ -85,8 +85,7 @@ start_daemon() {
 echo "=== Setup ==="
 mkdir -p /work /run/guard /var/lib/guard
 mkdir -p /fakebin /shim
-install -o guarddaemon -g guarddaemon -m 0600 \
-  /dev/null /run/guard/.verbs.yaml.learning-lock
+install -m 0600 /dev/null /run/guard/.verbs.yaml.learning-lock
 generate_fixture_value > "$ADMIN_TOKEN_FILE"
 printf '\n' >> "$ADMIN_TOKEN_FILE"
 chmod 0400 "$ADMIN_TOKEN_FILE"
@@ -212,7 +211,8 @@ chmod 0755 /run/guard /fakebin /shim
 chmod 0400 "$UPSTREAM_KUBECONFIG"
 chown -R guardexec:guardexec /work
 chown guarddaemon:guarddaemon \
-  /run/guard /var/lib/guard "$UPSTREAM_KUBECONFIG"
+  /run/guard /var/lib/guard "$UPSTREAM_KUBECONFIG" \
+  /run/guard/.verbs.yaml.learning-lock
 chown -R guarddaemon:guarddaemon /shim
 chown guarddaemon:guarddaemon /home/guarddaemon
 chown agent:agent /home/agent
@@ -249,6 +249,7 @@ else
 fi
 
 echo "=== Start daemon with distinct child identity (gate=consequence, no LLM) ==="
+cd /
 : > /var/log/guard.log
 start_daemon
 chown guarddaemon:guarddaemon "$ADMIN_TOKEN_FILE"
@@ -265,7 +266,7 @@ assert_daemon_boundary
 
 echo
 echo "=== 1. transparent shims broker through Guard ==="
-if cd /work && agent_shim env SSH_AUTH_SOCK=/tmp/agent.sock ssh safe-host >/tmp/ssh-shim.out 2>/tmp/ssh-shim.err; then
+if cd /authority && agent_shim env SSH_AUTH_SOCK=/tmp/agent.sock ssh safe-host >/tmp/ssh-shim.out 2>/tmp/ssh-shim.err; then
   bad "opaque ssh execution bypassed the closed executable profile registry"
 else
   if grep -q "guarded-ssh" /tmp/ssh-shim.out; then
@@ -274,12 +275,12 @@ else
     ok "opaque ssh execution was rejected before process start"
   fi
 fi
-OUT=$(cd /work && agent_shim kubectl version --client 2>/tmp/kubectl-shim.err)
+OUT=$(cd /authority && agent_shim kubectl version --client 2>/tmp/kubectl-shim.err)
 case "$OUT" in
-  guarded-kubectl:version\ --client:/work:none) ok "kubectl shim reached Guard with argv/cwd preserved" ;;
+  guarded-kubectl:version\ --client:/authority:none) ok "kubectl shim reached Guard with argv/cwd preserved" ;;
   *) bad "kubectl shim output mismatch: '$OUT'"; cat /tmp/kubectl-shim.err ;;
 esac
-if cd /work && agent_shim helm upgrade --install demo ./chart --namespace staging --dry-run --diff >/tmp/helm-shim.out 2>/tmp/helm-shim.err; then
+if cd /authority && agent_shim helm upgrade --install demo ./chart --namespace staging --dry-run --diff >/tmp/helm-shim.out 2>/tmp/helm-shim.err; then
   bad "fixed identity executed Helm with mutable profile authority"
 elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp/helm-shim.err \
   && ! grep -q 'guarded-helm' /tmp/helm-shim.out; then
@@ -287,7 +288,7 @@ elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp
 else
   bad "fixed-identity Helm denial did not report the profile boundary"; cat /tmp/helm-shim.err
 fi
-if cd /work && agent_shim ansible web -m ping --check >/tmp/ansible-shim.out 2>/tmp/ansible-shim.err; then
+if cd /authority && agent_shim ansible web -m ping --check >/tmp/ansible-shim.out 2>/tmp/ansible-shim.err; then
   bad "fixed identity executed Ansible with mutable profile authority"
 elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp/ansible-shim.err \
   && ! grep -q 'guarded-ansible' /tmp/ansible-shim.out; then
@@ -295,7 +296,7 @@ elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp
 else
   bad "fixed-identity Ansible denial did not report the profile boundary"; cat /tmp/ansible-shim.err
 fi
-if cd /work && agent_shim ansible-playbook /work/site.yml --check --diff --limit web >/tmp/playbook-shim.out 2>/tmp/playbook-shim.err; then
+if cd /authority && agent_shim ansible-playbook /work/site.yml --check --diff --limit web >/tmp/playbook-shim.out 2>/tmp/playbook-shim.err; then
   bad "fixed identity executed ansible-playbook with mutable profile authority"
 elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp/playbook-shim.err \
   && ! grep -q 'guarded-ansible-playbook' /tmp/playbook-shim.out; then

@@ -68,6 +68,7 @@ verbs:
     coverage:
       - name: fixture-command
         action: preauthorized
+        cwd: /authority
 
   - name: helm-checked-upgrade
     description: Verify fixed identity rejects Helm profile authority before execution
@@ -78,6 +79,7 @@ verbs:
     coverage:
       - name: fixture-command
         action: preauthorized
+        cwd: /authority
 
   - name: ansible-ping-check
     description: Verify fixed identity rejects Ansible profile authority before execution
@@ -88,6 +90,7 @@ verbs:
     coverage:
       - name: fixture-command
         action: preauthorized
+        cwd: /authority
 
   - name: ansible-ping-all-cwd
     description: Verify caller-owned Ansible profile discovery remains unavailable
@@ -108,6 +111,7 @@ verbs:
     coverage:
       - name: fixture-command
         action: preauthorized
+        cwd: /authority
 
   - name: failing-revert
     description: Scale a fixture whose deterministic rollback fails
@@ -154,6 +158,10 @@ verbs:
     args: ["/scenario/ansible/site.yml", "--check", "--diff", "--limit", "fixture"]
     consequence: reversible
     trusted: true
+    coverage:
+      - name: fixture-project
+        action: preauthorized
+        cwd: /scenario/ansible
 
   - name: workload-maintenance
     description: Apply a recoverable fake workload maintenance operation
@@ -209,6 +217,10 @@ verbs:
     baseline: false
     consequence: reversible
     trusted: true
+    coverage:
+      - name: fixture-project
+        action: preauthorized
+        cwd: /scenario/ansible
 
   - name: access-workload-maintenance
     description: Apply the fake workload maintenance operation

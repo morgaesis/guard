@@ -1713,6 +1713,7 @@ run_phase() {
   RAW="$PHASE_OUTPUT/$SCENARIO.log"
   trap 'printf "phase=%s line=%s\n" "${3:-unknown}" "$LINENO" > "$FAILURE"' ERR
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
+  cd /
   case "$SCENARIO" in
     SU-13) phase_su13 "$3" ;;
     SU-14) phase_su14 "$3" ;;
@@ -1732,7 +1733,7 @@ run_phase() {
 }
 
 run_journey() {
-  local verb="$1" expected="$2" cwd="${3:-/scenario/fixtures}"
+  local verb="$1" expected="$2" cwd="${3:-/}"
   printf 'authority=typed-verb:%s consequence=catalog-bound cwd=%s\n' "$verb" "$cwd" >> "$RAW"
   (cd "$cwd" && guard verb run "$verb" --socket "$SOCKET") >>"$RAW" 2>&1
   grep -q "$expected" "$RAW"
@@ -1747,7 +1748,7 @@ assert_child_capability_contract() {
 }
 
 expect_profile_tool_denial() {
-  local mode="$1" verb="$2" cwd="${3:-/scenario/fixtures}" output
+  local mode="$1" verb="$2" cwd="${3:-/}" output
   output="/scenario/raw/$SCENARIO-$mode-$verb.out"
   if (cd "$cwd" && guard verb run "$verb" --socket "$SOCKET") >"$output" 2>&1; then
     printf 'typed profile tool unexpectedly executed: mode=%s verb=%s\n' "$mode" "$verb" > "$FAILURE"

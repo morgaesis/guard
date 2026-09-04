@@ -2193,7 +2193,10 @@ fn set_owner_only_permissions(file: &File) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let permissions = file.metadata()?.permissions();
+        if permissions.mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
     }
     #[cfg(windows)]
     apply_owner_only_windows_dacl_to_handle(file)?;
