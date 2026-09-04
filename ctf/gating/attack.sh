@@ -450,7 +450,7 @@ DAEMON_READY=false
 for _ in $(seq 1 50); do
   if kill -0 "$DAEMON_PID" 2>/dev/null \
     && [ -S "$SOCK" ] \
-    && timeout 2 agent guard status --socket "$SOCK" >/dev/null 2>&1; then
+    && timeout 2 runuser -u agent -- guard status --socket "$SOCK" >/dev/null 2>&1; then
     DAEMON_READY=true
     break
   fi
