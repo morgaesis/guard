@@ -422,6 +422,7 @@ daemon() {
     --socket "$SOCKET" \
     --socket-group guard-clients \
     --verbs "$PROTECTED_CATALOG" \
+    --immutable-verbs-lock "$PROTECTED_CATALOG_LOCK" \
     --state-db /scenario/data/state.db \
     --audit-log /scenario/data/audit.jsonl \
     --history-retention 3600 \
@@ -734,6 +735,7 @@ private_daemon_start() {
       --socket "$PRIVATE_SOCKET" \
       --socket-group guard-clients \
       --verbs "$PROTECTED_CATALOG" \
+      --immutable-verbs-lock "$PROTECTED_CATALOG_LOCK" \
       --state-db "$PRIVATE_ROOT/data/state.db" \
       --audit-log "$PRIVATE_ROOT/data/audit.jsonl" \
       --history-retention 3600 \
@@ -1637,6 +1639,7 @@ phase_su22() {
           --gate consequence \
           --socket "$PRIVATE_ROOT/not-a-directory/guard.sock" \
           --verbs "$PROTECTED_CATALOG" \
+          --immutable-verbs-lock "$PROTECTED_CATALOG_LOCK" \
           --state-db "$PRIVATE_ROOT/data/state.db" \
           --audit-log "$PRIVATE_ROOT/data/audit.jsonl" \
           --exec-user guardexec \
