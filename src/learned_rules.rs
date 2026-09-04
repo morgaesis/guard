@@ -1265,6 +1265,14 @@ fn validate_windows_authority_handle_with_current_user(
                 anyhow::bail!("failed to enumerate the Windows authority DACL");
             }
             let header = ace.cast::<ACE_HEADER>();
+            // An inherit-only ACE does not grant rights on this object. Each
+            // descendant authority object is opened and validated separately,
+            // so inherited grants become enforceable when they reach the
+            // descendant rather than making a trusted ancestor unusable.
+            const INHERIT_ONLY_ACE: u8 = 0x08;
+            if unsafe { (*header).AceFlags } & INHERIT_ONLY_ACE != 0 {
+                continue;
+            }
             match unsafe { (*header).AceType } {
                 ACCESS_DENIED_ACE_TYPE => continue,
                 ACCESS_ALLOWED_ACE_TYPE => {}
@@ -3610,8 +3618,14 @@ fn windows_dacl_digest(path: &Path) -> Result<String> {
         {
             anyhow::bail!("Windows DACL contains an out-of-bounds ACE")
         }
-        generation
-            .extend_from_slice(unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), ace_size) });
+        let mut ace_bytes =
+            unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), ace_size) }.to_vec();
+        // INHERITED_ACE records where a grant came from, not what it grants.
+        // Windows may recompute this provenance bit while applying an
+        // otherwise identical DACL during replacement recovery.
+        const INHERITED_ACE: u8 = 0x10;
+        ace_bytes[1] &= !INHERITED_ACE;
+        generation.extend_from_slice(&ace_bytes);
     }
     Ok(content_digest(&generation))
 }
@@ -6601,6 +6615,30 @@ mod tests {
         assert!(error
             .to_string()
             .contains("grants mutation rights to an untrusted principal"));
+
+        let inherit_only_parent = temp.path().join("inherit-only");
+        std::fs::create_dir(&inherit_only_parent).unwrap();
+        apply_windows_test_dacl(&inherit_only_parent, "D:P(A;;FA;;;OW)(A;OICIIO;FA;;;AU)");
+        let inherit_only_handle = open_parent_directory(&inherit_only_parent).unwrap();
+        validate_windows_authority_handle_with_current_user(&inherit_only_handle, true, true)
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dacl_generation_ignores_inheritance_provenance() {
+        let temp = authority_tempdir();
+        let direct = temp.path().join("direct.yaml");
+        let inherited = temp.path().join("inherited.yaml");
+        write_authority_file(&direct, "version: 1\n").unwrap();
+        write_authority_file(&inherited, "version: 1\n").unwrap();
+        apply_windows_test_dacl(&direct, "D:P(A;;FA;;;OW)(A;;GR;;;AU)");
+        apply_windows_test_dacl(&inherited, "D:P(A;;FA;;;OW)(A;ID;GR;;;AU)");
+
+        assert_eq!(
+            windows_dacl_digest(&direct).unwrap(),
+            windows_dacl_digest(&inherited).unwrap()
+        );
     }
 
     #[cfg(windows)]
