@@ -85,6 +85,8 @@ echo "=== Setup ==="
 mkdir -p /work /run/guard /var/lib/guard
 mkdir -p /fakebin /shim
 install -m 0600 /etc/guard/verbs.yaml /run/guard/verbs.yaml
+install -o guarddaemon -g guarddaemon -m 0600 \
+  /dev/null /run/guard/.verbs.yaml.learning-lock
 generate_fixture_value > "$ADMIN_TOKEN_FILE"
 printf '\n' >> "$ADMIN_TOKEN_FILE"
 chmod 0400 "$ADMIN_TOKEN_FILE"

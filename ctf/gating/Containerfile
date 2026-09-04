@@ -39,6 +39,11 @@ RUN groupadd -g 2000 guard-clients \
     && usermod -aG guard-clients agent \
     && usermod -aG guard-clients other-agent
 
+# Catalog validation binds fixed file arguments to trusted ancestors. The
+# attack fixture replaces `/work` with its own bounded filesystem before
+# daemon startup; synthetic scenarios retain these immutable image anchors.
+RUN install -d -o root -g root -m 0755 /work /work/ansible-project
+
 # The daemon's immutable authority mountpoint is anchored directly under the
 # read-only container rootfs, outside every daemon-writable ancestor.
 RUN install -d -o root -g root -m 0555 /authority

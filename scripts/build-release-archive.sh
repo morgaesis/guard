@@ -347,6 +347,18 @@ if [ -e "$root" ] || [ -e "$archive" ]; then
 fi
 
 cd "$source_root"
+# A linked worktree's `.git` indirection is outside Cross's `/project` mount.
+# Resolve release identity on the host and pass it through Cross using the
+# automatically forwarded `CARGO_` namespace so both builds embed one value.
+export CARGO_GUARD_GIT_COMMIT
+CARGO_GUARD_GIT_COMMIT=$(git rev-parse --short HEAD)
+export CARGO_GUARD_GIT_BRANCH=detached
+release_tag=$(git tag --points-at HEAD | LC_ALL=C sort | sed -n '1p')
+if [ -n "$release_tag" ]; then
+  export CARGO_GUARD_GIT_TAG="$release_tag"
+else
+  unset CARGO_GUARD_GIT_TAG
+fi
 release_build=()
 if [ "${USE_CROSS:-false}" = true ]; then
   [ "$BUILD_TARGET" = aarch64-unknown-linux-gnu ] || {
