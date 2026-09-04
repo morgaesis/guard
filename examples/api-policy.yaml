@@ -1,7 +1,7 @@
 # Kubernetes API policy: gated cluster access for in-process API clients.
 #
-# When the daemon fronts the apiserver with
-# `guard server start --exec-user guard-exec --kube-proxy`,
+# Load this file as the packaged API proxy's `--api-policy`. When the daemon
+# fronts the apiserver,
 # every API request from an external operator/bootstrap client (helm, kubectl, terraform's k8s
 # provider, k9s, client libraries) is parsed into a typed operation and matched
 # against this policy. Unlike the verb catalog, which gates whole commands, this

@@ -35,7 +35,7 @@ pub(crate) struct RunClientOptions {
     pub(crate) explain: bool,
 }
 
-/// CLI spelling of the ssh host-key mode. Kebab-case value names
+/// Legacy CLI spelling of the SSH host-key mode. Kebab-case value names
 /// (`only-existing`, `accept-new`, `accept-all`) are derived by clap.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub(crate) enum SshHostKeyCliMode {
@@ -714,7 +714,7 @@ fn gate_client(
 pub(crate) async fn handle_api(command: ApiCommands) -> Result<()> {
     match command {
         ApiCommands::Kubeconfig { .. } => anyhow::bail!(
-            "`guard api kubeconfig` has been removed because access-managed sessions are command-only; use approved kubectl or helm command verbs"
+            "`guard api kubeconfig` has been removed because access-managed sessions are command-only; use an approved typed kubectl operation"
         ),
     }
 }
@@ -2173,10 +2173,25 @@ fn verb_menu_human_lines(item: &server::VerbMenuItem) -> Vec<String> {
         if item.has_revert { " revertable" } else { "" },
         item.description
     )];
+    if !item.arg_template.is_empty() {
+        lines.push(format!(
+            "    arguments: {}",
+            item.arg_template
+                .iter()
+                .map(|argument| placeholder_display(argument))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
     lines.extend(
         item.params
             .iter()
-            .map(|parameter| format!("    --param {parameter}=<value>")),
+            .map(|parameter| match item.param_patterns.get(parameter) {
+                Some(pattern) => {
+                    format!("    --param {parameter}=<value> matches {pattern}")
+                }
+                None => format!("    --param {parameter}=<value>"),
+            }),
     );
     lines
 }

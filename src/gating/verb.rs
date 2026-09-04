@@ -17,9 +17,9 @@ use super::approval::{DelayedAuthorityPlan, DelayedAuthorityProfile, DelayedAuth
 use super::coverage::reversibility_rank;
 use super::{semantic_executable_key as executable_match_key, Reversibility};
 use crate::learned_rules::{
-    load_immutable_learning_file_snapshot, load_learning_file_snapshot,
-    rewrite_learning_file_bounded, write_learning_file_atomically_for_locked_snapshot,
-    AsyncDurableStore, LearningFileSnapshot,
+    load_immutable_learning_file_snapshot, load_immutable_learning_file_snapshot_with_lock,
+    load_learning_file_snapshot, rewrite_learning_file_bounded,
+    write_learning_file_atomically_for_locked_snapshot, AsyncDurableStore, LearningFileSnapshot,
 };
 use crate::redact::{
     command_contains_sensitive_literals, named_value_contains_sensitive_literals,
@@ -840,6 +840,18 @@ impl VerbCatalog {
     /// does not become writable by the daemon.
     pub fn load_immutable(path: &Path) -> Result<Self> {
         let snapshot = load_immutable_learning_file_snapshot(path)?;
+        Self::from_immutable_snapshot(path, snapshot)
+    }
+
+    /// Load immutable process input while coordinating startup through an
+    /// independently located writable lock. The catalog retains no live path,
+    /// so it cannot hot-reload or accept promotion writes after startup.
+    pub fn load_immutable_with_lock(path: &Path, lock_path: &Path) -> Result<Self> {
+        let snapshot = load_immutable_learning_file_snapshot_with_lock(path, lock_path)?;
+        Self::from_immutable_snapshot(path, snapshot)
+    }
+
+    fn from_immutable_snapshot(path: &Path, snapshot: LearningFileSnapshot) -> Result<Self> {
         let bytes = snapshot.content().context("verb catalog does not exist")?;
         let text = std::str::from_utf8(bytes)
             .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
@@ -1958,8 +1970,9 @@ pub(crate) fn is_kebab_name(name: &str) -> bool {
 /// `server::binary_allowed`: a path-qualified binary (either side) requires an
 /// exact match, so a binary reached via a different, path-qualified location
 /// (e.g. `/tmp/other/kubectl`) can never reverse-match a verb authored for the
-/// bare name, or vice versa; a bare name matches case-insensitively by
-/// basename with a stripped `.exe` suffix.
+/// bare name, or vice versa. Bare names follow the platform executable-key
+/// convention: case-sensitive on Unix, and case-insensitive with a stripped
+/// `.exe` suffix on Windows.
 fn binary_names_match(observed: &str, verb_binary: &str) -> bool {
     if observed.contains('/')
         || observed.contains('\\')
@@ -6891,11 +6904,19 @@ fn validate_verb(verb: &Verb) -> Result<()> {
     if verb.binary.trim().is_empty() {
         bail!("verb '{}' has an empty binary", verb.name);
     }
+    let executable = executable_match_key(&verb.binary);
+    if matches!(executable.as_str(), "bash" | "dash" | "ksh" | "sh" | "zsh") {
+        bail!(
+            "verb '{}' forward command binary '{}' has no closed executable authority profile; shell script verbs are unsupported because their executable inputs cannot be bound as closed process authority; invoke a supported profiled executable directly",
+            verb.name,
+            verb.binary,
+        );
+    }
     if authorized_executable_profile(&verb.binary).is_none() {
         bail!(
             "verb '{}' forward command binary '{}' has no closed executable authority profile",
             verb.name,
-            verb.binary
+            verb.binary,
         );
     }
     if verb.credential_plan.as_deref().is_some_and(str::is_empty) {
@@ -9762,6 +9783,23 @@ verbs:
             assert!(authorized_executable_profile(binary).is_none());
             assert!(validate_durable_process_authority(binary, &[]).is_err());
         }
+    }
+
+    #[test]
+    fn shell_script_verbs_fail_at_catalog_load_with_migration_guidance() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: run-maintenance
+    binary: bash
+    args: [/var/lib/guard/maintenance.sh]
+    consequence: reversible
+"#,
+        )
+        .expect_err("shell scripts cannot provide closed executable authority");
+        let message = format!("{error:#}");
+        assert!(message.contains("shell script verbs are unsupported"));
+        assert!(message.contains("invoke a supported profiled executable directly"));
     }
 
     #[test]

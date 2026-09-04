@@ -5,12 +5,19 @@ parameters, describes credential and execution plans, declares consequence, and
 optionally supplies rollback. The daemon loads an operator catalog through
 `--verbs` or `GUARD_VERBS`. Foreground servers hot-reload catalog changes. The
 packaged Windows service loads its administrator-owned catalog once at startup.
+Other service managers can select the same immutable startup mode with
+`--immutable-verbs-lock`, using a writable lock path separate from the catalog.
 
 ```bash
 guard verb list
 guard verb show scale-deployment
 guard verb run scale-deployment --param name=web --param replicas=2 --param namespace=production
 ```
+
+The requester view of `guard verb show` prints the ordered argument template
+and each parameter's anchored pattern. This makes absolute-path and other value
+conventions visible before invocation. Executable, credential, provenance, and
+trust metadata remain available only in the operator view.
 
 [`examples/verbs.yaml`](../examples/verbs.yaml) contains command-template and
 coverage-cell examples. A catalog may declare `platform: unix` or
@@ -75,6 +82,11 @@ A template renders each `{param}` as one argv element without a shell or word
 splitting. Parameter patterns are fully anchored. A value cannot begin with `-`
 unless the parameter explicitly permits it, which prevents parameter and flag
 injection.
+
+Shell interpreters are not valid verb binaries because a script and everything
+it dispatches cannot be bound as closed process authority. Catalog linting and
+server startup reject these entries with guidance to invoke a supported
+profiled executable directly, before a script can fail at execution time.
 
 ```yaml
 verbs:

@@ -235,6 +235,39 @@ fn contain_request(binary: &str, args: &[&str], revert: RevertSpec) -> ExecuteRe
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn containment_dry_run_rejects_an_unprofiled_forward_command() {
+    let (mut cfg, _operator, agent) = gating_config(7002, 1000);
+    cfg.config.dry_run = true;
+    let request = contain_request("bash", &["script.sh"], RevertSpec::new("true", Vec::new()));
+    let mut sink = tokio::io::sink();
+
+    let response = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        "recoverable change".to_string(),
+        None,
+    )
+    .await
+    .into_response();
+
+    assert!(!response.allowed);
+    assert!(
+        response
+            .reason
+            .contains("no closed executable authority profile"),
+        "unexpected containment dry-run response: {response:?}"
+    );
+}
+
+#[cfg(unix)]
 fn held_request(
     binary: &str,
     args: Vec<String>,
@@ -3611,7 +3644,7 @@ async fn hold_approval_arms_then_requester_resumes_once() {
     let guidance = held_response.verb_guidance.as_deref().unwrap();
     assert_eq!(
         guidance,
-        format!("ask your admin to approve request {handle} (see guard access show {handle})")
+        format!("operator approval required for request {handle} (see guard access show {handle})")
     );
 
     // Non-operator approve is refused; the hold stays pending.
@@ -4766,7 +4799,7 @@ async fn exhausted_multi_verb_hold_requests_every_required_scope() {
         .expect("requester-safe approval guidance");
     for handle in &handles {
         assert!(guidance.contains(&format!(
-            "ask your admin to approve request {handle} (see guard access show {handle})"
+            "operator approval required for request {handle} (see guard access show {handle})"
         )));
     }
     assert!(!guidance.contains("guard access approve"));
@@ -6710,7 +6743,7 @@ async fn access_audience_controls_hold_visibility_and_next_action() {
     assert_eq!(
         owner_item.approval_options,
         vec![format!(
-            "ask your admin to approve request {handle} (see guard access show {handle})"
+            "operator approval required for request {handle} (see guard access show {handle})"
         )]
     );
 
@@ -6768,7 +6801,7 @@ fn execution_approval_guidance_respects_authenticated_audience() {
     );
     assert_eq!(
         super::super::admin::approval_guidance(&cfg, &requester, handle, false),
-        format!("ask your admin to approve request {handle} (see guard access show {handle})")
+        format!("operator approval required for request {handle} (see guard access show {handle})")
     );
 }
 
@@ -7561,7 +7594,7 @@ async fn approval_hold_rejects_opaque_secondary_execution() {
     );
 
     let request = ExecuteRequest {
-        binary: "sh".to_string(),
+        binary: "bash".to_string(),
         args: vec!["-c".to_string(), "approval-helper".to_string()],
         auth_token: None,
         env: HashMap::new(),

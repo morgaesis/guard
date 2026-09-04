@@ -118,6 +118,9 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for Unix and Windows principal separation.
 Loopback TCP uses bearer identity rather than a kernel-authenticated local
 principal. It requires an execution token and a separate admin token for admin
 RPCs. Consequence gating and per-principal secret injection are unavailable.
+On Unix, execution through `--exec-user` requires root or `CAP_SETUID` and
+`CAP_SETGID`; the packaged systemd service configures this identity boundary.
+The command below assumes those privileges are present.
 
 ```bash
 export GUARD_AUTH_TOKEN="..."

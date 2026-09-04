@@ -1434,7 +1434,7 @@ pub(super) async fn validate_durable_access_provenance(
 fn approval_options(handle: &str, audience: &AccessAudience, one_shot: bool) -> Vec<String> {
     if !audience.is_operator {
         return vec![format!(
-            "ask your admin to approve request {handle} (see guard access show {handle})"
+            "operator approval required for request {handle} (see guard access show {handle})"
         )];
     }
 
@@ -1635,15 +1635,38 @@ async fn consequence_for_reference(server: &ServerContext, reference: &str) -> S
     }
 }
 
-/// The next command this audience should run against a hold. The operator
-/// decides and then reads the transcript; the requester waits and then resumes.
-fn hold_next_action(handle: &str, state: &str, is_operator: bool) -> String {
-    match (state, is_operator) {
-        ("pending", true) => format!("guard access approve {handle} --once"),
-        ("pending", false) => format!("guard approval show {handle} --wait"),
-        ("armed", true) => format!("guard approval show {handle} --wait"),
-        ("armed", false) => format!("guard approval resume {handle}"),
+/// The next command this audience should run against a hold. A caller who is
+/// both requester and operator resumes its own armed hold rather than being
+/// treated only as the approving operator.
+fn hold_next_action(handle: &str, state: &str, is_operator: bool, is_requester: bool) -> String {
+    match (state, is_operator, is_requester) {
+        ("pending", true, _) => format!("guard access approve {handle} --once"),
+        ("pending", false, _) => format!("guard approval show {handle} --wait"),
+        ("armed", _, true) => format!("guard approval resume {handle}"),
+        ("armed", true, false) => format!("guard approval show {handle} --wait"),
+        ("armed", false, false) => format!("guard approval show {handle}"),
         _ => format!("guard approval show {handle}"),
+    }
+}
+
+#[cfg(test)]
+mod hold_next_action_tests {
+    use super::hold_next_action;
+
+    #[test]
+    fn requester_operator_resumes_its_own_armed_hold() {
+        assert_eq!(
+            hold_next_action("ap-1", "armed", true, true),
+            "guard approval resume ap-1"
+        );
+        assert_eq!(
+            hold_next_action("ap-1", "armed", true, false),
+            "guard approval show ap-1 --wait"
+        );
+        assert_eq!(
+            hold_next_action("ap-1", "pending", true, true),
+            "guard access approve ap-1 --once"
+        );
     }
 }
 
@@ -1734,7 +1757,12 @@ async fn access_item_for_approval(
         default_use_policy: awaiting_decision.then(|| "bounded".to_string()),
         default_uses: awaiting_decision.then_some(1),
         state: projected_state.to_string(),
-        next_action: hold_next_action(&approval.handle, projected_state, audience.is_operator),
+        next_action: hold_next_action(
+            &approval.handle,
+            projected_state,
+            audience.is_operator,
+            scope_eq(&approval.snapshot.principal, &audience.principal),
+        ),
         approval_options: if awaiting_decision {
             approval_options(&approval.handle, audience, true)
         } else {
@@ -4030,7 +4058,17 @@ fn verb_menu_item(verb: &Verb) -> VerbMenuItem {
     VerbMenuItem {
         name: verb.name.clone(),
         description: verb.description.clone(),
+        arg_template: verb
+            .args
+            .iter()
+            .map(|argument| redact_output_text(argument))
+            .collect(),
         params: verb.params.keys().cloned().collect(),
+        param_patterns: verb
+            .params
+            .iter()
+            .map(|(name, spec)| (name.clone(), redact_output_text(&spec.pattern)))
+            .collect(),
         consequence: verb.consequence.as_str().to_string(),
         hold: verb.hold,
         has_revert: verb.revert.is_some(),

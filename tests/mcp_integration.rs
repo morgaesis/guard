@@ -31,7 +31,7 @@ fn generated_test_credential(label: &str) -> String {
 fn trusted_tempdir() -> TempDir {
     let directory = tempfile::Builder::new()
         .prefix("guard-")
-        .tempdir_in(std::env::current_dir().expect("integration working directory"))
+        .tempdir()
         .expect("trusted integration tempdir");
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
         .expect("restrict integration tempdir");
@@ -555,7 +555,10 @@ async fn removed_authority_commands_cannot_mint_or_modify_sessions() {
     assert_eq!(output.status.code(), Some(125));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("has been removed"), "{stderr}");
-    assert!(stderr.contains("kubectl or helm command verbs"), "{stderr}");
+    assert!(
+        stderr.contains("approved typed kubectl operation"),
+        "{stderr}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -689,7 +692,7 @@ async fn typed_verb_denial_prints_requester_safe_access_guidance() {
         .unwrap_or_else(|| panic!("durable request reference missing from stderr: {stderr}"));
     assert!(reference.starts_with("gr-"));
     assert!(stderr.contains(&format!(
-        "ask your admin to approve request {reference} (see guard access show {reference})"
+        "operator approval required for request {reference} (see guard access show {reference})"
     )));
     assert!(!stderr.contains("guard access approve"));
     assert!(stderr.contains(&format!("guard access show {reference}")));
@@ -930,7 +933,7 @@ async fn mcp_end_to_end_initialize_list_call() {
     assert_eq!(
         access_item["approval_options"],
         json!([format!(
-            "ask your admin to approve request {reference} (see guard access show {reference})"
+            "operator approval required for request {reference} (see guard access show {reference})"
         )])
     );
 

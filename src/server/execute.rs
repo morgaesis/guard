@@ -1237,6 +1237,17 @@ fn command_delayed_authority_plan(
 /// shell, language, or command-dispatch syntax. These carriers are rejected at
 /// process admission, with earlier checks on durable hold and containment paths.
 pub(super) fn missing_authorized_execution_profile_reason(binary: &str) -> Option<String> {
+    #[cfg(test)]
+    if matches!(
+        binary,
+        "sh" | "guard-nonexistent-binary-xyz" | "guard-nonexistent-binary-delete-failure"
+    ) {
+        // Process-lifecycle tests use these commands to create controlled
+        // child groups, synchronization points, and spawn failures. Production
+        // builds do not have this exception, and catalog validation rejects
+        // shell interpreters.
+        return None;
+    }
     guard::gating::verb::authorized_executable_profile(binary)
         .is_none()
         .then(|| {
@@ -1764,25 +1775,23 @@ fn default_tool_profile_authority_paths(
             }
         }
         "kubectl" => {
-            if !child_environment_contains(effective_child_env, "KUBECONFIG")
-                && !args.iter().any(|argument| {
-                    argument == "--kubeconfig" || argument.starts_with("--kubeconfig=")
-                })
-            {
-                if let Some(home) = &home {
-                    include(home.join(".kube/config"));
-                }
+            let discovers_default_kubeconfig =
+                !child_environment_contains(effective_child_env, "KUBECONFIG")
+                    && !args.iter().any(|argument| {
+                        argument == "--kubeconfig" || argument.starts_with("--kubeconfig=")
+                    });
+            if let Some(home) = home.as_ref().filter(|_| discovers_default_kubeconfig) {
+                include(home.join(".kube/config"));
             }
         }
         "helm" => {
-            if !child_environment_contains(effective_child_env, "KUBECONFIG")
-                && !args.iter().any(|argument| {
-                    argument == "--kubeconfig" || argument.starts_with("--kubeconfig=")
-                })
-            {
-                if let Some(home) = &home {
-                    include(home.join(".kube/config"));
-                }
+            let discovers_default_kubeconfig =
+                !child_environment_contains(effective_child_env, "KUBECONFIG")
+                    && !args.iter().any(|argument| {
+                        argument == "--kubeconfig" || argument.starts_with("--kubeconfig=")
+                    });
+            if let Some(home) = home.as_ref().filter(|_| discovers_default_kubeconfig) {
+                include(home.join(".kube/config"));
             }
             if !child_environment_contains(effective_child_env, "HELM_CONFIG_HOME") {
                 if let Some(config) = &xdg_config {
@@ -4703,6 +4712,9 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
 ) -> ExecuteResult {
     let server = context.server;
     let caller = context.caller;
+    if let Some(reason) = missing_authorized_execution_profile_reason(&request.binary) {
+        return ExecuteResult::denied(reason);
+    }
     if server.config.dry_run {
         tracing::info!(
             "Dry-run: not executing {} ({})",

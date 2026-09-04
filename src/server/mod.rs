@@ -18,10 +18,7 @@ use guard::evaluate::Evaluator;
 use guard::gating::approval::ApprovalRegistry;
 use guard::gating::provisional::ProvisionalRegistry;
 use guard::gating::read_grant::GrantReadRegistry;
-use guard::gating::ssh_readonly::{
-    command_tokens, is_fixed_readonly_diagnostic, ssh_argument_boundaries,
-    ssh_options_all_readonly_safe,
-};
+use guard::gating::ssh_readonly::{command_tokens, ssh_argument_boundaries};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use guard::learned_rules::{
@@ -1136,38 +1133,19 @@ fn dangerous_env_name(key: &str) -> bool {
         || upper.starts_with("GIT_CONFIG_VALUE_")
 }
 
-/// Deterministic pre-LLM ALLOW for a small, fixed set of trivially safe
-/// read-only commands: local identity/status (`id`, `whoami`, `hostname`,
-/// `uptime`) and, over `ssh`, a fixed read-only diagnostic as the remote
-/// command. Returns the allow reason, or `None` to fall through to the LLM.
+/// Deterministic pre-LLM ALLOW for a small, fixed set of trivially safe local
+/// identity and status commands (`id`, `whoami`, `hostname`, `uptime`). Returns
+/// the allow reason, or `None` to fall through to the LLM.
 ///
-/// This is a latency/cost optimization only. It is deliberately narrow:
-/// paranoid mode disables it; any shell metacharacter, injected env/secret
-/// (checked by the caller), or risky SSH transport option
-/// (`-L`/`-D`/`-J`/`-W`/`ProxyCommand`/`LocalCommand`/forwarding) forfeits
-/// the fast path back to the model. Like a trusted verb, it is a
-/// deterministic allow and intentionally precedes the evaluator.
+/// This is a latency/cost optimization only. Paranoid mode disables it, and
+/// injected environment or secret bindings are checked by the caller. Like a
+/// trusted verb, it intentionally precedes the evaluator.
 fn deterministic_safe_allow_reason(
     server: &ServerContext,
     binary: &str,
-    args: &[String],
+    _args: &[String],
 ) -> Option<String> {
     if matches!(server.state.evaluator.mode(), Some(PolicyMode::Paranoid)) {
-        return None;
-    }
-
-    if binary == "ssh" {
-        let destination = crate::ssh::extract_destination(args)?;
-        let remote_command = crate::ssh::extract_command(args);
-        if remote_command.trim().is_empty() || !ssh_options_all_readonly_safe(args) {
-            return None;
-        }
-        if is_fixed_readonly_diagnostic(&remote_command) {
-            return Some(format!(
-                "deterministic safe allow: fixed read-only remote command on {}",
-                destination
-            ));
-        }
         return None;
     }
 

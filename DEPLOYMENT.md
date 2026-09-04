@@ -107,47 +107,16 @@ than the intended agent account. Set `GUARD_ALLOWED_UIDS=1000,1001` in
 `/etc/default/guard` when using the packaged service. The unit keeps `--users`
 separate from this systemd expansion. Its default value is UID 0, so ordinary
 agents fail closed until the list is configured. `NoNewPrivileges=true`
-prevents approved children from gaining privilege through setuid helpers; the
-wide-access model below relaxes it deliberately.
+prevents approved children from gaining privilege through setuid helpers.
 
-## Wide host access
+## Privileged host operations
 
-A deployment whose agents debug and administer the local host through Guard
-gives the broker deliberately broad reach: the guard-exec account carries
-passwordless sudo for fixed-identity local commands, while the daemon holds
-secret-backend and API authority and exposes the socket to the agent group. Passwordless sudo
-requires a host-local sudoers entry for the guard-exec account and, because the
-packaged unit mounts the host filesystem read-only and sets
-`NoNewPrivileges=true`, a service drop-in that removes those restrictions:
-
-```ini
-[Service]
-NoNewPrivileges=false
-ProtectSystem=false
-ProtectHome=false
-```
-
-Run `systemctl daemon-reload` and restart `guard.service` after installing the
-drop-in. These settings let setuid `sudo` elevate and let approved children
-write normal host and home paths. This is the intended shape of a sudo-like
-broker, not a hardening gap. The enforcement surface is the evaluator envelope,
-operator policy and catalogs, and the audit stream - not a minimized daemon.
-Guard alone holding the credentials is what keeps a direct tool invocation
-outside Guard inert.
-
-Wide access raises the cost of instruction defects, so pair it with:
-
-- a narrow socket group and a `--users` restriction;
-- shipped audit and periodic review of allowed mutations;
-- prompt regression coverage for the deployed mode prompt and typed verbs for
-  built-in executable profiles;
-  a new house executable requires a closed profile in Guard before policy or a
-  catalog entry can authorize it;
-- saved grants for recurring apply-class work, so denials stay rare and each
-  one is meaningful.
-
-Consequence gating adds holds for the irreversible tail once enabled; keep
-holds exceptional so each one gets real operator attention.
+The fixed execution account does not receive `sudo` authority. `sudo` has no
+closed executable profile, so policy, a catalog entry, or operator approval
+cannot authorize it. Keep `NoNewPrivileges=true`, `ProtectSystem=strict`, and
+`ProtectHome=true` enabled. Host operations use a built-in profiled executable
+whose complete process authority Guard can bind, or a brokered API with an
+explicit protocol policy.
 
 Administrative RPCs authenticate the admin bearer token, never a uid. The
 daemon's own uid grants no operator authority, independently of the dedicated
@@ -517,7 +486,7 @@ disables kuberc and command shadowing. Fixed identity rejects Ansible and Helm
 because their mutable profile state cannot safely cross identities. Caller
 identity rejects Ansible, Helm, and kubectl because it has no immutable typed
 profile snapshot. Caller-specific scalar secrets remain available to admitted
-non-profile commands under `--exec-as-caller`; the agent names an entitlement,
+profiled commands under `--exec-as-caller`; the agent names an entitlement,
 not the secret value.
 
 Shims are convenience wrappers around `guard run`; they are not security
@@ -551,6 +520,13 @@ Load internal reusable grant state with `--grants
 /etc/guard/saved-grants.yaml` and the operator verb catalog with `--verbs
 /etc/guard/verbs.yaml`. Both catalogs are operator-owned. An explicitly
 configured missing, malformed, or duplicate catalog fails startup.
+
+Operators of packaged Linux services can set
+`GUARD_VERBS=/etc/guard/verbs.yaml` together with
+`GUARD_IMMUTABLE_VERBS_LOCK=/run/guard/verbs.lock` in `/etc/default/guard`.
+This mode loads the operator-owned catalog once, verifies the runtime lock, and
+disables automatic verb promotion. Keep the catalog under `/etc/guard` and the
+lock under the service-owned `/run/guard` runtime directory.
 
 Request and manage access per worker or incident:
 

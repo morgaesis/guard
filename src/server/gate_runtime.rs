@@ -2177,6 +2177,9 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     }
 
     if server.config.dry_run {
+        if let Some(why) = missing_authorized_execution_profile_reason(&request.binary) {
+            return ExecuteResult::exec_failed(reason, why);
+        }
         return ExecuteResult::dry_run_gated(
             format!(
                 "{} [GATE] would execute inside a containment envelope (auto-revert: {})",

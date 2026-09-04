@@ -28,6 +28,7 @@ jobs:
     name: Create GitHub Release
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write  # Publishes release assets and release notes.
       id-token: write  # Requests the OIDC token that signs the provenance.

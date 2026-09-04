@@ -298,8 +298,8 @@ release.
   infer hidden intent or replace per-request evaluation.
 - API protocol integrations share the typed resolver and consequence gate while
   retaining endpoint-specific credentials and rollback identity.
-- A raw SSH stream adapter is a separate protocol-security boundary. Brokered
-  `ssh` command execution does not imply transport-level mediation.
+- SSH command execution is unsupported because it has no executable authority
+  profile. A raw SSH stream adapter is a separate protocol boundary.
 - Human output remains compatible with normal tools. Structured output carries
   decision, coverage, and escalation context for agents.
 - The guard binary name is `guard`. Environment variables use the `GUARD_*` prefix. `SSH_GUARD_*` names are not recognized.

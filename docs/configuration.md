@@ -35,56 +35,48 @@ not in command-line arguments.
 | `GUARD_NOTIFY_CMD` | unset | Operator command receiving one JSON gate-lifecycle event on stdin. |
 | `GUARD_NOTIFY_TIMEOUT_SECS` | `10` | Notify command timeout in seconds, from 1 to 60. |
 | `GUARD_VERBS` | state directory when promotion needs it | Typed verb catalog. The packaged Windows service requires an explicit administrator-owned catalog, loads it once, and disables promotion. |
+| `GUARD_IMMUTABLE_VERBS_LOCK` | unset | Lock path for an immutable startup snapshot of `GUARD_VERBS`. When set with a catalog, Guard loads the catalog once, verifies the lock, and disables promotion. |
 | `GUARD_GRANTS` | unset | Reusable saved-grant catalog. |
 
 `--system-prompt <path>` replaces the compiled mode prompt.
 `--system-prompt-append <path>` and `GUARD_PROMPT_APPEND` add local context
 without replacing the base prompt.
 
-The append file is the operator's channel for tool knowledge the evaluator
-lacks. The safe-mode prompt judges unfamiliar tools unevaluable and denies
-their mutations (the readonly prompt instead leans toward allowing ambiguous
-read-only work), so a host that runs in-house or niche tooling under safe mode
-describes each such tool there: what its mutation surface is, which invocations
-are inspection, and which argument shapes are out of bounds. Typed verbs are
-the deterministic alternative for tools whose semantics should not depend on
-evaluator judgment at all.
-
-For example, an operator-provided `site-admin` binary with
-`inspect --service NAME` and `apply --service NAME` subcommands can use this
-prompt supplement:
+The append file is the operator's channel for deployment-specific semantics of
+an executable that already has a built-in authority profile. It cannot add a
+new executable to the authority registry. For example, a host can describe its
+local `systemctl` unit boundaries:
 
 ```text
-Local tool: site-admin
-- `site-admin inspect --service NAME` reads service state and does not mutate it.
-- `site-admin apply --service NAME` reconciles the named service and may change
-  configuration, processes, and remote state. Treat it as an opaque mutation.
-- Reject unknown subcommands, payload arguments, shell fragments, stdin-driven
-  input, and service names that are not visible as one argv element.
+Local systemd policy:
+- `systemctl status api.service` and `systemctl status worker.service` inspect
+  deployment services without changing them.
+- Treat other local units as outside this deployment's intended scope.
 ```
 
-When only a fixed inspection set is required, a typed verb removes evaluator
-ambiguity:
+Use a typed verb when the allowed operation should be deterministic:
 
 ```yaml
 version: 1
 verbs:
-  - name: site-admin-inspect
+  - name: service-status
     description: Inspect one configured service
-    binary: site-admin
-    args: [inspect, --service, "{service}"]
+    binary: systemctl
+    args: [status, "{service}.service"]
     params:
       service:
         enum: [api, worker]
     consequence: reversible
 ```
 
-The prompt supplement explains novel invocations. The typed verb is the
-enforcement surface for repeated commands whose executable shapes are finite.
+The prompt supplement explains local meaning within an existing profile. The
+typed verb is the enforcement surface for repeated command shapes. Executables
+without a built-in authority profile fail closed at catalog load and process
+admission.
 An optional `exec_timeout_secs` field applies a wall-clock limit to one verb and
 overrides `GUARD_EXEC_TIMEOUT_SECS`; setting the field to `0` makes that verb
 unlimited.
-A copyable supplement in this style for an in-house `servicectl` CLI is at
+A copyable supplement in this style for local systemd units is at
 [`examples/system-prompt-append-tools.md`](../examples/system-prompt-append-tools.md).
 
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
@@ -340,13 +332,8 @@ command text, arguments, secret names, reasons, or argv, and the only labels are
 fixed constants such as `outcome="denied"`. Reading it never gates or slows a
 request: counters are lock-free atomics and gauges are read only at scrape time.
 
-## SSH host keys
+## SSH compatibility
 
-`guard run --hostkey <mode>` changes only a brokered `ssh` command:
-
-- `only-existing` preserves strict checking and is the default.
-- `accept-new` trusts a new key but rejects a changed key.
-- `accept-all` disables host authentication and always returns to the evaluator.
-
-Guard injects host-key arguments before evaluation, audit, and spawn, so all
-three surfaces see the same argv.
+`guard run --hostkey <mode>` remains accepted for legacy client compatibility,
+but SSH has no executable authority profile and is rejected before process
+start. Guard does not advertise SSH or host-key options in its MCP contract.

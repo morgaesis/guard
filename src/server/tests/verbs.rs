@@ -1616,11 +1616,15 @@ verbs:
     };
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].name, "inspect-fixture");
+    assert_eq!(items[0].arg_template, vec!["show", "{target}"]);
     assert_eq!(items[0].params, vec!["target"]);
+    assert_eq!(
+        items[0].param_patterns.get("target").map(String::as_str),
+        Some("^[a-z0-9-]+$")
+    );
     let encoded = serde_json::to_string(&response).unwrap();
     for private in [
         "printf",
-        "^[a-z0-9-]+$",
         "operator-only provenance",
         "trusted",
         "coverage",
@@ -1739,10 +1743,10 @@ verbs:
 }
 
 /// Requester verb detail uses the same baseline and usable principal-bound
-/// activated-verb visibility as the menu. It returns only the menu projection,
-/// while an operator retains the complete catalog definition. Missing and
-/// unavailable names share one response so callers cannot enumerate the
-/// catalog through `verb show`.
+/// activated-verb visibility as the menu. It returns invocation-planning data
+/// without executable or authority metadata, while an operator retains the
+/// complete catalog definition. Missing and unavailable names share one
+/// response so callers cannot enumerate the catalog through `verb show`.
 #[tokio::test]
 async fn requester_verb_show_matches_menu_visibility_without_leaking_catalog_detail() {
     let (mut cfg, _buf) = make_test_config();
@@ -1831,10 +1835,19 @@ verbs:
         };
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, name);
+        if name != "foreign-maintenance" {
+            assert_eq!(
+                items[0].arg_template.last().map(String::as_str),
+                Some("{target}")
+            );
+            assert_eq!(
+                items[0].param_patterns.get("target").map(String::as_str),
+                Some("^[a-z0-9-]+$")
+            );
+        }
         let encoded = serde_json::to_string(&items).unwrap();
         for private in [
             "printf",
-            "^[a-z0-9-]+$",
             "private catalog evidence",
             "requester-only evidence",
         ] {

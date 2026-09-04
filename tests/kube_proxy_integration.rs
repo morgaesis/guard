@@ -6167,7 +6167,9 @@ async fn proxy_rejects_helm_release_secret_instead_of_returning_false_empty_stat
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["status"], "Failure");
     assert_eq!(v["reason"], "Forbidden");
-    assert!(v["message"].as_str().unwrap().contains("typed Helm verb"));
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("local Helm execution is not supported"));
+    assert!(message.contains("non-Helm typed Kubernetes operation"));
     assert!(!v.to_string().contains("SDRzSUFB"));
 }
 

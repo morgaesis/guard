@@ -3104,7 +3104,8 @@ impl SessionStore {
                             %error,
                             "ignoring durable grant request that fails current validation; \
                              the row remains stored and is not honored until an operator retires it \
-                             with `guard access deny <handle>`"
+                             while the daemon is inactive with \
+                             `guard state-db retire-rejected-grant-request --file <state.db> <handle>`"
                         );
                     }
                     continue;

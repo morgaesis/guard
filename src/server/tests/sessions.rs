@@ -1349,7 +1349,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     assert_eq!(
         first.approval_options,
         vec![format!(
-            "ask your admin to approve request {} (see guard access show {})",
+            "operator approval required for request {} (see guard access show {})",
             first.reference, first.reference
         )]
     );
@@ -3402,7 +3402,7 @@ async fn sessionless_denied_typed_command_returns_access_request_guidance() {
         .expect("denied typed command returns requester guidance");
     assert_eq!(
         guidance,
-        format!("ask your admin to approve request {handle} (see guard access show {handle})")
+        format!("operator approval required for request {handle} (see guard access show {handle})")
     );
     assert!(!guidance.contains("guard access approve"));
 
@@ -3470,7 +3470,7 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
         .expect("novel denial explains how to request typed access");
     assert_eq!(
         guidance,
-        format!("ask your admin to approve request {handle} (see guard access show {handle})")
+        format!("operator approval required for request {handle} (see guard access show {handle})")
     );
     assert!(!guidance.contains("guard access approve"));
     let original = request.args.clone();

@@ -59,6 +59,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             gate,
             approval_ttl,
             verbs,
+            immutable_verbs_lock,
             grants,
             allow_bin,
             child_env,
@@ -152,6 +153,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             gate,
             approval_ttl,
             verbs,
+            immutable_verbs_lock,
             grants,
             allow_bin,
             child_env,
@@ -209,6 +211,31 @@ fn parses_exec_timeout_secs() {
         panic!("expected server start");
     };
     assert_eq!(exec_timeout_secs, Some(42));
+}
+
+#[test]
+fn parses_immutable_verbs_lock() {
+    let ServerCommands::Start {
+        verbs,
+        immutable_verbs_lock,
+        ..
+    } = parse_start(&[
+        "guard",
+        "server",
+        "start",
+        "--verbs",
+        "/etc/guard/verbs.yaml",
+        "--immutable-verbs-lock",
+        "/run/guard/verbs.lock",
+    ])
+    else {
+        panic!("expected server start");
+    };
+    assert_eq!(verbs, Some(PathBuf::from("/etc/guard/verbs.yaml")));
+    assert_eq!(
+        immutable_verbs_lock,
+        Some(PathBuf::from("/run/guard/verbs.lock"))
+    );
 }
 
 #[test]

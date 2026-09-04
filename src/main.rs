@@ -166,6 +166,7 @@ mod server;
 mod session;
 mod session_store;
 mod shim;
+#[cfg(test)]
 mod ssh;
 mod tool_config;
 #[cfg(windows)]
@@ -287,7 +288,7 @@ enum MainArgs {
         #[arg(long = "confirm-check", value_name = "COMMAND", requires = "revert")]
         confirm_check: Option<String>,
         /// Authority and transport required to run the confirmation check and
-        /// rollback, such as "brokered SSH to firewall-a".
+        /// rollback, such as "remote firewall control session".
         #[arg(
             long = "revert-control-path",
             value_name = "DESCRIPTION",
@@ -312,12 +313,14 @@ enum MainArgs {
         /// auto-learned shape over-blocked something that should be allowed.
         #[arg(long = "reevaluate", action = ArgAction::SetTrue)]
         reevaluate: bool,
-        /// SSH host-key policy for a guarded `ssh` command. `only-existing`
-        /// (default) keeps ssh's strict checking; `accept-new` trusts a new
-        /// host on first contact but still rejects a changed key; `accept-all`
-        /// gives up host verification and never rides the deterministic fast
-        /// path. Only affects `ssh`.
-        #[arg(long = "hostkey", value_enum, default_value = "only-existing")]
+        /// Legacy SSH host-key option retained for command-line compatibility.
+        /// SSH has no executable authority profile and is rejected.
+        #[arg(
+            long = "hostkey",
+            value_enum,
+            default_value = "only-existing",
+            hide = true
+        )]
         hostkey: SshHostKeyCliMode,
         /// Binary to execute
         binary: String,
@@ -338,7 +341,7 @@ enum MainArgs {
         /// Emit machine-readable output when listing shims.
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
-        /// Comma-separated list of tools to shim (e.g. ssh,kubectl,helm);
+        /// Comma-separated list of tools to shim (e.g. kubectl,systemctl);
         /// required to install, omit to list installed shims
         #[arg(value_delimiter = ',')]
         tools: Option<Vec<String>>,
@@ -1196,6 +1199,12 @@ enum ServerCommands {
         #[arg(long, value_name = "PATH")]
         verbs: Option<PathBuf>,
 
+        /// Load `--verbs` once as immutable process input while coordinating the
+        /// startup read through this writable lock path. This disables catalog
+        /// hot reload and auto-promotion. Env: GUARD_IMMUTABLE_VERBS_LOCK.
+        #[arg(long = "immutable-verbs-lock", value_name = "PATH")]
+        immutable_verbs_lock: Option<PathBuf>,
+
         /// YAML catalog of reusable saved grants.
         /// Env: GUARD_GRANTS.
         #[arg(long, alias = "profiles", value_name = "PATH")]
@@ -1265,8 +1274,8 @@ enum ServerCommands {
         api_client_config_out: Option<PathBuf>,
 
         /// Front the Kubernetes apiserver with a TLS-terminating proxy on ADDR
-        /// (e.g. 127.0.0.1:8443). Each API request from a brokered client (helm,
-        /// kubectl, terraform, k9s, client libraries) is gated against
+        /// (e.g. 127.0.0.1:8443). Each API request from a brokered client (kubectl,
+        /// terraform, k9s, client libraries) is gated against
         /// --api-policy and re-originated to the real apiserver with the
         /// credentials only the daemon holds. Requires --kubeconfig; incompatible
         /// with --exec-as-caller. Env: GUARD_KUBE_PROXY.

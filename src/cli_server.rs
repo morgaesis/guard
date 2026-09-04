@@ -228,21 +228,21 @@ pub(crate) fn default_verbs_path() -> Option<PathBuf> {
 fn should_create_default_verbs_path(
     allow_promotion_enabled: bool,
     gate_enabled: bool,
-    immutable_service_catalog: bool,
+    immutable_catalog: bool,
 ) -> bool {
-    allow_promotion_enabled && gate_enabled && !immutable_service_catalog
+    allow_promotion_enabled && gate_enabled && !immutable_catalog
 }
 
-fn allow_promotion_for_catalog(requested: bool, immutable_service_catalog: bool) -> bool {
-    requested && !immutable_service_catalog
+fn allow_promotion_for_catalog(requested: bool, immutable_catalog: bool) -> bool {
+    requested && !immutable_catalog
 }
 
-fn require_explicit_service_verbs_path(
+fn require_explicit_immutable_verbs_path(
     path: Option<PathBuf>,
-    immutable_service_catalog: bool,
+    immutable_catalog: bool,
 ) -> Result<Option<PathBuf>> {
-    if immutable_service_catalog && path.is_none() {
-        anyhow::bail!("the packaged Windows service requires an explicit verb catalog");
+    if immutable_catalog && path.is_none() {
+        anyhow::bail!("immutable verb catalog mode requires an explicit verb catalog");
     }
     Ok(path)
 }
@@ -324,6 +324,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             gate,
             approval_ttl,
             verbs,
+            immutable_verbs_lock,
             grants,
             allow_bin,
             child_env,
@@ -478,6 +479,12 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 configured_admin_token.is_some(),
             )?;
             let immutable_service_catalog = cfg!(windows) && service;
+            let immutable_verbs_lock = immutable_verbs_lock.or_else(|| {
+                guard_env("IMMUTABLE_VERBS_LOCK")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+            });
+            let immutable_catalog = immutable_service_catalog || immutable_verbs_lock.is_some();
             let admin_token = if admin_token_stdin {
                 Some(read_admin_token_stdin()?)
             } else {
@@ -852,10 +859,10 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     .unwrap_or(true)
             };
             let allow_promotion_enabled =
-                allow_promotion_for_catalog(requested_allow_promotion, immutable_service_catalog);
-            if requested_allow_promotion && immutable_service_catalog {
+                allow_promotion_for_catalog(requested_allow_promotion, immutable_catalog);
+            if requested_allow_promotion && immutable_catalog {
                 tracing::info!(
-                    "Auto-verb promotion disabled because the packaged service catalog is immutable"
+                    "Auto-verb promotion disabled because the verb catalog is immutable process input"
                 );
             }
             if allow_promotion_enabled {
@@ -1320,16 +1327,14 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             // explicit administrator-owned catalog from its installer. It
             // does not create a profile-local catalog because service
             // configuration is immutable process input.
-            let explicit_verbs_path = require_explicit_service_verbs_path(
-                explicit_verbs_path,
-                immutable_service_catalog,
-            )?;
+            let explicit_verbs_path =
+                require_explicit_immutable_verbs_path(explicit_verbs_path, immutable_catalog)?;
             let verbs_path = match explicit_verbs_path {
                 Some(path) => Some(path),
                 None if should_create_default_verbs_path(
                     allow_promotion_enabled,
                     gate_mode.is_on(),
-                    immutable_service_catalog,
+                    immutable_catalog,
                 ) =>
                 {
                     let path = default_verbs_path()
@@ -1346,14 +1351,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 None => None,
             };
             if let Some(path) = verbs_path {
-                #[cfg(windows)]
-                let catalog = if immutable_service_catalog {
+                let catalog = if let Some(lock_path) = immutable_verbs_lock.as_deref() {
+                    guard::gating::verb::VerbCatalog::load_immutable_with_lock(&path, lock_path)
+                } else if immutable_service_catalog {
                     guard::gating::verb::VerbCatalog::load_immutable(&path)
                 } else {
                     guard::gating::verb::VerbCatalog::load(&path)
                 };
-                #[cfg(not(windows))]
-                let catalog = guard::gating::verb::VerbCatalog::load(&path);
                 let catalog = catalog
                     .with_context(|| format!("failed to load verb catalog {}", path.display()))?;
                 tracing::info!(
@@ -2314,12 +2318,12 @@ mod verb_catalog_path_tests {
     use std::path::PathBuf;
 
     use super::{
-        allow_promotion_for_catalog, require_explicit_service_verbs_path,
+        allow_promotion_for_catalog, require_explicit_immutable_verbs_path,
         should_create_default_verbs_path,
     };
 
     #[test]
-    fn immutable_service_requires_an_explicit_catalog() {
+    fn immutable_catalog_requires_an_explicit_path_and_disables_promotion() {
         assert!(!should_create_default_verbs_path(true, true, true));
         assert!(should_create_default_verbs_path(true, true, false));
         assert!(!should_create_default_verbs_path(false, true, false));
@@ -2330,15 +2334,15 @@ mod verb_catalog_path_tests {
 
         let configured = PathBuf::from("configured-verbs.yaml");
         assert_eq!(
-            require_explicit_service_verbs_path(Some(configured.clone()), true).unwrap(),
+            require_explicit_immutable_verbs_path(Some(configured.clone()), true).unwrap(),
             Some(configured)
         );
-        assert!(require_explicit_service_verbs_path(None, true)
+        assert!(require_explicit_immutable_verbs_path(None, true)
             .unwrap_err()
             .to_string()
             .contains("requires an explicit verb catalog"));
         assert_eq!(
-            require_explicit_service_verbs_path(None, false).unwrap(),
+            require_explicit_immutable_verbs_path(None, false).unwrap(),
             None
         );
     }

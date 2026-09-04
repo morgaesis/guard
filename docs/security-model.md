@@ -147,11 +147,10 @@ Execution identity and credential delivery have different compromise bounds:
 | Per-caller child identity | Root Unix socket deployments using `--exec-as-caller` | The child receives the authenticated caller's filesystem authority and may receive caller-scoped scalar secrets. Typed Ansible, Helm, and kubectl profiles are denied. TCP, API proxying, fixed-child credential bindings, and secret-file delivery are unavailable in this mode. |
 | Windows | Named-pipe policy, access administration, and inspection | Local process execution and API proxying fail closed because no distinct worker identity or secure client-authority handoff is available. |
 
-Guard has no general scoped SSH credential endpoint. Brokered SSH-using tools
-receive no Guard-managed SSH credential in fixed mode or use caller-owned authority under
-`--exec-as-caller`. Daemon-held SSH requires a separately authenticated stream
-protocol, destination and forwarding constraints, revocation semantics, and an
-independent security review.
+Guard has no SSH executable authority profile, so brokered SSH execution is
+rejected before process start in both fixed-identity and `--exec-as-caller`
+modes. Daemon-held SSH requires a separately authenticated stream protocol,
+destination and forwarding constraints, and revocation semantics.
 
 The API proxy injects the endpoint upstream credential only after the request is
 allowed. It strips authentication headers, redacts protocol-classified secret
@@ -273,10 +272,10 @@ share one generic gate while retaining separate listener, policy, credential,
 coverage, and revert identities.
 
 Raw SSH is a bidirectional byte stream with forwarding, subsystems, interactive
-shells, and nested transports. The fixed child carries no daemon-held SSH
-credentials, and `--exec-as-caller` uses caller-owned authority. A daemon-held
-raw stream adapter requires its own protocol design and security review rather
-than being treated as a generic HTTP proxy configuration.
+shells, and nested transports. Guard rejects SSH command execution because no
+profile closes that authority surface. A daemon-held raw stream adapter requires
+its own protocol design rather than being treated as a generic HTTP proxy
+configuration.
 
 ## Practical limits
 

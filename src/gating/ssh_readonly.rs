@@ -1,8 +1,6 @@
-//! Deterministic pre-LLM classification of ssh invocations as read-only-safe.
-//! These parsers decide whether a guarded ssh command can take the
-//! deterministic allow fast path without evaluator review, so a parsing
-//! divergence here skips evaluation entirely. They are pure functions on the
-//! untrusted argv, kept in the library crate so they can be fuzzed.
+//! Legacy SSH argv parsing retained for request validation, credential-path
+//! preflight, and wire compatibility. SSH has no executable authority profile,
+//! so these pure parsers cannot authorize process start.
 
 /// SSH options that consume the following argument as their value.
 ///
@@ -96,7 +94,7 @@ fn ssh_option_takes_separate_argument(arg: &str) -> bool {
 /// a read-only diagnostic: no command execution, no agent / X11 / port /
 /// socket forwarding, no proxy or jump host, no tunnel, no external config or
 /// identity/library file, and no control socket. Any unrecognized option
-/// forfeits the fast path to the evaluator.
+/// fails this legacy compatibility classification.
 ///
 /// The scan covers the whole "option zone", not just the options before the
 /// destination. ssh honors options that appear *between* the destination and
@@ -110,9 +108,9 @@ fn ssh_option_takes_separate_argument(arg: &str) -> bool {
 /// This is intentionally stricter than enumerating dangerous options: an
 /// option we have not vetted (including future ssh additions, `-F` external
 /// configs, `-I` PKCS#11 modules, `-E`/`-i`/`-S` file paths, and `-o`
-/// directives outside the vetted keyword set) never takes the fast path.
+/// directives outside the vetted keyword set) fail this classification.
 /// Combined short flags such as `-Cq` are treated as unrecognized rather than
-/// decomposed, again forfeiting to the evaluator.
+/// decomposed and therefore fail this classification.
 pub fn ssh_options_all_readonly_safe(args: &[String]) -> bool {
     let boundaries = ssh_argument_boundaries(args);
     let option_zone_end = boundaries.command_start.unwrap_or(args.len());
@@ -182,7 +180,7 @@ pub fn ssh_options_all_readonly_safe(args: &[String]) -> bool {
         }
 
         // Anything else (forwarding, proxy, jump, tunnel, external config or
-        // key/library file, control socket, X11, unknown option) forfeits.
+        // key/library file, control socket, X11, unknown option) fails.
         return false;
     }
     true
@@ -228,8 +226,8 @@ pub fn ssh_o_directive_readonly_safe(value: &str) -> bool {
         // Host-key checking is permitted only in its security-preserving
         // forms. Disabling it (`no`/`off`) or deferring to an interactive
         // prompt (`ask`) would let an interposed relay alter the
-        // diagnostic's output, so those forfeit to the evaluator rather than
-        // taking the deterministic fast path. An empty value falls back to
+        // diagnostic's output, so those fail the compatibility classifier. An
+        // empty value falls back to
         // ssh's strict default, which is safe.
         "stricthostkeychecking" => matches!(directive_value, "yes" | "accept-new" | ""),
         _ => false,
@@ -238,7 +236,7 @@ pub fn ssh_o_directive_readonly_safe(value: &str) -> bool {
 
 /// True only for an exact, whole read-only diagnostic command (no shell
 /// control, no arguments beyond a fixed safe flag). Anything else returns
-/// false and falls back to the model.
+/// false. This classifier does not grant executable authority.
 pub fn is_fixed_readonly_diagnostic(command: &str) -> bool {
     if contains_shell_control(command) {
         return false;

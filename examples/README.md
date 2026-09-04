@@ -6,8 +6,8 @@ function calling, and two retries. The files in this directory opt into a
 specific deterministic policy, verb catalog, saved grant, API policy, or model
 fallback configuration.
 
-Load a policy with
-`guard server start --exec-user guard-exec --policy examples/<file>.yaml`, or
+Load a policy for local non-executing validation with
+`guard server start --dry-run --exec-user guard-exec --policy examples/<file>.yaml`, or
 place it at `~/.config/guard/policy.yaml` for automatic discovery. Load an env
 file with your service manager or
 `set -a; source examples/<file>.env; set +a`.
@@ -55,11 +55,10 @@ regex per parameter, single-argv rendering, no shell), which is what makes
 
 - **[api-policy.yaml](api-policy.yaml)** -- Kubernetes API proxy policy.
   First-match-wins rules over typed API operations (verb, resource, namespace,
-  subresource) for
-  `guard server start --exec-user guard-exec --kube-proxy`: reads allowed with
-  Secret values redacted, non-production writes allowed behind the auto-revert
-  envelope, deletes held for operator approval. Hot-reloaded; the proxy is
-  default-deny without it. Load with `--api-policy`.
+  subresource). Load it as the packaged API proxy's `--api-policy`. The proxy
+  serves reads with Secret values redacted, non-production writes behind the
+  auto-revert envelope, and deletes held for operator approval. The proxy is
+  default-deny without an API policy.
 
 - **[github-policy.yaml](github-policy.yaml)** /
   **[vercel-policy.yaml](vercel-policy.yaml)** -- API proxy policies for the
@@ -71,8 +70,8 @@ regex per parameter, single-argv rendering, no shell), which is what makes
   deletes and side-effect-only operations. Load with `--api-policy`.
 
 - **[system-prompt-append-tools.md](system-prompt-append-tools.md)** --
-  Evaluator prompt supplement describing an in-house tool's read and mutation
-  surface, in the worked style from
+  Evaluator prompt supplement describing deployment-specific systemd unit
+  scope, in the worked style from
   [docs/configuration.md](../docs/configuration.md). Adds local tool knowledge
   to the mode prompt without replacing it; load with `--system-prompt-append`
   or `GUARD_PROMPT_APPEND`.

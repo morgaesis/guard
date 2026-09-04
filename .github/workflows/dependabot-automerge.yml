@@ -4,6 +4,8 @@ name: Dependabot review gate
 # review. A separate job records the narrower auto-merge eligibility signal.
 
 "on":
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
     types:
@@ -14,20 +16,28 @@ name: Dependabot review gate
 permissions: {}
 
 concurrency:
-  group: dependabot-review-${{ github.event.pull_request.number }}
+  group: dependabot-review-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
   review-gate:
     name: Classify dependency update
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: read
     outputs:
       eligible: ${{ steps.policy.outputs.eligible }}
     steps:
+      - name: Record mainline classification
+        if: github.event_name == 'push'
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          echo "Dependency classification applies to pull requests; mainline evidence is complete."
+
       - name: Classify pull request source
+        if: github.event_name == 'pull_request'
         id: source
         run: |
           set -euo pipefail
@@ -177,8 +187,9 @@ jobs:
   eligibility:
     name: Auto-merge eligible
     needs: review-gate
-    if: needs.review-gate.outputs.eligible == 'true'
+    if: github.event_name == 'pull_request' && needs.review-gate.outputs.eligible == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions: {}
     steps:
       - name: Record eligibility

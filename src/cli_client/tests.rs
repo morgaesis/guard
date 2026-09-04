@@ -58,7 +58,12 @@ fn requester_verb_show_has_stable_human_and_json_menu_projections() {
     let item = server::VerbMenuItem {
         name: "inspect-fixture".to_string(),
         description: "Inspect one fixture".to_string(),
+        arg_template: vec!["show".to_string(), "{target}".to_string()],
         params: vec!["target".to_string()],
+        param_patterns: std::collections::BTreeMap::from([(
+            "target".to_string(),
+            "^/srv/fixtures/[a-z0-9-]+$".to_string(),
+        )]),
         consequence: "reversible".to_string(),
         hold: false,
         has_revert: false,
@@ -67,7 +72,8 @@ fn requester_verb_show_has_stable_human_and_json_menu_projections() {
         verb_menu_human_lines(&item),
         vec![
             "inspect-fixture [reversible] - Inspect one fixture".to_string(),
-            "    --param target=<value>".to_string(),
+            "    arguments: show <target>".to_string(),
+            "    --param target=<value> matches ^/srv/fixtures/[a-z0-9-]+$".to_string(),
         ]
     );
     let document = verb_show_menu_json(&item);
@@ -75,6 +81,11 @@ fn requester_verb_show_has_stable_human_and_json_menu_projections() {
     assert_eq!(document["type"], "verb_show");
     assert_eq!(document["projection"], "agent_menu");
     assert_eq!(document["item"]["name"], "inspect-fixture");
+    assert_eq!(document["item"]["arg_template"][1], "{target}");
+    assert_eq!(
+        document["item"]["param_patterns"]["target"],
+        "^/srv/fixtures/[a-z0-9-]+$"
+    );
     assert!(document["item"].get("binary").is_none());
 }
 
@@ -249,19 +260,19 @@ fn denied_guidance_lists_every_durable_request_exactly() {
 }
 
 #[test]
-fn requester_guidance_does_not_label_admin_handoff_as_an_approve_command() {
+fn requester_guidance_describes_operator_approval_without_assuming_separate_admin() {
     let mut response = provisional_response(None, None);
     response.allowed = false;
     response.status = None;
     response.handle = Some("gr-requester".to_string());
     response.approval_options = vec![
-        "ask your admin to approve request gr-requester (see guard access show gr-requester)"
+        "operator approval required for request gr-requester (see guard access show gr-requester)"
             .to_string(),
     ];
 
     let lines = access_request_guidance_lines(&response);
     assert!(lines.contains(
-        &"ask your admin to approve request gr-requester (see guard access show gr-requester)"
+        &"operator approval required for request gr-requester (see guard access show gr-requester)"
             .to_string()
     ));
     assert!(lines
@@ -329,7 +340,7 @@ fn held_banner_names_containment_only_when_the_server_reports_a_route() {
     let mut response = provisional_response(None, None);
     response.status = Some(server::GateStatus::Held);
     response.verb_guidance = Some(
-            "ask your admin to approve request hold-1\ncontain: re-run with --revert '<cmd>' --confirm-within 300 to execute under auto-revert"
+            "operator approval required for request hold-1\ncontain: re-run with --revert '<cmd>' --confirm-within 300 to execute under auto-revert"
                 .to_string(),
         );
     assert_eq!(
@@ -341,7 +352,7 @@ fn held_banner_names_containment_only_when_the_server_reports_a_route() {
             ]
         );
 
-    response.verb_guidance = Some("ask your admin to approve request hold-1".to_string());
+    response.verb_guidance = Some("operator approval required for request hold-1".to_string());
     assert_eq!(
         held_discovery_lines(&response),
         vec!["inspect: guard provisionals".to_string()]

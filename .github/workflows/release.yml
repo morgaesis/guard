@@ -23,6 +23,7 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -120,6 +121,7 @@ jobs:
     name: Resolve release targets
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
     steps:
@@ -135,6 +137,7 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: [test, release_targets]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.release_targets.outputs.matrix) }}
@@ -575,6 +578,7 @@ jobs:
     name: Generate SBOM
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:

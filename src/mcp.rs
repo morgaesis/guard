@@ -1472,17 +1472,12 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                         "properties": {
                             "binary": {
                                 "type": "string",
-                                "description": "Binary to execute (e.g. ssh, kubectl, helm, aws). Required unless `verb` is provided."
+                                "description": "Profiled binary to execute (for example systemctl, kubectl, or printf). Required unless `verb` is provided."
                             },
                             "args": {
                                 "type": "array",
                                 "items": { "type": "string" },
                                 "description": "Arguments to pass to the binary. Only meaningful with `binary`; omit for a verb invocation."
-                            },
-                            "hostkey": {
-                                "type": "string",
-                                "enum": ["only-existing", "accept-new", "accept-all"],
-                                "description": "SSH host-key policy for guarded ssh commands. only-existing (default) keeps ssh's strict checking; accept-new trusts a new host on first contact but rejects a changed key; accept-all gives up host verification."
                             },
                             "env": {
                                 "type": "object",
@@ -1608,7 +1603,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 {
                     "name": VERB_LIST_TOOL_NAME,
                     "title": "List Operator Verb Catalog",
-                    "description": "List the operator-defined verb catalog (the agent's allow-listed menu). Each verb names a binary, its consequence class, and validated parameters. Invoke a verb with the run tool's `verb` argument; this tool only reads the catalog and never executes anything.",
+                    "description": "List the requester-visible operator verb menu. Each item includes its argument template, consequence class, and validated parameter patterns without exposing executable or authority metadata. Invoke a verb with the run tool's `verb` argument; this tool only reads the catalog and never executes anything.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -3232,7 +3227,7 @@ mod tests {
             "status": null,
             "handle": "request-example",
             "approval_options": [
-                "ask your admin to approve request request-example (see guard access show request-example)"
+                "operator approval required for request request-example (see guard access show request-example)"
             ],
             "exit_code": null,
             "stdout": null,
@@ -3240,7 +3235,7 @@ mod tests {
         }));
 
         assert!(text.contains(
-            "ask your admin to approve request request-example (see guard access show request-example)"
+            "operator approval required for request request-example (see guard access show request-example)"
         ));
         assert!(!text.contains("guard access approve"));
     }
@@ -3566,10 +3561,9 @@ mod tests {
             response["result"]["tools"][0]["inputSchema"]["properties"]["waitApproval"]["type"],
             json!(["integer", "boolean"])
         );
-        assert_eq!(
-            response["result"]["tools"][0]["inputSchema"]["properties"]["hostkey"]["enum"],
-            json!(["only-existing", "accept-new", "accept-all"])
-        );
+        assert!(response["result"]["tools"][0]["inputSchema"]["properties"]
+            .get("hostkey")
+            .is_none());
         assert_eq!(
             response["result"]["tools"][0]["inputSchema"]["properties"]["secretFiles"]["type"],
             "object"
@@ -3623,7 +3617,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_tool_args_accepts_hostkey_mode() {
+    fn guard_tool_args_retains_legacy_hostkey_wire_compatibility() {
         let parsed: GuardToolArgs = serde_json::from_value(json!({
             "binary": "ssh",
             "args": ["host01", "id"],
@@ -3869,7 +3863,7 @@ mod tests {
             "args": ["firewall-a", "apply"],
             "revert": "ssh firewall-a rollback",
             "confirmCheck": "ssh firewall-a verify",
-            "revertControlPath": "brokered SSH to firewall-a",
+            "revertControlPath": "remote firewall control session",
             "confirmWithin": 45
         }))
         .unwrap();
@@ -3880,7 +3874,7 @@ mod tests {
         );
         assert_eq!(
             parsed.revert_control_path.as_deref(),
-            Some("brokered SSH to firewall-a")
+            Some("remote firewall control session")
         );
         assert_eq!(parsed.confirm_within, Some(45));
     }

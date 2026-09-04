@@ -16,7 +16,7 @@
 # inject because there is nothing to substitute.
 #
 # Load with:
-#   guard server start --verbs examples/verbs-readonly.yaml \
+#   guard server start --dry-run --verbs examples/verbs-readonly.yaml \
 #     --socket .cache/guard.sock --exec-user guard-exec
 
 platform: unix

@@ -110,8 +110,8 @@ Store secrets in the daemon backend, then name them at execution time:
 
 ```bash
 guard secrets add DEPLOY_TOKEN
-guard run --secret DEPLOY_TOKEN deploy-tool status
-guard run --secret API_TOKEN=DEPLOY_TOKEN api-client status
+guard run --secret DEPLOY_TOKEN printenv DEPLOY_TOKEN
+guard run --secret API_TOKEN=DEPLOY_TOKEN printenv API_TOKEN
 ```
 
 These `guard run` forms require a daemon configured with `--exec-as-caller`.
@@ -186,7 +186,7 @@ endpoint probe and self-scoped admin probe:
 
 | Tool | Purpose | Key arguments | CLI equivalent |
 | ---- | ------- | ------------- | -------------- |
-| `guard_run` | Execute one command through the daemon | `binary` (string) plus `args` (string array), or `verb` (`{name, params}`) for a catalog verb; one of the two is required. Optional: `env`, `secretEnv`, `secretFiles` (string maps), `secrets` (string array), `hostkey` (enum), containment gating (`revert`, `confirmCheck`, `revertControlPath` strings; `confirmWithin` integer; `requireApproval` boolean; `waitApproval` integer seconds or boolean), `reevaluate` (boolean) | `guard run`, `guard verb run` |
+| `guard_run` | Execute one command through the daemon | `binary` (string) plus `args` (string array), or `verb` (`{name, params}`) for a catalog verb; one of the two is required. Optional: `env`, `secretEnv`, `secretFiles` (string maps), `secrets` (string array), containment gating (`revert`, `confirmCheck`, `revertControlPath` strings; `confirmWithin` integer; `requireApproval` boolean; `waitApproval` integer seconds or boolean), `reevaluate` (boolean) | `guard run`, `guard verb run` |
 | `guard_verbs` | Read the operator-defined verb catalog | none | `guard verb list` |
 | `guard_access_request` | Request access for an intended operation | `intent` (string, required) | `guard access request` |
 | `guard_access_list` | List the caller's requests, holds, and access sessions | none | `guard access list` |

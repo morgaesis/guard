@@ -112,7 +112,7 @@ Legacy grant, session, and appeal commands return a direct error pointing to
 Internally, a verb coverage cell is silent outside its declared bounds.
 Allowing one active-proxy `kubectl get` cell does not generate denies for
 unrelated commands, so ordinary read-only work such as
-`guard run ssh host uptime` remains independently evaluable. Raw commands
+`guard run systemctl status sshd.service` remains independently evaluable. Raw commands
 reverse-match every applicable verb cell, which lets agents benefit from verbs
 without changing their normal tool syntax.
 

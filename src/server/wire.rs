@@ -1033,7 +1033,14 @@ pub struct VerbSummary {
 pub struct VerbMenuItem {
     pub name: String,
     pub description: String,
+    /// Ordered argument template, without the executable or any private
+    /// authority metadata. Placeholders correspond to entries in `params`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arg_template: Vec<String>,
     pub params: Vec<String>,
+    /// Anchored validation patterns for the parameters visible in this menu.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub param_patterns: std::collections::BTreeMap<String, String>,
     pub consequence: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hold: bool,
@@ -1393,7 +1400,7 @@ impl AccessRequestGuidance {
     fn new(reference: String, operator_guidance: bool, one_shot: bool) -> Self {
         let approval_options = if !operator_guidance {
             vec![format!(
-                "ask your admin to approve request {reference} (see guard access show {reference})"
+                "operator approval required for request {reference} (see guard access show {reference})"
             )]
         } else if one_shot {
             vec![format!("guard access approve {reference} --once")]
@@ -2313,12 +2320,14 @@ mod decision_trace_feature_tests {
         );
         assert_eq!(
             requester.access_requests[0].approval_options,
-            vec!["ask your admin to approve request access-a (see guard access show access-a)"]
+            vec![
+                "operator approval required for request access-a (see guard access show access-a)"
+            ]
         );
         assert_eq!(
             requester.verb_guidance.as_deref(),
             Some(
-                "ask your admin to approve request access-a (see guard access show access-a)\nask your admin to approve request access-b (see guard access show access-b)"
+                "operator approval required for request access-a (see guard access show access-a)\noperator approval required for request access-b (see guard access show access-b)"
             )
         );
 
@@ -2363,7 +2372,7 @@ mod decision_trace_feature_tests {
         .into_response();
         assert_eq!(
             requester.approval_options,
-            vec!["ask your admin to approve request hold-a (see guard access show hold-a)"]
+            vec!["operator approval required for request hold-a (see guard access show hold-a)"]
         );
 
         let operator = ExecuteResult::held(

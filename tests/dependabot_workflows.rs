@@ -123,7 +123,9 @@ fn dependabot_batches_each_ecosystem_by_semver_risk() {
 fn review_workflow_separates_required_classification_from_eligibility() {
     let workflow = parse_yaml(REVIEW_WORKFLOW);
     let triggers = mapping(field(&workflow, "on"));
-    assert_eq!(triggers.len(), 1);
+    assert_eq!(triggers.len(), 2);
+    let push = field(field(&workflow, "on"), "push");
+    assert_eq!(strings(field(push, "branches")), ["main"]);
     let pull_request = field(field(&workflow, "on"), "pull_request");
     assert_eq!(strings(field(pull_request, "branches")), ["main"]);
     assert_eq!(
@@ -140,6 +142,17 @@ fn review_workflow_separates_required_classification_from_eligibility() {
 
     let review_job = job(&workflow, "review-gate");
     assert_eq!(field(review_job, "name"), "Classify dependency update");
+    assert_eq!(
+        field(
+            named_step(review_job, "Record mainline classification"),
+            "if"
+        ),
+        "github.event_name == 'push'"
+    );
+    assert_eq!(
+        field(named_step(review_job, "Classify pull request source"), "if"),
+        "github.event_name == 'pull_request'"
+    );
     let permissions = mapping(field(review_job, "permissions"));
     assert_eq!(permissions.len(), 2);
     assert_eq!(field(field(review_job, "permissions"), "contents"), "read");
@@ -194,7 +207,7 @@ fn review_workflow_separates_required_classification_from_eligibility() {
     assert_eq!(field(eligibility, "needs"), "review-gate");
     assert_eq!(
         field(eligibility, "if"),
-        "needs.review-gate.outputs.eligible == 'true'"
+        "github.event_name == 'pull_request' && needs.review-gate.outputs.eligible == 'true'"
     );
     assert!(mapping(field(eligibility, "permissions")).is_empty());
 
@@ -251,6 +264,16 @@ fn privileged_policy_errors(source: &str) -> Vec<&'static str> {
         return errors;
     }
     let merge_job = job(&workflow, "enable-auto-merge");
+    let job_condition = string(field(merge_job, "if"));
+    for required in [
+        "github.event.workflow_run.conclusion == 'success'",
+        "github.event.workflow_run.event == 'pull_request'",
+        "github.event.workflow_run.actor.login == 'dependabot[bot]'",
+    ] {
+        if !job_condition.contains(required) {
+            errors.push("source-job-condition");
+        }
+    }
     let permissions = field(merge_job, "permissions");
     let permissions_valid = permissions.as_mapping().is_some_and(|permissions| {
         permissions.len() == 3
