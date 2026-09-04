@@ -1237,6 +1237,7 @@ function Get-GuardServiceStartupDiagnostic {
                 if ($errorLine -match '(?i)state database|state-db|sqlite|authority file') { return 'durable-state' }
                 if ($errorLine -match '(?i)named pipe|socket|listener|endpoint') { return 'local-endpoint' }
                 if ($errorLine -match '(?i)kubeconfig|api proxy|brokered') { return 'brokered-api' }
+                if ($errorLine -match '(?i)service dispatcher|StartServiceCtrlDispatcher') { return 'service-dispatcher' }
                 if ($errorLine -match '(?i)permission|access is denied|dacl|acl') { return 'filesystem-authority' }
                 return 'daemon-startup'
             }

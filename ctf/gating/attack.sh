@@ -197,7 +197,7 @@ printf 'guarded-ansible-playbook:%s:%s\n' "$*" "$(pwd)"
 EOF
 cat >/fakebin/whoami <<'EOF'
 #!/bin/sh
-[ "$#" -eq 1 ] && [ "$1" = child-contract ] || exit 51
+[ "$#" -eq 0 ] || exit 51
 cap_eff="$(awk '/^CapEff:/ { print $2 }' "/proc/$$/status")"
 case "$cap_eff" in
   ''|*[1-9a-fA-F]*) exit 52 ;;
@@ -440,22 +440,37 @@ else
 fi
 
 echo
-echo "=== 9. restart mid-window: future deadline is re-armed ==="
+echo "=== 9. abrupt restart mid-window: future deadline is re-armed ==="
 agent guard verb run scale-workload --param name=restart --confirm-within 600 --socket "$SOCK" >/tmp/restart.out 2>&1
 RHANDLE=$(handle_of /tmp/restart.out)
-kill "$DAEMON_PID" 2>/dev/null; wait "$DAEMON_PID" 2>/dev/null
+kill -KILL "$DAEMON_PID" 2>/dev/null || true
+wait "$DAEMON_PID" 2>/dev/null || true
 start_daemon
-for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
-assert_daemon_boundary
-sleep 5
-PROVISIONALS=$(operator guard provisionals --socket "$SOCK" 2>/dev/null || true)
-if [ -f /work/restart.scaled ] \
-  && printf '%s\n' "$PROVISIONALS" | grep -Fq "$RHANDLE" \
-  && printf '%s\n' "$PROVISIONALS" | grep -q '^\[armed\]'; then
-  ok "restart left the change in place and re-armed its future deadline"
+DAEMON_READY=false
+for _ in $(seq 1 50); do
+  if kill -0 "$DAEMON_PID" 2>/dev/null \
+    && [ -S "$SOCK" ] \
+    && agent guard status --socket "$SOCK" >/dev/null 2>&1; then
+    DAEMON_READY=true
+    break
+  fi
+  sleep 0.2
+done
+if [ "$DAEMON_READY" = true ]; then
+  assert_daemon_boundary
+  sleep 5
+  PROVISIONALS=$(operator guard provisionals --socket "$SOCK" 2>/dev/null || true)
+  if [ -f /work/restart.scaled ] \
+    && printf '%s\n' "$PROVISIONALS" | grep -Fq "$RHANDLE" \
+    && printf '%s\n' "$PROVISIONALS" | grep -q '^\[armed\]'; then
+    ok "abrupt restart left the change in place and re-armed its future deadline"
+  else
+    bad "abrupt restart recovery did not behave (workload marker present? $( [ -f /work/restart.scaled ] && echo yes || echo no ))"
+    printf '%s\n' "$PROVISIONALS" | head
+  fi
 else
-  bad "restart recovery did not behave (workload marker present? $( [ -f /work/restart.scaled ] && echo yes || echo no ))"
-  printf '%s\n' "$PROVISIONALS" | head
+  bad "daemon did not become ready after abrupt restart"
+  tail -50 /var/log/guard.log
 fi
 
 echo

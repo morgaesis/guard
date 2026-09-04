@@ -50,8 +50,12 @@ pub fn is_service_invocation(args: &[String]) -> bool {
 pub fn run() -> Result<()> {
     init_service_logging();
     tracing::info!("guard service: connecting to the Service Control Manager");
-    service_dispatcher::start(SERVICE_NAME, ffi_service_main)
-        .context("failed to start the service control dispatcher (StartServiceCtrlDispatcher)")?;
+    if let Err(error) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
+        tracing::error!("guard service: service dispatcher error: {error}");
+        return Err(error).context(
+            "failed to start the service control dispatcher (StartServiceCtrlDispatcher)",
+        );
+    }
     Ok(())
 }
 

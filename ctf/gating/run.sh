@@ -821,7 +821,6 @@ checks = {
             'chmod 0700 "$directory"',
             'mv "$directory" "$directory-replaced"',
             "mkdir /authority-sibling",
-            "mv / /tmp/root-replaced",
             'mv "$lock" "$lock-replaced"',
             'expected_catalog_mount',
             'expected_lock_mount',

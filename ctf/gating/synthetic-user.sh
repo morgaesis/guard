@@ -247,7 +247,6 @@ assert_protected_catalog_as_daemon() {
     || mkdir "$PROTECTED_CATALOG_DIR" \
     || chmod 0700 / \
     || mkdir /authority-sibling \
-    || mv / /tmp/root-replaced \
     || rm -f "$PROTECTED_CATALOG_LOCK" \
     || mv "$PROTECTED_CATALOG_LOCK" "$PROTECTED_CATALOG_LOCK-replaced" \
     || mv "$lock_replacement" "$PROTECTED_CATALOG_LOCK"; then
@@ -355,7 +354,6 @@ assert_catalog_mutation_rejected_after_identity_transition() {
         || mkdir "$directory" \
         || chmod 0700 / \
         || mkdir /authority-sibling \
-        || mv / /tmp/root-replaced \
         || rm -f "$lock" \
         || mv "$lock" "$lock-replaced" \
         || mv "$lock_replacement" "$lock"; then

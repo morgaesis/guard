@@ -1725,6 +1725,21 @@ Describe 'Guard Windows installer state and ACL contract' {
         finally { $DataDir = $savedDataDir }
     }
 
+    It 'classifies service dispatcher startup failures without returning free-form content' {
+        $savedDataDir = $DataDir
+        try {
+            $DataDir = Join-Path $TestDrive "service-dispatcher-log-$(New-GuardTestIdentifier)"
+            New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+            [IO.File]::WriteAllText(
+                (Join-Path $DataDir 'guard.log'),
+                'ERROR guard service: service dispatcher error: fixture detail'
+            )
+
+            (Get-GuardServiceStartupDiagnostic) | Should -Be 'service-dispatcher'
+        }
+        finally { $DataDir = $savedDataDir }
+    }
+
     It 'classifies service-controller failures when no daemon log is available' {
         $savedDataDir = $DataDir
         try {

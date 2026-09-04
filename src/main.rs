@@ -172,8 +172,6 @@ mod tool_config;
 #[cfg(windows)]
 mod winsvc;
 
-#[cfg(windows)]
-use anyhow::Context;
 use anyhow::Result;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use injection::{collect_unique_pairs, derive_env_name, is_valid_env_name};
@@ -1654,33 +1652,32 @@ fn guard_env(suffix: &str) -> Option<String> {
     guard::env::guard_env(suffix)
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run_main().await {
+fn main() {
+    if let Err(error) = run_process() {
         eprintln!("guard: {error:#}");
         std::process::exit(EXIT_GUARD_ERROR);
     }
 }
 
-async fn run_main() -> Result<()> {
-    let _ = dotenvy::dotenv();
-
-    // Windows service entry. The installer registers the daemon with
-    // `server start ... --service`; when the Service Control Manager launches
-    // that command we must answer its start/stop handshake from a dispatcher
-    // thread rather than run in the foreground. Detect it from argv before any
-    // logging or arg parsing, and hand the process to the dispatcher (on a
-    // blocking thread so it owns its own runtime). An interactive run never
-    // sets `--service`, so the foreground path below is unaffected.
+fn run_process() -> Result<()> {
+    // Windows requires an own-process service's process main thread to enter
+    // StartServiceCtrlDispatcher promptly. Detect the installer-only marker
+    // before constructing the foreground Tokio runtime and hand the main
+    // thread directly to the dispatcher. An interactive run never sets
+    // `--service`, so it continues through the normal CLI path below.
     #[cfg(windows)]
     {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         if winsvc::is_service_invocation(&argv) {
-            return tokio::task::spawn_blocking(winsvc::run)
-                .await
-                .context("the service dispatcher thread panicked")?;
+            return winsvc::run();
         }
     }
+
+    tokio::runtime::Runtime::new()?.block_on(run_main())
+}
+
+async fn run_main() -> Result<()> {
+    let _ = dotenvy::dotenv();
 
     // Log level: RUST_LOG > GUARD_LOG_LEVEL > "warn"
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {

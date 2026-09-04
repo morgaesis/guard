@@ -12,7 +12,6 @@ verbs:
     coverage:
       - name: fixture-command
         action: preauthorized
-        cwd: /src
 
   - name: child-secret-file-contract
     description: Verify fixed-identity credential delivery remains unavailable
@@ -30,13 +29,11 @@ verbs:
   - name: child-capability-contract
     description: Verify the child identity and empty effective capability set
     binary: whoami
-    args: [child-contract]
     consequence: reversible
     trusted: true
     coverage:
       - name: fixture-command
         action: preauthorized
-        cwd: /src
 
   - name: scale-workload
     description: Scale a fixture workload; auto-reverts unless confirmed
@@ -50,7 +47,6 @@ verbs:
     coverage:
       - name: fixture-command
         action: preauthorized
-        cwd: /src
 
   - name: delete-fixture-namespace
     description: Delete the fixed fixture namespace (irreversible; held)
@@ -61,7 +57,6 @@ verbs:
     coverage:
       - name: fixture-command
         action: preauthorized
-        cwd: /src
 
   - name: kubectl-version
     description: Exercise transparent kubectl shim
