@@ -3425,7 +3425,7 @@ fn restore_replacement_metadata(
     let Some(expected_generation) = marker.expected_security_generation.as_deref() else {
         return Ok(());
     };
-    if windows_dacl_digest(destination)? == expected_generation {
+    if windows_dacl_generation_matches(destination, expected_generation)? {
         return Ok(());
     }
     if !path_present(&paths.backup)? {
@@ -3435,7 +3435,7 @@ fn restore_replacement_metadata(
     let destination_file = open_windows_recovery_file(destination)?;
     apply_security_descriptor_to_handle(&destination_file, &descriptor, information)?;
     destination_file.sync_all()?;
-    if windows_dacl_digest(destination)? != expected_generation {
+    if !windows_dacl_generation_matches(destination, expected_generation)? {
         anyhow::bail!("replacement DACL does not match its transaction metadata")
     }
     Ok(())
@@ -3484,7 +3484,7 @@ fn verify_windows_security_generation(path: &Path, expected: Option<&str>) -> Re
     let Some(expected) = expected else {
         return Ok(());
     };
-    if windows_dacl_digest(path)? != expected {
+    if !windows_dacl_generation_matches(path, expected)? {
         anyhow::bail!("Windows rollback DACL does not match its transaction generation")
     }
     Ok(())
@@ -3496,7 +3496,7 @@ fn verify_windows_security_generation(_path: &Path, _expected: Option<&str>) -> 
 }
 
 #[cfg(windows)]
-fn windows_dacl_digest(path: &Path) -> Result<String> {
+fn read_windows_dacl_descriptor(path: &Path) -> Result<Vec<u8>> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::{GetFileSecurityW, DACL_SECURITY_INFORMATION};
 
@@ -3531,7 +3531,87 @@ fn windows_dacl_digest(path: &Path) -> Result<String> {
     {
         return Err(std::io::Error::last_os_error()).context("failed to read the Windows DACL");
     }
-    Ok(content_digest(&descriptor))
+    Ok(descriptor)
+}
+
+#[cfg(windows)]
+fn windows_dacl_digest(path: &Path) -> Result<String> {
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, GetAclInformation, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, ACL_SIZE_INFORMATION, SE_DACL_PROTECTED,
+    };
+
+    let mut descriptor = read_windows_dacl_descriptor(path)?;
+    let mut dacl_present = 0;
+    let mut dacl = std::ptr::null_mut();
+    let mut dacl_defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.as_mut_ptr().cast(),
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("failed to locate the Windows DACL");
+    }
+    if dacl_present == 0 || dacl.is_null() {
+        anyhow::bail!("Windows authority object has no bounded DACL")
+    }
+    let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("failed to measure the Windows DACL");
+    }
+    let dacl_length = size.AclBytesInUse as usize;
+    let descriptor_start = descriptor.as_ptr() as usize;
+    let descriptor_end = descriptor_start
+        .checked_add(descriptor.len())
+        .context("Windows security descriptor length overflow")?;
+    let dacl_start = dacl as usize;
+    let dacl_end = dacl_start
+        .checked_add(dacl_length)
+        .context("Windows DACL length overflow")?;
+    if dacl_start < descriptor_start || dacl_end > descriptor_end {
+        anyhow::bail!("Windows DACL lies outside its security descriptor")
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe {
+        GetSecurityDescriptorControl(descriptor.as_mut_ptr().cast(), &mut control, &mut revision)
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect Windows DACL controls");
+    }
+    let dacl_bytes = unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), dacl_length) };
+    // Windows can regenerate self-relative descriptor bookkeeping while
+    // preserving the ordered ACL. The ACL bytes and inheritance protection
+    // are the authority that transaction recovery must bind.
+    let mut generation = Vec::with_capacity(dacl_length.saturating_add(1));
+    generation.push(u8::from(control & SE_DACL_PROTECTED != 0));
+    generation.extend_from_slice(dacl_bytes);
+    Ok(content_digest(&generation))
+}
+
+#[cfg(windows)]
+fn windows_legacy_dacl_digest(path: &Path) -> Result<String> {
+    Ok(content_digest(&read_windows_dacl_descriptor(path)?))
+}
+
+#[cfg(windows)]
+fn windows_dacl_generation_matches(path: &Path, expected: &str) -> Result<bool> {
+    // Accept interrupted transactions written by versions that hashed the
+    // complete self-relative descriptor.
+    Ok(windows_dacl_digest(path)? == expected || windows_legacy_dacl_digest(path)? == expected)
 }
 
 #[cfg(all(test, windows))]
@@ -3541,43 +3621,12 @@ pub(crate) fn authority_dacl_digest_for_test(path: &Path) -> Result<String> {
 
 #[cfg(windows)]
 fn windows_security_descriptor(path: &Path) -> Result<(Vec<u8>, u32)> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::{
-        GetFileSecurityW, GetSecurityDescriptorControl, DACL_SECURITY_INFORMATION,
+        GetSecurityDescriptorControl, DACL_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
         UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
-    let wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut needed = 0;
-    unsafe {
-        GetFileSecurityW(
-            wide.as_ptr(),
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            0,
-            &mut needed,
-        );
-    }
-    if needed == 0 {
-        return Err(std::io::Error::last_os_error()).context("failed to read the Windows DACL");
-    }
-    let mut descriptor = vec![0u8; needed as usize];
-    if unsafe {
-        GetFileSecurityW(
-            wide.as_ptr(),
-            DACL_SECURITY_INFORMATION,
-            descriptor.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error()).context("failed to read the Windows DACL");
-    }
+    let mut descriptor = read_windows_dacl_descriptor(path)?;
     let mut control = 0;
     let mut revision = 0;
     if unsafe {
@@ -4290,9 +4339,9 @@ fn write_learning_file_atomically_windows(
         phase: LearningTransactionPhase::Preparing,
         candidate_generation: content_digest(content.as_bytes()),
         expected_generation: original_generation.clone(),
-        expected_security_generation: expected_security
-            .as_ref()
-            .map(|(descriptor, _)| content_digest(descriptor)),
+        expected_security_generation: destination_exists
+            .then(|| windows_dacl_digest(path))
+            .transpose()?,
         expected_unix_mode: None,
     };
     lock.verify_parent_binding()?;
@@ -4407,18 +4456,17 @@ fn write_learning_file_atomically_windows(
             .sync_all()
             .with_context(|| format!("failed to flush replaced file {}", path.display()))?;
         if let Some((expected, information)) = &expected_security {
-            let (actual, _) = read_security_descriptor(path)
-                .with_context(|| format!("failed to verify security for {}", path.display()))?;
-            if actual != *expected {
+            let expected_generation = marker
+                .expected_security_generation
+                .as_deref()
+                .context("replacement DACL generation is missing")?;
+            if !windows_dacl_generation_matches(path, expected_generation)? {
                 apply_security_descriptor_to_handle(&destination_file, expected, *information)
                     .with_context(|| {
                         format!("failed to restore security for {}", path.display())
                     })?;
                 destination_file.sync_all()?;
-                let (restored, _) = read_security_descriptor(path).with_context(|| {
-                    format!("failed to verify restored security for {}", path.display())
-                })?;
-                if restored != *expected {
+                if !windows_dacl_generation_matches(path, expected_generation)? {
                     anyhow::bail!(
                         "replacement changed the Windows security descriptor for {}",
                         path.display()

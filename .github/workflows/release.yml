@@ -643,6 +643,21 @@ jobs:
                 end;
               def canonicalize_component:
                 canonicalize_bom_reference
+                | if (.hashes? | type) == "array" then
+                    .hashes |= sort_unordered
+                  else
+                    .
+                  end
+                | if (.licenses? | type) == "array" then
+                    .licenses |= sort_unordered
+                  else
+                    .
+                  end
+                | if (.externalReferences? | type) == "array" then
+                    .externalReferences |= sort_unordered
+                  else
+                    .
+                  end
                 | if (.components? | type) == "array" then
                     .components |= (map(canonicalize_component) | sort_unordered)
                   else
@@ -667,6 +682,21 @@ jobs:
                 and (.metadata.component? | type) == "object"
                 then
                   .metadata.component |= canonicalize_component
+                else
+                  .
+                end
+              | if (.metadata.authors? | type) == "array" then
+                  .metadata.authors |= sort_unordered
+                else
+                  .
+                end
+              | if (.metadata.properties? | type) == "array" then
+                  .metadata.properties |= sort_unordered
+                else
+                  .
+                end
+              | if (.metadata.tools? | type) == "array" then
+                  .metadata.tools |= sort_unordered
                 else
                   .
                 end
