@@ -14,9 +14,11 @@ and project files.
 The central bypass-prevention invariant is daemon-held upstream credentials.
 API tokens, upstream kubeconfigs, and secret-store values belong to the daemon
 principal and enter only protocol brokers or caller-specific execution. The
-shared fixed child receives no Guard-managed credentials. Operators keep
-independent credentials inaccessible to it. Brokered clients receive only the
-local Guard endpoint and scoped Guard authority.
+shared fixed child receives none of those credentials. Its optional generated
+Kubernetes client config carries only a local transport bearer scoped to the
+active Guard proxy. Operators keep independent credentials inaccessible to it.
+Brokered clients receive only the local Guard endpoint and scoped Guard
+authority.
 
 Guard is not a sandbox. If the agent can read the same credential, connect to
 the upstream directly, modify daemon policy, replace the daemon binary, or gain
@@ -143,7 +145,7 @@ Execution identity and credential delivery have different compromise bounds:
 
 | Context | Intended use | Compromise bound |
 |---|---|---|
-| Dedicated child identity | Default Unix identity for commands without Guard-managed credentials | A child cannot read daemon state, per-run credentials, tool-config credentials, or temporary read-grant ACLs. Operators keep independent credentials inaccessible to this account. The UID is shared across executions and is not a process sandbox. |
+| Dedicated child identity | Default Unix identity for commands without upstream or per-run credentials | A child cannot read daemon state, upstream or per-run credentials, unrelated tool-config credentials, or temporary read-grant ACLs. An optional generated Kubernetes client config carries only a local transport bearer scoped to the active Guard proxy. Operators keep independent credentials inaccessible to this account. The UID is shared across executions and is not a process sandbox. |
 | Per-caller child identity | Root Unix socket deployments using `--exec-as-caller` | The child receives the authenticated caller's filesystem authority and may receive caller-scoped scalar secrets. Typed Ansible, Helm, and kubectl profiles are denied. TCP, API proxying, fixed-child credential bindings, and secret-file delivery are unavailable in this mode. |
 | Windows | Named-pipe policy, access administration, and inspection | Local process execution and API proxying fail closed because no distinct worker identity or secure client-authority handoff is available. |
 

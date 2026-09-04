@@ -8,9 +8,11 @@ ordinary commands or API requests and describe missing access in prose. The
 Guard daemon applies policy, reduces approved intent to bounded enforcement
 coverage, evaluates risk, and keeps daemon-held upstream credentials behind
 brokered API boundaries. Fixed-identity execution uses a non-root child account
-that differs from the daemon account, receives no Guard-managed credentials,
-and cannot read daemon state. Operators must keep independent credentials
-inaccessible to that child account.
+that differs from the daemon account, receives no upstream or per-run
+credentials, and cannot read daemon state. An optional generated Kubernetes
+client config carries only a local transport bearer scoped to the active Guard
+proxy. Operators must keep independent credentials inaccessible to that child
+account.
 
 ```console
 $ guard run uptime
@@ -213,12 +215,13 @@ command-only and export no API bearer. See [API proxy](docs/api-proxy.md).
 ## Security boundary
 
 Credential ownership prevents bypass. The fixed child account receives no
-Guard-managed credentials, while the daemon retains secret-backend and API
-upstream authority. Operators keep unrelated credentials inaccessible to the
-child. The agent account can reach only the Guard socket, named pipe, or a
-loopback broker endpoint. Output redaction, audit records, behavioral
-session limits, and frozen hold snapshots reduce exposure after a request enters
-the broker.
+upstream or per-run credentials, while the daemon retains secret-backend and
+API upstream authority. Its optional generated Kubernetes client config carries
+only a local transport bearer scoped to the active Guard proxy. Operators keep
+unrelated credentials inaccessible to the child. The agent account can reach
+only the Guard socket, named pipe, or a loopback broker endpoint. Output
+redaction, audit records, behavioral session limits, and frozen hold snapshots
+reduce exposure after a request enters the broker.
 
 Guard cannot contain an agent that can read the same credentials or reach the
 same upstream by another path. Pair it with operating-system isolation,
