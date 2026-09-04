@@ -349,6 +349,7 @@ if [ "${USE_CROSS:-false}" = true ]; then
   }
   release_build=(
     cross --config 'build.rustc-wrapper=""'
+    --config 'env.SCCACHE_CLIENT_SIDE=""'
     build --locked --release --target "$BUILD_TARGET"
     --jobs 1
     --config profile.release.codegen-units=1
@@ -360,6 +361,7 @@ else
   }
   release_build=(
     cargo --config 'build.rustc-wrapper=""'
+    --config 'env.SCCACHE_CLIENT_SIDE=""'
     build --locked --release --target "$BUILD_TARGET"
     --config profile.release.codegen-units=1
   )
