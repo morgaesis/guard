@@ -266,7 +266,7 @@ assert_daemon_boundary
 
 echo
 echo "=== 1. transparent shims broker through Guard ==="
-if cd /authority && agent_shim env SSH_AUTH_SOCK=/tmp/agent.sock ssh safe-host >/tmp/ssh-shim.out 2>/tmp/ssh-shim.err; then
+if (cd /authority && agent_shim env SSH_AUTH_SOCK=/tmp/agent.sock ssh safe-host) >/tmp/ssh-shim.out 2>/tmp/ssh-shim.err; then
   bad "opaque ssh execution bypassed the closed executable profile registry"
 else
   if grep -q "guarded-ssh" /tmp/ssh-shim.out; then
@@ -280,7 +280,7 @@ case "$OUT" in
   guarded-kubectl:version\ --client:/authority:none) ok "kubectl shim reached Guard with argv/cwd preserved" ;;
   *) bad "kubectl shim output mismatch: '$OUT'"; cat /tmp/kubectl-shim.err ;;
 esac
-if cd /authority && agent_shim helm upgrade --install demo ./chart --namespace staging --dry-run --diff >/tmp/helm-shim.out 2>/tmp/helm-shim.err; then
+if (cd /authority && agent_shim helm upgrade --install demo ./chart --namespace staging --dry-run --diff) >/tmp/helm-shim.out 2>/tmp/helm-shim.err; then
   bad "fixed identity executed Helm with mutable profile authority"
 elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp/helm-shim.err \
   && ! grep -q 'guarded-helm' /tmp/helm-shim.out; then
@@ -288,7 +288,7 @@ elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp
 else
   bad "fixed-identity Helm denial did not report the profile boundary"; cat /tmp/helm-shim.err
 fi
-if cd /authority && agent_shim ansible web -m ping --check >/tmp/ansible-shim.out 2>/tmp/ansible-shim.err; then
+if (cd /authority && agent_shim ansible web -m ping --check) >/tmp/ansible-shim.out 2>/tmp/ansible-shim.err; then
   bad "fixed identity executed Ansible with mutable profile authority"
 elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp/ansible-shim.err \
   && ! grep -q 'guarded-ansible' /tmp/ansible-shim.out; then
@@ -296,7 +296,7 @@ elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp
 else
   bad "fixed-identity Ansible denial did not report the profile boundary"; cat /tmp/ansible-shim.err
 fi
-if cd /authority && agent_shim ansible-playbook /work/site.yml --check --diff --limit web >/tmp/playbook-shim.out 2>/tmp/playbook-shim.err; then
+if (cd /authority && agent_shim ansible-playbook /work/site.yml --check --diff --limit web) >/tmp/playbook-shim.out 2>/tmp/playbook-shim.err; then
   bad "fixed identity executed ansible-playbook with mutable profile authority"
 elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp/playbook-shim.err \
   && ! grep -q 'guarded-ansible-playbook' /tmp/playbook-shim.out; then

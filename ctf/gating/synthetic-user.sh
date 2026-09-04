@@ -316,9 +316,12 @@ assert_catalog_mutation_rejected_after_identity_transition() {
   local target_uid="$1" target_gid="$2" label="$3"
   local expected_catalog_mount="$4" expected_lock_mount="$5" expected_root_mount="$6"
   local marker replacement lock_replacement status
-  marker="/tmp/catalog-owner-transition-$label"
-  replacement="/tmp/catalog-owner-replacement-$label"
-  lock_replacement="/tmp/catalog-lock-owner-replacement-$label"
+  # This scratch directory is deliberately non-sticky. A transitioned child
+  # can own the files it creates while the daemon identity can still perform
+  # deterministic cleanup through the parent directory's write authority.
+  marker="/scenario/fixtures/catalog-owner-transition-$label"
+  replacement="/scenario/fixtures/catalog-owner-replacement-$label"
+  lock_replacement="/scenario/fixtures/catalog-lock-owner-replacement-$label"
   rm -f "$marker" "$replacement" "$lock_replacement"
   set +e
   # The child expands these expressions after changing identity.

@@ -529,6 +529,7 @@ function Assert-DedicatedStateDirectory {
         "$databaseName-shm",
         "$databaseName-journal",
         "$databaseName.daemon.lock",
+        'guard.log',
         'authority.hmac',
         'api-proxy-reverts',
         'secret-files',
@@ -1258,7 +1259,55 @@ function Get-GuardServiceStartupDiagnostic {
         }
     }
     catch { }
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'System'
+            ProviderName = 'Service Control Manager'
+            StartTime = (Get-Date).AddMinutes(-2)
+        } -ErrorAction Stop | Where-Object {
+            $_.Message -match '(?i)\bguard\b|Guard consequence gate'
+        })
+        foreach ($event in $events) {
+            $message = [string]$event.Message
+            if ($message -match '(?i)logon failure|account name is invalid|password is incorrect') {
+                return 'service-account-logon'
+            }
+            if ($message -match '(?i)system cannot find the file|file specified') {
+                return 'service-binary-missing'
+            }
+            if ($message -match '(?i)access is denied') {
+                return 'service-access-denied'
+            }
+            if ($message -match '(?i)not a valid Win32 application') {
+                return 'service-binary-invalid'
+            }
+            if ($message -match '(?i)did not respond.*timely fashion') {
+                return 'service-handshake-timeout'
+            }
+            switch ([int]$event.Id) {
+                7009 { return 'service-handshake-timeout' }
+                7011 { return 'service-handshake-timeout' }
+                7023 { return 'service-process-terminated' }
+                7024 { return 'service-process-terminated' }
+                7031 { return 'service-process-terminated' }
+                7034 { return 'service-process-terminated' }
+                7038 { return 'service-account-logon' }
+                7000 { return 'service-start-failed' }
+            }
+        }
+    }
+    catch { }
     return ''
+}
+
+function Initialize-GuardServiceLog {
+    New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+    Assert-NoReparsePoint -Path $DataDir
+    $serviceLog = Join-Path $DataDir 'guard.log'
+    if (-not (Test-Path -LiteralPath $serviceLog)) {
+        [IO.File]::WriteAllBytes($serviceLog, [byte[]]@())
+    }
+    Assert-NoReparsePoint -Path $serviceLog
 }
 
 function Remove-GuardOperatorArtifacts {
@@ -2892,6 +2941,7 @@ function Invoke-Install {
         if (-not (Test-Path -LiteralPath $VerbsPath) -and $haveSourceVerbs) {
             Copy-Item -LiteralPath $sourceVerbs -Destination $VerbsPath
         }
+        Initialize-GuardServiceLog
         Set-DeploymentAcls -GuardSid $guardSid -StatePaths $(if ($snapshot) { $snapshot.StatePaths } else { $null })
         Set-ServiceEnvironment -Environment $serviceEnvironment -GuardSid $guardSid
         Invoke-InstallerTestFault -Point 'after-environment'

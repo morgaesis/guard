@@ -1751,6 +1751,40 @@ Describe 'Guard Windows installer state and ACL contract' {
         finally { $DataDir = $savedDataDir }
     }
 
+    It 'classifies service-controller event messages without returning free-form content' {
+        $savedDataDir = $DataDir
+        try {
+            $DataDir = Join-Path $TestDrive "missing-service-event-log-$(New-GuardTestIdentifier)"
+            Mock Get-CimInstance { return [pscustomobject]@{ Win32ExitCode = 0 } }
+            Mock Get-WinEvent {
+                return [pscustomobject]@{
+                    Id = 7000
+                    Message = 'The Guard consequence gate service failed to start because the executable is not a valid Win32 application. credential=fixture'
+                }
+            }
+
+            (Get-GuardServiceStartupDiagnostic) | Should -Be 'service-binary-invalid'
+            Should -Invoke Get-WinEvent -Times 1 -Exactly
+        }
+        finally { $DataDir = $savedDataDir }
+    }
+
+    It 'creates the service log without truncating existing diagnostics' {
+        $savedDataDir = $DataDir
+        try {
+            $DataDir = Join-Path $TestDrive "service-log-initialization-$(New-GuardTestIdentifier)"
+            Initialize-GuardServiceLog
+            $serviceLog = Join-Path $DataDir 'guard.log'
+            Test-Path -LiteralPath $serviceLog -PathType Leaf | Should -BeTrue
+            [IO.File]::WriteAllText($serviceLog, 'retained diagnostic')
+
+            Initialize-GuardServiceLog
+
+            [IO.File]::ReadAllText($serviceLog) | Should -Be 'retained diagnostic'
+        }
+        finally { $DataDir = $savedDataDir }
+    }
+
     It 'waits through a transient service-controller start transition' {
         $service = New-GuardTestServiceController -Status 'Stopped' -StatusAfterWait 'Running'
         $name = "guard-$(New-GuardTestIdentifier)"
