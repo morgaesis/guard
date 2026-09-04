@@ -845,6 +845,7 @@ jobs:
             replica="$replica_dist/$(basename "$primary")"
             cmp --silent "$primary" "$replica" || {
               echo "independent SBOM generations produced different output: $(basename "$primary")" >&2
+              diff --unified=3 "$primary" "$replica" || true
               exit 1
             }
           done
