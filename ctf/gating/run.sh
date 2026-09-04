@@ -738,9 +738,16 @@ workflow_ignore_rules = {
 workflow_context_rules = {
     rule for rule in dockerignore_rules if rule.startswith("!.github")
 }
+capability_verb = re.search(
+    r"(?ms)^  - name: child-capability-contract\n(?P<body>.*?)(?=^  - name:|\Z)",
+    catalog,
+)
 
 checks = {
-    "capability contract uses the closed whoami profile": "binary: whoami\n    args: [child-contract]" in catalog and '"whoami"' in profiles,
+    "capability contract uses the closed whoami profile": capability_verb is not None
+    and "    binary: whoami\n" in capability_verb.group("body")
+    and "    args:" not in capability_verb.group("body")
+    and '"whoami"' in profiles,
     "credential contract uses the closed true profile": 'binary: "true"' in catalog and '"true"' in profiles,
     "fixture API reuses closed systemd authority under caller identity with protected credentials": all(
         marker in source
