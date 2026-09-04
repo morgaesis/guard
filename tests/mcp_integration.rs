@@ -888,6 +888,12 @@ async fn mcp_end_to_end_initialize_list_call() {
         .expect("handle description");
     assert!(handle_description.contains("held"));
     assert!(handle_description.contains("provisional"));
+    let approval_description = guard_run["outputSchema"]["properties"]["approval_options"]
+        ["description"]
+        .as_str()
+        .expect("approval options description");
+    assert!(approval_description.contains("operator-neutral"));
+    assert!(!approval_description.contains("their admin"));
     for tool in tools {
         assert!(
             tool["outputSchema"].is_object(),

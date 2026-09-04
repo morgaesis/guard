@@ -1553,7 +1553,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             "approval_options": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Audience-correct approval guidance for a denied or held request. Operators receive exact commands; requesters are directed to their admin."
+                                "description": "Audience-correct approval guidance for a denied or held request. Operators receive exact commands; requesters receive operator-neutral next steps."
                             },
                             "access_requests": {
                                 "type": "array",
