@@ -172,22 +172,26 @@ EOF
 assert_protected_catalog_as_daemon() {
   local authority_owner catalog_mount_identity expected_lock root_mount_identity
   local lock_mount_identity marker replacement lock_replacement mounted_targets
+  echo 'synthetic catalog preflight: initial authority' >&2
   [ "$(stat -c '%u:%g:%a' /)" = 0:0:755 ]
   [ -f "$PROTECTED_CATALOG" ]
   [ -r "$PROTECTED_CATALOG" ]
   [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
     "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
+  echo 'synthetic catalog preflight: mount identities' >&2
   catalog_mount_identity="$(capture_exact_mount_identity "$PROTECTED_CATALOG_DIR" ro)" \
     || return 1
   lock_mount_identity="$(capture_exact_mount_identity "$PROTECTED_CATALOG_LOCK" rw)" \
     || return 1
   root_mount_identity="$(capture_exact_mount_identity / ro)" || return 1
+  echo 'synthetic catalog preflight: mount targets' >&2
   mounted_targets="$(findmnt -rn -o TARGET | awk -v directory="$PROTECTED_CATALOG_DIR" '
     $0 == directory || index($0, directory "/") == 1 { print }
   ' | LC_ALL=C sort)"
   [ "$mounted_targets" = "$(printf '%s\n%s\n' \
     "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG_LOCK" | LC_ALL=C sort)" ]
 
+  echo 'synthetic catalog preflight: ownership' >&2
   if caller_identity_scenario; then
     [ "$(id -u)" -eq 0 ]
     authority_owner=0:0
@@ -203,6 +207,7 @@ assert_protected_catalog_as_daemon() {
     "$authority_owner:444" ]
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_LOCK")" = "$expected_lock" ]
 
+  echo 'synthetic catalog preflight: local mutation rejection' >&2
   replacement=/tmp/protected-catalog-replacement
   lock_replacement=/tmp/protected-catalog-lock-replacement
   marker=/tmp/protected-catalog-lock-marker
@@ -229,6 +234,7 @@ assert_protected_catalog_as_daemon() {
     return 1
   fi
   [ -f "$PROTECTED_CATALOG" ]
+  echo 'synthetic catalog preflight: writable coordination lock' >&2
   exec 9<>"$PROTECTED_CATALOG_LOCK"
   flock -n 9
   printf 'fixture-lock-contract\n' >&9
@@ -240,6 +246,7 @@ assert_protected_catalog_as_daemon() {
   rm -f "$replacement" "$lock_replacement" "$marker"
   [ -f "$PROTECTED_CATALOG_LOCK" ]
   [ ! -s "$PROTECTED_CATALOG_LOCK" ]
+  echo 'synthetic catalog preflight: stable mount identities' >&2
   [ "$(capture_exact_mount_identity "$PROTECTED_CATALOG_DIR" ro)" = \
     "$catalog_mount_identity" ]
   [ "$(capture_exact_mount_identity "$PROTECTED_CATALOG_LOCK" rw)" = \
@@ -249,15 +256,19 @@ assert_protected_catalog_as_daemon() {
   # The rootfs-backed mountpoint remains immutable under every representative
   # identity reachable through CAP_SETUID. Ownership satisfies Guard's trust
   # checks; the read-only mount enforces catalog immutability.
+  echo 'synthetic catalog preflight: root identity transition' >&2
   assert_catalog_mutation_rejected_after_identity_transition \
     0 0 root-identity "$catalog_mount_identity" "$lock_mount_identity" \
     "$root_mount_identity"
+  echo 'synthetic catalog preflight: daemon identity transition' >&2
   assert_catalog_mutation_rejected_after_identity_transition \
     1000 1000 fixed-daemon-identity "$catalog_mount_identity" \
     "$lock_mount_identity" "$root_mount_identity"
+  echo 'synthetic catalog preflight: alternate identity transition' >&2
   assert_catalog_mutation_rejected_after_identity_transition \
     65534 65534 alternate-identity "$catalog_mount_identity" \
     "$lock_mount_identity" "$root_mount_identity"
+  echo 'synthetic catalog preflight: final digest' >&2
   [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
     "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
 }

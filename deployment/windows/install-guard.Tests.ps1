@@ -1725,6 +1725,17 @@ Describe 'Guard Windows installer state and ACL contract' {
         finally { $DataDir = $savedDataDir }
     }
 
+    It 'classifies service-controller failures when no daemon log is available' {
+        $savedDataDir = $DataDir
+        try {
+            $DataDir = Join-Path $TestDrive "missing-service-log-$(New-GuardTestIdentifier)"
+            Mock Get-CimInstance { return [pscustomobject]@{ Win32ExitCode = 1069 } }
+
+            (Get-GuardServiceStartupDiagnostic) | Should -Be 'service-account-logon'
+        }
+        finally { $DataDir = $savedDataDir }
+    }
+
     It 'waits through a transient service-controller start transition' {
         $service = New-GuardTestServiceController -Status 'Stopped' -StatusAfterWait 'Running'
         $name = "guard-$(New-GuardTestIdentifier)"

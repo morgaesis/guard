@@ -6898,9 +6898,9 @@ mod tests {
         )
         .unwrap();
 
-        if let Some(warning) = outcome.warning() {
-            panic!("atomic rewrite reported a warning: {warning:#}");
-        }
+        assert!(outcome.warning().is_some_and(|warning| warning
+            .to_string()
+            .contains("does not expose independent directory-entry flush confirmation")));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "version: 2\n");
         assert_eq!(windows_dacl_digest(&path).unwrap(), expected_dacl);
     }

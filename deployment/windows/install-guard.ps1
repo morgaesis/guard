@@ -1227,20 +1227,37 @@ function ConvertTo-SanitizedDiagnosticOutput {
 
 function Get-GuardServiceStartupDiagnostic {
     $serviceLog = Join-Path $DataDir 'guard.log'
-    if (-not (Test-Path -LiteralPath $serviceLog -PathType Leaf)) { return '' }
-    try {
-        $lines = @(Get-Content -LiteralPath $serviceLog -Tail 80 -ErrorAction Stop |
-            Where-Object { $_ -match 'guard service.*error|daemon terminated with error' })
-        if ($lines.Count -eq 0) { return '' }
-        $errorLine = [string]$lines[-1]
-        if ($errorLine -match '(?i)verb catalog|catalog authority') { return 'verb-catalog' }
-        if ($errorLine -match '(?i)state database|state-db|sqlite|authority file') { return 'durable-state' }
-        if ($errorLine -match '(?i)named pipe|socket|listener|endpoint') { return 'local-endpoint' }
-        if ($errorLine -match '(?i)kubeconfig|api proxy|brokered') { return 'brokered-api' }
-        if ($errorLine -match '(?i)permission|access is denied|dacl|acl') { return 'filesystem-authority' }
-        return 'daemon-startup'
+    if (Test-Path -LiteralPath $serviceLog -PathType Leaf) {
+        try {
+            $lines = @(Get-Content -LiteralPath $serviceLog -Tail 80 -ErrorAction Stop |
+                Where-Object { $_ -match 'guard service.*error|daemon terminated with error' })
+            if ($lines.Count -gt 0) {
+                $errorLine = [string]$lines[-1]
+                if ($errorLine -match '(?i)verb catalog|catalog authority') { return 'verb-catalog' }
+                if ($errorLine -match '(?i)state database|state-db|sqlite|authority file') { return 'durable-state' }
+                if ($errorLine -match '(?i)named pipe|socket|listener|endpoint') { return 'local-endpoint' }
+                if ($errorLine -match '(?i)kubeconfig|api proxy|brokered') { return 'brokered-api' }
+                if ($errorLine -match '(?i)permission|access is denied|dacl|acl') { return 'filesystem-authority' }
+                return 'daemon-startup'
+            }
+        }
+        catch { }
     }
-    catch { return '' }
+    try {
+        $service = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
+        switch ([int]$service.Win32ExitCode) {
+            2 { return 'service-binary-missing' }
+            5 { return 'service-access-denied' }
+            1053 { return 'service-handshake-timeout' }
+            1067 { return 'service-process-terminated' }
+            1069 { return 'service-account-logon' }
+            default {
+                if ([int]$service.Win32ExitCode -ne 0) { return 'service-control-manager' }
+            }
+        }
+    }
+    catch { }
+    return ''
 }
 
 function Remove-GuardOperatorArtifacts {
