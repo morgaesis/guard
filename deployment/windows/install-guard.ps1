@@ -1269,6 +1269,23 @@ function Get-GuardServiceStartupDiagnostic {
         })
         foreach ($event in $events) {
             $message = [string]$event.Message
+            $eventCodeToken = ''
+            if (@($event.Properties).Count -gt 1) {
+                $eventCodeToken = [string]$event.Properties[1].Value
+            }
+            if ([int]$event.Id -eq 7000 -and $eventCodeToken -match '^%%(?<code>[0-9]{1,10})$') {
+                $eventCode = [int64]$Matches.code
+                switch ($eventCode) {
+                    2 { return 'service-binary-missing' }
+                    3 { return 'service-binary-path-missing' }
+                    5 { return 'service-access-denied' }
+                    193 { return 'service-binary-invalid' }
+                    1053 { return 'service-handshake-timeout' }
+                    1067 { return 'service-process-terminated' }
+                    1069 { return 'service-account-logon' }
+                    default { return "service-start-failed-code-$eventCode" }
+                }
+            }
             if ($message -match '(?i)logon failure|account name is invalid|password is incorrect') {
                 return 'service-account-logon'
             }

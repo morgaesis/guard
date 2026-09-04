@@ -270,11 +270,12 @@ assert_daemon_runtime_boundary() {
     --env "GUARD_SU_DAEMON_MODE=$mode" \
     --env "GUARD_SU_EXPECTED_GROUPS=$expected_groups" \
     "$container" /bin/sh -c '
+    set -eu
     pids=$(pgrep -u "$GUARD_SU_DAEMON_UID" -x guard)
     [ "$(printf "%s\n" "$pids" | sed "/^$/d" | wc -l)" -eq 1 ] || exit 1
     cap_eff=$(awk "/^CapEff:/ { value = tolower(\$2); sub(/^0+/, \"\", value); print value == \"\" ? \"0\" : value }" /proc/$pids/status)
     [ "$cap_eff" = c0 ]
-    groups=$(awk "/^Groups:/ { for (index = 2; index <= NF; index++) print \$index }" /proc/$pids/status |
+    groups=$(awk "/^Groups:/ { for (field = 2; field <= NF; field++) print \$field }" /proc/$pids/status |
       LC_ALL=C sort -n | paste -sd, -)
     [ "$groups" = "$GUARD_SU_EXPECTED_GROUPS" ]
     if [ "$GUARD_SU_DAEMON_MODE" = caller ]; then
@@ -1206,6 +1207,7 @@ if [ "$failures" -ne 0 ]; then
         -e '/^- Result: /p' \
         -e '/^- Classification: /p' \
         -e '/^- Evidence: /p' \
+        -e '/^- Failure signal: /p' \
         "$evidence"
       if [ -f "$RESULTS_DIR/$scenario.host-failure.md" ]; then
         sed -n \

@@ -46,7 +46,9 @@ RUN install -d -o root -g root -m 0755 /work /work/ansible-project
 
 # The daemon's immutable authority mountpoint is anchored directly under the
 # read-only container rootfs, outside every daemon-writable ancestor.
-RUN install -d -o root -g root -m 0555 /authority
+RUN install -d -o root -g root -m 0555 /authority \
+    && printf 'hello\n' > /authority/seed.txt \
+    && chmod 0444 /authority/seed.txt
 
 # The shared catalog also binds synthetic Ansible coverage to this canonical
 # project directory. Synthetic runs replace `/scenario` with their private

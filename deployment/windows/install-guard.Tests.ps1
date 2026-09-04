@@ -1769,6 +1769,28 @@ Describe 'Guard Windows installer state and ACL contract' {
         finally { $DataDir = $savedDataDir }
     }
 
+    It 'classifies numeric service-controller event codes without returning free-form content' {
+        $savedDataDir = $DataDir
+        try {
+            $DataDir = Join-Path $TestDrive "missing-service-code-log-$(New-GuardTestIdentifier)"
+            Mock Get-CimInstance { return [pscustomobject]@{ Win32ExitCode = 0 } }
+            Mock Get-WinEvent {
+                return [pscustomobject]@{
+                    Id = 7000
+                    Message = 'The Guard consequence gate service failed to start.'
+                    Properties = @(
+                        [pscustomobject]@{ Value = 'Guard consequence gate' },
+                        [pscustomobject]@{ Value = '%%1053' }
+                    )
+                }
+            }
+
+            (Get-GuardServiceStartupDiagnostic) | Should -Be 'service-handshake-timeout'
+            Should -Invoke Get-WinEvent -Times 1 -Exactly
+        }
+        finally { $DataDir = $savedDataDir }
+    }
+
     It 'creates the service log without truncating existing diagnostics' {
         $savedDataDir = $DataDir
         try {

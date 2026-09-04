@@ -6,7 +6,7 @@ verbs:
   - name: read-file
     description: Read the fixed seed file (reversible)
     binary: cat
-    args: ["/work/seed.txt"]
+    args: ["/authority/seed.txt"]
     consequence: reversible
     trusted: true
     coverage:
@@ -242,7 +242,7 @@ verbs:
   - name: access-file-read
     description: Read the fake operator file
     binary: cat
-    args: ["/scenario/fixtures/operator-note"]
+    args: ["/authority/operator-note"]
     baseline: false
     consequence: reversible
     trusted: true

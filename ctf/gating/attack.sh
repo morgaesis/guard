@@ -50,6 +50,7 @@ assert_daemon_boundary() {
 }
 
 start_daemon() {
+  rm -f "$SOCK"
   setpriv \
     --reuid=guarddaemon \
     --regid=guarddaemon \
@@ -108,7 +109,6 @@ users:
 EOF
 install -m 0640 /dev/null "$BROKERED_KUBECONFIG"
 chown guarddaemon:guardexec "$BROKERED_KUBECONFIG"
-echo "hello" > /work/seed.txt
 printf '%s\n' '---' '- hosts: web' '  gather_facts: false' '  tasks: []' > /work/site.yml
 mkdir -p /work/ansible-project
 printf '[defaults]\ninventory = inventory\n' > /work/ansible-project/ansible.cfg
@@ -450,7 +450,7 @@ DAEMON_READY=false
 for _ in $(seq 1 50); do
   if kill -0 "$DAEMON_PID" 2>/dev/null \
     && [ -S "$SOCK" ] \
-    && agent guard status --socket "$SOCK" >/dev/null 2>&1; then
+    && timeout 2 agent guard status --socket "$SOCK" >/dev/null 2>&1; then
     DAEMON_READY=true
     break
   fi

@@ -6,6 +6,7 @@ SOCKET=/scenario/run/guard.sock
 PROTECTED_CATALOG_DIR=/authority
 PROTECTED_CATALOG="$PROTECTED_CATALOG_DIR/verbs.yaml"
 PROTECTED_CATALOG_LOCK="$PROTECTED_CATALOG_DIR/.verbs.yaml.learning-lock"
+PROTECTED_OPERATOR_NOTE="$PROTECTED_CATALOG_DIR/operator-note"
 SCENARIO="${2:-}"
 RAW="/scenario/raw/$SCENARIO.log"
 PRINCIPAL_ROOT="/scenario/principals/$(id -u)"
@@ -64,7 +65,6 @@ setup_fixture() {
   chmod 0777 /scenario/fixtures /scenario/fixtures/staging /scenario/ansible
   chgrp guard-clients /scenario/run
   chmod 0755 /scenario/run
-  printf 'synthetic operator note\n' > /scenario/fixtures/operator-note
   cat > "$UPSTREAM_KUBECONFIG" <<'EOF'
 apiVersion: v1
 kind: Config
@@ -414,6 +414,7 @@ assert_daemon_path_contract() {
 
 daemon() {
   setup_fixture
+  rm -f "$SOCKET"
   echo 'synthetic daemon preflight: runtime path contract' >&2
   assert_daemon_path_contract
   echo 'synthetic daemon preflight: immutable catalog contract' >&2
@@ -1131,7 +1132,7 @@ phase_su16() {
       [ "$(response_handle /scenario/journey/cross-command.out)" = "$(read_handle command)" ]
       expect_failure cross-cloud guard run --json printf 'fixture-vm Running\n'
       [ "$(response_handle /scenario/journey/cross-cloud.out)" = "$(read_handle cloud)" ]
-      expect_failure cross-file guard run --json cat /scenario/fixtures/operator-note
+      expect_failure cross-file guard run --json cat "$PROTECTED_OPERATOR_NOTE"
       [ "$(response_handle /scenario/journey/cross-file.out)" = "$(read_handle file)" ]
       (cd /scenario/ansible && expect_failure cross-ansible guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
       [ "$(response_handle /scenario/journey/cross-ansible.out)" = "$(read_handle ansible)" ]
@@ -1201,7 +1202,7 @@ phase_su16() {
       expect_failure command-third guard run --json printf 'bounded-command-complete\n'
       grep -q 'use limit is exhausted' /scenario/journey/command-third.out
       capture_phase cloud-use guard run --json printf 'fixture-vm Running\n'
-      capture_phase file-use guard run --json cat /scenario/fixtures/operator-note
+      capture_phase file-use guard run --json cat "$PROTECTED_OPERATOR_NOTE"
       (cd /scenario/ansible && expect_failure ansible-use guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
       grep -Eq 'fixed-identity|shared child UID' /scenario/journey/ansible-use.out
       ! grep -q 'changed=0' /scenario/journey/ansible-use.out
@@ -1346,7 +1347,7 @@ phase_su18() {
       ;;
     after-revoke)
       [ "$(id -u)" -eq 1001 ]
-      expect_failure revoked-denied guard run --json cat /scenario/fixtures/operator-note
+      expect_failure revoked-denied guard run --json cat "$PROTECTED_OPERATOR_NOTE"
       ;;
     verify)
       [ "$(id -u)" -eq 1000 ]
@@ -1402,7 +1403,7 @@ phase_su19() {
       [ "$(id -u)" -eq 1001 ]
       capture_phase primary-command-use guard run --json printf 'bounded-command-complete\n'
       grep -q 'bounded-command-complete' /scenario/journey/primary-command-use.out
-      expect_failure primary-file-denied guard run --json cat /scenario/fixtures/operator-note
+      expect_failure primary-file-denied guard run --json cat "$PROTECTED_OPERATOR_NOTE"
       fresh="$(response_handle /scenario/journey/primary-file-denied.out)"
       [ -n "$fresh" ]
       [ "$fresh" != "$(read_handle primary-file)" ]
@@ -1410,7 +1411,7 @@ phase_su19() {
       ;;
     use-secondary)
       [ "$(id -u)" -eq 1002 ]
-      capture_phase secondary-file-use guard run --json cat /scenario/fixtures/operator-note
+      capture_phase secondary-file-use guard run --json cat "$PROTECTED_OPERATOR_NOTE"
       grep -q 'synthetic operator note' /scenario/journey/secondary-file-use.out
       expect_failure secondary-command-pending guard run --json printf 'bounded-command-complete\n'
       fresh="$(response_handle /scenario/journey/secondary-command-pending.out)"
@@ -1472,7 +1473,7 @@ PY
       ;;
     consume-secondary-first)
       [ "$(id -u)" -eq 1002 ]
-      capture_phase durable-file-first guard run --json cat /scenario/fixtures/operator-note
+      capture_phase durable-file-first guard run --json cat "$PROTECTED_OPERATOR_NOTE"
       ;;
     revoke-after-restart)
       [ "$(id -u)" -eq 1000 ]
@@ -1498,7 +1499,7 @@ PY
       ;;
     post-revoke-secondary)
       [ "$(id -u)" -eq 1002 ]
-      capture_phase durable-file-second guard run --json cat /scenario/fixtures/operator-note
+      capture_phase durable-file-second guard run --json cat "$PROTECTED_OPERATOR_NOTE"
       ;;
     after-second-restart-primary)
       [ "$(id -u)" -eq 1001 ]
@@ -1508,8 +1509,8 @@ PY
       ;;
     after-second-restart-secondary)
       [ "$(id -u)" -eq 1002 ]
-      capture_phase durable-file-third guard run --json cat /scenario/fixtures/operator-note
-      expect_failure durable-file-exhausted guard run --json cat /scenario/fixtures/operator-note
+      capture_phase durable-file-third guard run --json cat "$PROTECTED_OPERATOR_NOTE"
+      expect_failure durable-file-exhausted guard run --json cat "$PROTECTED_OPERATOR_NOTE"
       grep -q 'use limit is exhausted' /scenario/journey/durable-file-exhausted.out
       ;;
     verify)
@@ -1584,7 +1585,7 @@ phase_su21() {
         'Inspect the fake CloudStack virtual machines' --json
       retry="$(request_reference /scenario/journey/terminal-cloud-retry.out)"
       [ "$retry" != "$(read_handle terminal-cloud)" ]
-      expect_failure terminal-file-run guard run --json cat /scenario/fixtures/operator-note
+      expect_failure terminal-file-run guard run --json cat "$PROTECTED_OPERATOR_NOTE"
       [ "$(response_handle /scenario/journey/terminal-file-run.out)" != "$(read_handle terminal-file)" ]
       ;;
     stale-and-verify)
@@ -1949,15 +1950,20 @@ prepare_principals() {
   mkdir -p "$PROTECTED_CATALOG_DIR"
   chmod 0755 "$PROTECTED_CATALOG_DIR"
   cp /etc/guard/verbs.yaml "$PROTECTED_CATALOG"
+  printf 'synthetic operator note\n' > "$PROTECTED_OPERATOR_NOTE"
   chmod 0444 "$PROTECTED_CATALOG"
+  chmod 0444 "$PROTECTED_OPERATOR_NOTE"
   install -m 0600 /dev/null "$PROTECTED_CATALOG_LOCK"
   chmod 0555 "$PROTECTED_CATALOG_DIR"
   chown "$daemon_owner" \
-    "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG" "$PROTECTED_CATALOG_LOCK"
+    "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG" "$PROTECTED_CATALOG_LOCK" \
+    "$PROTECTED_OPERATOR_NOTE"
 
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_DIR")" = \
     "$daemon_owner:555" ]
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG")" = \
+    "$daemon_owner:444" ]
+  [ "$(stat -c '%u:%g:%a' "$PROTECTED_OPERATOR_NOTE")" = \
     "$daemon_owner:444" ]
   [ "$(stat -c '%u:%g:%a' "$PROTECTED_CATALOG_LOCK")" = \
     "$daemon_owner:600" ]
@@ -1982,6 +1988,7 @@ collect_phase() {
 
 collect_result() {
   local scenario="$2" expected="$3" candidate temporary phase_manifest phase_digest
+  local failure_file failure_signal=''
   local -a candidates=()
   local uid
   [ "$(id -u)" -eq 0 ]
@@ -1997,6 +2004,36 @@ collect_result() {
     && grep -Fqx -- '- Result: passed' "${candidates[0]}"; then
     head -c 131072 "${candidates[0]}" > "$temporary"
   else
+    for uid in 1000 1001 1002; do
+      failure_file="/scenario/principals/$uid/failure.txt"
+      [ -f "$failure_file" ] || continue
+      candidate="$(sed -n '1p' "$failure_file")"
+      case "$candidate" in
+        'test filter failed: '*|'test filter matched no tests: '*)
+          if [[ "$candidate" =~ ^test\ filter\ (failed|matched\ no\ tests):\ [A-Za-z0-9_]+$ ]]; then
+            failure_signal="$candidate"
+          fi
+          ;;
+        'phase='*)
+          if [[ "$candidate" =~ ^phase=[A-Za-z0-9_-]+\ line=[0-9]+$ ]]; then
+            failure_signal="$candidate"
+          fi
+          ;;
+        'caller could not inspect its own live provisional'|\
+        'live failing revert did not surface revert_failed')
+          failure_signal="$candidate"
+          ;;
+        'live failing-revert verb did not enter the provisional state: '*)
+          failure_signal='live failing-revert verb did not enter the provisional state'
+          ;;
+        'typed profile tool unexpectedly executed: '*)
+          if [[ "$candidate" =~ ^typed\ profile\ tool\ unexpectedly\ executed:\ mode=(fixed|caller)\ verb=[A-Za-z0-9_-]+$ ]]; then
+            failure_signal="$candidate"
+          fi
+          ;;
+      esac
+      [ -z "$failure_signal" ] || break
+    done
     {
       echo "# $scenario"
       echo
@@ -2005,6 +2042,9 @@ collect_result() {
       echo "- Evidence: the root collector did not receive one matching successful candidate result"
       echo "- Isolation: rootless container, private daemon/socket/database/fixtures/principal/network namespace, network disabled"
       echo "- Raw transcript: retained only in the ephemeral scenario volume and removed during teardown"
+      if [ -n "$failure_signal" ]; then
+        printf '%s\n' "- Failure signal: \`$failure_signal\`"
+      fi
     } > "$temporary"
   fi
   phase_manifest="$COLLECTOR_ROOT/$scenario.phase-output.sha256"
