@@ -332,6 +332,8 @@ source_root="${SOURCE_ROOT:-$PWD}"
 dist_dir="${DIST_DIR:-$source_root/dist}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$source_root/target}"
 export CARGO_INCREMENTAL=0
+# Source paths affect compiler output even when symbols are stripped.
+export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$source_root=/guard-source"
 bundle="guard-${RELEASE_LABEL}-${BUILD_TARGET}"
 archive="$dist_dir/${bundle}.tar.gz"
 root="$dist_dir/$bundle"
