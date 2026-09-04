@@ -2194,7 +2194,7 @@ fn set_owner_only_permissions(file: &File) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let permissions = file.metadata()?.permissions();
-        if permissions.mode() & 0o077 != 0 {
+        if permissions.mode() & 0o777 != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }
