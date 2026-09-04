@@ -280,7 +280,7 @@ case "$OUT" in
 esac
 if cd /work && agent_shim helm upgrade --install demo ./chart --namespace staging --dry-run --diff >/tmp/helm-shim.out 2>/tmp/helm-shim.err; then
   bad "fixed identity executed Helm with mutable profile authority"
-elif grep -Eq 'fixed-identity|shared child UID' /tmp/helm-shim.err \
+elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp/helm-shim.err \
   && ! grep -q 'guarded-helm' /tmp/helm-shim.out; then
   ok "fixed identity denied Helm before process start"
 else
@@ -288,7 +288,7 @@ else
 fi
 if cd /work && agent_shim ansible web -m ping --check >/tmp/ansible-shim.out 2>/tmp/ansible-shim.err; then
   bad "fixed identity executed Ansible with mutable profile authority"
-elif grep -Eq 'fixed-identity|shared child UID' /tmp/ansible-shim.err \
+elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp/ansible-shim.err \
   && ! grep -q 'guarded-ansible' /tmp/ansible-shim.out; then
   ok "fixed identity denied Ansible before process start"
 else
@@ -296,7 +296,7 @@ else
 fi
 if cd /work && agent_shim ansible-playbook /work/site.yml --check --diff --limit web >/tmp/playbook-shim.out 2>/tmp/playbook-shim.err; then
   bad "fixed identity executed ansible-playbook with mutable profile authority"
-elif grep -Eq 'fixed-identity|shared child UID' /tmp/playbook-shim.err \
+elif grep -Eq 'fixed-identity|shared child UID|immutable profile snapshots' /tmp/playbook-shim.err \
   && ! grep -q 'guarded-ansible-playbook' /tmp/playbook-shim.out; then
   ok "fixed identity denied ansible-playbook before process start"
 else

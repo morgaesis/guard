@@ -332,6 +332,7 @@ source_root="${SOURCE_ROOT:-$PWD}"
 dist_dir="${DIST_DIR:-$source_root/dist}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$source_root/target}"
 export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 bundle="guard-${RELEASE_LABEL}-${BUILD_TARGET}"
 archive="$dist_dir/${bundle}.tar.gz"
 root="$dist_dir/$bundle"
@@ -347,19 +348,13 @@ if [ "${USE_CROSS:-false}" = true ]; then
     echo "cross compilation selected for an unexpected target" >&2
     exit 1
   }
-  release_build=(
-    cross build --locked --release --target "$BUILD_TARGET"
-    --config profile.release.codegen-units=1
-  )
+  release_build=(cross build --locked --release --target "$BUILD_TARGET")
 else
   [ "$BUILD_TARGET" != aarch64-unknown-linux-gnu ] || {
     echo "aarch64 Linux release requires cross compilation" >&2
     exit 1
   }
-  release_build=(
-    cargo build --locked --release --target "$BUILD_TARGET"
-    --config profile.release.codegen-units=1
-  )
+  release_build=(cargo build --locked --release --target "$BUILD_TARGET")
 fi
 (
   case "$BUILD_TARGET" in

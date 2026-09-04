@@ -212,6 +212,22 @@ fn gating_config(
     (cfg, operator, agent)
 }
 
+/// Build a gating config whose principals can be reconstructed by the active
+/// platform during deferred approval execution.
+fn reconstructable_gating_config(
+    operator_id: u32,
+    agent_id: u32,
+) -> (ServerContext, CallerIdentity, CallerIdentity) {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.config.daemon_uid = operator_id;
+    cfg.config.daemon_principal = super::local_test_principal(operator_id);
+    cfg.config.exec_as_caller = true;
+    let operator = super::local_test_operator(operator_id);
+    let agent = super::local_test_caller(agent_id);
+    (cfg, operator, agent)
+}
+
 /// A request with a structured revert, used to drive `arm_containment_with_authority`.
 fn contain_request(binary: &str, args: &[&str], revert: RevertSpec) -> ExecuteRequest {
     ExecuteRequest {
@@ -5838,7 +5854,7 @@ fn hash_secret_value_is_keyed_salted_and_value_sensitive() {
 /// secrets. Persisted snapshots contain names and hashes, never values.
 #[tokio::test]
 async fn approve_rejected_when_bound_secret_value_changed() {
-    let (cfg, _operator, agent) = gating_config(7201, 4201);
+    let (cfg, _operator, agent) = reconstructable_gating_config(7201, 4201);
     let agent_principal = agent.principal();
     let p = agent_principal.clone().expect("agent principal");
     cfg.state
@@ -6320,7 +6336,7 @@ async fn typed_ansible_secret_file_approval_is_bound_then_refused_for_fixed_iden
 /// before approval. Approval fails closed when the absent secret appears.
 #[tokio::test]
 async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
-    let (cfg, _operator, agent) = gating_config(7203, 4203);
+    let (cfg, _operator, agent) = reconstructable_gating_config(7203, 4203);
     let agent_principal = agent.principal();
     let p = agent_principal.clone().expect("agent principal");
     // The secret does NOT exist at hold time.
@@ -8155,7 +8171,7 @@ async fn approved_snapshot_rejects_changed_session_revision() {
 
 #[tokio::test]
 async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
-    let (cfg, _, agent) = gating_config(7018, 1000);
+    let (cfg, _, agent) = reconstructable_gating_config(7018, 1000);
     let snapshot = ApprovalSnapshot {
         binary: "true".to_string(),
         args: Vec::new(),

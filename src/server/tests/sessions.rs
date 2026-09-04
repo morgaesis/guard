@@ -1,7 +1,9 @@
 use crate::grant_profile::{EvaluationMode, GrantRequestStatus, SavedGrantCatalog};
+#[cfg(unix)]
+use crate::server::admin::handle_admin_request_owned;
 use crate::server::admin::{
-    handle_admin_request_for_test, handle_admin_request_owned, install_approved_access_verbs,
-    prune_grant_requests, validate_durable_access_provenance, MAX_GRANT_REQUESTS,
+    handle_admin_request_for_test, install_approved_access_verbs, prune_grant_requests,
+    validate_durable_access_provenance, MAX_GRANT_REQUESTS,
 };
 use crate::server::execute::{
     admit_access_use, evaluation_cache_scope, execute_command, session_source_from_eval,
@@ -209,6 +211,7 @@ async fn verb_synthesis_preserves_sensitive_read_hold() {
     assert!(verb.hold);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn approved_synthesized_access_executes_deterministically_without_catalog_file() {
     #[cfg(unix)]
@@ -1133,6 +1136,7 @@ async fn full_access_queue_rejects_before_synthesis_or_catalog_change() {
     assert_eq!(cfg.state.verbs.read().await.version(), before);
 }
 
+#[cfg(unix)]
 #[test]
 fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
     std::thread::Builder::new()
@@ -1285,6 +1289,7 @@ verbs:
     );
 }
 
+#[cfg(unix)]
 async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() {
     #[cfg(unix)]
     let _environment_guard = TEST_ENV_LOCK.lock().await;

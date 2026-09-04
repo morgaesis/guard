@@ -242,6 +242,43 @@ async fn run_verb_synthesis_llm(listener: tokio::net::TcpListener) {
     run_verb_synthesis_llm_with(listener, synthesized_compiler_check_arguments).await;
 }
 
+fn local_test_principal(id: u32) -> guard::principal::PrincipalKey {
+    #[cfg(windows)]
+    {
+        guard::principal::PrincipalKey::from_sid(format!(
+            "S-1-5-21-1000000000-1000000001-1000000002-{id}"
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        guard::principal::PrincipalKey::from_uid(id)
+    }
+}
+
+fn local_test_caller(id: u32) -> super::wire::CallerIdentity {
+    #[cfg(windows)]
+    {
+        super::wire::CallerIdentity::Windows {
+            sid: local_test_principal(id).into_string(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        super::wire::CallerIdentity::Unix { uid: id }
+    }
+}
+
+fn local_test_operator(id: u32) -> super::wire::CallerIdentity {
+    #[cfg(windows)]
+    {
+        local_test_caller(id)
+    }
+    #[cfg(not(windows))]
+    {
+        super::wire::CallerIdentity::UnixAdmin { uid: id }
+    }
+}
+
 fn make_test_config() -> (ServerContext, SharedBuf) {
     // LLM disabled, no static policy → policy_allowed() never hits
     // this path; we manufacture results directly for audit tests.

@@ -377,7 +377,18 @@ jobs:
           }
 
           try {
-            & $installer @candidateInstall
+            try {
+              & $installer @candidateInstall
+            }
+            catch {
+              $serviceLog = Join-Path $DataDir 'guard.log'
+              if (Test-Path -LiteralPath $serviceLog -PathType Leaf) {
+                Get-Content -LiteralPath $serviceLog -Tail 40 |
+                  Where-Object { $_ -match 'guard service.*error|daemon terminated with error' } |
+                  ForEach-Object { Write-Warning "Guard startup diagnostic: $_" }
+              }
+              throw
+            }
             & $installer -Action access-list -Json | Out-Null
             $guardSid = Get-GuardSid
             $statePaths = Get-GuardStatePaths -ServicePathName (Get-ServicePathName)

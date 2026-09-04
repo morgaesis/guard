@@ -3625,9 +3625,51 @@ fn windows_dacl_digest(path: &Path) -> Result<String> {
         // otherwise identical DACL during replacement recovery.
         const INHERITED_ACE: u8 = 0x10;
         ace_bytes[1] &= !INHERITED_ACE;
+        // Effective inherited file ACEs have generic access rights mapped to
+        // their file-specific equivalents. Normalize the two representations
+        // because they grant the same authority and Windows may choose either
+        // form while applying an otherwise identical DACL.
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+        const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+        if matches!(
+            ace_bytes[0],
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
+        ) && ace_bytes.len() >= 8
+        {
+            let mask = u32::from_le_bytes(ace_bytes[4..8].try_into().unwrap());
+            let normalized = normalize_windows_file_access_mask(mask);
+            ace_bytes[4..8].copy_from_slice(&normalized.to_le_bytes());
+        }
         generation.extend_from_slice(&ace_bytes);
     }
     Ok(content_digest(&generation))
+}
+
+#[cfg(windows)]
+fn normalize_windows_file_access_mask(mask: u32) -> u32 {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const FILE_GENERIC_READ: u32 = 0x0012_0089;
+    const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
+    const FILE_GENERIC_EXECUTE: u32 = 0x0012_00a0;
+    const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+
+    let mut normalized = mask & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+    if mask & GENERIC_READ != 0 {
+        normalized |= FILE_GENERIC_READ;
+    }
+    if mask & GENERIC_WRITE != 0 {
+        normalized |= FILE_GENERIC_WRITE;
+    }
+    if mask & GENERIC_EXECUTE != 0 {
+        normalized |= FILE_GENERIC_EXECUTE;
+    }
+    if mask & GENERIC_ALL != 0 {
+        normalized |= FILE_ALL_ACCESS;
+    }
+    normalized
 }
 
 #[cfg(windows)]
@@ -6638,6 +6680,23 @@ mod tests {
         assert_eq!(
             windows_dacl_digest(&direct).unwrap(),
             windows_dacl_digest(&inherited).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dacl_generation_normalizes_generic_file_rights() {
+        let temp = authority_tempdir();
+        let generic = temp.path().join("generic.yaml");
+        let specific = temp.path().join("specific.yaml");
+        write_authority_file(&generic, "version: 1\n").unwrap();
+        write_authority_file(&specific, "version: 1\n").unwrap();
+        apply_windows_test_dacl(&generic, "D:P(A;;FA;;;OW)(A;;GR;;;AU)");
+        apply_windows_test_dacl(&specific, "D:P(A;;FA;;;OW)(A;;0x00120089;;;AU)");
+
+        assert_eq!(
+            windows_dacl_digest(&generic).unwrap(),
+            windows_dacl_digest(&specific).unwrap()
         );
     }
 

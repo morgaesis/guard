@@ -336,7 +336,7 @@ impl ProtocolConfig for KubernetesProtocol {
                 "exec" | "attach" | "portforward" | "proxy" | "ephemeralcontainers"
             ) {
                 return Some(format!(
-                    "guard api-proxy: kubernetes subresource '{sub}' is not permitted; Guard's brokered kubeconfig supports non-interactive typed kubectl operations only"
+                    "guard api-proxy: kubernetes subresource '{sub}' is not permitted; Guard's brokered kubeconfig supports non-interactive typed kubectl operations only; use an operator-approved typed Kubernetes diagnostic that avoids interactive subresources"
                 ));
             }
         }
@@ -646,6 +646,7 @@ mod tests {
             let reason = p.deny_outright(&o).expect("denied");
             assert!(reason.contains(sub));
             assert!(reason.contains("non-interactive typed kubectl operations only"));
+            assert!(reason.contains("operator-approved typed Kubernetes diagnostic"));
         }
         let ec = op(
             "PATCH",

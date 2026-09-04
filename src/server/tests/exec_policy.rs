@@ -2567,6 +2567,8 @@ async fn extra_child_env_forwards_named_var_to_child() {
     );
 
     let token = format!("child-env-{}", std::process::id());
+    let principal = super::local_test_principal(1000);
+    let caller = super::local_test_caller(1000);
     {
         let mut sessions = cfg.state.sessions.write().await;
         sessions.grant(
@@ -2585,9 +2587,7 @@ async fn extra_child_env_forwards_named_var_to_child() {
                 static_only: true,
                 auto_amend: false,
                 granted_at: 0,
-                owner: crate::session::SessionOwner::Principal(
-                    guard::principal::PrincipalKey::from_uid(1000),
-                ),
+                owner: crate::session::SessionOwner::Principal(principal),
             },
         );
     }
@@ -2609,7 +2609,7 @@ async fn extra_child_env_forwards_named_var_to_child() {
         wait_approval_secs: None,
         verb: None,
     };
-    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    let result = execute_command(req, &cfg, &caller).await;
     match &result.exec {
         ExecOutcome::Completed { stdout, .. } => assert!(
             stdout
