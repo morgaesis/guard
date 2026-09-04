@@ -3452,7 +3452,26 @@ fn restore_replacement_metadata(
     apply_security_descriptor_to_handle(&destination_file, &descriptor, information)?;
     destination_file.sync_all()?;
     if !windows_dacl_generation_matches(destination, expected_generation)? {
-        anyhow::bail!("replacement DACL does not match its transaction metadata")
+        let expected = windows_dacl_generation(&paths.backup)?;
+        let actual = windows_dacl_generation(destination)?;
+        let expected_count = u16::from_le_bytes([expected[1], expected[2]]);
+        let actual_count = u16::from_le_bytes([actual[1], actual[2]]);
+        let first_difference = expected
+            .iter()
+            .zip(&actual)
+            .position(|(left, right)| left != right)
+            .map_or_else(
+                || expected.len().min(actual.len()).to_string(),
+                |offset| offset.to_string(),
+            );
+        anyhow::bail!(
+            "replacement DACL does not match its transaction metadata \
+             (expected {expected_count} ACEs/{expected_length} semantic bytes, \
+             observed {actual_count} ACEs/{actual_length}; first difference at byte \
+             {first_difference})",
+            expected_length = expected.len(),
+            actual_length = actual.len(),
+        )
     }
     Ok(())
 }
@@ -3552,6 +3571,11 @@ fn read_windows_dacl_descriptor(path: &Path) -> Result<Vec<u8>> {
 
 #[cfg(windows)]
 fn windows_dacl_digest(path: &Path) -> Result<String> {
+    Ok(content_digest(&windows_dacl_generation(path)?))
+}
+
+#[cfg(windows)]
+fn windows_dacl_generation(path: &Path) -> Result<Vec<u8>> {
     use windows_sys::Win32::Security::{
         GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, IsValidAcl, ACE_HEADER,
         SE_DACL_PROTECTED,
@@ -3642,7 +3666,7 @@ fn windows_dacl_digest(path: &Path) -> Result<String> {
         }
         generation.extend_from_slice(&ace_bytes);
     }
-    Ok(content_digest(&generation))
+    Ok(generation)
 }
 
 #[cfg(windows)]
@@ -6698,6 +6722,29 @@ mod tests {
             windows_dacl_digest(&generic).unwrap(),
             windows_dacl_digest(&specific).unwrap()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_rewrite_preserves_an_inherited_dacl() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("authority.yaml");
+        std::fs::write(&path, "version: 1\n").unwrap();
+        let expected_dacl = windows_dacl_digest(&path).unwrap();
+
+        let outcome = write_learning_file_atomically_windows(
+            &path,
+            Some(Some(b"version: 1\n")),
+            None,
+            "version: 2\n",
+        )
+        .unwrap();
+
+        if let Some(warning) = outcome.warning() {
+            panic!("atomic rewrite reported a warning: {warning:#}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "version: 2\n");
+        assert_eq!(windows_dacl_digest(&path).unwrap(), expected_dacl);
     }
 
     #[cfg(windows)]
