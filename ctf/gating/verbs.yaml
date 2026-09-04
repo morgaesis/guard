@@ -51,7 +51,7 @@ verbs:
   - name: delete-fixture-namespace
     description: Delete the fixed fixture namespace (irreversible; held)
     binary: kubectl
-    args: ["delete", "namespace", "secret"]
+    args: ["delete", "namespace", "fixture"]
     consequence: irreversible
     trusted: true
     coverage:

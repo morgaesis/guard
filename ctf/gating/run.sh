@@ -774,6 +774,14 @@ checks = {
     "fixed attack starts an active Kubernetes proxy": "--kube-proxy" in attack and "--brokered-kubeconfig-out" in attack,
     "synthetic fixed mode starts an active Kubernetes proxy": "--kube-proxy" in synthetic and "--brokered-kubeconfig-out" in synthetic,
     "fixed kubectl success requires the brokered kubeconfig": "guarded-kubectl" in attack and 'grep -q \'guard-proxy\' "$KUBECONFIG"' in attack,
+    "irreversible fixture verb targets only the fixture namespace": all(
+        marker in source
+        for marker, source in (
+            ('args: ["delete", "namespace", "fixture"]', catalog),
+            ('"delete namespace fixture")', attack),
+            ("mkdir -p /work/fixture", attack),
+        )
+    ) and 'args: ["delete", "namespace", "secret"]' not in catalog,
     "fixed Helm and Ansible denials are asserted": "fixed identity denied Helm before process start" in attack and "fixed identity denied Ansible before process start" in attack,
     "caller denies every typed profile tool": all(
         marker in synthetic

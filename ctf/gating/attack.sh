@@ -113,7 +113,7 @@ printf '%s\n' '---' '- hosts: web' '  gather_facts: false' '  tasks: []' > /work
 mkdir -p /work/ansible-project
 printf '[defaults]\ninventory = inventory\n' > /work/ansible-project/ansible.cfg
 printf 'all\n' > /work/ansible-project/inventory
-mkdir -p /work/secret && echo "data" > /work/secret/file
+mkdir -p /work/fixture && echo "data" > /work/fixture/file
 cat >/fakebin/ssh <<'EOF'
 #!/bin/sh
 case "${SSH_AUTH_SOCK:-}" in
@@ -158,9 +158,9 @@ case "$*" in
   "scale deployment/restart --replicas=1 -n fixture")
     unlink /work/restart.scaled
     ;;
-  "delete namespace secret")
-    unlink /work/secret/file
-    rmdir /work/secret
+  "delete namespace fixture")
+    unlink /work/fixture/file
+    rmdir /work/fixture
     ;;
 esac
 printf 'guarded-kubectl:%s:%s:%s\n' "$*" "$(pwd)" "${SSH_AUTH_SOCK:-none}"
@@ -372,7 +372,7 @@ echo
 echo "=== 4. irreversible verb is HELD, not executed ==="
 agent guard verb run delete-fixture-namespace --socket "$SOCK" >/tmp/held.out 2>&1
 HHANDLE=$(handle_of /tmp/held.out)
-if grep -qi "HELD" /tmp/held.out && [ -d /work/secret ]; then
+if grep -qi "HELD" /tmp/held.out && [ -d /work/fixture ]; then
   ok "irreversible action held (not executed; target intact)"
 else
   bad "irreversible action was not held"; cat /tmp/held.out
@@ -386,7 +386,7 @@ if [ -n "$HHANDLE" ]; then
   else
     ok "agent self-approve refused (no admin token)"
   fi
-  if [ -d /work/secret ]; then
+  if [ -d /work/fixture ]; then
     ok "target still intact after self-approve attempt"
   else
     bad "target destroyed by agent self-approve"
@@ -397,7 +397,7 @@ echo
 echo "=== 6. operator approval arms the bound snapshot; requester resumes it ==="
 if [ -n "$HHANDLE" ]; then
   if operator guard access approve "$HHANDLE" --once --socket "$SOCK" >/tmp/opapprove.out 2>&1; then
-    if [ -d /work/secret ]; then
+    if [ -d /work/fixture ]; then
       ok "operator approval armed the hold without executing it"
     else
       bad "operator approval executed as the operator"
@@ -406,7 +406,7 @@ if [ -n "$HHANDLE" ]; then
     bad "operator approval did not arm the hold"; cat /tmp/opapprove.out
   fi
   if agent guard resume "$HHANDLE" --socket "$SOCK" >/tmp/resume.out 2>&1; then
-    if [ ! -d /work/secret ]; then
+    if [ ! -d /work/fixture ]; then
       ok "requester resumed the approved snapshot"
     else
       bad "requester resume did not execute"
