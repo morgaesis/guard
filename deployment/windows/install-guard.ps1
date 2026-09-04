@@ -1225,6 +1225,24 @@ function ConvertTo-SanitizedDiagnosticOutput {
     return $sanitized
 }
 
+function Get-GuardServiceStartupDiagnostic {
+    $serviceLog = Join-Path $DataDir 'guard.log'
+    if (-not (Test-Path -LiteralPath $serviceLog -PathType Leaf)) { return '' }
+    try {
+        $lines = @(Get-Content -LiteralPath $serviceLog -Tail 80 -ErrorAction Stop |
+            Where-Object { $_ -match 'guard service.*error|daemon terminated with error' })
+        if ($lines.Count -eq 0) { return '' }
+        $errorLine = [string]$lines[-1]
+        if ($errorLine -match '(?i)verb catalog|catalog authority') { return 'verb-catalog' }
+        if ($errorLine -match '(?i)state database|state-db|sqlite|authority file') { return 'durable-state' }
+        if ($errorLine -match '(?i)named pipe|socket|listener|endpoint') { return 'local-endpoint' }
+        if ($errorLine -match '(?i)kubeconfig|api proxy|brokered') { return 'brokered-api' }
+        if ($errorLine -match '(?i)permission|access is denied|dacl|acl') { return 'filesystem-authority' }
+        return 'daemon-startup'
+    }
+    catch { return '' }
+}
+
 function Remove-GuardOperatorArtifacts {
     param(
         [Parameter(Mandatory)][string]$TaskName,
@@ -1325,7 +1343,14 @@ function Start-GuardService {
         }
         if ($attempt -lt 3) { Start-Sleep -Milliseconds 200 }
     }
-    throw "Guard service '$Name' did not reach Running after 3 bounded state-transition attempts. Last observed status: '$lastStatus'. Last transition error: $lastError"
+    $daemonDiagnostic = Get-GuardServiceStartupDiagnostic
+    $diagnosticSuffix = if ([string]::IsNullOrWhiteSpace($daemonDiagnostic)) {
+        ''
+    }
+    else {
+        "; daemon diagnostic: $daemonDiagnostic"
+    }
+    throw "Guard service '$Name' did not reach Running after 3 bounded state-transition attempts. Last observed status: '$lastStatus'. Last transition error: $lastError$diagnosticSuffix"
 }
 
 function Assert-ServicePathName {

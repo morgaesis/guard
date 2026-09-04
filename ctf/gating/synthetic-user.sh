@@ -380,8 +380,11 @@ assert_daemon_path_contract() {
 
 daemon() {
   setup_fixture
+  echo 'synthetic daemon preflight: runtime path contract' >&2
   assert_daemon_path_contract
+  echo 'synthetic daemon preflight: immutable catalog contract' >&2
   assert_protected_catalog_as_daemon
+  echo 'synthetic daemon preflight: launching daemon' >&2
   export HOME=/scenario/home
   export XDG_CONFIG_HOME=/scenario/config
   export XDG_DATA_HOME=/scenario/data

@@ -1710,6 +1710,21 @@ Describe 'Guard Windows installer state and ACL contract' {
         $sanitized | Should -Match '\[output truncated\]$'
     }
 
+    It 'classifies service startup logs without returning free-form content' {
+        $savedDataDir = $DataDir
+        try {
+            $DataDir = Join-Path $TestDrive "service-log-$(New-GuardTestIdentifier)"
+            New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+            [IO.File]::WriteAllText(
+                (Join-Path $DataDir 'guard.log'),
+                'ERROR guard service: daemon terminated with error: failed to load verb catalog credential=fixture'
+            )
+
+            (Get-GuardServiceStartupDiagnostic) | Should -Be 'verb-catalog'
+        }
+        finally { $DataDir = $savedDataDir }
+    }
+
     It 'waits through a transient service-controller start transition' {
         $service = New-GuardTestServiceController -Status 'Stopped' -StatusAfterWait 'Running'
         $name = "guard-$(New-GuardTestIdentifier)"
@@ -1749,6 +1764,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         $diagnostic = "start-failed-$(New-GuardTestIdentifier)"
         Mock Get-Service { return $service }
         Mock Start-Service { throw $diagnostic }
+        Mock Get-GuardServiceStartupDiagnostic { return 'verb-catalog' }
         Mock Start-Sleep { return }
         $caught = $null
 
@@ -1759,10 +1775,11 @@ Describe 'Guard Windows installer state and ACL contract' {
             $caught = $_.Exception.Message
         }
 
-        $caught | Should -Be "Guard service '$name' did not reach Running after 3 bounded state-transition attempts. Last observed status: 'Stopped'. Last transition error: $diagnostic"
+        $caught | Should -Be "Guard service '$name' did not reach Running after 3 bounded state-transition attempts. Last observed status: 'Stopped'. Last transition error: $diagnostic; daemon diagnostic: verb-catalog"
         $service.WaitCalls | Should -Be 0
         Should -Invoke Get-Service -Times 6 -Exactly
         Should -Invoke Start-Service -Times 3 -Exactly
+        Should -Invoke Get-GuardServiceStartupDiagnostic -Times 1 -Exactly
         Should -Invoke Start-Sleep -Times 2 -Exactly
     }
 
