@@ -1797,112 +1797,31 @@ fn apply_owner_only_windows_dacl(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn apply_security_descriptor_to_handle(
+fn apply_security_descriptor_to_pinned_file(
     file: &File,
+    path: &Path,
     descriptor: &[u8],
     information: u32,
 ) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{
-        AddAce, GetAce, GetSecurityDescriptorDacl, InitializeAcl, IsValidAcl, ACE_HEADER, ACL,
-        INHERITED_ACE, UNPROTECTED_DACL_SECURITY_INFORMATION,
-    };
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::SetFileSecurityW;
 
+    // SetFileSecurityW applies the complete file-system descriptor in one
+    // operation. The retained handle excludes delete sharing, while the
+    // identity checks prove that the path still names that pinned file.
+    verify_open_file_binding(file, path)?;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
     let mut descriptor = descriptor.to_vec();
-    let mut dacl_present = 0;
-    let mut dacl = std::ptr::null_mut();
-    let mut dacl_defaulted = 0;
-    let dacl_result = unsafe {
-        GetSecurityDescriptorDacl(
-            descriptor.as_mut_ptr().cast(),
-            &mut dacl_present,
-            &mut dacl,
-            &mut dacl_defaulted,
-        )
-    };
-    if dacl_result == 0 {
+    if unsafe { SetFileSecurityW(wide.as_ptr(), information, descriptor.as_mut_ptr().cast()) } == 0
+    {
         return Err(std::io::Error::last_os_error())
-            .context("failed to read the replacement Windows DACL");
+            .context("failed to apply a DACL to the pinned file-system path");
     }
-    if dacl_present == 0 {
-        anyhow::bail!("replacement Windows security descriptor does not contain a DACL");
-    }
-    if dacl.is_null() {
-        anyhow::bail!("replacement Windows security descriptor contains a null DACL");
-    }
-    if unsafe { IsValidAcl(dacl) } == 0 {
-        anyhow::bail!("replacement Windows security descriptor contains an invalid DACL");
-    }
-
-    // Re-enabling inheritance asks Windows to append the parent's inherited
-    // ACEs. Supplying inherited ACEs from the saved descriptor at the same
-    // time would duplicate them. Keep the explicit ordered ACL here and let
-    // the object manager reconstruct the inherited suffix once.
-    let explicit_dacl = if information & UNPROTECTED_DACL_SECURITY_INFORMATION != 0 {
-        let mut explicit_aces = Vec::new();
-        let mut explicit_size = std::mem::size_of::<ACL>();
-        for index in 0..unsafe { (*dacl).AceCount } {
-            let mut ace = std::ptr::null_mut();
-            if unsafe { GetAce(dacl, u32::from(index), &mut ace) } == 0 || ace.is_null() {
-                anyhow::bail!("failed to enumerate the replacement Windows DACL");
-            }
-            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-            if header.AceFlags & (INHERITED_ACE as u8) != 0 {
-                continue;
-            }
-            let ace_size = usize::from(header.AceSize);
-            explicit_size = explicit_size
-                .checked_add(ace_size)
-                .context("replacement Windows DACL length overflow")?;
-            explicit_aces.push((ace, ace_size));
-        }
-
-        let word_count = explicit_size
-            .checked_add(std::mem::size_of::<u32>() - 1)
-            .context("replacement Windows DACL allocation overflow")?
-            / std::mem::size_of::<u32>();
-        let mut buffer = vec![0u32; word_count];
-        let acl = buffer.as_mut_ptr().cast::<ACL>();
-        let acl_size = u32::try_from(explicit_size)
-            .context("replacement Windows DACL exceeds the platform size limit")?;
-        let revision = u32::from(unsafe { (*dacl).AclRevision });
-        if unsafe { InitializeAcl(acl, acl_size, revision) } == 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to initialize the explicit replacement Windows DACL");
-        }
-        for (ace, ace_size) in explicit_aces {
-            let ace_size = u32::try_from(ace_size)
-                .context("replacement Windows ACE exceeds the platform size limit")?;
-            if unsafe { AddAce(acl, revision, u32::MAX, ace, ace_size) } == 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("failed to copy an explicit replacement Windows ACE");
-            }
-        }
-        Some(buffer)
-    } else {
-        None
-    };
-    let dacl = explicit_dacl
-        .as_ref()
-        .map_or(dacl, |buffer| buffer.as_ptr().cast_mut().cast::<ACL>());
-    let status = unsafe {
-        SetSecurityInfo(
-            file.as_raw_handle(),
-            SE_FILE_OBJECT,
-            information,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            dacl,
-            std::ptr::null_mut(),
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(status as i32))
-            .context("failed to apply a DACL through the pinned file-system handle");
-    }
-    Ok(())
+    verify_open_file_binding(file, path)
 }
 
 #[cfg(windows)]
@@ -3510,7 +3429,12 @@ fn restore_replacement_metadata(
     }
     let (descriptor, information) = windows_security_descriptor(&paths.backup)?;
     let destination_file = open_windows_recovery_file(destination)?;
-    apply_security_descriptor_to_handle(&destination_file, &descriptor, information)?;
+    apply_security_descriptor_to_pinned_file(
+        &destination_file,
+        destination,
+        &descriptor,
+        information,
+    )?;
     destination_file.sync_all()?;
     if !windows_dacl_generation_matches(destination, expected_generation)? {
         let expected = windows_dacl_generation(&paths.backup)?;
@@ -4429,8 +4353,8 @@ fn write_learning_file_atomically_windows(
 ) -> Result<LearningWriteOutcome> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::{
-        GetFileSecurityW, GetSecurityDescriptorControl, SetFileSecurityW,
-        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        GetFileSecurityW, GetSecurityDescriptorControl, DACL_SECURITY_INFORMATION,
+        GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
         UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
@@ -4495,18 +4419,6 @@ fn write_learning_file_atomically_windows(
             set_information |= UNPROTECTED_DACL_SECURITY_INFORMATION;
         }
         Ok((descriptor, set_information))
-    }
-
-    fn apply_security_descriptor(path: &Path, descriptor: &[u8], information: u32) -> Result<()> {
-        let path = wide(path.as_os_str());
-        let mut descriptor = descriptor.to_vec();
-        if unsafe { SetFileSecurityW(path.as_ptr(), information, descriptor.as_mut_ptr().cast()) }
-            == 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to apply the Windows DACL");
-        }
-        Ok(())
     }
 
     fn read_owner_and_group(path: &Path) -> Result<Vec<u8>> {
@@ -4624,14 +4536,18 @@ fn write_learning_file_atomically_windows(
         // the destination metadata; the accessible DACL is verified after the
         // replacement. Owner and group are never set, and SACL access is
         // neither requested nor claimed.
-        apply_security_descriptor_to_handle(&temporary, descriptor, *information).with_context(
-            || {
-                format!(
-                    "cannot preserve security for learning file {}",
-                    path.display()
-                )
-            },
-        )?;
+        apply_security_descriptor_to_pinned_file(
+            &temporary,
+            &paths.source,
+            descriptor,
+            *information,
+        )
+        .with_context(|| {
+            format!(
+                "cannot preserve security for learning file {}",
+                path.display()
+            )
+        })?;
         apply_owner_only_windows_dacl_to_handle(&temporary)?;
     }
     temporary
@@ -4643,10 +4559,17 @@ fn write_learning_file_atomically_windows(
     if destination_exists {
         copy_file_owner_only(path, &paths.backup_staging)?;
         if let Some((descriptor, information)) = &expected_security {
-            apply_security_descriptor(&paths.backup_staging, descriptor, *information)
-                .with_context(|| {
-                    format!("failed to preserve backup security for {}", path.display())
-                })?;
+            let backup_staging = open_windows_recovery_file(&paths.backup_staging)?;
+            apply_security_descriptor_to_pinned_file(
+                &backup_staging,
+                &paths.backup_staging,
+                descriptor,
+                *information,
+            )
+            .with_context(|| {
+                format!("failed to preserve backup security for {}", path.display())
+            })?;
+            backup_staging.sync_all()?;
         }
         if original_generation.as_deref() != Some(digest_file(&paths.backup_staging)?.as_str()) {
             anyhow::bail!("learning transaction backup digest changed during creation")
@@ -4730,10 +4653,13 @@ fn write_learning_file_atomically_windows(
                 .as_deref()
                 .context("replacement DACL generation is missing")?;
             if !windows_dacl_generation_matches(path, expected_generation)? {
-                apply_security_descriptor_to_handle(&destination_file, expected, *information)
-                    .with_context(|| {
-                        format!("failed to restore security for {}", path.display())
-                    })?;
+                apply_security_descriptor_to_pinned_file(
+                    &destination_file,
+                    path,
+                    expected,
+                    *information,
+                )
+                .with_context(|| format!("failed to restore security for {}", path.display()))?;
                 destination_file.sync_all()?;
                 if !windows_dacl_generation_matches(path, expected_generation)? {
                     let actual_generation = windows_dacl_generation(path)?;
@@ -6959,6 +6885,7 @@ mod tests {
     #[test]
     fn windows_atomic_rewrite_preserves_an_inherited_dacl() {
         let temp = tempfile::tempdir().unwrap();
+        apply_windows_test_dacl(temp.path(), "D:P(A;OICI;FA;;;OW)(A;OICI;GR;;;AU)");
         let path = temp.path().join("authority.yaml");
         std::fs::write(&path, "version: 1\n").unwrap();
         let expected_dacl = windows_dacl_digest(&path).unwrap();
