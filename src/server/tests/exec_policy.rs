@@ -1417,6 +1417,7 @@ async fn buffered_exec_timeout_kills_the_process_group_and_is_audited() {
 #[cfg(unix)]
 #[tokio::test]
 async fn streaming_exec_timeout_does_not_reset_on_keepalive() {
+    let _environment_guard = TEST_ENV_LOCK.lock().await;
     let (mut cfg, _) = make_test_config();
     cfg.config.exec_as_caller = true;
     cfg.config.exec_timeout_secs = 1;
@@ -1439,7 +1440,7 @@ async fn streaming_exec_timeout_does_not_reset_on_keepalive() {
 
     match result.exec {
         ExecOutcome::Failed { reason, started } => {
-            assert!(started);
+            assert!(started, "{reason}");
             assert!(reason.starts_with("exec_timeout:"), "{reason}");
         }
         other => panic!("expected streaming timeout failure, got {other:?}"),

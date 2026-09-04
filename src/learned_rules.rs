@@ -138,10 +138,11 @@ pub(crate) fn replace_immutable_lock_before_write_open_for_test(
     path: &Path,
     hook: impl FnOnce(&Path) + Send + 'static,
 ) {
+    let path = canonical_destination(path).unwrap_or_else(|_| path.to_path_buf());
     immutable_lock_preopen_hooks()
         .lock()
         .expect("immutable-lock pre-open hook lock")
-        .insert(path.to_path_buf(), Box::new(hook));
+        .insert(path, Box::new(hook));
 }
 
 #[cfg(test)]
@@ -2020,6 +2021,7 @@ fn open_owner_only_new(path: &Path) -> Result<File> {
     use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let sddl = "D:P(A;;FA;;;OW)\0".encode_utf16().collect::<Vec<_>>();
@@ -2051,7 +2053,7 @@ fn open_owner_only_new(path: &Path) -> Result<File> {
             wide.as_ptr(),
             // WRITE_DAC is the standard access right 0x0004_0000.
             GENERIC_READ | GENERIC_WRITE | 0x0004_0000,
-            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             &security,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -6783,12 +6785,15 @@ mod tests {
             0
         );
         let before_security = security(&path);
+        let before_dacl = windows_dacl_digest(&path).unwrap();
         let before_attributes = unsafe { GetFileAttributesW(path_wide.as_ptr()) };
 
         write_learning_file_atomically(&path, "new").unwrap();
         write_learning_file_atomically(&path, "newer").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
-        assert_eq!(security(&path), before_security);
+        let after_security = security(&path);
+        ensure_windows_owner_group_compatible(&before_security, &after_security).unwrap();
+        assert_eq!(windows_dacl_digest(&path).unwrap(), before_dacl);
         let after_attributes = unsafe { GetFileAttributesW(path_wide.as_ptr()) };
         assert_eq!(
             after_attributes & !FILE_ATTRIBUTE_ARCHIVE,

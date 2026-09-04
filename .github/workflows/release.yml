@@ -685,6 +685,12 @@ jobs:
                 else
                   .
                 end
+              | del(.serialNumber)
+              | if (.metadata? | type) == "object" then
+                  .metadata.timestamp = (env.SOURCE_DATE_EPOCH | tonumber | todateiso8601)
+                else
+                  .
+                end
               | if (.metadata.authors? | type) == "array" then
                   .metadata.authors |= sort_unordered
                 else
@@ -798,8 +804,8 @@ jobs:
               and (.unrelated."bom-ref" == $preserved)
               and (.unrelated.ref == $preserved)
               and (.unrelated.sequence == ["second", "first"])
-              and (.serialNumber == "urn:uuid:6aaf6be9-d7ea-4d09-abcb-ee495a0f24ea")
-              and (.metadata.timestamp == "2023-11-14T22:13:20Z")
+              and (has("serialNumber") | not)
+              and (.metadata.timestamp == (env.SOURCE_DATE_EPOCH | tonumber | todateiso8601))
             ' \
               "$first_canonical" > /dev/null || {
               echo "SBOM canonicalization changed ordered or unrelated data" >&2
