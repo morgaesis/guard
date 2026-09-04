@@ -3581,6 +3581,11 @@ fn windows_dacl_generation(path: &Path) -> Result<Vec<u8>> {
         SE_DACL_PROTECTED,
     };
 
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect Windows DACL object {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("Windows DACL generation requires a regular file")
+    }
     let mut descriptor = read_windows_dacl_descriptor(path)?;
     let mut dacl_present = 0;
     let mut dacl = std::ptr::null_mut();
@@ -3619,13 +3624,13 @@ fn windows_dacl_generation(path: &Path) -> Result<Vec<u8>> {
         return Err(std::io::Error::last_os_error())
             .context("failed to inspect Windows DACL controls");
     }
-    // Windows can regenerate self-relative descriptor bookkeeping while
-    // preserving the ordered ACEs. ACL allocation fields and revisions are
-    // representation details; the ordered ACE bytes and inheritance
-    // protection are authority.
-    let mut generation = Vec::new();
-    generation.push(u8::from(control & SE_DACL_PROTECTED != 0));
-    generation.extend_from_slice(&unsafe { (*dacl).AceCount }.to_le_bytes());
+    // Windows can regenerate self-relative descriptor bookkeeping and
+    // inheritance routing while preserving the effective ordered file ACEs.
+    // ACL allocation fields, revisions, inheritance provenance, and flags
+    // that only control propagation to descendants are representation details
+    // for these file objects. ACE order, trustee, type, effective access mask,
+    // and inheritance protection remain authority.
+    let mut normalized_aces = Vec::new();
     for index in 0..unsafe { (*dacl).AceCount } {
         let mut ace = std::ptr::null_mut();
         if unsafe { GetAce(dacl, u32::from(index), &mut ace) } == 0 || ace.is_null() {
@@ -3644,11 +3649,17 @@ fn windows_dacl_generation(path: &Path) -> Result<Vec<u8>> {
         }
         let mut ace_bytes =
             unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), ace_size) }.to_vec();
-        // INHERITED_ACE records where a grant came from, not what it grants.
-        // Windows may recompute this provenance bit while applying an
-        // otherwise identical DACL during replacement recovery.
-        const INHERITED_ACE: u8 = 0x10;
-        ace_bytes[1] &= !INHERITED_ACE;
+        // An inherit-only ACE does not apply to the current object. Learning
+        // transaction generations cover regular files, which have no
+        // descendants to receive the ACE.
+        const INHERIT_ONLY_ACE: u8 = 0x08;
+        if ace_bytes[1] & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
+        // These flags control propagation to descendants or record where an
+        // ACE came from. They do not alter access to the current file.
+        const FILE_INHERITANCE_FLAGS: u8 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10;
+        ace_bytes[1] &= !FILE_INHERITANCE_FLAGS;
         // Effective inherited file ACEs have generic access rights mapped to
         // their file-specific equivalents. Normalize the two representations
         // because they grant the same authority and Windows may choose either
@@ -3664,7 +3675,15 @@ fn windows_dacl_generation(path: &Path) -> Result<Vec<u8>> {
             let normalized = normalize_windows_file_access_mask(mask);
             ace_bytes[4..8].copy_from_slice(&normalized.to_le_bytes());
         }
-        generation.extend_from_slice(&ace_bytes);
+        normalized_aces.push(ace_bytes);
+    }
+    let ace_count = u16::try_from(normalized_aces.len())
+        .context("Windows DACL contains too many effective ACEs")?;
+    let mut generation = Vec::new();
+    generation.push(u8::from(control & SE_DACL_PROTECTED != 0));
+    generation.extend_from_slice(&ace_count.to_le_bytes());
+    for ace in normalized_aces {
+        generation.extend_from_slice(&ace);
     }
     Ok(generation)
 }
@@ -6704,6 +6723,40 @@ mod tests {
         assert_eq!(
             windows_dacl_digest(&direct).unwrap(),
             windows_dacl_digest(&inherited).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dacl_generation_ignores_file_inheritance_routing() {
+        let temp = authority_tempdir();
+        let direct = temp.path().join("direct.yaml");
+        let propagating = temp.path().join("propagating.yaml");
+        write_authority_file(&direct, "version: 1\n").unwrap();
+        write_authority_file(&propagating, "version: 1\n").unwrap();
+        apply_windows_test_dacl(&direct, "D:P(A;;FA;;;OW)(A;;GR;;;AU)");
+        apply_windows_test_dacl(&propagating, "D:P(A;;FA;;;OW)(A;OICINP;GR;;;AU)");
+
+        assert_eq!(
+            windows_dacl_digest(&direct).unwrap(),
+            windows_dacl_digest(&propagating).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dacl_generation_ignores_inherit_only_file_aces() {
+        let temp = authority_tempdir();
+        let direct = temp.path().join("direct.yaml");
+        let inherit_only = temp.path().join("inherit-only.yaml");
+        write_authority_file(&direct, "version: 1\n").unwrap();
+        write_authority_file(&inherit_only, "version: 1\n").unwrap();
+        apply_windows_test_dacl(&direct, "D:P(A;;FA;;;OW)");
+        apply_windows_test_dacl(&inherit_only, "D:P(A;;FA;;;OW)(A;OICIIO;GR;;;AU)");
+
+        assert_eq!(
+            windows_dacl_digest(&direct).unwrap(),
+            windows_dacl_digest(&inherit_only).unwrap()
         );
     }
 
