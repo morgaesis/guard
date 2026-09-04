@@ -1805,7 +1805,10 @@ fn apply_security_descriptor_to_handle(
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+    use windows_sys::Win32::Security::{
+        AddAce, GetAce, GetSecurityDescriptorDacl, InitializeAcl, IsValidAcl, ACE_HEADER, ACL,
+        INHERITED_ACE, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
 
     let mut descriptor = descriptor.to_vec();
     let mut dacl_present = 0;
@@ -1829,6 +1832,61 @@ fn apply_security_descriptor_to_handle(
     if dacl.is_null() {
         anyhow::bail!("replacement Windows security descriptor contains a null DACL");
     }
+    if unsafe { IsValidAcl(dacl) } == 0 {
+        anyhow::bail!("replacement Windows security descriptor contains an invalid DACL");
+    }
+
+    // Re-enabling inheritance asks Windows to append the parent's inherited
+    // ACEs. Supplying inherited ACEs from the saved descriptor at the same
+    // time would duplicate them. Keep the explicit ordered ACL here and let
+    // the object manager reconstruct the inherited suffix once.
+    let explicit_dacl = if information & UNPROTECTED_DACL_SECURITY_INFORMATION != 0 {
+        let mut explicit_aces = Vec::new();
+        let mut explicit_size = std::mem::size_of::<ACL>();
+        for index in 0..unsafe { (*dacl).AceCount } {
+            let mut ace = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, u32::from(index), &mut ace) } == 0 || ace.is_null() {
+                anyhow::bail!("failed to enumerate the replacement Windows DACL");
+            }
+            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+            if header.AceFlags & (INHERITED_ACE as u8) != 0 {
+                continue;
+            }
+            let ace_size = usize::from(header.AceSize);
+            explicit_size = explicit_size
+                .checked_add(ace_size)
+                .context("replacement Windows DACL length overflow")?;
+            explicit_aces.push((ace, ace_size));
+        }
+
+        let word_count = explicit_size
+            .checked_add(std::mem::size_of::<u32>() - 1)
+            .context("replacement Windows DACL allocation overflow")?
+            / std::mem::size_of::<u32>();
+        let mut buffer = vec![0u32; word_count];
+        let acl = buffer.as_mut_ptr().cast::<ACL>();
+        let acl_size = u32::try_from(explicit_size)
+            .context("replacement Windows DACL exceeds the platform size limit")?;
+        let revision = u32::from(unsafe { (*dacl).AclRevision });
+        if unsafe { InitializeAcl(acl, acl_size, revision) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to initialize the explicit replacement Windows DACL");
+        }
+        for (ace, ace_size) in explicit_aces {
+            let ace_size = u32::try_from(ace_size)
+                .context("replacement Windows ACE exceeds the platform size limit")?;
+            if unsafe { AddAce(acl, revision, u32::MAX, ace, ace_size) } == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to copy an explicit replacement Windows ACE");
+            }
+        }
+        Some(buffer)
+    } else {
+        None
+    };
+    let dacl = explicit_dacl
+        .as_ref()
+        .map_or(dacl, |buffer| buffer.as_ptr().cast_mut().cast::<ACL>());
     let status = unsafe {
         SetSecurityInfo(
             file.as_raw_handle(),
