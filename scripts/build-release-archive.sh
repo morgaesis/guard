@@ -349,12 +349,10 @@ if [ "${USE_CROSS:-false}" = true ]; then
     echo "cross compilation selected for an unexpected target" >&2
     exit 1
   }
+  # Cross 0.2.5 falls back to host Cargo when passed Cargo's global
+  # --config option. Supply release profile overrides through Cargo env.
   release_build=(
-    cross --config 'build.rustc-wrapper=""'
-    --config 'env.SCCACHE_CLIENT_SIDE=""'
-    build --locked --release --target "$BUILD_TARGET"
-    --jobs 1
-    --config profile.release.codegen-units=1
+    cross build --locked --release --target "$BUILD_TARGET" --jobs 1
   )
 else
   [ "$BUILD_TARGET" != aarch64-unknown-linux-gnu ] || {
@@ -369,6 +367,7 @@ else
   )
 fi
 (
+  export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
   case "$BUILD_TARGET" in
     *-unknown-linux-gnu) export CARGO_PROFILE_RELEASE_STRIP=symbols ;;
     *) unset CARGO_PROFILE_RELEASE_STRIP ;;
