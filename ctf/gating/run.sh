@@ -842,7 +842,7 @@ checks = {
             "sanitize_startup_diagnostics",
             "timeout --kill-after=1s 5s podman logs",
             "timeout --kill-after=1s 5s podman cp",
-            "| tar -xO",
+            "| tar -xOf -",
         )
     ) and "timeout --kill-after=1s 5s podman exec" not in runner,
     "loopback API proxy requires authenticated client context": "a proxy transport or session bearer is required" in proxy_server and "ProxyTransportAuth" in proxy_server,

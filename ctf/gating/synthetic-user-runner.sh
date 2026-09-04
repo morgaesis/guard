@@ -328,7 +328,7 @@ collect_startup_diagnostics() {
     echo '## Daemon log'
     timeout --kill-after=1s 5s podman cp \
       "$container:/scenario/raw/daemon.log" - 9>&- 2>/dev/null \
-      | tar -xO 2>/dev/null \
+      | tar -xOf - 2>/dev/null \
       | tail -n 160 \
       || echo '[daemon log collection unavailable]'
   } | sanitize_startup_diagnostics > "$evidence"

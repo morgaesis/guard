@@ -3596,11 +3596,11 @@ fn windows_dacl_digest(path: &Path) -> Result<String> {
             .context("failed to inspect Windows DACL controls");
     }
     // Windows can regenerate self-relative descriptor bookkeeping while
-    // preserving the ordered ACEs. ACL allocation fields are not authority;
-    // the revision, ordered ACE bytes, and inheritance protection are.
+    // preserving the ordered ACEs. ACL allocation fields and revisions are
+    // representation details; the ordered ACE bytes and inheritance
+    // protection are authority.
     let mut generation = Vec::new();
     generation.push(u8::from(control & SE_DACL_PROTECTED != 0));
-    generation.push(unsafe { (*dacl).AclRevision });
     generation.extend_from_slice(&unsafe { (*dacl).AceCount }.to_le_bytes());
     for index in 0..unsafe { (*dacl).AceCount } {
         let mut ace = std::ptr::null_mut();

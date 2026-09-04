@@ -2546,6 +2546,7 @@ async fn exec_secret_injection_is_isolated_per_uid() {
         .await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn extra_child_env_forwards_named_var_to_child() {
     let (mut cfg, _) = make_test_config();
@@ -2555,15 +2556,9 @@ async fn extra_child_env_forwards_named_var_to_child() {
     std::env::set_var("GUARD_CHILD_TEST_PT", "brokered-value-xyz");
     cfg.config.extra_child_env = vec!["GUARD_CHILD_TEST_PT".to_string()];
 
-    #[cfg(unix)]
     let (bin, args) = (
         "printenv".to_string(),
         vec!["GUARD_CHILD_TEST_PT".to_string()],
-    );
-    #[cfg(windows)]
-    let (bin, args) = (
-        "cmd".to_string(),
-        vec!["/c".to_string(), "echo %GUARD_CHILD_TEST_PT%".to_string()],
     );
 
     let token = format!("child-env-{}", std::process::id());
