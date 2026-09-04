@@ -366,78 +366,79 @@ fn privileged_workflow_has_one_validated_native_merge_step() {
 
 #[test]
 fn privileged_workflow_policy_rejects_negative_mutations() {
+    let privileged_workflow = PRIVILEGED_WORKFLOW.replace("\r\n", "\n");
     let mutations = [
         (
             "checkout",
-            PRIVILEGED_WORKFLOW.replace(
+            privileged_workflow.replace(
                 "    steps:\n      - name:",
                 "    steps:\n      - uses: actions/checkout@v4\n      - name:",
             ),
         ),
         (
             "artifact",
-            PRIVILEGED_WORKFLOW.replace(
+            privileged_workflow.replace(
                 "    steps:\n      - name:",
                 "    steps:\n      - uses: actions/download-artifact@v4\n      - name:",
             ),
         ),
         (
             "cache",
-            PRIVILEGED_WORKFLOW.replace(
+            privileged_workflow.replace(
                 "    steps:\n      - name:",
                 "    steps:\n      - uses: actions/cache@v4\n      - name:",
             ),
         ),
         (
             "pull request body",
-            PRIVILEGED_WORKFLOW.replace(
+            privileged_workflow.replace(
                 "head_repository: .head.repo.full_name",
                 "head_repository: .head.repo.full_name, pull_body: .body",
             ),
         ),
         (
             "pull request target",
-            PRIVILEGED_WORKFLOW.replace("  workflow_run:", "  pull_request_target:"),
+            privileged_workflow.replace("  workflow_run:", "  pull_request_target:"),
         ),
         (
             "write all",
-            PRIVILEGED_WORKFLOW.replace(
+            privileged_workflow.replace(
                 "    permissions:\n      actions: read\n      contents: write\n      pull-requests: write",
                 "    permissions: write-all",
             ),
         ),
         (
             "missing actions read",
-            PRIVILEGED_WORKFLOW.replace("      actions: read\n", ""),
+            privileged_workflow.replace("      actions: read\n", ""),
         ),
         (
             "admin bypass",
-            PRIVILEGED_WORKFLOW.replace("            --auto \\\n", "            --auto \\\n            --admin \\\n"),
+            privileged_workflow.replace("            --auto \\\n", "            --auto \\\n            --admin \\\n"),
         ),
         (
             "stale head",
-            PRIVILEGED_WORKFLOW.replace(
+            privileged_workflow.replace(
                 " || [ \"$current_head_sha\" != \"$source_head_sha\" ]",
                 "",
             ),
         ),
         (
             "workflow drift",
-            PRIVILEGED_WORKFLOW.replace(
+            privileged_workflow.replace(
                 "          if [ \"$source_blob_sha\" != \"$trusted_blob_sha\" ]; then",
                 "          if false; then",
             ),
         ),
         (
             "job signals",
-            PRIVILEGED_WORKFLOW.replace(
+            privileged_workflow.replace(
                 ".name == \"Auto-merge eligible\"",
                 ".name == \"Some other job\"",
             ),
         ),
         (
             "untrusted interpolation",
-            PRIVILEGED_WORKFLOW.replace(
+            privileged_workflow.replace(
                 "          set -euo pipefail",
                 "          set -euo pipefail\n          echo \"${{ github.event.workflow_run.head_sha }}\"",
             ),
@@ -446,7 +447,7 @@ fn privileged_workflow_policy_rejects_negative_mutations() {
 
     for (name, mutation) in mutations {
         assert_ne!(
-            mutation, PRIVILEGED_WORKFLOW,
+            mutation, privileged_workflow,
             "mutation {name} did not apply"
         );
         assert!(

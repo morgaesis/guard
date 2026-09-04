@@ -172,12 +172,34 @@ EOF
 assert_protected_catalog_as_daemon() {
   local authority_owner catalog_mount_identity expected_lock root_mount_identity
   local lock_mount_identity marker replacement lock_replacement mounted_targets
+  local root_mode root_owner
   echo 'synthetic catalog preflight: initial authority' >&2
-  [ "$(stat -c '%u:%g:%a' /)" = 0:0:755 ]
-  [ -f "$PROTECTED_CATALOG" ]
-  [ -r "$PROTECTED_CATALOG" ]
+  root_owner="$(stat -c '%u:%g' /)" || return 1
+  root_mode="$(stat -c '%a' /)" || return 1
+  [ "$root_owner" = 0:0 ] || {
+    echo 'synthetic catalog preflight: root owner is not trusted' >&2
+    return 1
+  }
+  case "$root_mode" in
+    [1357][015][015]) ;;
+    *)
+      echo 'synthetic catalog preflight: root permissions are not trusted' >&2
+      return 1
+      ;;
+  esac
+  [ -f "$PROTECTED_CATALOG" ] || {
+    echo 'synthetic catalog preflight: protected catalog is missing' >&2
+    return 1
+  }
+  [ -r "$PROTECTED_CATALOG" ] || {
+    echo 'synthetic catalog preflight: protected catalog is unreadable' >&2
+    return 1
+  }
   [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
-    "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
+    "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ] || {
+    echo 'synthetic catalog preflight: protected catalog digest differs' >&2
+    return 1
+  }
   echo 'synthetic catalog preflight: mount identities' >&2
   catalog_mount_identity="$(capture_exact_mount_identity "$PROTECTED_CATALOG_DIR" ro)" \
     || return 1
