@@ -49,9 +49,7 @@ RUN install -d -o root -g root -m 0755 /work /work/ansible-project
 RUN install -d -o root -g root -m 0555 /authority
 
 COPY ctf/gating/verbs.yaml /etc/guard/verbs.yaml
-RUN chmod 0644 /etc/guard/verbs.yaml \
-    && install -o guarddaemon -g guarddaemon -m 0600 \
-      /dev/null /etc/guard/.verbs.yaml.learning-lock
+RUN chmod 0644 /etc/guard/verbs.yaml
 COPY ctf/gating/attack.sh /attack.sh
 RUN chmod 0755 /attack.sh
 COPY ctf/gating/synthetic-user.sh /synthetic-user.sh

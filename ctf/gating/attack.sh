@@ -67,7 +67,8 @@ start_daemon() {
       --gate consequence \
       --socket "$SOCK" \
       --socket-group guard-clients \
-      --verbs /run/guard/verbs.yaml \
+      --verbs /etc/guard/verbs.yaml \
+      --immutable-verbs-lock /run/guard/.verbs.yaml.learning-lock \
       --state-db /var/lib/guard/state.db \
       --shim-dir /shim \
       --users 1001 \
@@ -84,7 +85,6 @@ start_daemon() {
 echo "=== Setup ==="
 mkdir -p /work /run/guard /var/lib/guard
 mkdir -p /fakebin /shim
-install -m 0600 /etc/guard/verbs.yaml /run/guard/verbs.yaml
 install -o guarddaemon -g guarddaemon -m 0600 \
   /dev/null /run/guard/.verbs.yaml.learning-lock
 generate_fixture_value > "$ADMIN_TOKEN_FILE"
@@ -212,8 +212,7 @@ chmod 0755 /run/guard /fakebin /shim
 chmod 0400 "$UPSTREAM_KUBECONFIG"
 chown -R guardexec:guardexec /work
 chown guarddaemon:guarddaemon \
-  /run/guard /var/lib/guard "$UPSTREAM_KUBECONFIG" \
-  /run/guard/verbs.yaml
+  /run/guard /var/lib/guard "$UPSTREAM_KUBECONFIG"
 chown -R guarddaemon:guarddaemon /shim
 chown guarddaemon:guarddaemon /home/guarddaemon
 chown agent:agent /home/agent
