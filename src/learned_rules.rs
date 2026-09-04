@@ -3689,6 +3689,98 @@ fn windows_dacl_generation(path: &Path) -> Result<Vec<u8>> {
 }
 
 #[cfg(windows)]
+fn windows_dacl_generation_difference(expected: &[u8], actual: &[u8]) -> String {
+    fn header(generation: &[u8]) -> Option<(bool, u16)> {
+        Some((
+            *generation.first()? != 0,
+            u16::from_le_bytes([*generation.get(1)?, *generation.get(2)?]),
+        ))
+    }
+
+    fn ace_at(generation: &[u8], offset: usize) -> Option<&[u8]> {
+        let size = usize::from(u16::from_le_bytes([
+            *generation.get(offset.checked_add(2)?)?,
+            *generation.get(offset.checked_add(3)?)?,
+        ]));
+        (size >= 4)
+            .then(|| offset.checked_add(size))
+            .flatten()
+            .and_then(|end| generation.get(offset..end))
+    }
+
+    let Some((expected_protected, expected_count)) = header(expected) else {
+        return "expected DACL generation is malformed".to_string();
+    };
+    let Some((actual_protected, actual_count)) = header(actual) else {
+        return "observed DACL generation is malformed".to_string();
+    };
+    if expected_protected != actual_protected {
+        return format!(
+            "inheritance protection differs (expected {expected_protected}, observed {actual_protected})"
+        );
+    }
+    if expected_count != actual_count {
+        return format!(
+            "effective ACE count differs (expected {expected_count}, observed {actual_count})"
+        );
+    }
+
+    let mut expected_offset = 3;
+    let mut actual_offset = 3;
+    for index in 0..expected_count {
+        let Some(expected_ace) = ace_at(expected, expected_offset) else {
+            return format!("expected ACE {index} is malformed");
+        };
+        let Some(actual_ace) = ace_at(actual, actual_offset) else {
+            return format!("observed ACE {index} is malformed");
+        };
+        if expected_ace != actual_ace {
+            let expected_type = expected_ace[0];
+            let actual_type = actual_ace[0];
+            if expected_type != actual_type {
+                return format!(
+                    "ACE {index} type differs (expected {expected_type}, observed {actual_type})"
+                );
+            }
+            let expected_flags = expected_ace[1];
+            let actual_flags = actual_ace[1];
+            if expected_flags != actual_flags {
+                return format!(
+                    "ACE {index} flags differ (expected 0x{expected_flags:02x}, observed 0x{actual_flags:02x})"
+                );
+            }
+            if expected_ace.len() != actual_ace.len() {
+                return format!(
+                    "ACE {index} size differs (expected {}, observed {})",
+                    expected_ace.len(),
+                    actual_ace.len()
+                );
+            }
+            if matches!(expected_type, 0 | 1) && expected_ace.len() >= 8 {
+                let expected_mask = u32::from_le_bytes(expected_ace[4..8].try_into().unwrap());
+                let actual_mask = u32::from_le_bytes(actual_ace[4..8].try_into().unwrap());
+                if expected_mask != actual_mask {
+                    return format!(
+                        "ACE {index} access mask differs (expected 0x{expected_mask:08x}, observed 0x{actual_mask:08x})"
+                    );
+                }
+            }
+            return format!("ACE {index} trustee or type-specific body differs");
+        }
+        expected_offset += expected_ace.len();
+        actual_offset += actual_ace.len();
+    }
+    if expected_offset != expected.len() || actual_offset != actual.len() {
+        return format!(
+            "trailing semantic bytes differ (expected {}, observed {})",
+            expected.len().saturating_sub(expected_offset),
+            actual.len().saturating_sub(actual_offset)
+        );
+    }
+    "semantic DACL generations differ without a structural difference".to_string()
+}
+
+#[cfg(windows)]
 fn normalize_windows_file_access_mask(mask: u32) -> u32 {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -4446,15 +4538,18 @@ fn write_learning_file_atomically_windows(
     let identity = format!("{:032x}", rand::random::<u128>());
     let paths = transaction_paths(path, &identity)?;
     let original_generation = destination_exists.then(|| digest_file(path)).transpose()?;
+    let expected_security_generation = destination_exists
+        .then(|| windows_dacl_generation(path))
+        .transpose()?;
     let mut marker = LearningTransactionMarker {
         version: LEARNING_TRANSACTION_VERSION,
         transaction_id: identity,
         phase: LearningTransactionPhase::Preparing,
         candidate_generation: content_digest(content.as_bytes()),
         expected_generation: original_generation.clone(),
-        expected_security_generation: destination_exists
-            .then(|| windows_dacl_digest(path))
-            .transpose()?,
+        expected_security_generation: expected_security_generation
+            .as_ref()
+            .map(|generation| content_digest(generation)),
         expected_unix_mode: None,
     };
     lock.verify_parent_binding()?;
@@ -4580,9 +4675,17 @@ fn write_learning_file_atomically_windows(
                     })?;
                 destination_file.sync_all()?;
                 if !windows_dacl_generation_matches(path, expected_generation)? {
+                    let actual_generation = windows_dacl_generation(path)?;
+                    let difference = windows_dacl_generation_difference(
+                        expected_security_generation
+                            .as_deref()
+                            .context("replacement DACL generation bytes are missing")?,
+                        &actual_generation,
+                    );
                     anyhow::bail!(
-                        "replacement changed the Windows security descriptor for {}",
-                        path.display()
+                        "replacement changed the Windows security descriptor for {}: {}",
+                        path.display(),
+                        difference
                     );
                 }
             }
@@ -6757,6 +6860,20 @@ mod tests {
         assert_eq!(
             windows_dacl_digest(&direct).unwrap(),
             windows_dacl_digest(&inherit_only).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dacl_generation_difference_does_not_expose_trustee_bytes() {
+        let mut expected = vec![1, 1, 0, 0, 0, 12, 0, 0xff, 0x01, 0x1f, 0];
+        expected.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let mut actual = expected.clone();
+        actual[14] = 0x00;
+
+        assert_eq!(
+            windows_dacl_generation_difference(&expected, &actual),
+            "ACE 0 trustee or type-specific body differs"
         );
     }
 
