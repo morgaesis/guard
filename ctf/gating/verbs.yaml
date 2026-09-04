@@ -12,7 +12,7 @@ verbs:
 
   - name: child-secret-file-contract
     description: Verify fixed-identity credential delivery remains unavailable
-    binary: true
+    binary: "true"
     consequence: reversible
     trusted: true
     coverage:

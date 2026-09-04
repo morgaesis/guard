@@ -3343,7 +3343,7 @@ mod line_limit_tests {
         .await;
         let parsed: AdminResponse = serde_json::from_str(&response).expect("admin response");
         assert!(
-            matches!(parsed, AdminResponse::Error { ref message } if message == "admin RPC refused: admin token is not configured"),
+            matches!(parsed, AdminResponse::Error { ref message } if message.contains("operator authority")),
             "{parsed:?}"
         );
     }
@@ -3362,7 +3362,7 @@ mod line_limit_tests {
         .await;
         let parsed: AdminResponse = serde_json::from_str(&response).expect("admin response");
         assert!(
-            matches!(parsed, AdminResponse::Error { ref message } if message == "admin RPC refused: admin token is not configured"),
+            matches!(parsed, AdminResponse::Error { ref message } if message.contains("operator authority")),
             "{parsed:?}"
         );
     }
@@ -3381,7 +3381,7 @@ mod line_limit_tests {
         .await;
         let parsed: AdminResponse = serde_json::from_str(&response).expect("admin response");
         assert!(
-            matches!(parsed, AdminResponse::Error { ref message } if message == "admin RPC refused: admin token is not configured"),
+            matches!(parsed, AdminResponse::Error { ref message } if message.contains("operator authority")),
             "{parsed:?}"
         );
     }

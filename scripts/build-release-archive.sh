@@ -331,6 +331,8 @@ done < <(release_target_rows)
 source_root="${SOURCE_ROOT:-$PWD}"
 dist_dir="${DIST_DIR:-$source_root/dist}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$source_root/target}"
+export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 bundle="guard-${RELEASE_LABEL}-${BUILD_TARGET}"
 archive="$dist_dir/${bundle}.tar.gz"
 root="$dist_dir/$bundle"

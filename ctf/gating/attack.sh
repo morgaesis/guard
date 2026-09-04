@@ -326,7 +326,7 @@ if agent guard run --socket "$SOCK" \
   true >/tmp/child-secret.out 2>/tmp/child-secret.err; then
   bad "fixed child identity accepted per-run credential delivery"
 elif grep -q 'shared child UID' /tmp/child-secret.err \
-  && [ -z "$(find /run/guard/secret-files -mindepth 1 -print -quit)" ]; then
+  && [ -z "$(runuser -u guarddaemon -- find /run/guard/secret-files -mindepth 1 -print -quit)" ]; then
   ok "fixed child identity rejected per-run credentials before lease creation"
 else
   bad "fixed child credential rejection did not fail closed"

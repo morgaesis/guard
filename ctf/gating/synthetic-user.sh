@@ -1906,6 +1906,7 @@ prepare_principals() {
   # directory only at the rootfs-backed read-only /authority mountpoint, with
   # the pre-created lock inode layered writable.
   mkdir -p "$PROTECTED_CATALOG_DIR"
+  chmod 0755 "$PROTECTED_CATALOG_DIR"
   cp /etc/guard/verbs.yaml "$PROTECTED_CATALOG"
   chmod 0444 "$PROTECTED_CATALOG"
   install -m 0600 /dev/null "$PROTECTED_CATALOG_LOCK"

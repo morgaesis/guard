@@ -1031,10 +1031,14 @@ mod tests {
 
     #[test]
     fn migrated_legacy_deny_matches_exact_argv_with_ansible_inventory() {
-        let catalog = SavedGrantCatalog::from_yaml(
-            "profiles:\n  - name: legacy\n    deny: [\"ansible-playbook --inventory=/srv/guard/blocked.ini\"]\n",
-        )
-        .expect("migrate profile");
+        #[cfg(unix)]
+        let inventory = "/srv/guard/blocked.ini";
+        #[cfg(windows)]
+        let inventory = "C:/srv/guard/blocked.ini";
+        let yaml = format!(
+            "profiles:\n  - name: legacy\n    deny: [\"ansible-playbook --inventory={inventory}\"]\n"
+        );
+        let catalog = SavedGrantCatalog::from_yaml(&yaml).expect("migrate profile");
         let grant = catalog.get("legacy").expect("saved grant");
         let migrated = &grant.generated_verbs[0];
 
@@ -1043,19 +1047,14 @@ mod tests {
             .upsert_saved_grant_verb(migrated.clone())
             .expect("install migrated deny");
 
-        let exact = verbs.match_command_all(
-            "ansible-playbook",
-            &["--inventory=/srv/guard/blocked.ini".to_string()],
-        );
+        let exact =
+            verbs.match_command_all("ansible-playbook", &[format!("--inventory={inventory}")]);
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].action, CoverageAction::Deny);
         assert!(verbs
             .match_command_all(
                 "ansible-playbook",
-                &[
-                    "--inventory=/srv/guard/blocked.ini".to_string(),
-                    "site.yml".to_string(),
-                ],
+                &[format!("--inventory={inventory}"), "site.yml".to_string(),],
             )
             .is_empty());
     }

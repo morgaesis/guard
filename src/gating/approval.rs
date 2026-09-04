@@ -110,12 +110,15 @@ pub enum ProcessExecutionIdentityMode {
     Caller,
 }
 
-/// Complete Unix process identity selected for an approved child. Group
-/// membership is executable and filesystem authority, so replay must bind it
-/// with the command rather than resolve it after approval.
+/// Complete process identity selected for an approved child. Unix group
+/// membership and the Windows process principal are executable and filesystem
+/// authority, so replay binds the identity with the command rather than
+/// resolving it after approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct ProcessExecutionIdentity {
     pub mode: ProcessExecutionIdentityMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<PrincipalKey>,
     pub user_id: u32,
     pub primary_group_id: u32,
     pub supplementary_group_ids: Vec<u32>,

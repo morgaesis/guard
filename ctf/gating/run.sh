@@ -741,7 +741,7 @@ workflow_context_rules = {
 
 checks = {
     "capability contract uses the closed whoami profile": "binary: whoami\n    args: [child-contract]" in catalog and '"whoami"' in profiles,
-    "credential contract uses the closed true profile": "binary: true" in catalog and '"true"' in profiles,
+    "credential contract uses the closed true profile": 'binary: "true"' in catalog and '"true"' in profiles,
     "fixture API reuses closed systemd authority under caller identity with protected credentials": all(
         marker in source
         for marker, source in (

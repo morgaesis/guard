@@ -2500,6 +2500,12 @@ fn validate_operator_authority_parent(
     path: &Path,
     _untrusted_unix_user_id: Option<u32>,
 ) -> Result<()> {
+    // A Windows volume root has no replaceable parent entry. Retaining its
+    // no-share-delete handle is sufficient while stricter DACL checks remain
+    // required for every descendant directory.
+    if path.parent().is_none() {
+        return parent_identity_matches(parent, path);
+    }
     validate_windows_operator_authority_handle(parent, true)?;
     parent_identity_matches(parent, path)
 }
@@ -3539,8 +3545,8 @@ fn read_windows_dacl_descriptor(path: &Path) -> Result<Vec<u8>> {
 #[cfg(windows)]
 fn windows_dacl_digest(path: &Path) -> Result<String> {
     use windows_sys::Win32::Security::{
-        AclSizeInformation, GetAclInformation, GetSecurityDescriptorControl,
-        GetSecurityDescriptorDacl, ACL_SIZE_INFORMATION, SE_DACL_PROTECTED,
+        GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, IsValidAcl, ACE_HEADER,
+        SE_DACL_PROTECTED,
     };
 
     let mut descriptor = read_windows_dacl_descriptor(path)?;
@@ -3561,28 +3567,15 @@ fn windows_dacl_digest(path: &Path) -> Result<String> {
     if dacl_present == 0 || dacl.is_null() {
         anyhow::bail!("Windows authority object has no bounded DACL")
     }
-    let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe {
-        GetAclInformation(
-            dacl,
-            (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
-            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error()).context("failed to measure the Windows DACL");
+    if unsafe { IsValidAcl(dacl) } == 0 {
+        anyhow::bail!("Windows authority object has an invalid DACL")
     }
-    let dacl_length = size.AclBytesInUse as usize;
     let descriptor_start = descriptor.as_ptr() as usize;
     let descriptor_end = descriptor_start
         .checked_add(descriptor.len())
         .context("Windows security descriptor length overflow")?;
     let dacl_start = dacl as usize;
-    let dacl_end = dacl_start
-        .checked_add(dacl_length)
-        .context("Windows DACL length overflow")?;
-    if dacl_start < descriptor_start || dacl_end > descriptor_end {
+    if dacl_start < descriptor_start || dacl_start >= descriptor_end {
         anyhow::bail!("Windows DACL lies outside its security descriptor")
     }
     let mut control = 0;
@@ -3594,13 +3587,32 @@ fn windows_dacl_digest(path: &Path) -> Result<String> {
         return Err(std::io::Error::last_os_error())
             .context("failed to inspect Windows DACL controls");
     }
-    let dacl_bytes = unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), dacl_length) };
     // Windows can regenerate self-relative descriptor bookkeeping while
-    // preserving the ordered ACL. The ACL bytes and inheritance protection
-    // are the authority that transaction recovery must bind.
-    let mut generation = Vec::with_capacity(dacl_length.saturating_add(1));
+    // preserving the ordered ACEs. ACL allocation fields are not authority;
+    // the revision, ordered ACE bytes, and inheritance protection are.
+    let mut generation = Vec::new();
     generation.push(u8::from(control & SE_DACL_PROTECTED != 0));
-    generation.extend_from_slice(dacl_bytes);
+    generation.push(unsafe { (*dacl).AclRevision });
+    generation.extend_from_slice(&unsafe { (*dacl).AceCount }.to_le_bytes());
+    for index in 0..unsafe { (*dacl).AceCount } {
+        let mut ace = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, u32::from(index), &mut ace) } == 0 || ace.is_null() {
+            anyhow::bail!("failed to enumerate the Windows DACL")
+        }
+        let ace_size = usize::from(unsafe { (*ace.cast::<ACE_HEADER>()).AceSize });
+        let ace_start = ace as usize;
+        let ace_end = ace_start
+            .checked_add(ace_size)
+            .context("Windows ACE length overflow")?;
+        if ace_size < std::mem::size_of::<ACE_HEADER>()
+            || ace_start < descriptor_start
+            || ace_end > descriptor_end
+        {
+            anyhow::bail!("Windows DACL contains an out-of-bounds ACE")
+        }
+        generation
+            .extend_from_slice(unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), ace_size) });
+    }
     Ok(content_digest(&generation))
 }
 

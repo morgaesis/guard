@@ -614,7 +614,7 @@ jobs:
             jq -S '
               def canonicalize_reference:
                 if type == "string" then
-                  sub("^path\\+file://[^#]*#guard@"; "pkg:cargo/guard@")
+                  sub("^path\\+file://[^#]*#(guard@)?"; "pkg:cargo/guard@")
                 else
                   .
                 end;
@@ -755,7 +755,7 @@ jobs:
                 unrelated: {"bom-ref": $preserved, ref: $preserved, sequence: ["second", "first"]}
               }' \
               > "$first"
-            jq -n --arg path 'path+file:///second-source#guard@1.2.3' --arg preserved "$preserved" \
+            jq -n --arg path 'path+file:///second-source#1.2.3' --arg preserved "$preserved" \
               '{
                 unrelated: {sequence: ["second", "first"], ref: $preserved, "bom-ref": $preserved},
                 formulation: [{

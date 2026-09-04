@@ -2255,13 +2255,32 @@ fn process_execution_identity_binding(
         } else {
             guard::gating::approval::ProcessExecutionIdentityMode::FixedUser
         },
+        principal: None,
         user_id: context.uid,
         primary_group_id: context.gid,
         supplementary_group_ids: context.supplementary_group_ids.clone(),
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_execution_identity_binding(
+    server: &ServerContext,
+    _exec_caller: Option<&ExecCallerContext>,
+) -> Result<guard::gating::approval::ProcessExecutionIdentity, String> {
+    Ok(guard::gating::approval::ProcessExecutionIdentity {
+        mode: if server.config.exec_as_caller {
+            guard::gating::approval::ProcessExecutionIdentityMode::Caller
+        } else {
+            guard::gating::approval::ProcessExecutionIdentityMode::FixedUser
+        },
+        principal: Some(server.config.daemon_principal.clone()),
+        user_id: 0,
+        primary_group_id: 0,
+        supplementary_group_ids: Vec::new(),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_execution_identity_binding(
     _server: &ServerContext,
     _exec_caller: Option<&ExecCallerContext>,
@@ -6862,10 +6881,15 @@ mod process_start_hardening_tests {
             ".ansible/roles",
             ".ssh",
             ".kube",
-            ".config/helm",
-            ".local/share/helm",
-            ".cache/helm",
         ] {
+            std::fs::create_dir_all(home.path().join(relative)).unwrap();
+        }
+        #[cfg(not(windows))]
+        for relative in [".config/helm", ".local/share/helm", ".cache/helm"] {
+            std::fs::create_dir_all(home.path().join(relative)).unwrap();
+        }
+        #[cfg(windows)]
+        for relative in ["AppData/Roaming/helm", "Temp/helm"] {
             std::fs::create_dir_all(home.path().join(relative)).unwrap();
         }
         std::fs::write(home.path().join(".ansible.cfg"), "[defaults]\n").unwrap();
@@ -6874,6 +6898,22 @@ mod process_start_hardening_tests {
             "HOME".to_string(),
             home.path().to_string_lossy().into_owned(),
         )]);
+        #[cfg(windows)]
+        let environment = {
+            let mut environment = environment;
+            environment.insert(
+                "APPDATA".to_string(),
+                home.path()
+                    .join("AppData/Roaming")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            environment.insert(
+                "TEMP".to_string(),
+                home.path().join("Temp").to_string_lossy().into_owned(),
+            );
+            environment
+        };
 
         let ansible =
             default_tool_profile_authority_paths("ansible", &[], &environment, home.path());
@@ -6892,9 +6932,17 @@ mod process_start_hardening_tests {
             .into_iter()
             .collect::<BTreeSet<_>>();
         assert!(helm.contains(&home.path().join(".kube/config")));
-        assert!(helm.contains(&home.path().join(".config/helm")));
-        assert!(helm.contains(&home.path().join(".local/share/helm")));
-        assert!(helm.contains(&home.path().join(".cache/helm")));
+        #[cfg(not(windows))]
+        {
+            assert!(helm.contains(&home.path().join(".config/helm")));
+            assert!(helm.contains(&home.path().join(".local/share/helm")));
+            assert!(helm.contains(&home.path().join(".cache/helm")));
+        }
+        #[cfg(windows)]
+        {
+            assert!(helm.contains(&home.path().join("AppData/Roaming/helm")));
+            assert!(helm.contains(&home.path().join("Temp/helm")));
+        }
 
         let explicit_kubeconfig = default_tool_profile_authority_paths(
             "kubectl",
