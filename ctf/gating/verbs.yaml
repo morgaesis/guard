@@ -9,6 +9,10 @@ verbs:
     args: ["/work/seed.txt"]
     consequence: reversible
     trusted: true
+    coverage:
+      - name: fixture-cwd
+        action: preauthorized
+        cwd: /src
 
   - name: child-secret-file-contract
     description: Verify fixed-identity credential delivery remains unavailable
@@ -18,6 +22,7 @@ verbs:
     coverage:
       - name: generated-file
         action: preauthorized
+        cwd: /src
         environment:
           - name: CHILD_FILE_PATH
             source: secret-file
@@ -29,6 +34,10 @@ verbs:
     args: [child-contract]
     consequence: reversible
     trusted: true
+    coverage:
+      - name: fixture-cwd
+        action: preauthorized
+        cwd: /src
 
   - name: scale-workload
     description: Scale a fixture workload; auto-reverts unless confirmed
@@ -39,6 +48,10 @@ verbs:
     consequence: recoverable
     revert: { binary: kubectl, args: ["scale", "deployment/{name}", "--replicas=1", "-n", "fixture"] }
     trusted: true
+    coverage:
+      - name: fixture-cwd
+        action: preauthorized
+        cwd: /src
 
   - name: delete-fixture-namespace
     description: Delete the fixed fixture namespace (irreversible; held)
@@ -46,6 +59,10 @@ verbs:
     args: ["delete", "namespace", "secret"]
     consequence: irreversible
     trusted: true
+    coverage:
+      - name: fixture-cwd
+        action: preauthorized
+        cwd: /src
 
   - name: kubectl-version
     description: Exercise transparent kubectl shim
@@ -53,6 +70,10 @@ verbs:
     args: ["version", "--client"]
     consequence: reversible
     trusted: true
+    coverage:
+      - name: fixture-cwd
+        action: preauthorized
+        cwd: /work
 
   - name: helm-checked-upgrade
     description: Verify fixed identity rejects Helm profile authority before execution
@@ -60,6 +81,10 @@ verbs:
     args: ["upgrade", "--install", "demo", "./chart", "--namespace", "staging", "--dry-run", "--diff"]
     consequence: reversible
     trusted: true
+    coverage:
+      - name: fixture-cwd
+        action: preauthorized
+        cwd: /work
 
   - name: ansible-ping-check
     description: Verify fixed identity rejects Ansible profile authority before execution
@@ -67,6 +92,10 @@ verbs:
     args: ["web", "-m", "ping", "--check"]
     consequence: reversible
     trusted: true
+    coverage:
+      - name: fixture-cwd
+        action: preauthorized
+        cwd: /work
 
   - name: ansible-ping-all-cwd
     description: Verify caller-owned Ansible profile discovery remains unavailable
@@ -74,6 +103,10 @@ verbs:
     args: ["-m", "ping", "all"]
     consequence: reversible
     trusted: true
+    coverage:
+      - name: fixture-cwd
+        action: preauthorized
+        cwd: /work/ansible-project
 
   - name: ansible-playbook-check-diff
     description: Verify fixed identity rejects ansible-playbook before execution
@@ -81,6 +114,10 @@ verbs:
     args: ["/work/site.yml", "--check", "--diff", "--limit", "web"]
     consequence: reversible
     trusted: true
+    coverage:
+      - name: fixture-cwd
+        action: preauthorized
+        cwd: /work
 
   - name: failing-revert
     description: Scale a fixture whose deterministic rollback fails
@@ -89,6 +126,10 @@ verbs:
     consequence: recoverable
     revert: { binary: "false", args: [] }
     trusted: true
+    coverage:
+      - name: fixture-cwd
+        action: preauthorized
+        cwd: /src
 
   - name: service-status
     description: Inspect one fake service through a closed command profile

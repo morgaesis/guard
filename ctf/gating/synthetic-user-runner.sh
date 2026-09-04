@@ -326,13 +326,11 @@ collect_startup_diagnostics() {
       || echo '[container log unavailable]'
     echo
     echo '## Daemon log'
-    timeout --kill-after=1s 5s podman exec --user 0:0 "$container" /bin/sh -c '
-      if [ -f /scenario/raw/daemon.log ]; then
-        tail -n 160 /scenario/raw/daemon.log
-      else
-        echo "[daemon log unavailable]"
-      fi
-    ' 9>&- 2>&1 || echo '[daemon log collection unavailable]'
+    timeout --kill-after=1s 5s podman cp \
+      "$container:/scenario/raw/daemon.log" - 9>&- 2>/dev/null \
+      | tar -xO 2>/dev/null \
+      | tail -n 160 \
+      || echo '[daemon log collection unavailable]'
   } | sanitize_startup_diagnostics > "$evidence"
   ensure_private_file "$evidence"
 }

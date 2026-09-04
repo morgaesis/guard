@@ -39,6 +39,11 @@ RUN groupadd -g 2000 guard-clients \
     && usermod -aG guard-clients agent \
     && usermod -aG guard-clients other-agent
 
+# Trusted fixture coverage binds the caller's working directory. These image
+# paths must exist when every catalog is validated; the attack replaces /work
+# with a bounded tmpfs and recreates its project tree before daemon startup.
+RUN install -d -o root -g root -m 0755 /work /work/ansible-project
+
 # The daemon's immutable authority mountpoint is anchored directly under the
 # read-only container rootfs, outside every daemon-writable ancestor.
 RUN install -d -o root -g root -m 0555 /authority

@@ -429,7 +429,7 @@ fi
 
 echo
 echo "=== 8. raw irreversible command stays gated (no verb escape) ==="
-echo "marker" > /work/marker.txt
+runuser -u guardexec -- sh -c 'printf "marker\n" > /work/marker.txt'
 agent guard run rm -rf /work/marker.txt --socket "$SOCK" >/tmp/raw.out 2>&1 || true
 if [ -f /work/marker.txt ]; then
   ok "raw destructive command did not execute"
