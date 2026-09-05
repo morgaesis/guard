@@ -21,7 +21,17 @@ COPY config ./config
 COPY tests ./tests
 COPY examples ./examples
 
-RUN cargo test --release --locked --quiet --no-run \
+# The registry, git checkouts, and target directory live in build cache mounts
+# so a rebuild after a source change reuses every unchanged dependency instead
+# of compiling the whole tree again. The finished target is copied into the
+# image because `run.sh test` runs the compiled test binaries from /src/target
+# at container run time, where no cache mount exists.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target-cache,sharing=locked \
+    CARGO_TARGET_DIR=/src/target-cache cargo test --release --locked --quiet --no-run \
+    && rm -rf /src/target \
+    && cp -a /src/target-cache /src/target \
     && install -m 0755 target/release/guard /usr/local/bin/guard
 
 # Three distinct identities: the daemon/operator (uid 1000) and two agents
