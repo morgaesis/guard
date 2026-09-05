@@ -441,7 +441,13 @@ fi
 
 echo
 echo "=== 9. abrupt restart mid-window: future deadline is re-armed ==="
-agent guard verb run scale-workload --param name=restart --confirm-within 600 --socket "$SOCK" >/tmp/restart.out 2>&1
+if ! timeout 15 runuser -u agent -- guard verb run scale-workload \
+  --param name=restart --confirm-within 600 --socket "$SOCK" >/tmp/restart.out 2>&1; then
+  bad "restart provisional request did not complete within 15 seconds"
+  cat /tmp/restart.out
+  tail -50 /var/log/guard.log
+  exit 1
+fi
 RHANDLE=$(handle_of /tmp/restart.out)
 kill -KILL "$DAEMON_PID" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true

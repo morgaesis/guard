@@ -715,6 +715,17 @@ ctf_text = "\n".join(
     for path in sorted((root / "ctf").rglob("*"))
     if path.is_file()
 )
+rust_test_source = "\n".join(
+    path.read_text(encoding="utf-8")
+    for source_root in (root / "src", root / "tests")
+    for path in sorted(source_root.rglob("*.rs"))
+)
+synthetic_test_filters = set(
+    re.findall(r"\brun_test_filter\s+([A-Za-z0-9_]+)", synthetic)
+)
+defined_rust_tests = set(
+    re.findall(r"(?m)^\s*(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*\(", rust_test_source)
+)
 
 workflow_fixtures = {
     ".github/dependabot.yml",
@@ -744,6 +755,8 @@ capability_verb = re.search(
 )
 
 checks = {
+    "synthetic test filters name existing Rust tests": bool(synthetic_test_filters)
+    and synthetic_test_filters <= defined_rust_tests,
     "capability contract uses the closed whoami profile": capability_verb is not None
     and "    binary: whoami\n" in capability_verb.group("body")
     and "    args:" not in capability_verb.group("body")
@@ -808,6 +821,26 @@ checks = {
         )
     ),
     "caller daemon paths and token are explicitly prepared": "assert_daemon_path_contract" in synthetic and "1000:0:440" in synthetic and "chown 0:guard-clients /scenario/run" in synthetic,
+    "synthetic state directory starts and remains daemon-private": all(
+        marker in synthetic
+        for marker in (
+            "assert_path_contract_stat /scenario/data 0:0:700 daemon-state",
+            "assert_path_contract_stat /scenario/data 1000:1000:700 daemon-state",
+            "chmod 0700 /scenario/data",
+        )
+    ),
+    "embedded contracts run from principal-owned storage": 'cd "$HOME" && "$binary" "$filter"' in synthetic,
+    "cwd-bound live revert runs from its declared scope": "cd /src && guard verb run failing-revert" in synthetic,
+    "phase failures survive ERR trap suppression": "trap 'status=$?; if [ \"$status\" -ne 0 ]" in synthetic,
+    "private upgrade daemon uses the fixed execution identity": all(
+        marker in synthetic
+        for marker in (
+            "--reuid 1000",
+            "--regid 1000",
+            "--groups 1003,2000",
+            "private daemon failed:",
+        )
+    ),
     "synthetic catalog uses an anchored read-only directory and one writable lock bind": all(
         marker in runner
         for marker in (
@@ -913,6 +946,14 @@ checks = {
             "trap 'handle_signal TERM' TERM",
             "record_sanitized_container_state",
             "content=controlled-phase-and-container-state-only",
+        )
+    ),
+    "fixed restart request has a local diagnostic deadline": all(
+        marker in attack
+        for marker in (
+            "timeout 15 runuser -u agent -- guard verb run scale-workload",
+            "restart provisional request did not complete within 15 seconds",
+            "tail -50 /var/log/guard.log",
         )
     ),
     "fixed attack cleanup is bounded, forceful, and idempotent": all(

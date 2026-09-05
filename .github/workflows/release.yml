@@ -396,7 +396,7 @@ jobs:
             Set-ServiceRegistryAcl -GuardSid $guardSid
 
             $stockPathName = Get-ServicePathName
-            $customPathName = "$stockPathName `"--audit-log`" `"$DataDir\audit.log`""
+            $customPathName = "$stockPathName `"--history-retention`" `"86400`""
             & sc.exe config $ServiceName binPath= $customPathName | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Could not install the custom service command fixture.' }
 
@@ -431,7 +431,18 @@ jobs:
             $serviceKey = Get-ServiceRegistryPath
             $current = @((Get-ItemProperty -LiteralPath $serviceKey -Name Environment).Environment)
             New-ItemProperty -LiteralPath $serviceKey -Name Environment -PropertyType MultiString -Value ($current + 'GUARD_INSTALLER_CI_MARKER=retained') -Force | Out-Null
-            & $installer @candidateInstall | Out-Null
+            try {
+              & $installer @candidateInstall | Out-Null
+            }
+            catch {
+              $serviceLog = Join-Path $DataDir 'guard.log'
+              if (Test-Path -LiteralPath $serviceLog -PathType Leaf) {
+                Get-Content -LiteralPath $serviceLog -Tail 40 |
+                  Where-Object { $_ -match 'guard service.*error|daemon terminated with error' } |
+                  ForEach-Object { Write-Warning "Guard upgrade diagnostic: $_" }
+              }
+              throw
+            }
             if ((Get-ServicePathName) -ne $customPathName) {
               throw 'Installer rerun did not preserve the exact service command line.'
             }

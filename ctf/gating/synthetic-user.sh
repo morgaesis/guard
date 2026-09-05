@@ -385,31 +385,55 @@ assert_catalog_mutation_rejected_after_identity_transition() {
 }
 
 assert_daemon_path_contract() {
+  assert_path_contract_stat() {
+    local path="$1" expected="$2" label="$3" observed
+    observed="$(stat -c '%u:%g:%a' "$path" 2>/dev/null || printf missing)"
+    if [ "$observed" != "$expected" ]; then
+      printf 'daemon path contract failed: %s expected=%s observed=%s\n' \
+        "$label" "$expected" "$observed" >&2
+      return 1
+    fi
+  }
   if caller_identity_scenario; then
     [ "$(id -u)" -eq 0 ]
-    [ "$(stat -c '%u:%g:%a' /scenario)" = 0:0:711 ]
-    [ "$(stat -c '%u:%g:%a' /scenario/home)" = 0:0:755 ]
-    [ "$(stat -c '%u:%g:%a' /scenario/config)" = 0:0:755 ]
-    [ "$(stat -c '%u:%g:%a' /scenario/data)" = 0:0:755 ]
-    [ "$(stat -c '%u:%g:%a' /scenario/run)" = 0:2000:755 ]
-    [ "$(stat -c '%u:%g:%a' /scenario/run/admin.token)" = 1000:0:440 ]
+    assert_path_contract_stat /scenario 0:0:711 scenario-root
+    assert_path_contract_stat /scenario/home 0:0:755 daemon-home
+    assert_path_contract_stat /scenario/config 0:0:755 daemon-config
+    assert_path_contract_stat /scenario/data 0:0:700 daemon-state
+    assert_path_contract_stat /scenario/run 0:2000:755 daemon-runtime
+    assert_path_contract_stat /scenario/run/admin.token 1000:0:440 admin-token
   else
     [ "$(id -u)" -eq 1000 ]
-    [ "$(stat -c '%u:%g:%a' /scenario)" = 1000:1000:711 ]
-    [ "$(stat -c '%u:%g:%a' /scenario/home)" = 1000:1000:755 ]
-    [ "$(stat -c '%u:%g:%a' /scenario/config)" = 1000:1000:755 ]
-    [ "$(stat -c '%u:%g:%a' /scenario/data)" = 1000:1000:755 ]
-    [ "$(stat -c '%u:%g:%a' /scenario/run)" = 1000:2000:755 ]
-    [ "$(stat -c '%u:%g:%a' /scenario/run/admin.token)" = 1000:0:400 ]
-    [ ! -r "$FIXTURE_API_TOKEN_FILE" ]
+    assert_path_contract_stat /scenario 1000:1000:711 scenario-root
+    assert_path_contract_stat /scenario/home 1000:1000:755 daemon-home
+    assert_path_contract_stat /scenario/config 1000:1000:755 daemon-config
+    assert_path_contract_stat /scenario/data 1000:1000:700 daemon-state
+    assert_path_contract_stat /scenario/run 1000:2000:755 daemon-runtime
+    assert_path_contract_stat /scenario/run/admin.token 1000:0:400 admin-token
+    [ ! -r "$FIXTURE_API_TOKEN_FILE" ] || {
+      echo 'daemon path contract failed: API token became readable' >&2
+      return 1
+    }
   fi
-  [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_AUTHORITY_DIR")" = 0:0:755 ]
-  [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_TOKEN_FILE")" = 0:0:600 ]
-  [ "$(stat -c '%u:%g:%a' "$FIXTURE_API_TOKEN_DIGEST_FILE")" = 0:0:444 ]
-  [ -r "$FIXTURE_API_TOKEN_DIGEST_FILE" ]
-  [ -r /scenario/run/admin.token ]
-  [ -w /scenario/data ]
-  [ -w /scenario/raw ]
+  assert_path_contract_stat "$FIXTURE_API_AUTHORITY_DIR" 0:0:755 api-authority
+  assert_path_contract_stat "$FIXTURE_API_TOKEN_FILE" 0:0:600 api-token
+  assert_path_contract_stat "$FIXTURE_API_TOKEN_DIGEST_FILE" 0:0:444 api-token-digest
+  [ -r "$FIXTURE_API_TOKEN_DIGEST_FILE" ] || {
+    echo 'daemon path contract failed: API token digest is unreadable' >&2
+    return 1
+  }
+  [ -r /scenario/run/admin.token ] || {
+    echo 'daemon path contract failed: admin token is unreadable' >&2
+    return 1
+  }
+  [ -w /scenario/data ] || {
+    echo 'daemon path contract failed: state directory is unwritable' >&2
+    return 1
+  }
+  [ -w /scenario/raw ] || {
+    echo 'daemon path contract failed: raw evidence directory is unwritable' >&2
+    return 1
+  }
 }
 
 daemon() {
@@ -502,7 +526,7 @@ run_test_filter() {
     esac
     listing="$("$binary" --list 2>/dev/null || true)"
     printf '%s\n' "$listing" | grep -Eq '[0-9]+ tests, [0-9]+ benchmarks$' || continue
-    output="$("$binary" "$filter" --nocapture 2>&1)" || {
+    output="$(cd "$HOME" && "$binary" "$filter" --nocapture 2>&1)" || {
       printf '%s\n' "$output" >> "$RAW"
       printf 'test filter failed: %s\n' "$filter" > "$FAILURE"
       return 1
@@ -534,7 +558,7 @@ run_contracts() {
     SU-06)
       run_test_filter permission_denied_path_understands_common_error_shapes
       run_test_filter caller_env_cannot_override_daemon_child_env
-      run_test_filter ansible_discovers_config_from_cwd_without_inherited_ansible_config
+      run_test_filter ansible_cwd_profile_is_rejected_before_process_start
       ;;
     SU-07)
       run_test_filter expiry_is_fail_closed_on_timer
@@ -545,7 +569,7 @@ run_contracts() {
     SU-08)
       local live_output
       run_test_filter revert_outcomes_recorded
-      if ! live_output="$(guard verb run failing-revert --confirm-within 1 --socket "$SOCKET" 2>&1)"; then
+      if ! live_output="$(cd /src && guard verb run failing-revert --confirm-within 1 --socket "$SOCKET" 2>&1)"; then
         printf '%s\n' "$live_output" >> "$RAW"
         printf 'live failing-revert verb did not enter the provisional state: %s\n' \
           "$(printf '%s\n' "$live_output" | safe_error_line)" > "$FAILURE"
@@ -660,11 +684,20 @@ require_hold_guidance() {
 
 save_request() {
   local name="$1" intent="$2" output="/scenario/journey/$1-request.out" handle
-  capture_phase "$name-request" guard access request "$intent" --json || return 1
+  capture_phase "$name-request" guard access request "$intent" --json || {
+    printf 'access request failed: %s-command\n' "$name" > "$FAILURE"
+    return 1
+  }
   handle="$(request_reference "$output")"
-  [ -n "$handle" ] || return 1
+  if [ -z "$handle" ]; then
+    printf 'access request failed: %s-reference\n' "$name" > "$FAILURE"
+    return 1
+  fi
   printf '%s\n' "$handle" > "/scenario/journey/$name.handle"
-  require_request_guidance "$output" "$handle"
+  require_request_guidance "$output" "$handle" || {
+    printf 'access request failed: %s-guidance\n' "$name" > "$FAILURE"
+    return 1
+  }
 }
 
 read_handle() {
@@ -754,8 +787,9 @@ PRIVATE_KUBE_PROXY=127.0.0.1:18444
 
 private_daemon_start() {
   local binary="$1" log_name="$2" pid ready=false
-  mkdir -p "$PRIVATE_ROOT/home" "$PRIVATE_ROOT/config" "$PRIVATE_ROOT/data" \
-    "$PRIVATE_ROOT/run" "$PRIVATE_ROOT/log"
+  install -d -o 1000 -g 1000 -m 0700 \
+    "$PRIVATE_ROOT/home" "$PRIVATE_ROOT/config" "$PRIVATE_ROOT/data" "$PRIVATE_ROOT/log"
+  install -d -o 1000 -g 2000 -m 0755 "$PRIVATE_ROOT/run"
   rm -f "$PRIVATE_SOCKET"
   HOME="$PRIVATE_ROOT/home" \
     XDG_CONFIG_HOME="$PRIVATE_ROOT/config" \
@@ -763,6 +797,9 @@ private_daemon_start() {
     PATH="/scenario/bin:/usr/local/bin:/usr/bin:/bin" \
     KUBECONFIG="$PRIVATE_BROKERED_KUBECONFIG" \
     nohup setpriv \
+      --reuid 1000 \
+      --regid 1000 \
+      --groups 1003,2000 \
       --bounding-set=-all,+setgid,+setuid \
       --inh-caps=+setgid,+setuid \
       --ambient-caps=+setgid,+setuid \
@@ -794,9 +831,22 @@ private_daemon_start() {
     fi
     sleep 0.1
   done
-  [ "$ready" = true ]
-  [ "$(stat -c '%a:%G' "$PRIVATE_SOCKET")" = 660:guard-clients ]
-  [ "$(awk '/^CapEff:/ { value = tolower($2); sub(/^0+/, "", value); print value == "" ? "0" : value }' "/proc/$pid/status")" = c0 ]
+  if [ "$ready" != true ]; then
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'private daemon failed: %s-socket-readiness\n' "$log_name" > "$FAILURE"
+    else
+      printf 'private daemon failed: %s-process-exit\n' "$log_name" > "$FAILURE"
+    fi
+    return 1
+  fi
+  if [ "$(stat -c '%a:%G' "$PRIVATE_SOCKET")" != 660:guard-clients ]; then
+    printf 'private daemon failed: %s-socket-contract\n' "$log_name" > "$FAILURE"
+    return 1
+  fi
+  if [ "$(awk '/^CapEff:/ { value = tolower($2); sub(/^0+/, "", value); print value == "" ? "0" : value }' "/proc/$pid/status")" != c0 ]; then
+    printf 'private daemon failed: %s-capability-contract\n' "$log_name" > "$FAILURE"
+    return 1
+  fi
 }
 
 private_daemon_stop() {
@@ -1750,6 +1800,7 @@ run_phase() {
   prepare_principal_output
   RAW="$PHASE_OUTPUT/$SCENARIO.log"
   trap '[ -s "$FAILURE" ] || printf "phase=%s line=%s\n" "${3:-unknown}" "$LINENO" > "$FAILURE"' ERR
+  trap 'status=$?; if [ "$status" -ne 0 ] && [ ! -s "$FAILURE" ]; then printf "phase=%s line=%s\n" "${3:-unknown}" "$LINENO" > "$FAILURE"; fi' EXIT
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
   cd /
   case "$SCENARIO" in
@@ -1926,6 +1977,7 @@ prepare_principals() {
   chmod 0700 "$COLLECTOR_ROOT" "$COLLECTOR_RESULTS" "$COLLECTOR_PHASES"
   chown -R "$daemon_owner" /scenario/home /scenario/config /scenario/data /scenario/raw \
     /scenario/fixtures /scenario/bin /scenario/ansible
+  chmod 0700 /scenario/data
   mkdir -p "$PRIVATE_ROOT/run"
   chown "$daemon_owner" /scenario
   : > "$BROKERED_KUBECONFIG"
@@ -2011,6 +2063,16 @@ collect_result() {
       case "$candidate" in
         'test filter failed: '*|'test filter matched no tests: '*)
           if [[ "$candidate" =~ ^test\ filter\ (failed|matched\ no\ tests):\ [A-Za-z0-9_]+$ ]]; then
+            failure_signal="$candidate"
+          fi
+          ;;
+        'access request failed: '*)
+          if [[ "$candidate" =~ ^access\ request\ failed:\ [A-Za-z0-9_-]+-(command|reference|guidance)$ ]]; then
+            failure_signal="$candidate"
+          fi
+          ;;
+        'private daemon failed: '*)
+          if [[ "$candidate" =~ ^private\ daemon\ failed:\ [A-Za-z0-9_-]+-(socket-readiness|process-exit|socket-contract|capability-contract)$ ]]; then
             failure_signal="$candidate"
           fi
           ;;
