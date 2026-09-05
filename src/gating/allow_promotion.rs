@@ -34,15 +34,10 @@
 //!   deny-shape synthesis, which both trust the model to propose a pattern
 //!   and merely validate it. Nothing here for a model (or a caller nudging
 //!   one through many approved requests) to widen.
-//! - **Which consequence classes are eligible.** Reversible and Recoverable
-//!   only. Irreversible is never even attempted: it always holds for
-//!   operator approval regardless of `trusted` (see `decide_gate`), so
-//!   promoting one buys no latency and only discards the per-instance LLM
-//!   reasoning a human would otherwise see in the hold queue. A Recoverable
-//!   verb may be promoted only with a validated revert, so the auto-revert
-//!   envelope -- not the model's word -- is what absorbs the residual risk
-//!   that a not-yet-observed parameter value behaves differently than the
-//!   evidence.
+//! - **Which consequence classes are eligible.** Only locally proven
+//!   read-only commands are eligible. Irreversible and Recoverable commands
+//!   remain under operator review or live inverse assessment; a model label or
+//!   model-generated rollback never creates unattended authority.
 //! - **Consistency across evidence.** Every approval folded into a bucket
 //!   must agree on the same reversibility class; a bucket that ever saw a
 //!   mixed or irreversible classification is permanently disqualified
@@ -56,8 +51,7 @@
 //! The LLM is still consulted once per promotion attempt with at least one
 //! varying position, but only to name the verb, write its description, judge
 //! whether generalizing over these *specific* varying positions is coherent
-//! for this binary, and -- for a Recoverable verb -- propose a revert. It
-//! never chooses the binary, the args template, the parameter patterns, or
+//! for this binary. It never chooses the binary, the args template, the parameter patterns, or
 //! the consequence class; those are derived here from evidence and re-
 //! validated from scratch regardless of what the model returns (see
 //! `gating::verb::validate_auto_promoted_verb_safety`). A fully literal
@@ -73,12 +67,23 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use super::verb::{
-    is_kebab_name, CoverageAction, CoverageProbe, CoverageProvenance, ParamSpec, Verb, VerbCommand,
-    VerbCoverageCell,
+    is_kebab_name, CoverageAction, CoverageObservationReplay, CoverageProvenance, ParamSpec, Verb,
+    VerbCommand, VerbCoverageCell,
 };
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
+#[cfg(test)]
+use crate::learned_rules::write_learning_file_atomically;
 use crate::learned_rules::{infer_service_from_binary, looks_dangerous_for_learned_allow};
+use crate::learned_rules::{
+    retry_learning_snapshot_conflicts, rewrite_learning_file_bounded, sanitize_learning_text,
+    write_learning_file_atomically_for_locked_snapshot, AsyncDurableStore, LearningFileSnapshot,
+    LearningWriteOutcome,
+};
+use crate::redact::{
+    command_contains_sensitive_literals, command_metadata,
+    flattened_command_contains_sensitive_literals, scrub_flattened_command_metadata,
+};
 
 /// Evidence samples kept per observation bucket: enough to see whether more
 /// than one distinct value occupies a varying position, bounded so neither
@@ -111,7 +116,7 @@ impl AllowPromotionConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllowPromotionFile {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -123,7 +128,7 @@ fn default_version() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllowObservation {
     pub service: String,
     pub binary: String,
@@ -186,23 +191,51 @@ pub struct AllowPromotionOutcome {
 pub struct AllowPromotionStore {
     config: AllowPromotionConfig,
     data: AllowPromotionFile,
+    snapshot: LearningFileSnapshot,
 }
 
 impl AllowPromotionStore {
     pub fn load(config: AllowPromotionConfig) -> Result<Self> {
-        let data = if config.path.exists() {
-            let content = std::fs::read_to_string(&config.path)
-                .with_context(|| format!("failed to read {}", config.path.display()))?;
-            if content.trim().is_empty() {
-                AllowPromotionFile::default()
+        let path = config.path.clone();
+        let (data, snapshot, warning) = rewrite_learning_file_bounded(&path, |snapshot| {
+            let mut data = if let Some(content) = snapshot.content() {
+                let content = std::str::from_utf8(content)
+                    .with_context(|| format!("{} is not UTF-8", config.path.display()))?;
+                if content.trim().is_empty() {
+                    AllowPromotionFile::default()
+                } else {
+                    serde_yaml_ng::from_str(content)
+                        .with_context(|| format!("failed to parse {}", config.path.display()))?
+                }
             } else {
-                serde_yaml_ng::from_str(&content)
-                    .with_context(|| format!("failed to parse {}", config.path.display()))?
+                AllowPromotionFile::default()
+            };
+            let original_len = data.observations.len();
+            data.observations.retain(|_, observation| {
+                !allow_observation_contains_sensitive_literals(observation)
+            });
+            let mut changed = original_len != data.observations.len();
+            for observation in data.observations.values_mut() {
+                let sanitized = sanitize_learning_text(&observation.last_reason);
+                changed |= sanitized != observation.last_reason;
+                observation.last_reason = sanitized;
+                let metadata = scrub_flattened_command_metadata(&observation.last_command);
+                changed |= metadata != observation.last_command;
+                observation.last_command = metadata;
             }
-        } else {
-            AllowPromotionFile::default()
-        };
-        Ok(Self { config, data })
+            let content = changed
+                .then(|| serde_yaml_ng::to_string(&data))
+                .transpose()?;
+            Ok((content, data))
+        })?;
+        if let Some(error) = warning {
+            tracing::warn!("allow-promotion cleanup committed with a durability warning: {error}");
+        }
+        Ok(Self {
+            config,
+            data,
+            snapshot,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -238,6 +271,43 @@ impl AllowPromotionStore {
         reversibility: Option<Reversibility>,
         reason: &str,
     ) -> Result<Option<AllowPromotionOutcome>> {
+        let config = self.config.clone();
+        let mut first = Some(self.clone());
+        let (current, outcome) = retry_learning_snapshot_conflicts(|| {
+            let mut current = match first.take() {
+                Some(current) => current,
+                None => Self::load(config.clone())?,
+            };
+            let mut candidate = current.clone();
+            let outcome = candidate.record_approval_in_memory(
+                binary,
+                args,
+                command,
+                risk,
+                reversibility,
+                reason,
+            )?;
+            current.commit_candidate(candidate.data)?;
+            Ok((current, outcome))
+        })?;
+        *self = current;
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_approval_in_memory(
+        &mut self,
+        binary: &str,
+        args: &[String],
+        command: &str,
+        risk: Option<i32>,
+        reversibility: Option<Reversibility>,
+        reason: &str,
+    ) -> Result<Option<AllowPromotionOutcome>> {
+        if command_contains_sensitive_literals(binary, args) {
+            return Ok(None);
+        }
+        let metadata = command_metadata(binary, args);
         if !self.config.enabled {
             return Ok(None);
         }
@@ -263,6 +333,7 @@ impl AllowPromotionStore {
         }
 
         let service = infer_service_from_binary(binary);
+        let reason = sanitize_learning_text(reason);
         let subcommand = args.first().cloned().unwrap_or_default();
         let arity = args.len();
         let key = format!("{service}|{binary}|{subcommand}|{arity}");
@@ -299,16 +370,16 @@ impl AllowPromotionStore {
                 max_risk_seen: risk_val,
                 first_seen_unix: now,
                 last_seen_unix: now,
-                last_command: command.to_string(),
-                last_reason: reason.to_string(),
+                last_command: metadata.clone(),
+                last_reason: reason.clone(),
                 last_attempt_at_approvals: 0,
             });
 
         observation.approvals = observation.approvals.saturating_add(1);
         observation.max_risk_seen = observation.max_risk_seen.max(risk_val);
         observation.last_seen_unix = now;
-        observation.last_command = command.to_string();
-        observation.last_reason = reason.to_string();
+        observation.last_command = metadata;
+        observation.last_reason = reason.clone();
         match observation.class_seen {
             None => observation.class_seen = Some(class),
             Some(seen) if seen != class => observation.mixed_class = true,
@@ -341,8 +412,6 @@ impl AllowPromotionStore {
         let max_risk_seen = observation.max_risk_seen;
         let out_class = observation.class_seen;
 
-        self.save()?;
-
         let Some(out_class) = out_class else {
             return Ok(None);
         };
@@ -357,7 +426,7 @@ impl AllowPromotionStore {
             samples,
             class: out_class,
             max_risk_seen,
-            reason: reason.to_string(),
+            reason,
         }))
     }
 
@@ -378,22 +447,56 @@ impl AllowPromotionStore {
         arity: usize,
     ) -> Result<()> {
         let key = format!("{service}|{binary}|{subcommand}|{arity}");
-        if let Some(observation) = self.data.observations.get_mut(&key) {
+        let mut candidate = self.data.clone();
+        if let Some(observation) = candidate.observations.get_mut(&key) {
             observation.resolved = true;
-            self.save()?;
+            self.commit_candidate(candidate)?;
         }
         Ok(())
     }
 
-    fn save(&self) -> Result<()> {
-        if let Some(parent) = self.config.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+    fn commit_candidate(&mut self, candidate: AllowPromotionFile) -> Result<()> {
+        if candidate == self.data {
+            return Ok(());
         }
-        let content = serde_yaml_ng::to_string(&self.data)?;
-        std::fs::write(&self.config.path, content)
-            .with_context(|| format!("failed to write {}", self.config.path.display()))
+        let outcome = self.save_data(&candidate)?;
+        let (committed, warning) = outcome.into_parts();
+        self.data = candidate;
+        self.snapshot = committed;
+        if let Some(error) = warning {
+            tracing::warn!(
+                "allow-promotion replacement committed with a durability warning: {}",
+                error
+            );
+        }
+        Ok(())
     }
+
+    fn save_data(&self, data: &AllowPromotionFile) -> Result<LearningWriteOutcome> {
+        let content = self.canonical_content(data)?;
+        write_learning_file_atomically_for_locked_snapshot(
+            &self.config.path,
+            &self.snapshot,
+            &content,
+        )
+    }
+
+    fn canonical_content(&self, data: &AllowPromotionFile) -> Result<String> {
+        let mut data = data.clone();
+        for observation in data.observations.values_mut() {
+            observation.last_reason = sanitize_learning_text(&observation.last_reason);
+            observation.last_command = scrub_flattened_command_metadata(&observation.last_command);
+        }
+        Ok(serde_yaml_ng::to_string(&data)?)
+    }
+}
+
+fn allow_observation_contains_sensitive_literals(observation: &AllowObservation) -> bool {
+    observation
+        .samples
+        .iter()
+        .any(|args| command_contains_sensitive_literals(&observation.binary, args))
+        || flattened_command_contains_sensitive_literals(&observation.last_command)
 }
 
 /// One derived template slot: either a literal token (identical across every
@@ -405,6 +508,43 @@ impl AllowPromotionStore {
 pub(crate) enum TemplateSlot {
     Literal(String),
     Param(BTreeSet<String>),
+}
+
+/// Automatic promotion does not create durable authority for tools whose
+/// behavior can be supplied by a project tree, implicit configuration, or
+/// plugins discovered from a caller working directory. Operators express
+/// these tools through a reviewed typed verb with an exact `cwd` constraint.
+pub fn is_cwd_dependent_opaque_carrier(binary: &str) -> bool {
+    let file_name = Path::new(binary)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(binary);
+    let binary = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name)
+        .to_ascii_lowercase();
+    matches!(
+        binary.as_str(),
+        "ansible"
+            | "ansible-playbook"
+            | "ansible-galaxy"
+            | "chef-client"
+            | "helm"
+            | "kustomize"
+            | "make"
+            | "nix"
+            | "nix-build"
+            | "nix-shell"
+            | "packer"
+            | "pulumi"
+            | "puppet"
+            | "salt"
+            | "salt-call"
+            | "terraform"
+            | "terragrunt"
+            | "tofu"
+    )
 }
 
 /// Diff same-arity evidence samples positionally: a position constant across
@@ -440,6 +580,8 @@ pub(crate) fn is_fully_literal(slots: &[TemplateSlot]) -> bool {
 /// Build the verb's `args` template tokens and named `ParamSpec`s from
 /// derived slots. A parameter's pattern is a plain anchored alternation of
 /// its exact, regex-escaped observed values -- never a free-form regex.
+/// Whitespace-bearing values use `single_argv` semantics and the exact
+/// observed maximum length, so they remain one bounded argv element.
 ///
 /// Two distinct varying positions can derive the same base name (e.g. a
 /// repeated flag: `rsync --exclude A --exclude B`), which would otherwise
@@ -468,15 +610,29 @@ pub(crate) fn build_args_and_params(
                     .collect::<Vec<_>>()
                     .join("|");
                 args.push(format!("{{{name}}}"));
-                params.insert(
-                    name,
+                let pattern = format!("^({alternation})$");
+                let spec = if values
+                    .iter()
+                    .any(|value| value.chars().any(char::is_whitespace))
+                {
+                    ParamSpec::bounded_single_argv(
+                        pattern,
+                        values
+                            .iter()
+                            .map(|value| value.chars().count())
+                            .max()
+                            .expect("parameter values are non-empty"),
+                        allow_dash,
+                    )
+                } else {
                     ParamSpec {
-                        pattern: format!("^({alternation})$"),
+                        pattern,
                         required: true,
                         default: None,
                         allow_dash,
-                    },
-                );
+                    }
+                };
+                params.insert(name, spec);
             }
         }
     }
@@ -584,6 +740,16 @@ pub(crate) fn choose_verb_name(
 /// (`Evaluator::try_confirm_verb_promotion`) still runs
 /// `verb::validate_auto_promoted_verb_safety` on the result before it is
 /// ever appended to the catalog.
+///
+/// Two structural bounds are enforced here rather than trusted from the
+/// caller:
+///
+/// - Automatic promotion never mints authority above
+///   `Reversibility::Reversible`; any other class is refused outright.
+/// - Provenance is honest about how it was produced: the recorded argv
+///   records are `observation_replays` derived from the observed evaluator
+///   decisions the template was compiled from, never `probes`, which would
+///   claim an executed match that never ran.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_candidate_verb(
     binary: &str,
@@ -595,7 +761,16 @@ pub(crate) fn build_candidate_verb(
     revert: Option<VerbCommand>,
     evidence: String,
     promotion_stamp: String,
-) -> Verb {
+) -> Result<Verb> {
+    if consequence != Reversibility::Reversible {
+        anyhow::bail!(
+            "automatic promotion may not mint a '{}' verb: only statically read-only \
+             (reversible) shapes are eligible",
+            consequence.as_str()
+        );
+    }
+    let description = sanitize_learning_text(&description);
+    let evidence = sanitize_learning_text(&evidence);
     let fixed_args = args
         .iter()
         .filter(|arg| !(arg.starts_with('{') && arg.ends_with('}')))
@@ -613,6 +788,7 @@ pub(crate) fn build_candidate_verb(
         inventory: None,
         namespace: None,
         fanout: None,
+        cwd: None,
         environment: Vec::new(),
         override_marker: None,
         sticky: false,
@@ -623,23 +799,22 @@ pub(crate) fn build_candidate_verb(
             prompt_stamp: promotion_stamp.clone(),
             model_stamp: promotion_stamp.clone(),
             generated_unix: now_unix(),
-            probes: vec![
-                CoverageProbe {
+            probes: Vec::new(),
+            observation_replays: vec![
+                CoverageObservationReplay {
                     dimension: "observed_shape".to_string(),
                     args: args.clone(),
-                    expected_match: true,
-                    observed_match: true,
+                    template_match: true,
                 },
-                CoverageProbe {
+                CoverageObservationReplay {
                     dimension: "outside_shape".to_string(),
                     args: vec!["--guard-outside-coverage".to_string()],
-                    expected_match: false,
-                    observed_match: false,
+                    template_match: false,
                 },
             ],
         }),
     }];
-    Verb {
+    Ok(Verb {
         name,
         description,
         binary: binary.to_string(),
@@ -650,12 +825,32 @@ pub(crate) fn build_candidate_verb(
         params,
         consequence,
         revert,
+        hold: false,
         trusted: true,
         prompt_context: None,
+        exec_timeout_secs: None,
         source_prose: None,
         evidence: Some(evidence),
         auto_promoted: true,
         promotion_stamp: Some(promotion_stamp),
+    })
+}
+
+impl AsyncDurableStore for AllowPromotionStore {
+    fn authority_name(&self) -> &'static str {
+        "allow-promotion"
+    }
+
+    fn durable_path(&self) -> Option<&Path> {
+        Some(&self.config.path)
+    }
+
+    fn same_durable_snapshot(&self, snapshot: &LearningFileSnapshot) -> bool {
+        self.snapshot.same_authority(snapshot)
+    }
+
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
     }
 }
 
@@ -677,7 +872,7 @@ mod tests {
 
     #[test]
     fn repeated_reversible_approvals_become_ready_once() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 2)).unwrap();
         let a = args(&["get", "pods", "-n", "foo"]);
@@ -724,8 +919,239 @@ mod tests {
     }
 
     #[test]
+    fn failed_allow_promotion_write_keeps_memory_and_durable_state_unchanged() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let path = temp.path().join("allow.yaml");
+        let mut store = AllowPromotionStore::load(config(path.clone(), 2)).unwrap();
+        let command_args = args(&["get", "pods"]);
+        store
+            .record_approval(
+                "kubectl",
+                &command_args,
+                "kubectl get pods",
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+            )
+            .unwrap();
+        let before_memory = store.data.clone();
+        let before_file = std::fs::read(&path).unwrap();
+        let blocker = temp.path().join("blocker");
+        crate::learned_rules::write_authority_file(&blocker, "not a directory").unwrap();
+        store.config.path = blocker.join("allow.yaml");
+
+        assert!(store
+            .record_approval(
+                "kubectl",
+                &command_args,
+                "kubectl get pods",
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+            )
+            .is_err());
+        assert_eq!(store.data, before_memory);
+        assert_eq!(std::fs::read(path).unwrap(), before_file);
+    }
+
+    #[test]
+    fn sensitive_allow_observations_are_rejected_and_purged_idempotently() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let path = temp.path().join("allow.yaml");
+        let config = config(path.clone(), 2);
+        let mut store = AllowPromotionStore::load(config.clone()).unwrap();
+        let safe = args(&["get", "pods"]);
+        store
+            .record_approval(
+                "kubectl",
+                &safe,
+                "kubectl get pods",
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+            )
+            .unwrap();
+        assert!(store
+            .data
+            .observations
+            .values()
+            .all(|observation| observation.last_command.contains("[argv-sha256:")));
+        let safe_bytes = std::fs::read(&path).unwrap();
+        let value = ["q", "7"].concat();
+        assert!(store
+            .record_approval(
+                "redis-cli",
+                &["-a".to_string(), value.clone()],
+                &format!("redis-cli -a {value}"),
+                Some(1),
+                Some(Reversibility::Reversible),
+                "ignored",
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), safe_bytes);
+
+        let mut contaminated = store.data.clone();
+        contaminated
+            .observations
+            .values_mut()
+            .for_each(|observation| observation.last_command = "kubectl get pods".to_string());
+        let mut observation = contaminated.observations.values().next().unwrap().clone();
+        observation.binary = "redis-cli".to_string();
+        observation.samples = vec![vec!["-a".to_string(), value.clone()]];
+        observation.last_command = format!("redis-cli -a {value}");
+        contaminated
+            .observations
+            .insert("sensitive".to_string(), observation);
+        write_learning_file_atomically(&path, &serde_yaml_ng::to_string(&contaminated).unwrap())
+            .unwrap();
+
+        let loaded = AllowPromotionStore::load(config.clone()).unwrap();
+        assert_eq!(loaded.data.observations.len(), 1);
+        assert!(loaded
+            .data
+            .observations
+            .values()
+            .all(|observation| observation
+                .last_command
+                .starts_with("[legacy-command-sha256:")));
+        let sanitized = std::fs::read(&path).unwrap();
+        assert!(!sanitized
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+        AllowPromotionStore::load(config).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), sanitized);
+    }
+
+    #[test]
+    fn allow_promotion_prose_is_sanitized_without_changing_samples() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let path = temp.path().join("allow.yaml");
+        let config = config(path.clone(), 2);
+        let value = ["q", "7"].concat();
+        let reason = format!("password={value}");
+        let safe = args(&["get", "pods"]);
+        let mut store = AllowPromotionStore::load(config.clone()).unwrap();
+        store
+            .record_approval(
+                "kubectl",
+                &safe,
+                "kubectl get pods",
+                Some(1),
+                Some(Reversibility::Reversible),
+                &reason,
+            )
+            .unwrap();
+        let expected_samples = store
+            .data
+            .observations
+            .values()
+            .next()
+            .unwrap()
+            .samples
+            .clone();
+        assert!(!std::fs::read(&path)
+            .unwrap()
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+
+        let mut contaminated = store.data.clone();
+        contaminated
+            .observations
+            .values_mut()
+            .for_each(|observation| observation.last_reason = reason.clone());
+        write_learning_file_atomically(&path, &serde_yaml_ng::to_string(&contaminated).unwrap())
+            .unwrap();
+        let loaded = AllowPromotionStore::load(config.clone()).unwrap();
+        assert_eq!(
+            loaded.data.observations.values().next().unwrap().samples,
+            expected_samples
+        );
+        let sanitized = std::fs::read(&path).unwrap();
+        assert!(!sanitized
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+        AllowPromotionStore::load(config).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), sanitized);
+    }
+
+    #[test]
+    fn promoted_verb_description_and_evidence_are_sanitized() {
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+        let verb = build_candidate_verb(
+            "fixturectl",
+            "fixture-status".to_string(),
+            contaminated.clone(),
+            vec!["status".to_string()],
+            BTreeMap::new(),
+            Reversibility::Reversible,
+            None,
+            contaminated,
+            "fixture-stamp".to_string(),
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&verb).unwrap();
+        assert!(!encoded
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+    }
+
+    #[test]
+    fn promoted_verb_provenance_replays_observations_and_claims_no_probes() {
+        let verb = build_candidate_verb(
+            "fixturectl",
+            "fixture-status".to_string(),
+            "Show fixture status".to_string(),
+            vec!["status".to_string()],
+            BTreeMap::new(),
+            Reversibility::Reversible,
+            None,
+            "evidence".to_string(),
+            "fixture-stamp".to_string(),
+        )
+        .unwrap();
+        assert!(verb.auto_promoted);
+        assert_eq!(verb.consequence, Reversibility::Reversible);
+        let provenance = verb.coverage[0].provenance.as_ref().unwrap();
+        assert_eq!(provenance.source, "automatic_evaluator_promotion");
+        assert!(
+            provenance.probes.is_empty(),
+            "nothing was executed against the matcher, so no probe may be claimed"
+        );
+        assert_eq!(provenance.observation_replays.len(), 2);
+        assert!(provenance
+            .observation_replays
+            .iter()
+            .any(|replay| replay.dimension == "observed_shape" && replay.template_match));
+        assert!(provenance
+            .observation_replays
+            .iter()
+            .any(|replay| replay.dimension == "outside_shape" && !replay.template_match));
+    }
+
+    #[test]
+    fn build_candidate_verb_refuses_any_class_above_reversible() {
+        for class in [Reversibility::Recoverable, Reversibility::Irreversible] {
+            let error = build_candidate_verb(
+                "fixturectl",
+                "fixture-restart".to_string(),
+                "Restart fixture".to_string(),
+                vec!["restart".to_string()],
+                BTreeMap::new(),
+                class,
+                None,
+                "evidence".to_string(),
+                "fixture-stamp".to_string(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("only statically read-only"));
+        }
+    }
+
+    #[test]
     fn irreversible_is_never_recorded() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 1)).unwrap();
         let result = store
@@ -746,7 +1172,7 @@ mod tests {
     fn missing_reversibility_is_never_recorded() {
         // Gate mode off: no classification at all. This module must stay
         // completely inert rather than guessing.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 1)).unwrap();
         let result = store
@@ -764,7 +1190,7 @@ mod tests {
 
     #[test]
     fn risk_at_or_above_ceiling_is_not_recorded() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 1)).unwrap();
         // Reversible ceiling is EXECUTE_NOW_MAX_RISK (4).
@@ -783,7 +1209,7 @@ mod tests {
 
     #[test]
     fn mixed_classification_permanently_disqualifies_the_bucket() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 2)).unwrap();
         let a = args(&["scale", "deployment", "web", "--replicas", "3"]);
@@ -827,7 +1253,7 @@ mod tests {
 
     #[test]
     fn dangerous_command_is_never_recorded() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 1)).unwrap();
         let result = store
@@ -883,6 +1309,41 @@ mod tests {
         assert!(!re.is_match("kube-system"));
         assert!(re.is_match("foo"));
         assert!(re.is_match("bar"));
+    }
+
+    #[test]
+    fn build_args_and_params_preserves_spaced_promql_values_as_bounded_single_argv() {
+        let api_query = r#"sum(rate(http_requests_total{job="api"}[5m])) by (job)"#;
+        let worker_query = r#"sum(rate(http_requests_total{job="worker"}[5m])) by (job)"#;
+        let samples = vec![
+            args(&["get", "pods", "--query", api_query]),
+            args(&["get", "pods", "--query", worker_query]),
+        ];
+        let slots = derive_template(&samples).unwrap();
+        let (built_args, params) = build_args_and_params(&slots);
+
+        assert_eq!(built_args, args(&["get", "pods", "--query", "{query}"]));
+        let spec = params.get("query").unwrap();
+        assert_eq!(
+            spec.value_type(),
+            crate::gating::verb::ParamValueType::SingleArgv
+        );
+        assert_eq!(
+            spec.max_length(),
+            Some(api_query.chars().count().max(worker_query.chars().count()))
+        );
+        let re = regex::Regex::new(spec.pattern_text()).unwrap();
+        assert!(re.is_match(api_query));
+        assert!(re.is_match(worker_query));
+        assert!(!re.is_match(r#"sum(rate(http_requests_total[5m])) by (job)"#));
+    }
+
+    #[test]
+    fn cwd_dependent_opaque_carriers_are_excluded_from_automatic_promotion() {
+        assert!(is_cwd_dependent_opaque_carrier("ansible-playbook"));
+        assert!(is_cwd_dependent_opaque_carrier("terraform"));
+        assert!(is_cwd_dependent_opaque_carrier("helm.exe"));
+        assert!(!is_cwd_dependent_opaque_carrier("kubectl"));
     }
 
     #[test]
@@ -972,7 +1433,7 @@ mod tests {
         // this module's entire premise, so 0 or 1 must not degenerate into
         // treating a single approval as sufficient.
         for degenerate in [0u32, 1] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::learned_rules::authority_tempdir();
             let mut degenerate_config = config(temp.path().join("allow.yaml"), 1);
             degenerate_config.min_approvals = degenerate;
             let mut store = AllowPromotionStore::load(degenerate_config).unwrap();
@@ -997,7 +1458,7 @@ mod tests {
 
     #[test]
     fn resolved_bucket_never_becomes_ready_again() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 2)).unwrap();
         let a = args(&["get", "pods"]);
@@ -1051,7 +1512,7 @@ mod tests {
 
     #[test]
     fn mark_resolved_on_missing_bucket_is_a_harmless_noop() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 2)).unwrap();
         // No observation was ever recorded for this key; this must not error.
@@ -1062,7 +1523,7 @@ mod tests {
 
     #[test]
     fn observation_buckets_are_capped_by_evicting_the_oldest() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 2)).unwrap();
 
@@ -1105,5 +1566,43 @@ mod tests {
             .data
             .observations
             .contains_key("service-0|bin-0|get|1"));
+    }
+
+    #[test]
+    fn stale_allow_instances_reapply_commutative_observations() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let config = config(temp.path().join("allow.yaml"), 2);
+        let mut first = AllowPromotionStore::load(config.clone()).unwrap();
+        let mut second = AllowPromotionStore::load(config.clone()).unwrap();
+        let argv = args(&["status"]);
+
+        first
+            .record_approval(
+                "fixturectl",
+                &argv,
+                "fixturectl status",
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+            )
+            .unwrap();
+        let outcome = second
+            .record_approval(
+                "fixturectl",
+                &argv,
+                "fixturectl status",
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.approvals, 2);
+
+        let loaded = AllowPromotionStore::load(config).unwrap();
+        assert_eq!(
+            loaded.data.observations.values().next().unwrap().approvals,
+            2
+        );
     }
 }

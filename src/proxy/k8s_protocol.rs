@@ -5,7 +5,10 @@
 //! stripping, and revert request shapes) out of the protocol-agnostic server
 //! loop.
 
+use hyper::header;
+use hyper::http::HeaderMap;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::gate::HttpRevert;
 use super::k8s;
@@ -16,6 +19,259 @@ use super::protocol::{CreatedIdentity, NonResourceRead, PlannedRevert, ProtocolC
 /// to, so the protocol is a unit value.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KubernetesProtocol;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KubernetesObjectState {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub uid: String,
+    pub resource_version: String,
+    pub contention_fingerprint: String,
+}
+
+pub(crate) fn object_state(op: &ApiOp, bytes: &[u8]) -> Option<KubernetesObjectState> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let metadata = value.get("metadata")?.as_object()?;
+    let name = metadata.get("name")?.as_str()?.to_string();
+    let namespace = metadata
+        .get("namespace")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| op.namespace.clone());
+    let uid = metadata.get("uid")?.as_str()?.to_string();
+    let resource_version = metadata.get("resourceVersion")?.as_str()?.to_string();
+    if name.is_empty() || uid.is_empty() || resource_version.is_empty() {
+        return None;
+    }
+    if op.name.as_deref().is_some_and(|expected| expected != name) {
+        return None;
+    }
+    if op
+        .namespace
+        .as_deref()
+        .is_some_and(|expected| namespace.as_deref() != Some(expected))
+    {
+        return None;
+    }
+
+    let mut comparable = value;
+    if let Some(metadata) = comparable
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+    {
+        metadata.remove("resourceVersion");
+        metadata.remove("managedFields");
+    }
+    if op.subresource.as_deref() != Some("status") {
+        if let Some(object) = comparable.as_object_mut() {
+            object.remove("status");
+        }
+    }
+    let canonical = serde_json::to_vec(&comparable).ok()?;
+    let contention_fingerprint = Sha256::digest(&canonical)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(KubernetesObjectState {
+        name,
+        namespace,
+        uid,
+        resource_version,
+        contention_fingerprint,
+    })
+}
+
+pub(crate) fn bind_mutation_preconditions(
+    op: &ApiOp,
+    headers: &HeaderMap,
+    body: &[u8],
+    state: &KubernetesObjectState,
+    observed_resource_version: &str,
+) -> Result<Vec<u8>, String> {
+    match op.verb {
+        Verb::Update => bind_object_resource_version(body, state, observed_resource_version),
+        Verb::Patch => bind_patch_preconditions(headers, body, state, observed_resource_version),
+        Verb::Delete => bind_delete_preconditions(body, state, observed_resource_version),
+        _ => Err("operation does not support Kubernetes object preconditions".to_string()),
+    }
+}
+
+fn bind_object_resource_version(
+    body: &[u8],
+    state: &KubernetesObjectState,
+    observed_resource_version: &str,
+) -> Result<Vec<u8>, String> {
+    let mut value: Value =
+        serde_json::from_slice(body).map_err(|_| "update body is not a JSON object".to_string())?;
+    let metadata = value
+        .as_object_mut()
+        .ok_or_else(|| "update body is not a JSON object".to_string())?
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(Default::default()))
+        .as_object_mut()
+        .ok_or_else(|| "update metadata is not an object".to_string())?;
+    reject_mismatched_metadata(metadata, state, observed_resource_version)?;
+    metadata.insert(
+        "resourceVersion".to_string(),
+        Value::String(state.resource_version.clone()),
+    );
+    serde_json::to_vec(&value).map_err(|_| "could not serialize guarded update".to_string())
+}
+
+fn bind_patch_preconditions(
+    headers: &HeaderMap,
+    body: &[u8],
+    state: &KubernetesObjectState,
+    observed_resource_version: &str,
+) -> Result<Vec<u8>, String> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if content_type == "application/json-patch+json" {
+        let mut operations: Vec<Value> = serde_json::from_slice(body)
+            .map_err(|_| "JSON Patch body is not an operation array".to_string())?;
+        for operation in &mut operations {
+            let Some(path) = operation.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            if path == "/metadata/resourceVersion" {
+                if operation.get("op").and_then(Value::as_str) != Some("test") {
+                    return Err(
+                        "JSON Patch cannot mutate metadata.resourceVersion directly".to_string()
+                    );
+                }
+                let value = operation.get("value").and_then(Value::as_str);
+                if !matches!(
+                    value,
+                    Some(version)
+                        if version == state.resource_version
+                            || version == observed_resource_version
+                ) {
+                    return Err(
+                        "request resourceVersion does not match the caller's observation"
+                            .to_string(),
+                    );
+                }
+                operation["value"] = Value::String(state.resource_version.clone());
+            } else if path == "/metadata/uid"
+                && (operation.get("op").and_then(Value::as_str) != Some("test")
+                    || operation.get("value").and_then(Value::as_str) != Some(&state.uid))
+            {
+                return Err("request UID does not match the live object".to_string());
+            }
+        }
+        let mut guarded = vec![
+            serde_json::json!({"op": "test", "path": "/metadata/uid", "value": state.uid}),
+            serde_json::json!({"op": "test", "path": "/metadata/resourceVersion", "value": state.resource_version}),
+        ];
+        guarded.append(&mut operations);
+        return serde_json::to_vec(&guarded)
+            .map_err(|_| "could not serialize guarded JSON Patch".to_string());
+    }
+
+    if !matches!(
+        content_type,
+        "" | "application/json"
+            | "application/merge-patch+json"
+            | "application/strategic-merge-patch+json"
+            | "application/apply-patch+yaml"
+            | "application/apply-patch+json"
+    ) {
+        return Err(format!(
+            "patch content type '{content_type}' cannot carry a guarded resourceVersion"
+        ));
+    }
+    let mut value: Value = if content_type == "application/apply-patch+yaml" {
+        serde_yaml_ng::from_slice(body)
+            .map_err(|_| "apply patch body is not a YAML object".to_string())?
+    } else {
+        serde_json::from_slice(body).map_err(|_| "patch body is not a JSON object".to_string())?
+    };
+    let metadata = value
+        .as_object_mut()
+        .ok_or_else(|| "patch body is not an object".to_string())?
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(Default::default()))
+        .as_object_mut()
+        .ok_or_else(|| "patch metadata is not an object".to_string())?;
+    reject_mismatched_metadata(metadata, state, observed_resource_version)?;
+    metadata.insert(
+        "resourceVersion".to_string(),
+        Value::String(state.resource_version.clone()),
+    );
+    serde_json::to_vec(&value).map_err(|_| "could not serialize guarded patch".to_string())
+}
+
+fn bind_delete_preconditions(
+    body: &[u8],
+    state: &KubernetesObjectState,
+    observed_resource_version: &str,
+) -> Result<Vec<u8>, String> {
+    let mut value = if body.is_empty() {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions"
+        })
+    } else {
+        serde_json::from_slice::<Value>(body)
+            .map_err(|_| "delete options body is not a JSON object".to_string())?
+    };
+    let preconditions = value
+        .as_object_mut()
+        .ok_or_else(|| "delete options body is not an object".to_string())?
+        .entry("preconditions")
+        .or_insert_with(|| Value::Object(Default::default()))
+        .as_object_mut()
+        .ok_or_else(|| "delete preconditions are not an object".to_string())?;
+    reject_existing_string(preconditions, "uid", &[&state.uid])?;
+    reject_existing_string(
+        preconditions,
+        "resourceVersion",
+        &[&state.resource_version, observed_resource_version],
+    )?;
+    preconditions.insert("uid".to_string(), Value::String(state.uid.clone()));
+    preconditions.insert(
+        "resourceVersion".to_string(),
+        Value::String(state.resource_version.clone()),
+    );
+    serde_json::to_vec(&value).map_err(|_| "could not serialize guarded delete".to_string())
+}
+
+fn reject_mismatched_metadata(
+    metadata: &mut serde_json::Map<String, Value>,
+    state: &KubernetesObjectState,
+    observed_resource_version: &str,
+) -> Result<(), String> {
+    reject_existing_string(metadata, "uid", &[&state.uid])?;
+    reject_existing_string(
+        metadata,
+        "resourceVersion",
+        &[&state.resource_version, observed_resource_version],
+    )
+}
+
+fn reject_existing_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    if let Some(value) = object.get(field) {
+        if !value
+            .as_str()
+            .is_some_and(|value| expected.contains(&value))
+        {
+            return Err(format!(
+                "request {field} does not match the caller's current observation"
+            ));
+        }
+    }
+    Ok(())
+}
 
 impl ProtocolConfig for KubernetesProtocol {
     fn name(&self) -> &str {
@@ -137,19 +393,25 @@ impl ProtocolConfig for KubernetesProtocol {
             )
     }
 
+    fn definitively_rejects_mutation(&self, _op: &ApiOp, status: u16) -> bool {
+        matches!(
+            status,
+            400 | 401 | 403 | 404 | 405 | 406 | 409 | 410 | 411 | 413 | 414 | 415 | 422 | 429
+        )
+    }
+
     fn wants_prior_snapshot(&self, op: &ApiOp) -> bool {
         matches!(op.verb, Verb::Update | Verb::Patch | Verb::Delete) && op.name.is_some()
     }
 
     /// An update/patch with a usable prior state reverts by PUT-restoring it, a
     /// delete reverts by POST-recreating the sanitized prior object, and a
-    /// create reverts by deleting the possibly server-named object from the
-    /// response.
+    /// named create reverts by deleting the object identified in the request.
     fn plan_revert(
         &self,
         op: &ApiOp,
         prior_object: Option<&[u8]>,
-        response: &[u8],
+        create_body: &[u8],
     ) -> Result<PlannedRevert, String> {
         match op.verb {
             Verb::Update | Verb::Patch => {
@@ -190,8 +452,8 @@ impl ProtocolConfig for KubernetesProtocol {
             _ => return Err("operation has no Kubernetes HTTP revert".to_string()),
         }
 
-        let value: Value = serde_json::from_slice(response).map_err(|_| {
-            "allowed write but response was unparsable; no auto-revert armed".to_string()
+        let value: Value = serde_json::from_slice(create_body).map_err(|_| {
+            "allowed create but request was unparsable; no auto-revert armed".to_string()
         })?;
         let Some(name) = value
             .get("metadata")
@@ -199,7 +461,7 @@ impl ProtocolConfig for KubernetesProtocol {
             .and_then(|n| n.as_str())
         else {
             return Err(
-                "allowed create but response carried no object name; no auto-revert armed"
+                "allowed create but request carried no object name; no auto-revert armed"
                     .to_string(),
             );
         };
@@ -407,6 +669,98 @@ mod tests {
     }
 
     #[test]
+    fn object_state_ignores_status_churn_but_keeps_mutable_fields() {
+        let operation = op("GET", "/apis/apps/v1/namespaces/d/deployments/api");
+        let first = object_state(
+            &operation,
+            br#"{"metadata":{"name":"api","namespace":"d","uid":"u1","resourceVersion":"10","labels":{"owner":"a"}},"spec":{"replicas":2},"status":{"readyReplicas":1}}"#,
+        )
+        .unwrap();
+        let status_only = object_state(
+            &operation,
+            br#"{"metadata":{"name":"api","namespace":"d","uid":"u1","resourceVersion":"11","labels":{"owner":"a"}},"spec":{"replicas":2},"status":{"readyReplicas":2}}"#,
+        )
+        .unwrap();
+        let metadata_change = object_state(
+            &operation,
+            br#"{"metadata":{"name":"api","namespace":"d","uid":"u1","resourceVersion":"12","labels":{"owner":"b"}},"spec":{"replicas":2},"status":{"readyReplicas":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            first.contention_fingerprint,
+            status_only.contention_fingerprint
+        );
+        assert_ne!(
+            first.contention_fingerprint,
+            metadata_change.contention_fingerprint
+        );
+
+        let status_operation = op("GET", "/apis/apps/v1/namespaces/d/deployments/api/status");
+        let status_first = object_state(
+            &status_operation,
+            br#"{"metadata":{"name":"api","namespace":"d","uid":"u1","resourceVersion":"10"},"status":{"readyReplicas":1}}"#,
+        )
+        .unwrap();
+        let status_changed = object_state(
+            &status_operation,
+            br#"{"metadata":{"name":"api","namespace":"d","uid":"u1","resourceVersion":"11"},"status":{"readyReplicas":2}}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            status_first.contention_fingerprint,
+            status_changed.contention_fingerprint
+        );
+    }
+
+    #[test]
+    fn mutation_bodies_receive_atomic_uid_and_version_preconditions() {
+        let state = KubernetesObjectState {
+            name: "api".to_string(),
+            namespace: Some("d".to_string()),
+            uid: "u1".to_string(),
+            resource_version: "17".to_string(),
+            contention_fingerprint: "digest".to_string(),
+        };
+
+        let update = op("PUT", "/apis/apps/v1/namespaces/d/deployments/api");
+        let guarded = bind_mutation_preconditions(
+            &update,
+            &HeaderMap::new(),
+            br#"{"metadata":{"name":"api"},"spec":{"replicas":3}}"#,
+            &state,
+            "17",
+        )
+        .unwrap();
+        let guarded: Value = serde_json::from_slice(&guarded).unwrap();
+        assert_eq!(guarded["metadata"]["resourceVersion"], "17");
+
+        let patch = op("PATCH", "/apis/apps/v1/namespaces/d/deployments/api");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+        let guarded = bind_mutation_preconditions(
+            &patch,
+            &headers,
+            br#"[{"op":"replace","path":"/spec/replicas","value":3}]"#,
+            &state,
+            "17",
+        )
+        .unwrap();
+        let guarded: Value = serde_json::from_slice(&guarded).unwrap();
+        assert_eq!(guarded[0]["path"], "/metadata/uid");
+        assert_eq!(guarded[1]["path"], "/metadata/resourceVersion");
+
+        let delete = op("DELETE", "/apis/apps/v1/namespaces/d/deployments/api");
+        let guarded =
+            bind_mutation_preconditions(&delete, &HeaderMap::new(), b"", &state, "17").unwrap();
+        let guarded: Value = serde_json::from_slice(&guarded).unwrap();
+        assert_eq!(guarded["preconditions"]["uid"], "u1");
+        assert_eq!(guarded["preconditions"]["resourceVersion"], "17");
+    }
+
+    #[test]
     fn tracks_bare_writes_with_faithful_reverts() {
         let p = KubernetesProtocol;
         assert!(p.tracks_write(&op("POST", "/api/v1/namespaces/d/pods")));
@@ -514,5 +868,19 @@ mod tests {
                 b"{}"
             )
             .is_err());
+    }
+
+    #[test]
+    fn only_definitive_client_rejections_retire_inert_containment() {
+        let protocol = KubernetesProtocol;
+        let create = op("POST", "/api/v1/namespaces/dev/pods");
+        for status in [
+            400, 401, 403, 404, 405, 406, 409, 410, 411, 413, 414, 415, 422, 429,
+        ] {
+            assert!(protocol.definitively_rejects_mutation(&create, status));
+        }
+        for status in [201, 408, 500, 502, 503, 504] {
+            assert!(!protocol.definitively_rejects_mutation(&create, status));
+        }
     }
 }

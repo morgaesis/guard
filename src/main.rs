@@ -1,6 +1,156 @@
 //! guard - evaluator-gated command execution for AI agents
 //!
 
+/// Fallible stdout boundary for the CLI process.
+///
+/// Rust's standard `print!` and `println!` macros panic when a downstream pipe
+/// closes. A CLI consumer such as `head` closing stdout is not a Guard failure,
+/// and it must not interrupt an already-admitted command lifecycle. Once the
+/// process observes `EPIPE`, later stdout writes become no-ops while normal
+/// command completion and exit-status handling continue.
+mod cli_output {
+    use std::fmt;
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct OutputState {
+        closed: AtomicBool,
+    }
+
+    impl OutputState {
+        const fn new() -> Self {
+            Self {
+                closed: AtomicBool::new(false),
+            }
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+
+        fn normalize_write(
+            &self,
+            result: io::Result<usize>,
+            attempted: usize,
+        ) -> io::Result<usize> {
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    self.closed.store(true, Ordering::Relaxed);
+                    Ok(attempted)
+                }
+                result => result,
+            }
+        }
+
+        fn normalize_flush(&self, result: io::Result<()>) -> io::Result<()> {
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    self.closed.store(true, Ordering::Relaxed);
+                    Ok(())
+                }
+                result => result,
+            }
+        }
+    }
+
+    static STDOUT_STATE: OutputState = OutputState::new();
+
+    pub(super) struct Stdout;
+
+    pub(super) fn stdout() -> Stdout {
+        Stdout
+    }
+
+    impl Write for Stdout {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if STDOUT_STATE.is_closed() {
+                return Ok(buffer.len());
+            }
+            STDOUT_STATE.normalize_write(io::stdout().lock().write(buffer), buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if STDOUT_STATE.is_closed() {
+                return Ok(());
+            }
+            STDOUT_STATE.normalize_flush(io::stdout().lock().flush())
+        }
+    }
+
+    pub(super) fn write_stdout(arguments: fmt::Arguments<'_>, newline: bool) {
+        let mut writer = stdout();
+        let result = writer.write_fmt(arguments).and_then(|()| {
+            if newline {
+                writer.write_all(b"\n")
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = result {
+            panic!("failed writing to stdout: {error}");
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn broken_pipe_closes_output_without_losing_the_attempted_length() {
+            let state = OutputState::new();
+            let result = state.normalize_write(
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture consumer closed",
+                )),
+                12,
+            );
+            assert_eq!(result.unwrap(), 12);
+            assert!(state.is_closed());
+            assert!(state
+                .normalize_flush(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture consumer closed",
+                )))
+                .is_ok());
+        }
+
+        #[test]
+        fn non_pipe_output_failures_remain_errors() {
+            let state = OutputState::new();
+            let error = state
+                .normalize_write(
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "fixture output denied",
+                    )),
+                    12,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(!state.is_closed());
+        }
+    }
+}
+
+// Explicit names keep this boundary visible at every call site and prevent
+// macro expansion in the process entrypoint from changing standard behavior.
+// Writer paths that need to propagate failures continue to return `io::Result`.
+macro_rules! cli_print {
+    ($($argument:tt)*) => {{
+        crate::cli_output::write_stdout(format_args!($($argument)*), false)
+    }};
+}
+
+macro_rules! cli_println {
+    () => {{
+        crate::cli_output::write_stdout(format_args!(""), true)
+    }};
+    ($($argument:tt)*) => {{
+        crate::cli_output::write_stdout(format_args!($($argument)*), true)
+    }};
+}
+
 mod cli_client;
 mod cli_secrets;
 mod cli_server;
@@ -42,6 +192,9 @@ const EXIT_GUARD_HELD: i32 = 127;
 /// One or more decisions in a completed access batch failed. This is a result
 /// status, not a guard operational failure.
 const EXIT_GUARD_ACCESS_DECISION_FAILED: i32 = 1;
+/// Invalid guard CLI usage, matching clap's own exit status for a rejected
+/// invocation. Used where a rule needs daemon state that clap cannot see.
+const EXIT_GUARD_INVALID_USAGE: i32 = 2;
 const JSON_SCHEMA_VERSION: u32 = 1;
 
 fn parse_unbounded_secs(value: &str) -> Result<u64, String> {
@@ -58,17 +211,17 @@ fn parse_unbounded_secs(value: &str) -> Result<u64, String> {
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    serde_json::to_writer_pretty(&mut lock, value)?;
-    writeln!(lock)?;
+    let mut stdout = cli_output::stdout();
+    serde_json::to_writer_pretty(&mut stdout, value)?;
+    writeln!(stdout)?;
     Ok(())
 }
 
 use cli_client::{
-    handle_access, handle_api, handle_audit_tail, handle_audit_verify, handle_config,
-    handle_gate_action, handle_provisionals, handle_status, handle_verb, run_exec, run_mcp,
-    GatingOptions, RunInjections, SshHostKeyCliMode,
+    handle_access, handle_api, handle_approval, handle_audit_tail, handle_audit_verify,
+    handle_config, handle_gate_action, handle_provisional_show, handle_provisionals, handle_resume,
+    handle_status, handle_verb, run_exec, run_mcp, warn_resume_alias_deprecated, GatingOptions,
+    RunClientOptions, RunInjections, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -102,6 +255,9 @@ enum MainArgs {
             guard-origin outcome. Use --json and read `allowed`/`status` for certainty."
     )]
     Run {
+        /// Override the daemon socket or Windows named pipe.
+        #[arg(long)]
+        socket: Option<String>,
         /// Emit one machine-readable result object instead of streaming child output.
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
@@ -146,10 +302,11 @@ enum MainArgs {
         #[arg(long = "wait-approval", value_name = "SECONDS|unbounded", num_args = 0..=1, default_missing_value = "unbounded", value_parser = parse_unbounded_secs)]
         wait_approval: Option<u64>,
         /// Skip the daemon's auto-learned deny-shape fast path and force a
-        /// fresh LLM look at this command. Never skips an operator-authored
-        /// policy deny rule -- those stay absolute either way. Use this if
-        /// you believe an auto-learned shape over-blocked something that
-        /// should be allowed.
+        /// fresh LLM look at this command. It applies to a denial reported as
+        /// `source: learned-deny` and to nothing else: an operator-authored
+        /// `source: static-policy` deny is absolute and is never skipped, and
+        /// an evaluator denial is unaffected. Use this if you believe an
+        /// auto-learned shape over-blocked something that should be allowed.
         #[arg(long = "reevaluate", action = ArgAction::SetTrue)]
         reevaluate: bool,
         /// SSH host-key policy for a guarded `ssh` command. `only-existing`
@@ -213,7 +370,7 @@ enum MainArgs {
     /// Request, approve, inspect, and extend principal-bound access.
     #[clap(
         subcommand,
-        after_help = "Common workflow:\n  guard access request \"restart the fixture service\"\n  guard access approve <request>\n  guard access approve <request> --once\n  guard access approve <request> --uses 3\n  guard access approve <request> --yes\n  guard access list\n  guard access show <request-or-session>\n  guard access revoke <session-or-agent>\n\nOn a terminal, approve reviews each request before deciding; --yes skips the review.\nRequests left undecided by skip or quit stay pending and do not fail the batch.\n\nExit status:\n  1      one or more decisions in the access batch failed"
+        after_help = "Common workflow:\n  guard access request \"restart the fixture service\"\n  guard access approve <request>\n  guard access approve <request> --once\n  guard access approve <request> --uses 3\n  guard access approve <request> --yes\n  guard access approve <request> --dry-run\n  guard access approve <request> --wait\n  guard access list\n  guard access show <request-or-session>\n  guard access revoke <session-or-agent>\n\nOn a terminal, approve reviews each request before deciding; --yes skips the review.\nThe review states what approving does: grant authority, arm a held snapshot, or release a parked API request.\nRequests left undecided by skip or quit stay pending and do not fail the batch.\n--dry-run and --wait each take a single request.\n\nExit status:\n  1      one or more decisions in the access batch failed\n  2      invalid guard CLI usage\n  127    approved and armed, or still held when --wait elapsed"
     )]
     Access(AccessCommands),
     /// Removed legacy authority command. Use `guard access`.
@@ -236,7 +393,7 @@ enum MainArgs {
     },
     /// Show daemon status. Always prints client + server version,
     /// uptime, evaluation mode, and dry-run state. The full config
-    /// snapshot is restricted to the daemon UID.
+    /// snapshot requires operator authority.
     Status {
         #[arg(long)]
         socket: Option<String>,
@@ -244,11 +401,12 @@ enum MainArgs {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
-    /// Print a categorized command tree with access markers.
+    /// Print the full command tree with one-line summaries, generated from
+    /// the CLI definition itself.
     #[clap(name = "help-tree")]
     HelpTree {
-        /// Include daemon-principal/admin-token commands.
-        #[arg(long, action = ArgAction::SetTrue)]
+        /// Superseded: the tree always includes operator-authorized commands.
+        #[arg(long, hide = true, action = ArgAction::SetTrue)]
         admin: bool,
     },
     /// Generate shell completion definitions.
@@ -263,6 +421,8 @@ enum MainArgs {
         /// Emit machine-readable provisional records.
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
+        #[command(subcommand)]
+        command: Option<ProvisionalCommands>,
     },
     /// Confirm a provisional: keep the change and cancel its auto-revert.
     /// Daemon-UID only.
@@ -277,12 +437,94 @@ enum MainArgs {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Superseded spelling of `guard approval resume`. Still works.
+    #[clap(hide = true)]
+    Resume {
+        handle: String,
+        #[arg(long, require_equals = true, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = server::parse_approval_wait_secs)]
+        wait: Option<u64>,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit the persisted execution result as one JSON document.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Inspect, discuss, or withdraw requester-owned held commands.
+    #[clap(subcommand)]
+    Approval(ApprovalCommands),
     /// Run or list operator-defined verbs (the typed, least-expressive interface).
     #[clap(subcommand)]
     Verb(VerbCommands),
     /// Inspect the daemon's hash-chained audit log. Daemon-principal only.
     #[clap(subcommand)]
     Audit(AuditCommands),
+}
+
+#[derive(Subcommand)]
+enum ProvisionalCommands {
+    /// Show full detail for one provisional execution.
+    Show {
+        /// Provisional handle from `guard provisionals`.
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit the machine-readable provisional record.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalCommands {
+    /// List held and decided commands visible to the caller.
+    List {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Show one held command and its persisted terminal transcript.
+    Show {
+        handle: String,
+        /// Block for SECONDS until the hold is armed or decided, then report.
+        /// A bare flag waits 300 seconds. This is a read: it never executes.
+        #[arg(long, require_equals = true, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = server::parse_approval_wait_secs)]
+        wait: Option<u64>,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Execute one operator-approved hold as its original requester.
+    Resume {
+        handle: String,
+        /// Block for SECONDS until the hold is armed, then run it. A bare flag
+        /// waits 300 seconds.
+        #[arg(long, require_equals = true, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = server::parse_approval_wait_secs)]
+        wait: Option<u64>,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit the persisted execution result as one JSON document.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Add a requester or operator note before the hold is decided.
+    Note {
+        handle: String,
+        text: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Cancel one requester-owned held command before execution.
+    Withdraw {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -333,6 +575,14 @@ enum AccessCommands {
         /// Grant exactly N uses. A batch exits 1 if any request fails.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
         uses: Option<u64>,
+        /// Block for SECONDS after approving a held command, until it is armed
+        /// or decided. A bare flag waits 300 seconds. Single request only.
+        #[arg(long, conflicts_with = "dry_run", require_equals = true, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = server::parse_approval_wait_secs)]
+        wait: Option<u64>,
+        /// Print what approving each request would do, then exit without
+        /// deciding anything.
+        #[arg(long = "dry-run", conflicts_with_all = ["wait", "yes"], action = ArgAction::SetTrue)]
+        dry_run: bool,
         #[arg(long)]
         socket: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
@@ -376,6 +626,19 @@ enum AccessCommands {
     },
     /// List compact request and session state.
     List {
+        /// Only items in this state (for example pending, active, expired).
+        #[arg(long, value_name = "STATE")]
+        state: Option<String>,
+        /// Only items requested by this agent principal.
+        #[arg(long, value_name = "PRINCIPAL")]
+        agent: Option<String>,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Show this local principal's active access-managed session.
+    Whoami {
         #[arg(long)]
         socket: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
@@ -383,6 +646,17 @@ enum AccessCommands {
     },
     /// Show detailed request or session coverage and evidence.
     Show {
+        reference: String,
+        /// Print the raw matcher JSON alongside the readable rendering.
+        #[arg(long, action = ArgAction::SetTrue)]
+        raw: bool,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Show detailed runtime state for one access-managed session.
+    Status {
         reference: String,
         #[arg(long)]
         socket: Option<String>,
@@ -393,6 +667,15 @@ enum AccessCommands {
 
 #[derive(Subcommand)]
 enum VerbCommands {
+    /// Validate a verb catalog locally without starting the daemon.
+    Lint {
+        /// Catalog to validate. Defaults to GUARD_VERBS or the daemon catalog path.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Apply canonical repairs to an otherwise valid catalog.
+        #[arg(long, action = ArgAction::SetTrue)]
+        fix: bool,
+    },
     /// List available verbs with their parameters and consequence class.
     List {
         #[arg(long)]
@@ -401,8 +684,7 @@ enum VerbCommands {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
-    /// Show one verb, including typed coverage and generation evidence.
-    #[clap(hide = true)]
+    /// Show one verb. Requesters see invocation details; operators also see policy evidence.
     Show {
         name: String,
         #[arg(long)]
@@ -410,12 +692,34 @@ enum VerbCommands {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
+    /// Add one operator-authored verb from a YAML file.
+    Add {
+        /// YAML file containing exactly one verb definition.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit a machine-readable addition result.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
     /// Delete one operator-authored verb.
-    #[clap(hide = true)]
     Delete {
         name: String,
         #[arg(long)]
         socket: Option<String>,
+    },
+    /// Replace one operator-authored verb without clobbering concurrent edits.
+    Amend {
+        name: String,
+        /// YAML file containing exactly one verb definition.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit a machine-readable amendment result.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     /// Run a verb with validated parameters: --param key=value (repeatable).
     Run {
@@ -551,6 +855,21 @@ fn parse_env_bool(value: &str) -> bool {
     )
 }
 
+/// Usage rules clap's grammar cannot express. A wait has one outcome, so it
+/// accepts exactly one reference; dry-run is intentionally batch-capable.
+fn access_usage_error(command: &AccessCommands) -> Option<String> {
+    let AccessCommands::Approve { requests, wait, .. } = command else {
+        return None;
+    };
+    if wait.is_none() || requests.len() == 1 {
+        return None;
+    }
+    Some(format!(
+        "--wait accepts exactly one request reference; received {}",
+        requests.len()
+    ))
+}
+
 fn legacy_authority_error(command: &str, replacement: &str) -> Result<()> {
     anyhow::bail!(
         "`guard {command}` has been removed because it bypasses the principal-bound access workflow; use `{replacement}`"
@@ -574,10 +893,19 @@ enum ServerCommands {
         #[arg(skip)]
         auth_token: Option<String>,
 
-        /// Separate token required for non-Ping TCP admin RPCs. Read from
-        /// GUARD_ADMIN_TOKEN.
+        /// Separate token required for non-Ping admin RPCs on every listener.
+        /// Read from GUARD_ADMIN_TOKEN (development only: a brokered child
+        /// can read the daemon's /proc/<pid>/environ).
         #[arg(skip)]
         admin_token: Option<String>,
+
+        /// Read the admin token's first line from stdin at startup. This is
+        /// the production channel: the operator's service manager opens the
+        /// root-held token file (e.g. systemd StandardInput=file:) so the
+        /// value never enters the daemon's environment, argv, or a file its
+        /// brokered children can read. Env: GUARD_ADMIN_TOKEN_STDIN.
+        #[arg(long = "admin-token-stdin", action = ArgAction::SetTrue)]
+        admin_token_stdin: bool,
 
         /// Group owning the UNIX socket.
         #[arg(long, value_name = "GROUP")]
@@ -626,6 +954,17 @@ enum ServerCommands {
         /// Env: GUARD_LLM_MODELS (comma-separated).
         #[arg(long, value_name = "MODEL[,MODEL]", value_delimiter = ',')]
         llm_models: Option<Vec<String>>,
+
+        /// Hidden-reasoning effort requested from the provider on every
+        /// evaluator call. Higher effort spends more reasoning tokens for
+        /// better decisions on reasoning-capable models.
+        /// Env: GUARD_LLM_REASONING_EFFORT.
+        #[arg(
+            long,
+            value_name = "EFFORT",
+            value_parser = ["minimal", "low", "medium", "high", "max"]
+        )]
+        llm_reasoning_effort: Option<String>,
 
         /// Enable or disable LLM evaluation.
         #[arg(
@@ -732,6 +1071,8 @@ enum ServerCommands {
         /// irreversible command is never eligible, since it always holds for
         /// operator approval regardless of `trusted`. See
         /// `gating::allow_promotion` for the full safety rationale.
+        /// The packaged Windows service disables promotion because its catalog
+        /// is administrator-owned immutable process input.
         /// Env: GUARD_LEARN_ALLOW.
         #[arg(
             long,
@@ -790,6 +1131,11 @@ enum ServerCommands {
         #[arg(long = "exec-as-caller", action = ArgAction::SetTrue)]
         exec_as_caller: bool,
 
+        /// Wall-clock limit for brokered commands in seconds. Zero is unlimited.
+        /// Env: GUARD_EXEC_TIMEOUT_SECS.
+        #[arg(long = "exec-timeout-secs", value_name = "SECONDS")]
+        exec_timeout_secs: Option<u64>,
+
         /// Path to custom system prompt file for the LLM evaluator
         #[arg(long, value_name = "PATH")]
         system_prompt: Option<PathBuf>,
@@ -812,7 +1158,8 @@ enum ServerCommands {
         approval_ttl: Option<String>,
 
         /// Path to the verb catalog YAML (the operator-defined, typed interface
-        /// agents call via `guard verb`). Hot-reloaded on change.
+        /// agents call via `guard verb`). Foreground servers hot-reload changes;
+        /// the packaged Windows service loads its catalog once at startup.
         /// Env: GUARD_VERBS.
         #[arg(long, value_name = "PATH")]
         verbs: Option<PathBuf>,
@@ -1058,7 +1405,8 @@ enum ServerCommands {
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the
         /// foreground. Hidden; it has no effect when not run as a Windows
-        /// service, and the daemon configuration is otherwise identical.
+        /// service. It also selects the packaged SYSTEM named-pipe operator
+        /// boundary and rejects an inheritable admin bearer.
         #[arg(long = "service", hide = true, action = ArgAction::SetTrue)]
         service: bool,
     },
@@ -1277,7 +1625,7 @@ async fn run_main() -> Result<()> {
     // that `guard --version` stays concise and does not require parsing
     // subcommands.
     if top_level_version_requested(&args) {
-        println!(
+        cli_println!(
             "guard v{} ({})",
             env!("CARGO_PKG_VERSION"),
             env!("GUARD_GIT_COMMIT")
@@ -1298,6 +1646,7 @@ async fn run_main() -> Result<()> {
 
     match result {
         Ok(MainArgs::Run {
+            socket,
             json,
             explain,
             env_vars,
@@ -1338,19 +1687,43 @@ async fn run_main() -> Result<()> {
                 },
                 gating,
                 hostkey.into(),
-                json,
-                explain,
+                RunClientOptions {
+                    socket,
+                    json,
+                    explain,
+                },
             )
             .await
         }
         Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
-        Ok(MainArgs::Provisionals { socket, json }) => handle_provisionals(socket, json).await,
+        Ok(MainArgs::Provisionals {
+            socket,
+            json,
+            command,
+        }) => match command {
+            Some(ProvisionalCommands::Show {
+                handle,
+                socket: show_socket,
+                json: show_json,
+            }) => handle_provisional_show(show_socket.or(socket), handle, json || show_json).await,
+            None => handle_provisionals(socket, json).await,
+        },
         Ok(MainArgs::Confirm { handle, socket }) => {
             handle_gate_action(socket, "confirm", handle).await
         }
         Ok(MainArgs::Revert { handle, socket }) => {
             handle_gate_action(socket, "revert", handle).await
         }
+        Ok(MainArgs::Resume {
+            handle,
+            wait,
+            socket,
+            json,
+        }) => {
+            warn_resume_alias_deprecated();
+            handle_resume(socket, handle, wait, json).await
+        }
+        Ok(MainArgs::Approval(subcommand)) => handle_approval(subcommand).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
         Ok(MainArgs::Audit(subcommand)) => match subcommand {
             AuditCommands::Verify { socket, json } => handle_audit_verify(socket, json).await,
@@ -1382,29 +1755,41 @@ async fn run_main() -> Result<()> {
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Api(subcommand)) => handle_api(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
-        Ok(MainArgs::Access(subcommand)) => handle_access(subcommand).await,
+        Ok(MainArgs::Access(subcommand)) => {
+            if let Some(message) = access_usage_error(&subcommand) {
+                let error =
+                    MainArgs::command().error(clap::error::ErrorKind::ArgumentConflict, message);
+                log_cli_usage_error(&args, &error);
+                error.exit();
+            }
+            handle_access(subcommand).await
+        }
         Ok(MainArgs::Session { .. }) => legacy_authority_error("session", "guard access"),
         Ok(MainArgs::Grant { .. }) => legacy_authority_error("grant", "guard access"),
         Ok(MainArgs::Appeal { .. }) => {
             legacy_authority_error("appeal", "guard access request <intent>")
         }
         Ok(MainArgs::Status { socket, json }) => handle_status(socket, json).await,
-        Ok(MainArgs::HelpTree { admin }) => {
-            print_help_tree(admin);
+        Ok(MainArgs::HelpTree { admin: _ }) => {
+            print_help_tree();
             Ok(())
         }
         Ok(MainArgs::Completions { shell }) => {
             let mut command = MainArgs::command();
-            clap_complete::generate(shell, &mut command, "guard", &mut std::io::stdout());
+            clap_complete::generate(shell, &mut command, "guard", &mut cli_output::stdout());
             Ok(())
         }
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
-                || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
                 || e.kind() == clap::error::ErrorKind::DisplayVersion =>
         {
-            // Let clap render help/version to stdout and exit 0.
-            e.exit();
+            write!(cli_output::stdout(), "{e}")?;
+            Ok(())
+        }
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            let exit_code = e.exit_code();
+            eprint!("{e}");
+            std::process::exit(exit_code);
         }
         Err(e) => {
             log_cli_usage_error(&args, &e);
@@ -1447,8 +1832,8 @@ fn print_nested_help(path: &[&str], bin_name: &str) -> Result<()> {
         })?;
     }
     command = command.bin_name(bin_name);
-    command.print_help()?;
-    println!();
+    command.write_help(&mut cli_output::stdout())?;
+    cli_println!();
     Ok(())
 }
 
@@ -1496,38 +1881,12 @@ struct UtcTimestamp;
 impl FormatTime for UtcTimestamp {
     fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
         let now = guard::env::now_unix();
-        write!(writer, "{}", unix_seconds_to_utc(now))
+        write!(writer, "{}", guard::env::unix_seconds_to_utc(now))
     }
-}
-
-fn unix_seconds_to_utc(ts: u64) -> String {
-    let days = (ts / 86_400) as i64;
-    let seconds = ts % 86_400;
-    let hour = seconds / 3_600;
-    let minute = (seconds % 3_600) / 60;
-    let second = seconds % 60;
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    if month <= 2 {
-        year += 1;
-    }
-    (year, month as u64, day as u64)
 }
 
 fn format_timestamp(ts: u64) -> String {
-    format!("{} ({ts})", unix_seconds_to_utc(ts))
+    format!("{} ({ts})", guard::env::unix_seconds_to_utc(ts))
 }
 
 fn log_cli_usage_error(args: &[String], error: &clap::Error) {
@@ -1579,55 +1938,59 @@ fn find_subcommand<'cmd>(parent: &'cmd clap::Command, token: &str) -> Option<&'c
         .find(|sub| sub.get_name() == token || sub.get_all_aliases().any(|alias| alias == token))
 }
 
-fn print_help_tree(admin: bool) {
-    let color = color_enabled_for_stdout();
-    println!("{}", paint("guard access summary", AnsiColor::Bold, color));
-    println!("  user");
-    println!("    run|exec <binary> [args...]");
-    println!("    server connect <binary> [args...]");
-    println!("    status");
-    println!("    server status");
-    println!("    secrets|secret add|remove|list");
-    println!("    verb list");
-    println!("    verb run <name> --param key=value");
-    println!("    access request \"<intent>\"");
-    println!("    access list");
-    println!("    access show <request-or-session>");
-    println!("    provisionals");
-    println!("    mcp serve");
-    println!();
-    println!("  local setup");
-    println!("    shim [tools] [--list|--remove]");
-    println!("    config show|set-server|set-port|set-token|set-admin-token|set-user|clear");
-    if admin {
-        println!();
-        println!("{}", paint("  admin", AnsiColor::Yellow, color));
-        println!("    server start");
-        println!("    verb show <name>");
-        println!("    access approve <request>... [--once|--uses N|--yes]");
-        println!("    access revoke <session-or-agent>");
-        println!("    access deny <request>... [--reason text]");
-        println!("    access extend <session-or-agent> \"<intent>\" [--once|--uses N]");
-        println!("    secrets list --detailed");
-        println!("    confirm|revert <handle>");
-        println!("    audit verify|tail [-n N]");
-    } else {
-        println!();
-        println!(
-            "{}",
-            paint(
-                "Run `guard help-tree --admin` to include daemon-principal/admin-token commands.",
-                AnsiColor::Cyan,
-                color,
-            )
-        );
+/// One entry of the generated help tree: the canonical command path, the
+/// display name (canonical name plus any accepted aliases), and the command's
+/// about text flattened to a single line. Derived from the clap command model
+/// itself so the tree cannot drift from the real CLI surface; hidden commands
+/// and clap's implicit `help` subcommand are excluded.
+fn help_tree_entries(
+    command: &clap::Command,
+    path: &[String],
+    entries: &mut Vec<(Vec<String>, String, String)>,
+) {
+    for sub in command.get_subcommands() {
+        if sub.is_hide_set() || sub.get_name() == "help" {
+            continue;
+        }
+        let mut sub_path = path.to_vec();
+        sub_path.push(sub.get_name().to_string());
+        let mut display = sub.get_name().to_string();
+        for alias in sub.get_all_aliases() {
+            display.push('|');
+            display.push_str(alias);
+        }
+        let about = sub
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        entries.push((sub_path.clone(), display, about));
+        help_tree_entries(sub, &sub_path, entries);
     }
-    println!();
-    println!("Access markers:");
-    println!("  user commands are available to allowed local callers.");
-    println!("  local setup commands edit client-side files for the invoking account.");
-    println!("  access list and show expose stable references and scoped authority, never raw session tokens.");
-    println!("  admin commands require the daemon principal or the TCP admin token.");
+}
+
+fn print_help_tree() {
+    let color = color_enabled_for_stdout();
+    cli_println!("{}", paint("guard command tree", AnsiColor::Bold, color));
+    let mut entries = Vec::new();
+    help_tree_entries(&MainArgs::command(), &[], &mut entries);
+    for (path, display, about) in &entries {
+        let indent = "  ".repeat(path.len());
+        let name = if path.len() == 1 {
+            paint(display, AnsiColor::Bold, color)
+        } else {
+            display.clone()
+        };
+        if about.is_empty() {
+            cli_println!("{indent}{name}");
+        } else {
+            cli_println!("{indent}{name}  {about}");
+        }
+    }
+    cli_println!();
+    cli_println!("Each summary states its own authority where one is required; commands without one are available to allowed local callers.");
 }
 #[cfg(test)]
 mod tests;

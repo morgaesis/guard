@@ -1,1 +1,1 @@
-server_socket: /home/agent/.guard/guard.sock
+server_socket: /home/guard/run/guard.sock

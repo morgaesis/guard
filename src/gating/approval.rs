@@ -2,7 +2,7 @@
 //! held at a point of no return until a human approves the exact artifact.
 //!
 //! A held command does not execute. It is enqueued with an immutable execution
-//! snapshot, and only an operator (daemon UID) can approve it. Approval executes
+//! snapshot, and only an authenticated operator can approve it. Approval executes
 //! strictly from the stored snapshot - no fields are accepted at approve time -
 //! so the approval is bound to exactly what was reviewed (gate on prediction).
 //! An unattended queue fails closed: holds past their TTL transition to
@@ -17,10 +17,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
 
-use super::{DecisionTrace, GateError, Reversibility};
+use super::{sanitize_gate_text, DecisionTrace, GateError, Reversibility};
 use crate::principal::{scope_eq, PrincipalKey};
 
 /// Optional binding of held secret VALUES to the artifact the operator reviewed.
@@ -92,10 +93,11 @@ pub struct ApprovalSnapshot {
     /// env-var -> secret-key mapping materialized as child-lifetime files.
     #[serde(default)]
     pub secret_file_keys: BTreeMap<String, String>,
-    /// If this hold originated from a verb, the verb name and the validated
-    /// params, plus the catalog version it was rendered against. The version
-    /// is the staleness fallback for rows without a `verb_digest`, where any
-    /// catalog change voids the approval.
+    /// If this hold originated from a verb, the verb name and catalog version.
+    /// `verb_params` remains for schema compatibility and is always empty;
+    /// replay uses the rendered immutable argv above. The version is the
+    /// staleness fallback for rows without a `verb_digest`, where any catalog
+    /// change voids the approval.
     pub verb_name: Option<String>,
     pub verb_params: BTreeMap<String, String>,
     pub catalog_version: Option<u64>,
@@ -105,6 +107,14 @@ pub struct ApprovalSnapshot {
     /// Absent on rows written before the digest existed.
     #[serde(default)]
     pub verb_digest: Option<String>,
+    /// Canonical digest of the complete composed matcher selection. Rows
+    /// without this field use the conservative single-verb compatibility
+    /// check at replay.
+    #[serde(default)]
+    pub verb_composition_digest: Option<String>,
+    /// Effective execution timeout captured with the immutable approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_timeout_secs: Option<u64>,
     /// Session-scoped access verbs selected when this immutable hold was
     /// created. Approval consumes their original bounded authority.
     #[serde(default)]
@@ -130,7 +140,21 @@ pub struct ApprovalSnapshot {
 
 impl ApprovalSnapshot {
     pub fn command_line(&self) -> String {
-        crate::redact::command_line(&self.binary, &self.args)
+        crate::redact::redact_command_line(&self.binary, &self.args)
+    }
+
+    pub fn contains_sensitive_literals(&self) -> bool {
+        crate::redact::command_contains_sensitive_literals(&self.binary, &self.args)
+    }
+
+    /// Remove literal-sensitive argv after the row has become non-replayable.
+    pub fn scrub_sensitive_literals(&mut self) -> bool {
+        if !self.contains_sensitive_literals() {
+            return false;
+        }
+        self.binary = "<unavailable>".to_string();
+        self.args.clear();
+        true
     }
 
     /// Short, stable fingerprint shown to the operator so two visually-similar
@@ -229,6 +253,40 @@ impl Approval {
     pub fn deadline_unix(&self) -> u64 {
         self.created_unix.saturating_add(self.ttl_secs)
     }
+
+    /// Canonicalize all non-authoritative text before it reaches a registry,
+    /// durable store, audit projection, or wire response.
+    pub fn sanitize_explanatory_text(&mut self) -> bool {
+        fn sanitize(value: &mut String) -> bool {
+            let sanitized = sanitize_gate_text(value);
+            if sanitized == *value {
+                return false;
+            }
+            *value = sanitized;
+            true
+        }
+
+        let mut changed = sanitize(&mut self.reason);
+        if let Some(trace) = self.decision_trace.as_mut() {
+            changed |= trace.sanitize_explanatory_text();
+        }
+        if let Some(reason) = self.decided_reason.as_mut() {
+            changed |= sanitize(reason);
+        }
+        for note in &mut self.notes {
+            changed |= sanitize(&mut note.author);
+            changed |= sanitize(&mut note.text);
+        }
+        let original_stdout = self.result_stdout.take();
+        let original_stderr = self.result_stderr.take();
+        let stdout = bound_approval_transcript(original_stdout.clone()).0;
+        let stderr = bound_approval_transcript(original_stderr.clone()).0;
+        let stdout_changed = stdout != original_stdout;
+        let stderr_changed = stderr != original_stderr;
+        self.result_stdout = stdout;
+        self.result_stderr = stderr;
+        changed | stdout_changed | stderr_changed
+    }
 }
 
 /// In-memory registry of held commands plus per-handle notifiers for blocking
@@ -237,6 +295,103 @@ impl Approval {
 pub struct ApprovalRegistry {
     items: HashMap<String, Approval>,
     notifiers: HashMap<String, Arc<Notify>>,
+    leases: Arc<WaiterLeaseState>,
+}
+
+pub const APPROVAL_TRANSCRIPT_SERIALIZED_BYTES: usize = 262_144;
+pub const APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX: &str = "\n[guard persisted transcript truncated]\n";
+
+fn json_payload_bytes(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' => 2,
+        '\u{0000}'..='\u{001f}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
+/// Redact and bound one transcript using the bytes occupied by its serialized
+/// JSON string field, including quotes and escapes. The same projection is
+/// used for persistence, restart loading, and wire responses.
+pub fn bound_approval_transcript(value: Option<String>) -> (Option<String>, bool) {
+    let Some(value) = value else {
+        return (None, false);
+    };
+    let exposed = crate::redact::redact_output_text(&value);
+    let already_truncated = exposed.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
+    if serde_json::to_vec(&exposed)
+        .expect("serializing a string cannot fail")
+        .len()
+        <= APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+    {
+        return (Some(exposed), already_truncated);
+    }
+
+    let source = exposed
+        .strip_suffix(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX)
+        .unwrap_or(&exposed);
+    let suffix_payload = APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX
+        .chars()
+        .map(json_payload_bytes)
+        .sum::<usize>();
+    let mut available = APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+        .saturating_sub(2)
+        .saturating_sub(suffix_payload);
+    let mut boundary = 0;
+    for (offset, character) in source.char_indices() {
+        let bytes = json_payload_bytes(character);
+        if bytes > available {
+            break;
+        }
+        available -= bytes;
+        boundary = offset + character.len_utf8();
+    }
+    let mut bounded = source[..boundary].to_string();
+    bounded.push_str(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
+    debug_assert!(
+        serde_json::to_vec(&bounded)
+            .expect("serializing a string cannot fail")
+            .len()
+            <= APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+    );
+    (Some(bounded), true)
+}
+
+#[derive(Default)]
+struct WaiterLeaseState {
+    next_id: AtomicU64,
+    active: Mutex<HashMap<String, HashMap<u64, ()>>>,
+}
+
+/// A transport-owned hold observation lease. Dropping it is idempotent and
+/// only releases the exact token that created it.
+pub struct WaiterLease {
+    handle: String,
+    lease_id: u64,
+    state: Weak<WaiterLeaseState>,
+}
+
+impl WaiterLease {
+    pub fn release_once(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Ok(mut active) = state.active.lock() else {
+            return;
+        };
+        if let Some(tokens) = active.get_mut(&self.handle) {
+            tokens.remove(&self.lease_id);
+            if tokens.is_empty() {
+                active.remove(&self.handle);
+            }
+        }
+        self.state = Weak::new();
+    }
+}
+
+impl Drop for WaiterLease {
+    fn drop(&mut self) {
+        self.release_once();
+    }
 }
 
 impl ApprovalRegistry {
@@ -252,6 +407,7 @@ impl ApprovalRegistry {
         let mut items = HashMap::new();
         let mut recovered = Vec::new();
         for mut row in rows {
+            row.sanitize_explanatory_text();
             if row.status == ApprovalStatus::Approving {
                 row.status = ApprovalStatus::ExecFailed;
                 row.decided_unix = Some(now);
@@ -266,18 +422,57 @@ impl ApprovalRegistry {
             Self {
                 items,
                 notifiers: HashMap::new(),
+                leases: Arc::new(WaiterLeaseState::default()),
             },
             recovered,
         )
     }
 
     /// Enqueue a hold and return its notifier so a blocking waiter can await it.
-    pub fn enqueue(&mut self, approval: Approval) -> Arc<Notify> {
+    pub fn enqueue(&mut self, mut approval: Approval) -> Arc<Notify> {
+        approval.sanitize_explanatory_text();
         let notify = Arc::new(Notify::new());
         self.notifiers
             .insert(approval.handle.clone(), notify.clone());
         self.items.insert(approval.handle.clone(), approval);
         notify
+    }
+
+    /// Register a waiter before an approval mutation. The notifier and lease
+    /// are created under the same registry lock, so retention cannot remove a
+    /// row between authorization and observation.
+    pub fn register_waiter(&mut self, handle: &str) -> Option<(Arc<Notify>, WaiterLease)> {
+        if !self.items.contains_key(handle) {
+            return None;
+        }
+        let notify = self
+            .notifiers
+            .entry(handle.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone();
+        let lease_id = self.leases.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut active = self.leases.active.lock().ok()?;
+        active
+            .entry(handle.to_string())
+            .or_default()
+            .insert(lease_id, ());
+        Some((
+            notify,
+            WaiterLease {
+                handle: handle.to_string(),
+                lease_id,
+                state: Arc::downgrade(&self.leases),
+            },
+        ))
+    }
+
+    pub fn active_waiters(&self, handle: &str) -> usize {
+        self.leases
+            .active
+            .lock()
+            .ok()
+            .and_then(|active| active.get(handle).map(HashMap::len))
+            .unwrap_or(0)
     }
 
     pub fn get(&self, handle: &str) -> Option<&Approval> {
@@ -287,11 +482,29 @@ impl ApprovalRegistry {
     pub fn set_decision_trace(&mut self, handle: &str, trace: DecisionTrace) -> Option<Approval> {
         let approval = self.items.get_mut(handle)?;
         approval.decision_trace = Some(trace);
+        approval.sanitize_explanatory_text();
         Some(approval.clone())
     }
 
     pub fn notifier(&self, handle: &str) -> Option<Arc<Notify>> {
         self.notifiers.get(handle).cloned()
+    }
+
+    /// Obtain the notifier for an existing hold, creating it when the row has
+    /// none. `from_rows` rebuilds the registry without notifiers, so every hold
+    /// recovered across a restart needs one minted on first wait; without this
+    /// a waiter parks on a notifier nobody wakes. Returns `None` for an unknown
+    /// handle so a caller cannot mint state for a row that does not exist.
+    pub fn notifier_or_create(&mut self, handle: &str) -> Option<Arc<Notify>> {
+        if !self.items.contains_key(handle) {
+            return None;
+        }
+        Some(
+            self.notifiers
+                .entry(handle.to_string())
+                .or_insert_with(|| Arc::new(Notify::new()))
+                .clone(),
+        )
     }
 
     /// All holds, newest first.
@@ -366,6 +579,7 @@ impl ApprovalRegistry {
             a.result_exit = exit;
             a.result_stdout = stdout;
             a.result_stderr = stderr;
+            a.sanitize_explanatory_text();
         }
         self.wake(handle);
     }
@@ -376,6 +590,7 @@ impl ApprovalRegistry {
             a.status = ApprovalStatus::ExecFailed;
             a.decided_unix = Some(now);
             a.decided_reason = Some(detail);
+            a.sanitize_explanatory_text();
         }
         self.wake(handle);
     }
@@ -406,6 +621,7 @@ impl ApprovalRegistry {
             author: author.to_string(),
             text: text.to_string(),
         });
+        approval.sanitize_explanatory_text();
         Ok(approval)
     }
 
@@ -430,13 +646,15 @@ impl ApprovalRegistry {
         approval.status = ApprovalStatus::Denied;
         approval.decided_unix = Some(now);
         approval.decided_reason = Some(reason);
+        approval.sanitize_explanatory_text();
         Ok(approval)
     }
 
     /// Install a row after its durable transition commits. Existing notifier
     /// identity is preserved; terminal transitions wake the waiter only after
     /// SQLite is authoritative.
-    pub fn install_persisted(&mut self, approval: Approval, wake: bool) {
+    pub fn install_persisted(&mut self, mut approval: Approval, wake: bool) {
+        approval.sanitize_explanatory_text();
         let handle = approval.handle.clone();
         self.items.insert(handle.clone(), approval);
         if wake {
@@ -497,6 +715,7 @@ impl ApprovalRegistry {
             .filter(|a| {
                 a.status.is_decided()
                     && now.saturating_sub(a.decided_unix.unwrap_or(a.created_unix)) > retention_secs
+                    && self.active_waiters(&a.handle) == 0
             })
             .map(|a| a.handle.clone())
             .collect();
@@ -533,6 +752,8 @@ mod tests {
             verb_params: BTreeMap::new(),
             catalog_version: None,
             verb_digest: None,
+            verb_composition_digest: None,
+            exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(PrincipalKey::from_uid(1001)),
@@ -647,6 +868,55 @@ mod tests {
     }
 
     #[test]
+    fn restarted_hold_registers_and_releases_a_new_waiter() {
+        let (mut registry, recovered) =
+            ApprovalRegistry::from_rows(vec![held("h1", 100, 3600)], 500);
+        assert!(recovered.is_empty());
+        assert!(registry.notifier("h1").is_none());
+
+        let (notifier, lease) = registry.register_waiter("h1").expect("known hold");
+        assert!(Arc::ptr_eq(
+            &notifier,
+            &registry.notifier("h1").expect("notifier re-registered")
+        ));
+        assert_eq!(registry.active_waiters("h1"), 1);
+        drop(lease);
+        assert_eq!(registry.active_waiters("h1"), 0);
+    }
+
+    #[test]
+    fn transcript_bound_counts_json_escapes_and_utf8_after_redaction() {
+        let pattern = "\"\\\n\u{0001}é界";
+        let input = pattern.repeat(APPROVAL_TRANSCRIPT_SERIALIZED_BYTES / pattern.len() + 1);
+        let (bounded, truncated) = bound_approval_transcript(Some(input));
+        let bounded = bounded.expect("transcript remains present");
+
+        assert!(truncated);
+        assert_eq!(
+            bounded
+                .matches(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX)
+                .count(),
+            1
+        );
+        assert!(bounded.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX));
+        assert!(
+            serde_json::to_vec(&bounded).unwrap().len() <= APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+        );
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn transcript_bound_is_stable_when_loaded_again() {
+        let input = "\\\"\n".repeat(APPROVAL_TRANSCRIPT_SERIALIZED_BYTES);
+        let (first, first_truncated) = bound_approval_transcript(Some(input));
+        let (second, second_truncated) = bound_approval_transcript(first.clone());
+
+        assert!(first_truncated);
+        assert!(second_truncated);
+        assert_eq!(second, first);
+    }
+
+    #[test]
     fn caps_count_pending_and_approving() {
         let mut r = ApprovalRegistry::new();
         r.enqueue(held("a", 100, 3600));
@@ -682,15 +952,15 @@ mod tests {
     async fn waiter_is_woken_on_decision() {
         let mut r = ApprovalRegistry::new();
         let notify = r.enqueue(held("h1", 100, 3600));
-        // Spawn a waiter; then decide and ensure it wakes.
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
         let waiter = tokio::spawn(async move {
-            notify.notified().await;
+            let mut notified = Box::pin(notify.notified());
+            notified.as_mut().enable();
+            let _ = registered_tx.send(());
+            notified.await;
         });
-        // Ensure the waiter has parked on notified() before we wake it;
-        // notify_waiters() only wakes tasks already awaiting.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        registered_rx.await.unwrap();
         r.deny("h1", 150, "no".into()).unwrap();
-        // notify_waiters wakes those currently awaiting; the spawned task should finish.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
             .await
             .expect("waiter should have been woken");

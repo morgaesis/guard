@@ -105,20 +105,25 @@ pub trait ProtocolConfig: Send + Sync {
     /// auto-revert envelope when the consequence gate is active.
     fn tracks_write(&self, op: &ApiOp) -> bool;
 
+    /// Whether response headers prove that a forwarded mutation did not apply.
+    /// The safe default treats every post-dispatch response as ambiguous.
+    fn definitively_rejects_mutation(&self, _op: &ApiOp, _status: u16) -> bool {
+        false
+    }
+
     /// Whether the server should fetch the object's current state before
     /// forwarding a tracked write, so [`Self::plan_revert`] can build a
     /// restore-style revert from it.
     fn wants_prior_snapshot(&self, op: &ApiOp) -> bool;
 
-    /// Build the revert for a tracked write that succeeded upstream.
+    /// Build the revert for a tracked write before it is sent upstream.
     /// `prior_object` is the raw body of the pre-write fetch (when one was
-    /// taken); `response` is the upstream response body. `Err` carries the
-    /// reason no revert could be built, which the server logs - the write is
-    /// already live either way, so an `Err` only means it will not auto-revert.
+    /// taken); `request_body` is the exact buffered write body. `Err` routes the
+    /// request to operator approval instead of forwarding it uncontained.
     fn plan_revert(
         &self,
         op: &ApiOp,
         prior_object: Option<&[u8]>,
-        response: &[u8],
+        request_body: &[u8],
     ) -> Result<PlannedRevert, String>;
 }

@@ -5,6 +5,8 @@
 set -u
 
 export PATH="/home/agent/.guard/shims:$PATH"
+export HTTPS_PROXY=http://guard-egress:3128
+export https_proxy=$HTTPS_PROXY
 
 PROMPT_FILE="${PROMPT_FILE:-/home/agent/ctf-prompt.md}"
 
@@ -23,7 +25,7 @@ fi
 # Confirm guard is reachable before launching the agent. A dead daemon
 # would cause every shimmed command to fail and waste turns.
 if ! guard status >/dev/null 2>&1; then
-    echo "guard daemon not responding on /home/agent/.guard/guard.sock" >&2
+    echo "guard daemon not responding on /home/guard/run/guard.sock" >&2
     exit 1
 fi
 

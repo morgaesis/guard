@@ -10,9 +10,11 @@
     tree is writable by the service.
 
     Administrative RPCs run in a transient scheduled task as the supported
-    local SYSTEM identity. Guard authorizes only the kernel-authenticated SYSTEM
-    SID as this additional Windows operator. Task operands are validated and
-    base64 encoded as data before PowerShell task syntax is constructed.
+    local SYSTEM identity. Guard accepts that kernel-authenticated SID as the
+    packaged Windows operator, rejects an admin bearer in service mode, and
+    does not grant operator authority to its daemon service SID. Task operands
+    are validated and base64 encoded as data before PowerShell task syntax is
+    constructed.
 
     The named pipe authenticates each local caller SID but does not restrict
     connections to one agent SID. Place mutually untrusted local accounts on
@@ -52,7 +54,7 @@ param(
     # Retains bounded sanitized output only. Executable tasks are always removed.
     [switch]$PreserveDiagnostics,
 
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
+    [string]$RepoRoot,
     [string]$CandidateExe,
     [string]$ExpectedSha256,
     [string]$Backup,
@@ -75,6 +77,7 @@ $PipePath = '\\.\pipe\guard'
 
 $InstallRoot = 'C:\Program Files\Guard'
 $DeployedExe = Join-Path $InstallRoot 'guard.exe'
+$DeployedOperatorScript = Join-Path $InstallRoot 'guard-operator.ps1'
 $ConfigRoot = 'C:\ProgramData\GuardConfig'
 $VerbsPath = Join-Path $ConfigRoot 'verbs.yaml'
 $DataDir = 'C:\ProgramData\Guard'
@@ -127,7 +130,24 @@ function Assert-NoReparsePoint {
     }
 }
 
+function Resolve-InstallRepoRoot {
+    if ($RepoRoot) {
+        if (-not (Test-Path -LiteralPath $RepoRoot -PathType Container)) {
+            throw "RepoRoot does not exist: '$RepoRoot'."
+        }
+        Assert-NoReparsePoint -Path $RepoRoot
+        return (Resolve-Path -LiteralPath $RepoRoot).Path
+    }
+    $archiveRoot = Join-Path $PSScriptRoot '..\..'
+    if (Test-Path -LiteralPath $archiveRoot -PathType Container) {
+        Assert-NoReparsePoint -Path $archiveRoot
+        return (Resolve-Path -LiteralPath $archiveRoot).Path
+    }
+    return $null
+}
+
 function Resolve-GuardExe {
+    param([string]$InstallRepoRoot)
     if ($CandidateExe) {
         if (-not (Test-Path -LiteralPath $CandidateExe -PathType Leaf)) {
             throw "CandidateExe does not exist: '$CandidateExe'."
@@ -135,11 +155,14 @@ function Resolve-GuardExe {
         Assert-NoReparsePoint -Path $CandidateExe
         return (Resolve-Path -LiteralPath $CandidateExe).Path
     }
-    $candidates = @(
-        (Join-Path $RepoRoot 'guard.exe'),
-        (Join-Path $RepoRoot 'target\release\guard.exe'),
-        (Join-Path $RepoRoot 'target\debug\guard.exe')
-    )
+    $candidates = if ($InstallRepoRoot) {
+        @(
+            (Join-Path $InstallRepoRoot 'guard.exe'),
+            (Join-Path $InstallRepoRoot 'target\release\guard.exe'),
+            (Join-Path $InstallRepoRoot 'target\debug\guard.exe')
+        )
+    }
+    else { @() }
     foreach ($candidate in $candidates) {
         if (Test-Path -LiteralPath $candidate -PathType Leaf) {
             Assert-NoReparsePoint -Path $candidate
@@ -1130,6 +1153,10 @@ function New-GuardBackup {
     New-Item -ItemType Directory -Path $path | Out-Null
     $files = @()
     $files += Copy-BackupFile -Source $DeployedExe -BackupPath $path -RelativePath 'guard.exe'
+    $operatorScriptPresent = Test-Path -LiteralPath $DeployedOperatorScript -PathType Leaf
+    if ($operatorScriptPresent) {
+        $files += Copy-BackupFile -Source $DeployedOperatorScript -BackupPath $path -RelativePath 'guard-operator.ps1'
+    }
     if ($Snapshot.CatalogPresent) {
         $files += Copy-BackupFile -Source $VerbsPath -BackupPath $path -RelativePath 'config/verbs.yaml'
     }
@@ -1162,6 +1189,7 @@ function New-GuardBackup {
         catalog_path = $VerbsPath
         binary_version = $Snapshot.BinaryVersion
         binary_sha256 = $Snapshot.BinaryHash.ToLowerInvariant()
+        operator_script_present = [bool]$operatorScriptPresent
         catalog_present = [bool]$Snapshot.CatalogPresent
         start_mode = $Snapshot.StartMode
         was_running = [bool]$Snapshot.WasRunning
@@ -1211,8 +1239,18 @@ function Read-ValidatedGuardBackup {
     if ($metadata.api_reverts_present -isnot [bool]) {
         throw 'Backup API revert metadata is invalid.'
     }
+    $operatorScriptPresent = $false
+    if ($metadata.PSObject.Properties.Name -contains 'operator_script_present') {
+        if ($metadata.operator_script_present -isnot [bool]) {
+            throw 'Backup operator script metadata is invalid.'
+        }
+        $operatorScriptPresent = [bool]$metadata.operator_script_present
+    }
+    else {
+        $metadata | Add-Member -NotePropertyName operator_script_present -NotePropertyValue $false
+    }
     $allowedFiles = @(
-        'guard.exe', 'config/verbs.yaml', 'service-environment.dpapi',
+        'guard.exe', 'guard-operator.ps1', 'config/verbs.yaml', 'service-environment.dpapi',
         'sqlite/state.db', 'sqlite/state.db-wal', 'sqlite/state.db-shm', 'sqlite/state.db-journal'
     )
     $seen = @{}
@@ -1237,6 +1275,9 @@ function Read-ValidatedGuardBackup {
     }
     if ([bool]$metadata.catalog_present -ne $seen.ContainsKey('config/verbs.yaml')) {
         throw 'Backup catalog metadata is inconsistent.'
+    }
+    if ($operatorScriptPresent -ne $seen.ContainsKey('guard-operator.ps1')) {
+        throw 'Backup operator script metadata is inconsistent.'
     }
     if ($metadata.binary_sha256 -ne (@($metadata.files | Where-Object path -eq 'guard.exe')[0].sha256)) {
         throw 'Backup binary metadata is inconsistent.'
@@ -1439,6 +1480,13 @@ function Restore-GuardInstallation {
     $metadata = $BackupRecord.Metadata
     $binarySource = Join-Path $BackupRecord.Path 'guard.exe'
     Install-FileAtomically -Source $binarySource -Destination $DeployedExe -ExpectedHash $metadata.binary_sha256
+    if ([bool]$metadata.operator_script_present) {
+        $operatorScriptEntry = @($metadata.files | Where-Object path -eq 'guard-operator.ps1')[0]
+        Install-FileAtomically -Source (Join-Path $BackupRecord.Path 'guard-operator.ps1') -Destination $DeployedOperatorScript -ExpectedHash $operatorScriptEntry.sha256
+    }
+    elseif (Test-Path -LiteralPath $DeployedOperatorScript) {
+        Remove-Item -LiteralPath $DeployedOperatorScript -Force
+    }
 
     foreach ($databaseFile in Get-DatabasePaths -Database $StateDb) {
         if (Test-Path -LiteralPath $databaseFile) { Remove-Item -LiteralPath $databaseFile -Force }
@@ -1474,7 +1522,11 @@ function Assert-NewInstallationRootsAbsent {
 
 function Invoke-Install {
     Assert-Admin -ForAction 'install'
-    $sourceExe = Resolve-GuardExe
+    $installRepoRoot = Resolve-InstallRepoRoot
+    $sourceExe = Resolve-GuardExe -InstallRepoRoot $installRepoRoot
+    $operatorScriptSource = (Resolve-Path -LiteralPath $PSCommandPath).Path
+    Assert-NoReparsePoint -Path $operatorScriptSource
+    $operatorScriptHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $operatorScriptSource).Hash.ToLowerInvariant()
     $expectedHash = Assert-ExpectedCandidateHash
     $serviceBeforeInstall = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $serviceBeforeInstall) { Assert-NewInstallationRootsAbsent }
@@ -1490,8 +1542,9 @@ function Invoke-Install {
         $existingEnvironment = if ($snapshot) { $snapshot.Environment } else { @{} }
         $serviceEnvironment = Merge-ServiceEnvironment -Existing $existingEnvironment -Imported (Import-LlmEnvironment -Path $EnvFile)
         $haveKey = $serviceEnvironment.ContainsKey('GUARD_LLM_API_KEY') -or $serviceEnvironment.ContainsKey('OPENROUTER_API_KEY')
-        $sourceVerbs = Join-Path $RepoRoot 'examples\verbs-kubectl.yaml'
-        $haveVerbs = (Test-Path -LiteralPath $VerbsPath) -or (Test-Path -LiteralPath $sourceVerbs)
+        $sourceVerbs = if ($installRepoRoot) { Join-Path $installRepoRoot 'examples\verbs-kubectl.yaml' } else { $null }
+        $haveSourceVerbs = $sourceVerbs -and (Test-Path -LiteralPath $sourceVerbs)
+        $haveVerbs = (Test-Path -LiteralPath $VerbsPath) -or $haveSourceVerbs
         $stockBinPath = Get-ServiceBinPath -HaveKey $haveKey -HaveVerbs $haveVerbs
         $existingPath = if ($snapshot) { $snapshot.PathName } else { $null }
         $serviceBinPath = Resolve-InstallServicePath -ExistingPath $existingPath -DesiredPath $stockBinPath
@@ -1522,8 +1575,9 @@ function Invoke-Install {
             Set-GuardServiceConfiguration -PathName $serviceBinPath -StartMode 'Manual'
         }
         Install-FileAtomically -Source $stagedExe -Destination $DeployedExe -ExpectedHash $expectedHash
+        Install-FileAtomically -Source $operatorScriptSource -Destination $DeployedOperatorScript -ExpectedHash $operatorScriptHash
         Invoke-InstallerTestFault -Point 'after-binary'
-        if (-not (Test-Path -LiteralPath $VerbsPath) -and (Test-Path -LiteralPath $sourceVerbs)) {
+        if (-not (Test-Path -LiteralPath $VerbsPath) -and $haveSourceVerbs) {
             Copy-Item -LiteralPath $sourceVerbs -Destination $VerbsPath
         }
         Set-DeploymentAcls -GuardSid $guardSid
@@ -1537,6 +1591,9 @@ function Invoke-Install {
         Invoke-InstallerTestFault -Point 'after-service-start'
         Verify-GuardService -ExpectedHash $expectedHash -ExpectedVersion $expectedVersion
         Assert-DeploymentAcls -GuardSid $guardSid
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedOperatorScript).Hash.ToLowerInvariant() -ne $operatorScriptHash) {
+            throw 'Installed operator script failed integrity validation.'
+        }
         if ($snapshot) {
             if (-not $snapshot.WasRunning) { Wait-ServiceStopped -Name $ServiceName }
             Set-GuardServiceConfiguration -PathName $serviceBinPath -StartMode $snapshot.StartMode

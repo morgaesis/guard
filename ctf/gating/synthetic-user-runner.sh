@@ -12,13 +12,12 @@ MEMORY="${GUARD_SU_MEMORY:-2g}"
 CPUS="${GUARD_SU_CPUS:-2}"
 PIDS="${GUARD_SU_PIDS:-256}"
 PREFIX="guard-su"
-ACTIVE_CONTAINER=""
-ACTIVE_VOLUME=""
-RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+ACTIVE_SCENARIO=""
+RUN_ID="${GUARD_SU_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_DIR=""
 MANIFEST=""
 OUTCOMES_FILE=""
-PRESERVED_FIXTURES=0
+CLEANUP_MANIFEST=""
 HOST_FAILURE_PHASE=""
 HOST_FAILURE_CATEGORY=""
 HOST_FAILURE_EXEC_STATUS=""
@@ -96,7 +95,7 @@ copy_scenario_result() {
   if [ "${GUARD_SU_TEST_COPY_FAILURE:-0}" = 1 ]; then
     return 1
   fi
-  podman cp "$container:/scenario/results/$scenario.md" "$RESULTS_DIR/$scenario.md"
+  podman cp "$container:/scenario/collector/results/$scenario.md" "$RESULTS_DIR/$scenario.md"
 }
 
 write_missing_result_evidence() {
@@ -121,6 +120,174 @@ assert_isolated_container() {
   podman inspect --format '{{json .HostConfig.CapDrop}}' "$container" | grep -Fq 'ALL'
   mounts="$(podman inspect --format '{{range .Mounts}}{{printf "%s %s\n" .Type .Destination}}{{end}}' "$container")"
   [ "$mounts" = 'volume /scenario' ]
+}
+
+resource_exists() {
+  local type="$1" name="$2"
+  case "$type" in
+    container) podman container inspect "$name" >/dev/null 2>&1 ;;
+    volume) podman volume inspect "$name" >/dev/null 2>&1 ;;
+    *) return 2 ;;
+  esac
+}
+
+resource_label() {
+  local type="$1" name="$2" label="$3"
+  case "$type" in
+    container) podman container inspect --format "{{index .Config.Labels \"$label\"}}" "$name" ;;
+    volume) podman volume inspect --format "{{index .Labels \"$label\"}}" "$name" ;;
+    *) return 2 ;;
+  esac
+}
+
+resource_matches_manifest_labels() {
+  local type="$1" name="$2" scenario="$3"
+  [ "$(resource_label "$type" "$name" guard.synthetic-user.run)" = "$RUN_ID" ] \
+    && [ "$(resource_label "$type" "$name" guard.synthetic-user.scenario)" = "$scenario" ]
+}
+
+manifest_has_resource() {
+  local type="$1" name="$2" scenario="$3"
+  awk -F '\t' -v type="$type" -v name="$name" -v scenario="$scenario" \
+    '($1 == "pending" || $1 == "resource") && $2 == type && $3 == name && $4 == scenario { found = 1 } END { exit !found }' \
+    "$CLEANUP_MANIFEST"
+}
+
+manifest_has_created_resource() {
+  local type="$1" name="$2" scenario="$3"
+  awk -F '\t' -v type="$type" -v name="$name" -v scenario="$scenario" \
+    '$1 == "resource" && $2 == type && $3 == name && $4 == scenario { found = 1 } END { exit !found }' \
+    "$CLEANUP_MANIFEST"
+}
+
+scenario_is_preserved() {
+  local scenario="$1"
+  awk -F '\t' -v scenario="$scenario" \
+    '$1 == "preserve" && $2 == scenario { found = 1 } END { exit !found }' "$CLEANUP_MANIFEST"
+}
+
+register_resource() {
+  local type="$1" name="$2" scenario="$3"
+  if ! resource_matches_manifest_labels "$type" "$name" "$scenario"; then
+    echo "synthetic-user resource labels do not match the active run: $type $name" >&2
+    return 1
+  fi
+  if ! manifest_has_created_resource "$type" "$name" "$scenario"; then
+    printf 'resource\t%s\t%s\t%s\n' "$type" "$name" "$scenario" >> "$CLEANUP_MANIFEST"
+  fi
+}
+
+register_pending_resource() {
+  local type="$1" name="$2" scenario="$3"
+  if ! manifest_has_resource "$type" "$name" "$scenario"; then
+    printf 'pending\t%s\t%s\t%s\n' "$type" "$name" "$scenario" >> "$CLEANUP_MANIFEST"
+  fi
+}
+
+mark_preserved() {
+  local scenario="$1"
+  if ! scenario_is_preserved "$scenario"; then
+    printf 'preserve\t%s\n' "$scenario" >> "$CLEANUP_MANIFEST"
+  fi
+}
+
+cleanup_registered_resource() {
+  local type="$1" name="$2" scenario="$3" running
+  if ! manifest_has_resource "$type" "$name" "$scenario"; then
+    echo "synthetic-user cleanup refused an unmanifested resource: $type $name" >&2
+    return 1
+  fi
+  if ! resource_exists "$type" "$name"; then
+    return 0
+  fi
+  if ! resource_matches_manifest_labels "$type" "$name" "$scenario"; then
+    echo "synthetic-user cleanup refused a resource with unexpected labels: $type $name" >&2
+    return 1
+  fi
+  case "$type" in
+    container)
+      running="$(podman container inspect --format '{{.State.Running}}' "$name")"
+      if [ "$running" = true ] && ! podman stop --time 5 "$name"; then
+        echo "synthetic-user cleanup could not stop container: $name" >&2
+        return 1
+      fi
+      if ! podman rm "$name"; then
+        echo "synthetic-user cleanup could not remove container: $name" >&2
+        return 1
+      fi
+      ;;
+    volume)
+      if ! podman volume rm "$name"; then
+        echo "synthetic-user cleanup could not remove volume: $name" >&2
+        return 1
+      fi
+      ;;
+  esac
+}
+
+cleanup_scenario() {
+  local scenario="$1" type name cleanup_failed=0
+  if scenario_is_preserved "$scenario"; then
+    return 0
+  fi
+  for type in container volume; do
+    while IFS=$'\t' read -r _ manifest_type name manifest_scenario; do
+      [ "$manifest_type" = "$type" ] && [ "$manifest_scenario" = "$scenario" ] || continue
+      if ! cleanup_registered_resource "$manifest_type" "$name" "$manifest_scenario"; then
+        cleanup_failed=1
+      fi
+    done < "$CLEANUP_MANIFEST"
+  done
+  return "$cleanup_failed"
+}
+
+recover_interrupted_run() {
+  local scenario cleanup_failed=0
+  [ -f "$CLEANUP_MANIFEST" ] || return 0
+  while IFS= read -r scenario; do
+    if ! cleanup_scenario "$scenario"; then
+      cleanup_failed=1
+    fi
+  done < <(awk -F '\t' '($1 == "pending" || $1 == "resource") { print $4 }' "$CLEANUP_MANIFEST" | LC_ALL=C sort -u)
+  return "$cleanup_failed"
+}
+
+assert_cleanup_invariants() {
+  local type name scenario cleanup_failed=0
+  for type in container volume; do
+    if [ "$type" = container ]; then
+      while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        scenario="$(resource_label "$type" "$name" guard.synthetic-user.scenario)"
+        if ! manifest_has_resource "$type" "$name" "$scenario" \
+          || ! resource_matches_manifest_labels "$type" "$name" "$scenario" \
+          || ! scenario_is_preserved "$scenario"; then
+          echo "synthetic-user cleanup invariant failed for labeled $type: $name" >&2
+          cleanup_failed=1
+        fi
+      done < <(podman ps -a --filter "label=guard.synthetic-user.run=$RUN_ID" --format '{{.Names}}')
+    else
+      while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        scenario="$(resource_label "$type" "$name" guard.synthetic-user.scenario)"
+        if ! manifest_has_resource "$type" "$name" "$scenario" \
+          || ! resource_matches_manifest_labels "$type" "$name" "$scenario" \
+          || ! scenario_is_preserved "$scenario"; then
+          echo "synthetic-user cleanup invariant failed for labeled $type: $name" >&2
+          cleanup_failed=1
+        fi
+      done < <(podman volume ls --filter "label=guard.synthetic-user.run=$RUN_ID" --format '{{.Name}}')
+    fi
+  done
+  while IFS=$'\t' read -r _ type name scenario; do
+    scenario_is_preserved "$scenario" || continue
+    if resource_exists "$type" "$name" \
+      && ! resource_matches_manifest_labels "$type" "$name" "$scenario"; then
+      echo "synthetic-user preserved resource is relabeled: $type $name" >&2
+      cleanup_failed=1
+    fi
+  done < "$CLEANUP_MANIFEST"
+  return "$cleanup_failed"
 }
 
 self_test() {
@@ -155,6 +322,14 @@ self_test() {
   if grep -Fq -- '- Status: running' "$MANIFEST"; then
     return 1
   fi
+  CLEANUP_MANIFEST="$test_dir/cleanup.manifest"
+  printf 'resource\tcontainer\tguard-su-test\tSU-TEST\n' > "$CLEANUP_MANIFEST"
+  manifest_has_resource container guard-su-test SU-TEST
+  if manifest_has_resource volume guard-su-test SU-TEST; then
+    return 1
+  fi
+  mark_preserved SU-TEST
+  scenario_is_preserved SU-TEST
   rm -r "$test_dir"
 }
 
@@ -163,6 +338,13 @@ if [ "${1:-}" = --self-test ]; then
   echo "synthetic-user runner self-test: passed"
   exit 0
 fi
+
+case "$RUN_ID" in
+  ''|*[!A-Za-z0-9._-]*)
+    echo "synthetic-user run ID must contain only letters, numbers, dot, underscore, or hyphen" >&2
+    exit 2
+    ;;
+esac
 
 if [ "$(id -u)" -eq 0 ]; then
   echo "synthetic-user scenarios require rootless Podman" >&2
@@ -176,6 +358,12 @@ if [ "$(podman info --format '{{.Host.Security.Rootless}}')" != "true" ]; then
   echo "synthetic-user scenarios require rootless Podman" >&2
   exit 2
 fi
+# Do not let Podman or its monitor inherit the runner's advisory-lock file
+# descriptor. A deliberately preserved failed container must not block the
+# next diagnostic run after this runner exits.
+podman() {
+  command podman "$@" 9>&-
+}
 mkdir -p "$EVIDENCE_ROOT"
 exec 9>"$EVIDENCE_ROOT/runner.lock"
 if ! flock -n 9; then
@@ -192,6 +380,20 @@ if [ "$#" -eq 0 ]; then
 fi
 TOTAL="$#"
 SELECTED=("$@")
+declare -A SELECTED_SEEN=()
+for scenario in "${SELECTED[@]}"; do
+  case "$scenario" in
+    ''|*[!A-Za-z0-9-]*)
+      echo "synthetic-user scenario name is invalid: $scenario" >&2
+      exit 2
+      ;;
+  esac
+  if [ -n "${SELECTED_SEEN[$scenario]:-}" ]; then
+    echo "synthetic-user scenario selected more than once: $scenario" >&2
+    exit 2
+  fi
+  SELECTED_SEEN[$scenario]=1
+done
 FULL_CATALOG=false
 if [ "${SELECTED[*]}" = "${CATALOG[*]}" ]; then
   FULL_CATALOG=true
@@ -199,7 +401,13 @@ fi
 RUN_DIR="$EVIDENCE_ROOT/runs/$RUN_ID"
 RESULTS_DIR="$RUN_DIR/scenarios"
 MANIFEST="$RUN_DIR/manifest.md"
+CLEANUP_MANIFEST="$RUN_DIR/cleanup.manifest"
 mkdir -p "$RESULTS_DIR"
+if ! recover_interrupted_run; then
+  echo "synthetic-user could not recover interrupted resources for run $RUN_ID" >&2
+  exit 1
+fi
+touch "$CLEANUP_MANIFEST"
 SOURCE_MANIFEST="$RUN_DIR/source-files.sha256"
 (
   cd "$REPO_ROOT"
@@ -219,6 +427,7 @@ printf '%s\n' "runs/$RUN_ID" > "$EVIDENCE_ROOT/latest-run"
   echo "- Run: \`$RUN_ID\`"
   echo "- Commit: \`$(git -C "$REPO_ROOT" rev-parse HEAD)\`"
   echo "- Source manifest: \`source-files.sha256\`"
+  echo "- Cleanup manifest: \`cleanup.manifest\`"
   echo "- Source digest: \`$SOURCE_DIGEST\`"
   echo "- Image: \`$(podman image inspect "$IMAGE" --format '{{.Id}}')\`"
   echo "- Complete catalog: \`$FULL_CATALOG\`"
@@ -226,16 +435,11 @@ printf '%s\n' "runs/$RUN_ID" > "$EVIDENCE_ROOT/latest-run"
   echo "- Status: running"
 } > "$MANIFEST"
 
-cleanup_one() {
-  local container="$1" volume="$2"
-  podman stop --time 5 "$container" >/dev/null 2>&1 || true
-  podman rm "$container" >/dev/null 2>&1 || true
-  podman volume rm "$volume" >/dev/null 2>&1 || true
-}
-
 cleanup_active() {
-  if [ -n "$ACTIVE_CONTAINER" ] && [ -n "$ACTIVE_VOLUME" ]; then
-    cleanup_one "$ACTIVE_CONTAINER" "$ACTIVE_VOLUME"
+  if [ -n "$ACTIVE_SCENARIO" ]; then
+    if ! cleanup_scenario "$ACTIVE_SCENARIO"; then
+      echo "synthetic-user cleanup failed; retaining $CLEANUP_MANIFEST for recovery" >&2
+    fi
   fi
   if [ -n "$OUTCOMES_FILE" ] && [ -f "$OUTCOMES_FILE" ]; then
     rm -- "$OUTCOMES_FILE"
@@ -247,7 +451,7 @@ trap 'exit 130' INT TERM
 
 run_one() {
   local scenario="$1"
-  local slug container volume result exec_status
+  local slug container init_container volume result exec_status
   local -a scenario_environment=(--env GUARD_SWEEPER_GRACE_SECS=1)
   HOST_FAILURE_PHASE=""
   HOST_FAILURE_CATEGORY=""
@@ -258,20 +462,68 @@ run_one() {
   fi
   slug="$(printf '%s' "$scenario" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
   container="$PREFIX-$slug-$RUN_ID"
+  init_container="$container-init"
   volume="$PREFIX-$slug-$RUN_ID-data"
-  ACTIVE_CONTAINER="$container"
-  ACTIVE_VOLUME="$volume"
+  ACTIVE_SCENARIO="$scenario"
   result="blocked"
-  trap 'cleanup_one "$container" "$volume"' RETURN
+  trap 'cleanup_scenario "$scenario"; trap - RETURN' RETURN
 
   write_status "$scenario" "$container" "$volume" "starting" "none established" "create the isolated fixture"
-  podman volume create "$volume" >/dev/null
+  register_pending_resource volume "$volume" "$scenario"
+  if ! podman volume create \
+    --label "guard.synthetic-user.run=$RUN_ID" \
+    --label "guard.synthetic-user.scenario=$scenario" \
+    "$volume" >/dev/null; then
+    record_host_failure "$scenario" volume-create volume-create 1
+    return 1
+  fi
+  if ! register_resource volume "$volume" "$scenario"; then
+    record_host_failure "$scenario" volume-manifest volume-create 1
+    return 1
+  fi
 
   if [ "$scenario" = SU-18 ]; then
     scenario_environment+=(--env GUARD_ACCESS_TTL_SECS=3)
   fi
+  register_pending_resource container "$init_container" "$scenario"
+  if ! podman create \
+    --name "$init_container" \
+    --label "guard.synthetic-user.run=$RUN_ID" \
+    --label "guard.synthetic-user.scenario=$scenario" \
+    --user 0:0 \
+    --network none \
+    --read-only \
+    --cap-drop ALL \
+    --cap-add CHOWN \
+    --security-opt no-new-privileges \
+    --memory "$MEMORY" \
+    --memory-swap "$MEMORY" \
+    --cpus "$CPUS" \
+    --pids-limit "$PIDS" \
+    --tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777 \
+    --volume "$volume:/scenario:rw" \
+    --entrypoint /synthetic-user.sh \
+    "$IMAGE" prepare-principals >/dev/null; then
+    record_host_failure "$scenario" principal-output-create container-create 1
+    return 1
+  fi
+  if ! register_resource container "$init_container" "$scenario"; then
+    record_host_failure "$scenario" principal-output-manifest container-create 1
+    return 1
+  fi
+  if ! podman start --attach "$init_container"; then
+    record_host_failure "$scenario" principal-output-setup container-start 1
+    return 1
+  fi
+  if ! cleanup_registered_resource container "$init_container" "$scenario"; then
+    record_host_failure "$scenario" principal-output-cleanup cleanup 1
+    return 1
+  fi
+  register_pending_resource container "$container" "$scenario"
   if podman create \
     --name "$container" \
+    --label "guard.synthetic-user.run=$RUN_ID" \
+    --label "guard.synthetic-user.scenario=$scenario" \
     --user 1000:1000 \
     --network none \
     --read-only \
@@ -283,7 +535,7 @@ run_one() {
     --pids-limit "$PIDS" \
     --tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777 \
     --tmpfs /var/log:rw,nosuid,nodev,size=32m,mode=0700 \
-    --volume "$volume:/scenario:rw,U" \
+    --volume "$volume:/scenario:rw" \
     "${scenario_environment[@]}" \
     --entrypoint /synthetic-user.sh \
     "$IMAGE" daemon "$scenario" >/dev/null; then
@@ -291,6 +543,10 @@ run_one() {
   else
     exec_status=$?
     record_host_failure "$scenario" container-create container-create "$exec_status"
+    return 1
+  fi
+  if ! register_resource container "$container" "$scenario"; then
+    record_host_failure "$scenario" container-manifest container-create 1
     return 1
   fi
 
@@ -341,6 +597,19 @@ run_one() {
     fi
   fi
 
+  if ! podman exec --user 0:0 "$container" \
+    /synthetic-user.sh collect-result "$scenario" "$result"; then
+    record_host_failure "$scenario" result-finalization evidence-collection 1
+    result="failed"
+  elif ! podman exec --user 0:0 "$container" \
+    grep -Fqx -- "- Result: $result" "/scenario/collector/results/$scenario.md"; then
+    record_host_failure "$scenario" result-verification evidence-collection 1
+    result="failed"
+    if ! podman exec --user 0:0 "$container" \
+      /synthetic-user.sh collect-result "$scenario" "$result"; then
+      record_host_failure "$scenario" result-finalization evidence-collection 1
+    fi
+  fi
   if ! copy_scenario_result "$container" "$scenario"; then
     record_host_failure "$scenario" result-copy evidence-copy 1
     write_missing_result_evidence "$scenario"
@@ -348,15 +617,16 @@ run_one() {
   fi
   if [ "$result" = failed ] && [ "${GUARD_SU_KEEP_FAILED:-0}" = 1 ]; then
     echo "$scenario: preserving failed fixture container=$container volume=$volume" >&2
-    PRESERVED_FIXTURES=$((PRESERVED_FIXTURES + 1))
-    ACTIVE_CONTAINER=""
-    ACTIVE_VOLUME=""
+    mark_preserved "$scenario"
+    ACTIVE_SCENARIO=""
     trap - RETURN
     return 1
   fi
-  cleanup_one "$container" "$volume"
-  ACTIVE_CONTAINER=""
-  ACTIVE_VOLUME=""
+  if ! cleanup_scenario "$scenario"; then
+    record_host_failure "$scenario" fixture-cleanup cleanup 1
+    return 1
+  fi
+  ACTIVE_SCENARIO=""
   trap - RETURN
   write_status "$scenario" "none" "none" "$result" "see scenarios/$scenario.md" "continue with the next isolated scenario"
   [ "$result" = passed ]
@@ -370,14 +640,22 @@ run_phase() {
     --env HOME="/tmp/synthetic-home-$uid" \
     --env XDG_CONFIG_HOME="/tmp/synthetic-config-$uid" \
     --env XDG_DATA_HOME="/tmp/synthetic-data-$uid" \
+    --env GUARD_ADMIN_TOKEN_FILE=/scenario/run/admin.token \
     "$container" timeout 120 /synthetic-user.sh phase "$scenario" "$phase"
   then
-    return 0
+    exec_status=0
   else
     exec_status=$?
   fi
-  record_host_failure "$scenario" "$phase" "$command_category" "$exec_status"
-  return "$exec_status"
+  if ! podman exec --user 0:0 "$container" \
+    /synthetic-user.sh collect-phase "$scenario" "$uid" "$phase" "$exec_status"; then
+    record_host_failure "$scenario" "$phase" evidence-collection 1
+    return 1
+  fi
+  if [ "$exec_status" -ne 0 ]; then
+    record_host_failure "$scenario" "$phase" "$command_category" "$exec_status"
+    return "$exec_status"
+  fi
 }
 
 restart_daemon() {
@@ -414,6 +692,7 @@ run_scenario() {
       run_phase "$container" "$scenario" 1000 approve || return
       run_phase "$container" "$scenario" 1001 use || return
       run_phase "$container" "$scenario" 1000 approve-execution || return
+      run_phase "$container" "$scenario" 1001 resume-execution || return
       run_phase "$container" "$scenario" 1002 isolate || return
       restart_daemon "$container" "$scenario" || return
       run_phase "$container" "$scenario" 1001 after-restart || return
@@ -434,6 +713,8 @@ run_scenario() {
       run_phase "$container" "$scenario" 1001 deny || return
       run_phase "$container" "$scenario" 1000 approve || return
       run_phase "$container" "$scenario" 1001 hold || return
+      run_phase "$container" "$scenario" 1000 approve-held || return
+      run_phase "$container" "$scenario" 1001 resume-held || return
       run_phase "$container" "$scenario" 1000 verify || return
       ;;
     SU-16)
@@ -527,12 +808,7 @@ HOST_FAILURE_CATEGORY=""
 HOST_FAILURE_EXEC_STATUS=""
 HOST_FAILURE_EVIDENCE=""
 
-leftovers="$(podman ps -a --format '{{.Names}}' | grep -c -- "-$RUN_ID$" || true)"
-leftover_volumes="$(podman volume ls --format '{{.Name}}' | grep -c -- "-$RUN_ID-data$" || true)"
-leftover_networks=0
-if [ "$leftovers" -ne "$PRESERVED_FIXTURES" ] \
-  || [ "$leftover_volumes" -ne "$PRESERVED_FIXTURES" ] \
-  || [ "$leftover_networks" -ne 0 ]; then
+if ! assert_cleanup_invariants; then
   echo "synthetic-user cleanup invariant failed" >&2
   exit 1
 fi
@@ -546,6 +822,13 @@ OUTCOMES_FILE="${MANIFEST}.outcomes"
 {
   echo
   echo "## Outcomes"
+  # Early host-side failures can skip result finalization entirely; every
+  # selected scenario must still contribute exactly one evidence row.
+  for scenario in "${SELECTED[@]}"; do
+    if [ ! -f "$RESULTS_DIR/$scenario.md" ]; then
+      write_missing_result_evidence "$scenario"
+    fi
+  done
   for scenario in "${SELECTED[@]}"; do
     evidence="$RESULTS_DIR/$scenario.md"
     outcome=$(sed -n 's/^- Result: //p' "$evidence" | head -n 1)
@@ -559,6 +842,30 @@ OUTCOMES_FILE="${MANIFEST}.outcomes"
   fi
 } > "$OUTCOMES_FILE"
 finalize_manifest_status "$manifest_status" "$OUTCOMES_FILE"
+cat "$OUTCOMES_FILE"
+if [ "$failures" -ne 0 ]; then
+  for scenario in "${SELECTED[@]}"; do
+    evidence="$RESULTS_DIR/$scenario.md"
+    if grep -Fqx -- '- Result: failed' "$evidence"; then
+      echo
+      echo "## Failure evidence: $scenario"
+      # Print only collector-authored summary fields. Raw transcripts and
+      # principal phase output remain inside the ephemeral scenario volume.
+      sed -n \
+        -e '/^- Result: /p' \
+        -e '/^- Classification: /p' \
+        -e '/^- Evidence: /p' \
+        "$evidence"
+      if [ -f "$RESULTS_DIR/$scenario.host-failure.md" ]; then
+        sed -n \
+          -e '/^- Phase: /p' \
+          -e '/^- Command category: /p' \
+          -e '/^- Podman exec status: /p' \
+          "$RESULTS_DIR/$scenario.host-failure.md"
+      fi
+    fi
+  done
+fi
 rm -- "$OUTCOMES_FILE"
 OUTCOMES_FILE=""
 write_status "complete" "none" "none" "$((TOTAL - failures)) passed, $failures failed" \

@@ -1,15 +1,18 @@
 #!/bin/bash
 # Adversarial harness for consequence gating. Runs inside the container.
 #
-# Deployment: an UNPRIVILEGED daemon runs as uid 1000 (also the operator); the
-# agent is uid 1001. The operator gate is bypass-resistant precisely because the
-# daemon UID (1000) differs from the agent's (1001): only uid 1000 can approve,
-# confirm, deny, or revert. Approved commands execute as the daemon identity
-# (this is the policy-gate deployment; the root-broker --exec-as-caller variant
-# is exercised in the WSL deployment, where setuid privilege drop is available).
+# Deployment: an unprivileged daemon runs as uid 1000 and the agent is uid
+# 1001. The operator gate is bypass-resistant because operator authority is
+# the admin bearer token: it lives in a root-owned file, the daemon receives it
+# through stdin at startup, and neither uid inherits its value. Approved
+# commands execute as the daemon
+# identity (this is the policy-gate deployment; the root-broker
+# --exec-as-caller variant is exercised in the WSL deployment, where setuid
+# privilege drop is available).
 set -u
 
 SOCK=/run/guard/guard.sock
+ADMIN_TOKEN_FILE=/run/guard/admin.token
 PASS=0
 FAIL=0
 
@@ -19,7 +22,7 @@ bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 # Run a guard command as the unprivileged agent (uid 1001) or the operator (1000).
 agent()    { runuser -u agent       -- "$@"; }
 agent_shim() { runuser -u agent -- env PATH="/shim:/fakebin:/usr/local/bin:/usr/bin:/bin" "$@"; }
-operator() { runuser -u guarddaemon -- "$@"; }
+operator() { runuser -u guarddaemon -- env GUARD_ADMIN_TOKEN_FILE="$ADMIN_TOKEN_FILE" "$@"; }
 
 handle_of() { grep -oE 'handle:[[:space:]]*[0-9a-f]+' "$1" | awk '{print $2}' | head -1; }
 
@@ -27,6 +30,7 @@ echo "=== Setup ==="
 mkdir -p /work /run/guard /var/lib/guard
 mkdir -p /fakebin /shim
 echo "hello" > /work/seed.txt
+printf '%s\n' '---' '- hosts: web' '  gather_facts: false' '  tasks: []' > /work/site.yml
 mkdir -p /work/ansible-project
 printf '[defaults]\ninventory = inventory\n' > /work/ansible-project/ansible.cfg
 printf 'all\n' > /work/ansible-project/inventory
@@ -116,6 +120,8 @@ else
 fi
 
 echo "=== Start unprivileged daemon (uid 1000, gate=consequence, no LLM) ==="
+install -o guarddaemon -g guarddaemon -m 0400 /dev/null "$ADMIN_TOKEN_FILE"
+printf 'gating-operator-token\n' > "$ADMIN_TOKEN_FILE"
 runuser -u guarddaemon -- env PATH="/fakebin:/usr/local/bin:/usr/bin:/bin" GUARD_SWEEPER_GRACE_SECS=2 guard server start \
   --no-llm \
   --gate consequence \
@@ -124,7 +130,8 @@ runuser -u guarddaemon -- env PATH="/fakebin:/usr/local/bin:/usr/bin:/bin" GUARD
   --state-db /var/lib/guard/state.db \
   --shim-dir /shim \
   --users 1001 \
-  >/var/log/guard.log 2>&1 &
+  --admin-token-stdin \
+  < "$ADMIN_TOKEN_FILE" >/var/log/guard.log 2>&1 &
 DAEMON_PID=$!
 
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
@@ -159,9 +166,9 @@ case "$OUT" in
   guarded-ansible-cwd:-m\ ping\ all:/work/ansible-project) ok "ansible shim discovered cwd inventory/config without caller ANSIBLE_CONFIG" ;;
   *) bad "ansible cwd discovery output mismatch: '$OUT'"; cat /tmp/ansible-cwd.err ;;
 esac
-OUT=$(cd /work && agent_shim ansible-playbook site.yml --check --diff --limit web 2>/tmp/playbook-shim.err)
+OUT=$(cd /work && agent_shim ansible-playbook /work/site.yml --check --diff --limit web 2>/tmp/playbook-shim.err)
 case "$OUT" in
-  guarded-ansible-playbook:site.yml\ --check\ --diff\ --limit\ web:/work) ok "ansible-playbook shim honored typed check/diff/limit shape" ;;
+  guarded-ansible-playbook:/work/site.yml\ --check\ --diff\ --limit\ web:/work) ok "ansible-playbook shim honored typed check/diff/limit shape" ;;
   *) bad "ansible-playbook shim output mismatch: '$OUT'"; cat /tmp/playbook-shim.err ;;
 esac
 if cd /work && agent_shim ansible-playbook site.yml >/tmp/playbook-deny.out 2>&1; then
@@ -198,9 +205,9 @@ agent guard verb run stage-file --param path=/work/keep.txt --confirm-within 30 
 HANDLE=$(handle_of /tmp/keep.out)
 if [ -n "$HANDLE" ]; then
   if agent guard confirm "$HANDLE" --socket "$SOCK" >/tmp/agentconfirm.out 2>&1; then
-    bad "agent confirmed its own provisional (should be daemon-UID only)"
+    bad "agent confirmed its own provisional (admin-token only)"
   else
-    ok "agent cannot confirm a provisional (daemon-UID only)"
+    ok "agent cannot confirm a provisional without the admin token"
   fi
   operator guard confirm "$HANDLE" --socket "$SOCK" >/dev/null 2>&1
   sleep 3
@@ -225,17 +232,24 @@ if [ -n "$HHANDLE" ]; then
   if agent guard access approve "$HHANDLE" --once --socket "$SOCK" >/tmp/selfapprove.out 2>&1; then
     bad "agent self-approved an irreversible hold (CRITICAL bypass)"
   else
-    ok "agent self-approve refused (not daemon UID)"
+    ok "agent self-approve refused (no admin token)"
   fi
   [ -d /work/secret ] && ok "target still intact after self-approve attempt" || bad "target destroyed by agent self-approve"
 fi
 
 echo
-echo "=== 6. operator approve executes from the bound snapshot ==="
+echo "=== 6. operator approval arms the bound snapshot; requester resumes it ==="
 if [ -n "$HHANDLE" ]; then
-  operator guard access approve "$HHANDLE" --once --socket "$SOCK" >/tmp/opapprove.out 2>&1
-  sleep 1
-  [ ! -d /work/secret ] && ok "operator approval executed the held action" || { bad "operator approval did not execute"; cat /tmp/opapprove.out; }
+  if operator guard access approve "$HHANDLE" --once --socket "$SOCK" >/tmp/opapprove.out 2>&1; then
+    [ -d /work/secret ] && ok "operator approval armed the hold without executing it" || bad "operator approval executed as the operator"
+  else
+    bad "operator approval did not arm the hold"; cat /tmp/opapprove.out
+  fi
+  if agent guard resume "$HHANDLE" --socket "$SOCK" >/tmp/resume.out 2>&1; then
+    [ ! -d /work/secret ] && ok "requester resumed the approved snapshot" || bad "requester resume did not execute"
+  else
+    bad "requester could not resume the approved snapshot"; cat /tmp/resume.out
+  fi
 fi
 
 echo
@@ -258,7 +272,9 @@ RHANDLE=$(handle_of /tmp/restart.out)
 kill "$DAEMON_PID" 2>/dev/null; wait "$DAEMON_PID" 2>/dev/null
 runuser -u guarddaemon -- env PATH="/fakebin:/usr/local/bin:/usr/bin:/bin" GUARD_SWEEPER_GRACE_SECS=2 guard server start \
   --no-llm --gate consequence --socket "$SOCK" --verbs /etc/guard/verbs.yaml \
-  --state-db /var/lib/guard/state.db --shim-dir /shim --users 1001 >>/var/log/guard.log 2>&1 &
+  --state-db /var/lib/guard/state.db --shim-dir /shim --users 1001 \
+  --admin-token-stdin \
+  < "$ADMIN_TOKEN_FILE" >>/var/log/guard.log 2>&1 &
 DAEMON_PID=$!
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
 chmod 711 "$(dirname "$SOCK")" 2>/dev/null || true

@@ -20,7 +20,7 @@ pub mod fuzzing {
 }
 
 pub use cache::{EvalCache, DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL_SECS};
-pub use config::{EvalConfig, LlmConfig};
+pub use config::{EvalConfig, LlmConfig, DEFAULT_REASONING_EFFORT, REASONING_EFFORT_VALUES};
 pub use redact::redact_for_llm;
 pub use result::{EvalResult, EvalSource, LlmResponse};
 
@@ -31,9 +31,12 @@ use prompt::{
 use verb_confirm::SYSTEM_PROMPT_CONFIRM_VERB_PROMOTION;
 
 use crate::gating::allow_promotion::AllowPromotionStore;
-use crate::gating::deny_shape::{split_command_line, DenyShapeStore};
+use crate::gating::deny_shape::DenyShapeStore;
 use crate::gating::GateMode;
-use crate::learned_rules::{AutoShimMode, LearnedRuleStore, LearningOutcome};
+use crate::learned_rules::{
+    acquire_async_authority_use_lease, run_async_durable_store_operation, AutoShimMode,
+    LearnedRuleStore, LearningOutcome,
+};
 use crate::policy::{PolicyEngine, PolicyMode};
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -42,11 +45,27 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CacheCommandIdentity<'a> {
+    Flat { command: &'a str },
+    Argv { binary: &'a str, args: &'a [String] },
+}
+
+#[derive(serde::Serialize)]
+struct CacheIdentity<'a> {
+    version: u8,
+    command: CacheCommandIdentity<'a>,
+    prompt_context: Option<&'a str>,
+    cache_scope: Option<&'a str>,
+}
+
 /// Build the evaluator decision-cache key.
 ///
 /// The key binds three independent dimensions so a memoized verdict is only
 /// ever served back to an identical request made under identical authority:
-///   - the structured request (`command`, plus daemon-supplied execution
+///   - the request, with structured callers encoded as binary plus exact argv
+///     elements, and daemon-supplied execution
 ///     context such as cwd/env when it is cacheable via `prompt_context`),
 ///   - the caller's authorization scope (`cache_scope`: the authenticated
 ///     principal and the session-grant revision), so a verdict decided for one
@@ -59,17 +78,21 @@ use tokio::sync::RwLock;
 /// not carry a per-principal execution identity.
 fn scoped_cache_key(
     command: &str,
+    structured_command: Option<(&str, &[String])>,
     prompt_context: Option<&str>,
     cache_scope: Option<&str>,
 ) -> String {
-    let request = match prompt_context {
-        Some(context) => format!("{command}\n\n[GUARD EVALUATION CONTEXT]\n{context}"),
-        None => command.to_string(),
+    let command = match structured_command {
+        Some((binary, args)) => CacheCommandIdentity::Argv { binary, args },
+        None => CacheCommandIdentity::Flat { command },
     };
-    match cache_scope {
-        Some(scope) => format!("[GUARD CACHE SCOPE]\n{scope}\n\n{request}"),
-        None => request,
-    }
+    serde_json::to_string(&CacheIdentity {
+        version: 1,
+        command,
+        prompt_context,
+        cache_scope,
+    })
+    .expect("cache identity serializes")
 }
 
 pub struct Evaluator {
@@ -90,6 +113,23 @@ pub struct Evaluator {
     /// a fresh stamp and `server::execute_command_inner` stops trusting
     /// verbs promoted under the old one. See `gating::allow_promotion`.
     verb_promotion_stamp: String,
+}
+
+/// A fresh learned-deny snapshot held through one command-start handoff.
+#[doc(hidden)]
+pub struct LearnedDenyUseLease {
+    lease: Option<crate::learned_rules::AuthorityUseLease<DenyShapeStore>>,
+}
+
+impl LearnedDenyUseLease {
+    #[doc(hidden)]
+    pub fn matching_reason(&self, binary: &str, args: &[String]) -> Option<String> {
+        self.lease.as_ref().and_then(|lease| {
+            lease
+                .matches(binary, args)
+                .map(|shape| shape.last_reason.clone())
+        })
+    }
 }
 
 impl Evaluator {
@@ -184,8 +224,12 @@ impl Evaluator {
             system_prompt
         };
 
-        let http_client = Client::builder()
-            .timeout(config.llm.timeout())
+        let mut http_client = Client::builder().timeout(config.llm.timeout());
+        if let Some(proxy_url) = config.llm.proxy_url.as_deref() {
+            http_client =
+                http_client.proxy(reqwest::Proxy::all(proxy_url).context("invalid LLM proxy URL")?);
+        }
+        let http_client = http_client
             .build()
             .context("failed to create HTTP client")?;
 
@@ -231,6 +275,31 @@ impl Evaluator {
         })
     }
 
+    /// Refresh and lease learned-deny authority for a finite process-start
+    /// handoff. A configured store that cannot be refreshed or leased fails
+    /// closed instead of preserving an earlier allow.
+    #[doc(hidden)]
+    pub async fn lease_learned_deny_for_use(&self) -> anyhow::Result<LearnedDenyUseLease> {
+        let Some(store) = self.deny_shapes.as_ref() else {
+            return Ok(LearnedDenyUseLease { lease: None });
+        };
+        refresh_deny_shapes_once(store).await?;
+        let lease = acquire_async_authority_use_lease(store, "learned deny command start").await?;
+        Ok(LearnedDenyUseLease { lease: Some(lease) })
+    }
+
+    /// Check only explicit operator-authored deny policy for a structured
+    /// command. This is used again at process start so typed authority and
+    /// approved replay cannot bypass a hard static deny.
+    #[doc(hidden)]
+    pub fn static_deny_reason_argv(&self, binary: &str, args: &[String]) -> Option<String> {
+        let command = crate::redact::command_line(binary, args);
+        self.policy_engine
+            .as_ref()?
+            .check_deny_fast_path(&command)
+            .map(|reason| crate::redact::redact_output_text(&reason))
+    }
+
     pub fn mode(&self) -> Option<PolicyMode> {
         self.mode
     }
@@ -269,7 +338,7 @@ impl Evaluator {
         cache_scope: Option<&str>,
         result: EvalResult,
     ) {
-        let key = scoped_cache_key(command, prompt_context, cache_scope);
+        let key = scoped_cache_key(command, None, prompt_context, cache_scope);
         let cached = match result {
             EvalResult::Allow {
                 reason,
@@ -299,10 +368,53 @@ impl Evaluator {
         prompt_context: Option<&str>,
         cache_scope: Option<&str>,
     ) -> Option<EvalResult> {
-        let key = scoped_cache_key(command, prompt_context, cache_scope);
+        let key = scoped_cache_key(command, None, prompt_context, cache_scope);
         let cache = self.cache.as_ref()?;
         let guard = cache.read().await;
         guard.get(&key)
+    }
+
+    #[cfg(test)]
+    async fn seed_scoped_argv_cache_for_test(
+        &self,
+        binary: &str,
+        args: &[String],
+        prompt_context: Option<&str>,
+        cache_scope: Option<&str>,
+        result: EvalResult,
+    ) {
+        let command = crate::redact::command_line(binary, args);
+        let key = scoped_cache_key(&command, Some((binary, args)), prompt_context, cache_scope);
+        let cached = match result {
+            EvalResult::Allow {
+                reason,
+                risk,
+                reversibility,
+                ..
+            } => CachedResult::Allow {
+                reason,
+                risk,
+                reversibility,
+            },
+            EvalResult::Deny { reason, risk, .. } => CachedResult::Deny { reason, risk },
+            EvalResult::Error(_) => return,
+        };
+        if let Some(cache) = &self.cache {
+            cache.write().await.insert(key, cached);
+        }
+    }
+
+    #[cfg(test)]
+    async fn probe_scoped_argv_cache_for_test(
+        &self,
+        binary: &str,
+        args: &[String],
+        prompt_context: Option<&str>,
+        cache_scope: Option<&str>,
+    ) -> Option<EvalResult> {
+        let command = crate::redact::command_line(binary, args);
+        let key = scoped_cache_key(&command, Some((binary, args)), prompt_context, cache_scope);
+        self.cache.as_ref()?.read().await.get(&key)
     }
 
     pub fn learning_enabled(&self) -> bool {
@@ -334,8 +446,14 @@ impl Evaluator {
         let Some(store) = &self.learned_rules else {
             return Ok(None);
         };
-        let mut guard = store.write().await;
-        guard.record_approval(binary, args, command, risk, reason)
+        let binary = binary.to_string();
+        let args = args.to_vec();
+        let command = command.to_string();
+        let reason = reason.to_string();
+        run_async_durable_store_operation(store, "learned approval", move |candidate| {
+            candidate.record_approval(&binary, &args, &command, risk, &reason)
+        })
+        .await
     }
 
     /// Hash of the model + prompts backing verb-promotion decisions. See the
@@ -408,8 +526,9 @@ impl Evaluator {
         prompt_append: Option<&str>,
         reevaluate: bool,
     ) -> EvalResult {
-        self.evaluate_with_reevaluate_inner(command, prompt_append, reevaluate, false, None)
+        self.evaluate_with_reevaluate_inner(command, None, prompt_append, reevaluate, false, None)
             .await
+            .sanitized()
     }
 
     /// Same as `evaluate_with_reevaluate`, but the decision cache is additionally
@@ -435,17 +554,45 @@ impl Evaluator {
     ) -> EvalResult {
         self.evaluate_with_reevaluate_inner(
             command,
+            None,
             prompt_append,
             reevaluate,
             cache_prompt_context,
             cache_scope,
         )
         .await
+        .sanitized()
+    }
+
+    /// Evaluate a structured command. Local text policy receives the display
+    /// form, while cache identity and provider redaction retain binary and argv
+    /// boundaries.
+    pub async fn evaluate_scoped_argv(
+        &self,
+        binary: &str,
+        args: &[String],
+        prompt_append: Option<&str>,
+        reevaluate: bool,
+        cache_prompt_context: bool,
+        cache_scope: Option<&str>,
+    ) -> EvalResult {
+        let command = crate::redact::command_line(binary, args);
+        self.evaluate_with_reevaluate_inner(
+            &command,
+            Some((binary, args)),
+            prompt_append,
+            reevaluate,
+            cache_prompt_context,
+            cache_scope,
+        )
+        .await
+        .sanitized()
     }
 
     async fn evaluate_with_reevaluate_inner(
         &self,
         command: &str,
+        structured_command: Option<(&str, &[String])>,
         prompt_append: Option<&str>,
         reevaluate: bool,
         cache_prompt_context: bool,
@@ -455,7 +602,7 @@ impl Evaluator {
         let cache_blocked_by_prompt = session_prompt_active && !cache_prompt_context;
         let prompt_context = (session_prompt_active && cache_prompt_context)
             .then(|| prompt_append.unwrap_or_default());
-        let cache_key = scoped_cache_key(command, prompt_context, cache_scope);
+        let cache_key = scoped_cache_key(command, structured_command, prompt_context, cache_scope);
 
         // Pre-LLM fast-reject: an explicit deny pattern (or deny-decision
         // group rule) rejects without an LLM call. A command that matches
@@ -483,14 +630,30 @@ impl Evaluator {
         // its only effect is forcing a fresh LLM call, never a grant, since
         // this store can only ever hold shapes the LLM already denied.
         if !reevaluate {
-            if let Some(ref store) = self.deny_shapes {
-                let (binary, args_joined) = split_command_line(command);
-                let hit = {
-                    let guard = store.read().await;
-                    guard
-                        .matches(binary, args_joined)
-                        .map(|shape| shape.last_reason.clone())
-                };
+            if let (Some(store), Some((binary, args))) =
+                (self.deny_shapes.as_ref(), structured_command)
+            {
+                if refresh_deny_shapes_once(store).await.is_err() {
+                    return EvalResult::Deny {
+                        reason: "learned deny authority is unavailable".to_string(),
+                        source: EvalSource::LearnedDeny,
+                        risk: None,
+                    };
+                }
+                let lease =
+                    match acquire_async_authority_use_lease(store, "learned deny decision").await {
+                        Ok(lease) => lease,
+                        Err(_) => {
+                            return EvalResult::Deny {
+                                reason: "learned deny authority is unavailable".to_string(),
+                                source: EvalSource::LearnedDeny,
+                                risk: None,
+                            }
+                        }
+                    };
+                let hit = lease
+                    .matches(binary, args)
+                    .map(|shape| shape.last_reason.clone());
                 if let Some(reason) = hit {
                     tracing::debug!("auto-learned deny shape matched: {}", reason);
                     return EvalResult::Deny {
@@ -522,7 +685,10 @@ impl Evaluator {
                 }
             }
 
-            let result = self.evaluate_llm(command, prompt_append).await;
+            let result = self
+                .evaluate_llm_with_argv(command, structured_command, prompt_append)
+                .await
+                .sanitized();
 
             // Only insert into cache when the verdict was made under the
             // base prompt. Decisions reached with a session-specific prompt
@@ -583,20 +749,88 @@ impl Evaluator {
         }
 
         EvalResult::Deny {
-            reason: "no policy and LLM disabled: default-deny".to_string(),
+            reason: crate::policy::NO_DECIDER_DEFAULT_DENY_REASON.to_string(),
             source: EvalSource::StaticPolicy,
             risk: None,
         }
     }
 }
 
+async fn refresh_deny_shapes_once(store: &Arc<RwLock<DenyShapeStore>>) -> anyhow::Result<()> {
+    run_async_durable_store_operation(store, "learned deny refresh", |candidate| {
+        *candidate = candidate.refreshed_copy()?;
+        Ok(())
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{EvalConfig, EvalResult, EvalSource, Evaluator};
-    use crate::gating::deny_shape::DenyShapeStore;
+    use crate::gating::deny_shape::{canonical_argv, DenyShapeStore};
     use crate::learned_rules::{AutoShimMode, LearnedRuleStore};
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn structured_cache_identity_preserves_every_argv_boundary() {
+        let evaluator =
+            Evaluator::new(EvalConfig::default().llm_enabled(false)).expect("build evaluator");
+        let scope = "principal:fixture:revision:1";
+        let joined = vec!["one two".to_string()];
+        let split = vec!["one".to_string(), "two".to_string()];
+
+        evaluator
+            .seed_scoped_argv_cache_for_test(
+                "fixturectl",
+                &joined,
+                None,
+                Some(scope),
+                EvalResult::Allow {
+                    reason: "joined allow".to_string(),
+                    source: EvalSource::Llm,
+                    risk: Some(1),
+                    reversibility: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            evaluator
+                .probe_scoped_argv_cache_for_test("fixturectl", &joined, None, Some(scope))
+                .await,
+            Some(EvalResult::Allow { .. })
+        ));
+        assert!(evaluator
+            .probe_scoped_argv_cache_for_test("fixturectl", &split, None, Some(scope))
+            .await
+            .is_none());
+
+        evaluator
+            .seed_scoped_argv_cache_for_test(
+                "fixturectl",
+                &split,
+                None,
+                Some(scope),
+                EvalResult::Deny {
+                    reason: "split deny".to_string(),
+                    source: EvalSource::Llm,
+                    risk: Some(7),
+                },
+            )
+            .await;
+        assert!(matches!(
+            evaluator
+                .probe_scoped_argv_cache_for_test("fixturectl", &split, None, Some(scope))
+                .await,
+            Some(EvalResult::Deny { .. })
+        ));
+        assert!(matches!(
+            evaluator
+                .probe_scoped_argv_cache_for_test("fixturectl", &joined, None, Some(scope))
+                .await,
+            Some(EvalResult::Allow { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn evaluate_with_context_session_prompt_does_not_seed_cache() {
@@ -715,7 +949,7 @@ mod tests {
         // matches nothing. Proven here by reaching the LLM stage (which
         // errors for lack of an API key) rather than short-circuiting to a
         // StaticPolicy deny on bare default-deny fallthrough.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("deny-only.yaml");
         std::fs::write(
             &path,
@@ -748,7 +982,7 @@ mod tests {
         // LLM, and allow matches do not skip the LLM either (no LLM-skip
         // glob mechanism is supported while the LLM is enabled -- use
         // `guard verb` for that; see examples/verbs-readonly.yaml).
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("allow-only.yaml");
         std::fs::write(&path, "policy:\n  commands:\n    allow:\n      - \"id\"\n").unwrap();
 
@@ -773,7 +1007,7 @@ mod tests {
         // `guard verb create`, can grant that. With no LLM key configured the
         // call must still reach (and fail in) the LLM path, not short-circuit
         // to an allow from the learned-rule store.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = LearnedRuleStore::load(crate::learned_rules::LearningConfig {
             path: temp.path().join("learned.yaml"),
             min_approvals: 1,
@@ -814,17 +1048,23 @@ mod tests {
         // synthesis LLM call itself is a separate, mocked-free unit boundary
         // covered in gating::deny_shape) and prove the wiring in
         // evaluate_with_context consults it before the LLM path.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(crate::gating::deny_shape::DenyLearningConfig::new(
             temp.path().join("deny.yaml"),
         ))
         .unwrap();
+        let denied_args = vec![
+            "delete".to_string(),
+            "namespace".to_string(),
+            "production".to_string(),
+        ];
+        let denied_evidence = canonical_argv(&denied_args);
         store
             .promote_shape(
                 "kubectl",
                 "kubectl",
-                r"^delete namespace \S+$",
-                &["delete namespace prod".to_string()],
+                &format!("^{}$", regex::escape(&denied_evidence)),
+                &[denied_evidence],
                 "namespace deletion is destructive",
                 3,
             )
@@ -834,7 +1074,10 @@ mod tests {
             Evaluator::new(EvalConfig::default().deny_shapes(Arc::new(RwLock::new(store))))
                 .unwrap();
 
-        match evaluator.evaluate("kubectl delete namespace prod").await {
+        match evaluator
+            .evaluate_scoped_argv("kubectl", &denied_args, None, false, false, None)
+            .await
+        {
             EvalResult::Deny { source, reason, .. } => {
                 assert_eq!(source, EvalSource::LearnedDeny);
                 assert!(reason.contains("namespace deletion is destructive"));
@@ -849,7 +1092,17 @@ mod tests {
         }
 
         // A non-matching command for the same binary must not be affected.
-        match evaluator.evaluate("kubectl get pods").await {
+        match evaluator
+            .evaluate_scoped_argv(
+                "kubectl",
+                &["get".to_string(), "pods".to_string()],
+                None,
+                false,
+                false,
+                None,
+            )
+            .await
+        {
             EvalResult::Error(msg) => assert!(msg.contains("API key")),
             other => {
                 panic!("expected fallthrough to the LLM for a non-matching shape, got {other:?}")
@@ -859,17 +1112,23 @@ mod tests {
 
     #[tokio::test]
     async fn reevaluate_flag_skips_only_the_learned_deny_store() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(crate::gating::deny_shape::DenyLearningConfig::new(
             temp.path().join("deny.yaml"),
         ))
         .unwrap();
+        let denied_args = vec![
+            "delete".to_string(),
+            "namespace".to_string(),
+            "production".to_string(),
+        ];
+        let denied_evidence = canonical_argv(&denied_args);
         store
             .promote_shape(
                 "kubectl",
                 "kubectl",
-                r"^delete namespace \S+$",
-                &["delete namespace prod".to_string()],
+                &format!("^{}$", regex::escape(&denied_evidence)),
+                &[denied_evidence],
                 "namespace deletion is destructive",
                 3,
             )
@@ -883,7 +1142,7 @@ mod tests {
         .unwrap();
 
         match evaluator
-            .evaluate_with_reevaluate("kubectl delete namespace prod", None, false)
+            .evaluate_scoped_argv("kubectl", &denied_args, None, false, false, None)
             .await
         {
             EvalResult::Deny { source, .. } => assert_eq!(source, EvalSource::LearnedDeny),
@@ -894,7 +1153,7 @@ mod tests {
         // disabled and no policy engine, the fallback is a bare default-deny
         // (StaticPolicy), proving the learned-deny check was bypassed.
         match evaluator
-            .evaluate_with_reevaluate("kubectl delete namespace prod", None, true)
+            .evaluate_scoped_argv("kubectl", &denied_args, None, true, false, None)
             .await
         {
             EvalResult::Deny { source, reason, .. } => {
@@ -903,5 +1162,58 @@ mod tests {
             }
             other => panic!("expected reevaluate to skip the learned-deny store, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn learned_deny_refresh_does_not_block_tokio_workers_or_hold_the_async_guard() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let path = temp.path().join("deny.yaml");
+        let store = DenyShapeStore::load(crate::gating::deny_shape::DenyLearningConfig::new(
+            path.clone(),
+        ))
+        .unwrap();
+        let evaluator = Evaluator::new(
+            EvalConfig::default()
+                .llm_enabled(false)
+                .deny_shapes(Arc::new(RwLock::new(store))),
+        )
+        .unwrap();
+        let acquired = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let locked_path = path.clone();
+        let lock_thread = {
+            let acquired = acquired.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                crate::learned_rules::hold_learning_file_lock_for_test(
+                    &locked_path,
+                    &acquired,
+                    &release,
+                );
+            })
+        };
+        acquired.wait();
+
+        let attempted =
+            crate::learned_rules::observe_authority_snapshot_attempt_for_test(path.clone());
+        let evaluation = tokio::spawn(async move {
+            evaluator
+                .evaluate_scoped_argv(
+                    "fixturectl",
+                    &["status".to_string()],
+                    None,
+                    false,
+                    false,
+                    None,
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || attempted.recv())
+            .await
+            .unwrap()
+            .expect("evaluation reached durable authority snapshot acquisition");
+        release.wait();
+        let _ = evaluation.await.unwrap();
+        lock_thread.join().unwrap();
     }
 }

@@ -1,11 +1,11 @@
-# Verb catalog: the operator-authored, typed interface agents call via
+# Unix verb catalog: the operator-authored, typed interface agents call via
 # `guard verb`, instead of raw shell. Load with:
 #
 #   guard server start --gate consequence --socket /run/guard/guard.sock \
 #       --verbs /etc/guard/verbs.yaml
 #
-# The catalog is the "slow clock": only the operator (daemon UID) edits this
-# file, and it is hot-reloaded on change. Agents cannot add or alter verbs.
+# The catalog is the "slow clock": only an operator-owned deployment path edits
+# this file, and it is hot-reloaded on change. Agents cannot add or alter verbs.
 #
 # Each verb names a fixed binary and an argv template. `{param}` placeholders are
 # substituted as exactly one argv element (no shell, no word-splitting), so
@@ -28,6 +28,7 @@
 # coverage cells. A cell that does not match has no effect. Use
 # `baseline: false` for a capability that only a session `--verb` activates.
 
+platform: unix
 verbs:
   # Baseline Ansible policy. Check mode is preauthorized for at most two
   # explicitly limited hosts. Apply mode always reaches the evaluator unless
@@ -44,7 +45,7 @@ verbs:
         required_args: ["--check"]
         inventory:
           options: ["-i", "--inventory"]
-          values: ["inventory/production"]
+          values: ["/srv/guard/inventory/production"]
         fanout:
           options: ["--limit"]
           max: 2
@@ -53,7 +54,7 @@ verbs:
         forbidden_args: ["--check"]
         inventory:
           options: ["-i", "--inventory"]
-          values: ["inventory/production"]
+          values: ["/srv/guard/inventory/production"]
         fanout:
           options: ["--limit"]
           max: 1
@@ -67,7 +68,7 @@ verbs:
     credential_plan: ansible-managed-ssh
     revert:
       binary: ansible-playbook
-      args: ["rollback-host-a.yml", "-i", "inventory/production", "--limit", "host-a"]
+      args: ["/srv/guard/playbooks/rollback-host-a.yml", "-i", "/srv/guard/inventory/production", "--limit", "host-a"]
     trusted: true
     coverage:
       - name: host-a-apply
@@ -78,7 +79,7 @@ verbs:
           values: ["host-a"]
         inventory:
           options: ["-i", "--inventory"]
-          values: ["inventory/production"]
+          values: ["/srv/guard/inventory/production"]
         fanout:
           options: ["--limit"]
           values: ["host-a"]

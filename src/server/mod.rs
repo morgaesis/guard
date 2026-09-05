@@ -19,10 +19,14 @@ use guard::gating::approval::ApprovalRegistry;
 use guard::gating::provisional::ProvisionalRegistry;
 use guard::gating::read_grant::GrantReadRegistry;
 use guard::gating::ssh_readonly::{
-    command_tokens, is_fixed_readonly_diagnostic, ssh_options_all_readonly_safe,
+    command_tokens, is_fixed_readonly_diagnostic, ssh_argument_boundaries,
+    ssh_options_all_readonly_safe,
 };
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
+use guard::learned_rules::{
+    acquire_async_authority_use_lease, run_async_durable_store_operation, AuthorityUseLease,
+};
 use guard::policy::PolicyMode;
 use guard::principal::PrincipalKey;
 
@@ -99,19 +103,20 @@ pub(crate) use runtime::CommandAdmissionConfig;
 #[cfg(windows)]
 pub(crate) use transport::winplat;
 pub use transport::Server;
-#[cfg(test)]
-pub(crate) use wire::AccessCapability;
 pub use wire::{
-    AccessDecisionResult, AccessItem, AccessRequestGuidance, AdminRequest, AdminResponse,
-    CommandSpec, ExecuteRequest, ExecuteResponse, GateStatus, OutputStream, RevertSpec,
-    SshHostKeyMode, VerbInvocation, VerbMatchInfo, VerbSummary,
+    grant_class_wait_refusal, parse_approval_wait_secs, AccessCapability, AccessDecisionResult,
+    AccessItem, AccessRequestGuidance, AdminRequest, AdminResponse, ApprovalSummary, CommandSpec,
+    ContainmentFailure, ContainmentFailureKind, ExecuteRequest, ExecuteResponse, GateStatus,
+    OutputStream, ProvisionalSummary, RevertSpec, SshHostKeyMode, VerbInvocation, VerbMatchInfo,
+    VerbMenuItem, VerbSummary, CAPABILITY_ACCESS_WHOAMI_V1, CAPABILITY_REQUESTER_VERB_SHOW_V1,
+    CONSEQUENCE_ARM, CONSEQUENCE_GRANT, CONSEQUENCE_RELEASE,
 };
 pub(crate) use wire::{
     ExecuteStreamMessage, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_FEATURE_TCP_NO_CWD,
     EXECUTE_PROTOCOL_VERSION,
 };
 
-use execute::{audit_command_line, audit_session_fingerprint};
+use execute::audit_session_fingerprint;
 use guard::audit::{AuditEvent, AuditKind};
 use wire::CallerIdentity;
 
@@ -134,6 +139,10 @@ pub(crate) struct ServerConfig {
     pub(crate) redact: bool,
     pub(crate) auth_token: Option<String>,
     pub(crate) admin_token: Option<String>,
+    /// Permit tokenless operator RPCs from a kernel-authenticated Windows
+    /// SYSTEM named-pipe peer. This is enabled only for the packaged Windows
+    /// service, whose operator wrapper runs in a transient SYSTEM task.
+    pub(crate) allow_windows_system_operator: bool,
     /// Unix-socket transport option; carried but never read on Windows.
     #[cfg_attr(windows, allow(dead_code))]
     pub(crate) socket_group: Option<String>,
@@ -154,18 +163,26 @@ pub(crate) struct ServerConfig {
     /// When true, approved Unix-socket requests execute as the connecting
     /// user instead of the daemon UID.
     pub(crate) exec_as_caller: bool,
+    /// Default wall-clock limit for brokered child execution. Zero preserves
+    /// unbounded execution unless a matched verb supplies an override.
+    pub(crate) exec_timeout_secs: u64,
     /// Wall-clock unix seconds when the daemon started. Surfaced via the
     /// Status admin RPC so callers can compute uptime.
     pub(crate) started_at_unix: u64,
-    /// Effective UID of the daemon process. Admin RPCs require the
-    /// caller to be this UID; there is no token-based elevation.
+    /// Effective UID of the daemon process. This identifies daemon-owned state
+    /// and the default child execution identity; it grants no admin authority.
     pub(crate) daemon_uid: u32,
     /// The daemon's own cross-platform principal: its uid on Unix, its process
-    /// SID on Windows. Operator/admin RPCs require the caller's principal to
-    /// equal this - the single "is the operator" source of truth on both
-    /// platforms.
+    /// SID on Windows. This principal owns internal state and proxy-generated
+    /// records but grants no admin authority.
     pub(crate) daemon_principal: PrincipalKey,
     pub(crate) state_db_path: Option<PathBuf>,
+    /// Canonical directory containing Guard's durable daemon state. Commands
+    /// may never read from it, independent of optional preflight checks.
+    pub(crate) state_dir: Option<PathBuf>,
+    /// Canonical operator verb catalog path, including catalogs outside the
+    /// state directory. It is protected as authorization material.
+    pub(crate) verb_catalog_path: Option<PathBuf>,
     /// Consequence-gating mode. `Off` preserves legacy behavior; `Consequence`
     /// routes LLM-approved commands by reversibility.
     pub(crate) gate: GateMode,
@@ -217,6 +234,7 @@ impl Default for ServerConfig {
             redact: false,
             auth_token: None,
             admin_token: None,
+            allow_windows_system_operator: false,
             socket_group: None,
             allowed_uids: None,
             shim_dir: None,
@@ -225,10 +243,13 @@ impl Default for ServerConfig {
             redact_secrets: Vec::new(),
             preflight: false,
             exec_as_caller: false,
+            exec_timeout_secs: 0,
             started_at_unix: guard::env::now_unix(),
             daemon_uid: current_uid(),
             daemon_principal: resolve_daemon_principal(),
             state_db_path: None,
+            state_dir: None,
+            verb_catalog_path: None,
             // Gating defaults to off; the daemon entrypoint enables it and
             // populates the registries from persisted state before serving.
             gate: GateMode::Off,
@@ -254,18 +275,32 @@ impl Default for ServerConfig {
 /// shared, so cloning the state clones handles, not contents.
 #[derive(Clone)]
 struct ServerState {
+    /// Keeps daemon-configured exact literals registered only for this daemon
+    /// instance. Per-command values remain scoped to their execution context.
+    _trusted_exact_secret_scope: guard::redact::TrustedExactSecretScope,
     evaluator: Arc<Evaluator>,
     secrets: Arc<SecretManager>,
     tool_registry: Arc<RwLock<ToolRegistry>>,
     /// Session grant registry. Grants here extend or narrow the policy
     /// decision for a specific session token.
     sessions: Arc<RwLock<SessionRegistry>>,
+    #[cfg(test)]
+    session_publication_events: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    session_transition_attempt_events: Arc<tokio::sync::Semaphore>,
     session_store: Option<SessionStore>,
     /// Shared task-ownership guard. Cloned contexts can start session
     /// maintenance at most once for this daemon instance.
     session_maintenance_started: Arc<AtomicBool>,
     /// Containment-envelope state (recoverable provisionals).
     provisional: Arc<RwLock<ProvisionalRegistry>>,
+    /// Serializes durable transitions for the same provisional handle without
+    /// coupling unrelated containment lifecycles through storage latency.
+    provisional_transition_gates: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+        >,
+    >,
     /// Operator-approval state (held irreversible commands).
     approvals: Arc<RwLock<ApprovalRegistry>>,
     /// Operator-authored verb catalog (the typed, least-expressive interface).
@@ -277,9 +312,9 @@ struct ServerState {
     saved_grants: Arc<RwLock<SavedGrantCatalog>>,
     /// Durable requests to amend a live or saved grant.
     grant_requests: Arc<RwLock<std::collections::BTreeMap<String, GrantRequest>>>,
-    /// Serializes terminal transitions so memory and durable state observe one
-    /// winner for approve, deny, and withdraw races.
-    grant_request_transition_gate: Arc<Mutex<()>>,
+    /// Serializes session-bound hold publication and grant-request terminal
+    /// transitions so revocation has one authority winner in this daemon.
+    authority_transition_gate: Arc<Mutex<()>>,
     /// Optional API proxies hosted alongside the gate socket. When set,
     /// the daemon terminates brokered clients' TLS, gates each API operation
     /// against the operator policy, and re-originates to the upstream with the
@@ -319,19 +354,27 @@ impl ServerState {
         session_store: Option<SessionStore>,
     ) -> Self {
         Self {
+            _trusted_exact_secret_scope: guard::redact::TrustedExactSecretScope::default(),
             evaluator: Arc::new(evaluator),
             secrets: Arc::new(secrets),
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             sessions: Arc::new(RwLock::new(sessions)),
+            #[cfg(test)]
+            session_publication_events: Arc::new(tokio::sync::Semaphore::new(0)),
+            #[cfg(test)]
+            session_transition_attempt_events: Arc::new(tokio::sync::Semaphore::new(0)),
             session_store,
             session_maintenance_started: Arc::new(AtomicBool::new(false)),
             provisional: Arc::new(RwLock::new(ProvisionalRegistry::new())),
+            provisional_transition_gates: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             approvals: Arc::new(RwLock::new(ApprovalRegistry::new())),
             verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
             verb_previews: Arc::new(RwLock::new(admin::VerbPreviewCache::default())),
             saved_grants: Arc::new(RwLock::new(SavedGrantCatalog::empty())),
             grant_requests: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
-            grant_request_transition_gate: Arc::new(Mutex::new(())),
+            authority_transition_gate: Arc::new(Mutex::new(())),
             protocol_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
             api_coverage: None,
             read_grants: Arc::new(RwLock::new(GrantReadRegistry::new())),
@@ -355,6 +398,33 @@ struct ServerContext {
     state: ServerState,
 }
 
+impl ServerContext {
+    fn redact_command_line(&self, binary: &str, args: &[String]) -> String {
+        let secrets = self
+            .config
+            .redact_secrets
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        guard::redact::redact_command_line_with_exact_secrets(binary, args, &secrets)
+    }
+
+    fn provisional_transition_gate(&self, handle: &str) -> Arc<Mutex<()>> {
+        let mut gates = self
+            .state
+            .provisional_transition_gates
+            .lock()
+            .expect("provisional transition gate registry is not poisoned");
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(handle).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(handle.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+}
+
 /// Per-request execution context threaded from the policy layer into gate
 /// routing and process spawn: the daemon context, the authenticated caller,
 /// the recursion depth, and the client output stream.
@@ -367,7 +437,70 @@ struct RequestContext<'a, W> {
 }
 
 impl ServerContext {
-    pub(super) fn emit_event(&self, event: runtime::NotifyEvent) {
+    async fn mutate_verb_catalog<T, F>(&self, task: &'static str, mutation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut VerbCatalog) -> Result<T> + Send + 'static,
+    {
+        run_async_durable_store_operation(&self.state.verbs, task, mutation).await
+    }
+
+    async fn refresh_verb_catalog_for_decision(&self) -> Result<()> {
+        run_async_durable_store_operation(&self.state.verbs, "verb catalog refresh", |candidate| {
+            *candidate = candidate.refreshed_copy()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn lease_verb_catalog_for_use(
+        &self,
+        task: &'static str,
+    ) -> Result<AuthorityUseLease<VerbCatalog>> {
+        let lease = acquire_async_authority_use_lease(&self.state.verbs, task).await?;
+        #[cfg(all(test, unix))]
+        let hook = verb_authority_lease_hooks()
+            .lock()
+            .unwrap()
+            .remove(&(Arc::as_ptr(&self.state.verbs) as usize, task));
+        #[cfg(all(test, unix))]
+        if let Some((acquired, release)) = hook {
+            acquired.add_permits(1);
+            release.acquire().await?.forget();
+        }
+        Ok(lease)
+    }
+
+    async fn refresh_and_lease_verb_catalog_for_use(
+        &self,
+        task: &'static str,
+    ) -> Result<AuthorityUseLease<VerbCatalog>> {
+        self.refresh_verb_catalog_for_decision().await?;
+        self.lease_verb_catalog_for_use(task).await
+    }
+
+    pub(super) fn emit_event(&self, mut event: runtime::NotifyEvent) {
+        let secrets = self
+            .config
+            .redact_secrets
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        for value in [
+            &mut event.handle,
+            &mut event.session_fingerprint,
+            &mut event.requester_principal,
+            &mut event.reason,
+            &mut event.status,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *value = guard::redact::redact_exact_and_registered_secrets(value, &secrets);
+        }
+        if let Some(behavior) = event.behavior.as_mut() {
+            guard::redact::redact_json_exact_secrets(behavior, &secrets);
+        }
         if let Some(hook) = &self.state.notify_hook {
             hook.emit(event);
         }
@@ -376,11 +509,9 @@ impl ServerContext {
     #[cfg(unix)]
     fn validate_uid(&self, uid: u32) -> Result<()> {
         if let Some(ref allowed) = self.config.allowed_uids {
-            // The daemon's own UID is always permitted to connect: it
-            // already controls the daemon process (signals, /proc), so
-            // this is not a security boundary. Without this exemption
-            // the daemon could not run admin RPCs against itself, which
-            // breaks self-management.
+            // The daemon's own UID is always permitted to connect: it already
+            // controls the daemon process (signals, /proc), so connection
+            // admission is not an operator-authority boundary.
             if !allowed.contains(&uid) && uid != self.config.daemon_uid {
                 tracing::warn!("connection rejected: uid {} not in allowed list", uid);
                 anyhow::bail!("connection not allowed for this user");
@@ -389,27 +520,32 @@ impl ServerContext {
         Ok(())
     }
 
-    /// Authorize an admin RPC. A local operator is the daemon identity, plus
-    /// the kernel-authenticated SYSTEM principal on Windows so an elevated
-    /// installer task can perform operator actions through the named pipe.
-    /// Unix peers receive no equivalent root exception. TCP administration
-    /// remains restricted to the separately authenticated TcpAdmin transport.
+    /// Authorize an admin RPC. Unix and foreground Windows operator authority
+    /// is represented by the admin bearer identity. The packaged Windows
+    /// service instead accepts kernel-authenticated SYSTEM so an elevated
+    /// installer task can perform operator actions through the named pipe; the
+    /// daemon service SID receives no matching exception. TCP administration
+    /// remains restricted to the separate admin bearer.
     /// Without this rule, an exec-allowed agent process could mint
     /// sessions whose `--prompt` overrides the LLM policy from itself.
     fn validate_admin(&self, caller: &CallerIdentity) -> Result<()> {
         if self.caller_is_admin(caller) {
             return Ok(());
         }
-        anyhow::bail!(
-            "admin RPC refused: caller is not the daemon principal or Windows SYSTEM operator"
-        );
+        anyhow::bail!("admin RPC refused: caller lacks operator authority");
     }
 
     fn caller_is_admin(&self, caller: &CallerIdentity) -> bool {
-        (caller.is_local_peer()
-            && matches!(caller.principal(), Some(ref p) if self.config.daemon_principal.eq_ci(p)))
-            || caller.is_windows_system_operator()
-            || matches!(caller, CallerIdentity::TcpAdmin { .. })
+        // Operator authority is the admin bearer identity or, only when the
+        // packaged boundary is enabled, the Windows SYSTEM SID. The daemon's
+        // own uid or service SID grants nothing: brokered children inherit the
+        // daemon identity in the default model and must not inherit its
+        // operator surface with it.
+        (self.config.allow_windows_system_operator && caller.is_windows_system_operator())
+            || matches!(
+                caller,
+                CallerIdentity::TcpAdmin { .. } | CallerIdentity::UnixAdmin { .. }
+            )
     }
 
     fn validate_token(&self, token: Option<&str>) -> Result<()> {
@@ -437,6 +573,13 @@ impl ServerContext {
     /// append; callers gating auditable actions must then fail closed.
     #[must_use]
     pub(super) fn emit_audit(&self, event: AuditEvent) -> bool {
+        let secrets = self
+            .config
+            .redact_secrets
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let event = event.redact_exact_secrets(&secrets);
         guard::audit::emit(self.state.audit.as_deref(), &event)
     }
 
@@ -472,7 +615,7 @@ impl ServerContext {
             AuditEvent::new(kind)
                 .caller(caller)
                 .session_fingerprint(audit_session_fingerprint(session_token))
-                .cmd(audit_command_line(binary, args))
+                .cmd(self.redact_command_line(binary, args))
                 .reason(reason),
         )
     }
@@ -523,10 +666,37 @@ impl ServerContext {
             AuditEvent::new(AuditKind::ExecFailed)
                 .caller(caller)
                 .session_fingerprint(audit_session_fingerprint(session_token))
-                .cmd(audit_command_line(binary, args))
+                .cmd(self.redact_command_line(binary, args))
                 .reason(reason),
         );
     }
+}
+
+#[cfg(all(test, unix))]
+type VerbAuthorityLeaseHook = (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>);
+
+#[cfg(all(test, unix))]
+fn verb_authority_lease_hooks() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<(usize, &'static str), VerbAuthorityLeaseHook>,
+> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<(usize, &'static str), VerbAuthorityLeaseHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(all(test, unix))]
+fn pause_verb_authority_lease_for_test(
+    server: &ServerContext,
+    task: &'static str,
+) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+    let acquired = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    verb_authority_lease_hooks().lock().unwrap().insert(
+        (Arc::as_ptr(&server.state.verbs) as usize, task),
+        (acquired.clone(), release.clone()),
+    );
+    (acquired, release)
 }
 
 /// The daemon's own principal: its uid on Unix, its process SID on Windows.
@@ -545,7 +715,7 @@ pub fn resolve_daemon_principal() -> PrincipalKey {
             Ok(sid) => PrincipalKey::from_sid(sid),
             Err(e) => {
                 tracing::error!(
-                    "daemon SID resolution failed ({e}); operator approval disabled (fail-closed)"
+                    "daemon SID resolution failed ({e}); daemon-principal isolation is fail-closed"
                 );
                 PrincipalKey::from_raw("\u{0}daemon-sid-unresolved\u{0}")
             }
@@ -554,8 +724,7 @@ pub fn resolve_daemon_principal() -> PrincipalKey {
 }
 
 /// Read the daemon's effective UID on Unix. Windows has no Unix UID; TCP
-/// callers are represented separately and cannot satisfy daemon-UID admin
-/// checks.
+/// callers are represented separately.
 #[cfg(unix)]
 fn current_uid() -> u32 {
     unsafe { libc::geteuid() as u32 }
@@ -679,6 +848,71 @@ fn binary_path_candidates(dir: &std::path::Path, binary: &str) -> Vec<PathBuf> {
     }
 }
 
+fn command_references_configured_path(
+    command: &str,
+    path: &std::path::Path,
+    directory: bool,
+) -> bool {
+    let command = command.replace('\\', "/").to_ascii_lowercase();
+    let path = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if path.is_empty() {
+        return false;
+    }
+    command.match_indices(&path).any(|(start, matched)| {
+        let before = command[..start].chars().next_back();
+        let after = command[start + matched.len()..].chars().next();
+        let boundary = |character: Option<char>| {
+            character.is_none_or(|character| {
+                character.is_ascii_whitespace()
+                    || matches!(
+                        character,
+                        '\'' | '"'
+                            | '='
+                            | ':'
+                            | ';'
+                            | ','
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '<'
+                            | '>'
+                            | '|'
+                            | '&'
+                    )
+            })
+        };
+        boundary(before) && (boundary(after) || (directory && after == Some('/')))
+    })
+}
+
+fn configured_credential_path_deny_reason(
+    binary: &str,
+    args: &[String],
+    state_dir: Option<&std::path::Path>,
+    verb_catalog_path: Option<&std::path::Path>,
+) -> Option<String> {
+    let command = if args.is_empty() {
+        binary.to_string()
+    } else {
+        format!("{} {}", binary, args.join(" "))
+    };
+    let references_state =
+        state_dir.is_some_and(|path| command_references_configured_path(&command, path, true));
+    let references_catalog = verb_catalog_path
+        .is_some_and(|path| command_references_configured_path(&command, path, false));
+    (references_state || references_catalog).then(|| {
+        "credential preflight denied: command references Guard state or verb catalog material"
+            .to_string()
+    })
+}
+
 fn deterministic_credential_deny_reason(binary: &str, args: &[String]) -> Option<String> {
     let command = if args.is_empty() {
         binary.to_string()
@@ -709,18 +943,33 @@ fn deterministic_credential_deny_reason(binary: &str, args: &[String]) -> Option
         );
     }
 
-    if lower.contains("/etc/default/guard")
-        || lower.contains("/var/lib/guard/.ssh/")
-        || lower.contains("/var/lib/guard/.kube/config")
-        || lower.contains("/.ssh/id_")
-        || lower.contains("~/.ssh/id_")
-        || lower.contains("/.kube/config")
-        || lower.contains("~/.kube/config")
-        || lower.contains("/.aws/credentials")
-        || lower.contains("~/.aws/credentials")
-        || lower.contains("/.env")
-        || tokens.iter().any(|token| token == ".env")
-    {
+    let references_credential_material = |text: &str, text_tokens: &[String]| {
+        text.contains("/etc/default/guard")
+            || text.contains("/var/lib/guard/.ssh/")
+            || text.contains("/var/lib/guard/.kube/config")
+            || text.contains("/.ssh/id_")
+            || text.contains("~/.ssh/id_")
+            || text.contains("/.kube/config")
+            || text.contains("~/.kube/config")
+            || text.contains("/.aws/credentials")
+            || text.contains("~/.aws/credentials")
+            || text.contains("/.env")
+            || text_tokens.iter().any(|token| token == ".env")
+    };
+    if references_credential_material(&lower, &tokens) {
+        if binary.eq_ignore_ascii_case("ssh") {
+            let boundaries = ssh_argument_boundaries(args);
+            if let Some(command_start) = boundaries.command_start {
+                let remote = args[command_start..].join(" ").to_ascii_lowercase();
+                let remote_tokens = command_tokens(&remote);
+                if references_credential_material(&remote, &remote_tokens) {
+                    return Some(
+                        "credential preflight denied: SSH remote command references credential material on the remote host"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         return Some(
             "credential preflight denied: command references credential material".to_string(),
         );
@@ -777,15 +1026,27 @@ fn dangerous_env_name(key: &str) -> bool {
             | "ENV"
             | "LD_PRELOAD"
             | "LD_LIBRARY_PATH"
+            | "LD_ORIGIN_PATH"
+            | "LD_PROFILE"
+            | "LD_PROFILE_OUTPUT"
             | "DYLD_INSERT_LIBRARIES"
             | "DYLD_LIBRARY_PATH"
+            | "GCONV_PATH"
+            | "GLIBC_TUNABLES"
             | "PYTHONPATH"
             | "PYTHONHOME"
             | "PYTHONSTARTUP"
             | "RUBYOPT"
+            | "RUBYLIB"
+            | "GEM_HOME"
+            | "GEM_PATH"
             | "NODE_OPTIONS"
             | "PERL5OPT"
             | "PERL5LIB"
+            | "PERL5DB"
+            | "CLASSPATH"
+            | "TCL_LIBRARY"
+            | "TK_LIBRARY"
             | "GIT_CONFIG"
             | "GIT_CONFIG_GLOBAL"
             | "GIT_CONFIG_SYSTEM"
@@ -793,6 +1054,23 @@ fn dangerous_env_name(key: &str) -> bool {
             | "GIT_SSH_COMMAND"
             | "SSH_AUTH_SOCK"
             | "SSH_ASKPASS"
+            // Pager/editor/filter hooks are shell-outs, not viewers: a value
+            // under any of these names is code the child would execute.
+            | "PAGER"
+            | "GIT_PAGER"
+            | "MANPAGER"
+            | "EDITOR"
+            | "VISUAL"
+            | "GIT_EDITOR"
+            | "SUDO_EDITOR"
+            | "LESSOPEN"
+            | "LESSCLOSE"
+            | "LESSPIPE"
+            | "VIMINIT"
+            | "EXINIT"
+            | "JAVA_TOOL_OPTIONS"
+            | "_JAVA_OPTIONS"
+            | "JDK_JAVA_OPTIONS"
     ) || upper.starts_with("LD_AUDIT")
         || upper.starts_with("GIT_CONFIG_KEY_")
         || upper.starts_with("GIT_CONFIG_VALUE_")
@@ -841,23 +1119,7 @@ fn deterministic_safe_allow_reason(
 }
 
 fn is_valid_secret_key(value: &str) -> bool {
-    if value.is_empty()
-        || value.contains('\0')
-        || value.starts_with('/')
-        || value.ends_with('/')
-        || value.contains("//")
-    {
-        return false;
-    }
-
-    value.split('/').all(|part| {
-        !part.is_empty()
-            && part != "."
-            && part != ".."
-            && part
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-    })
+    crate::session::CredentialReference::is_valid_store_name(value)
 }
 
 fn invalid_shell_secret_reference(

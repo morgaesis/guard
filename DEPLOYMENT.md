@@ -26,9 +26,11 @@ The principal split is mandatory:
 - The agent principal can connect to Guard and receives only non-authoritative
   request and session references. Approved command authority remains in daemon
   state and is bound automatically to the authenticated requester.
-- The operator principal is the daemon uid on Unix. On Windows, the daemon
-  service SID and the kernel-authenticated local SYSTEM SID can perform operator
-  RPCs; the installer runs elevated operator actions as SYSTEM.
+- On Unix, the operator principal holds the admin bearer token from the
+  root-held token file. The packaged Windows service instead accepts only
+  kernel-authenticated local SYSTEM on its named pipe and rejects an admin
+  bearer. The daemon's own uid or Windows service SID never grants operator
+  authority, so a brokered child cannot approve its own work.
 
 An agent that can read daemon credentials or reach the same upstream directly
 can bypass Guard.
@@ -64,6 +66,9 @@ install -m 0755 guard /usr/local/bin/guard
 install -o root -g root -m 0755 deployment/systemd/guard-operator /usr/local/sbin/guard-operator
 install -m 0644 deployment/systemd/guard.service /etc/systemd/system/
 install -m 0600 deployment/systemd/guard.env.example /etc/default/guard
+# Provision the admin token (root-held, root:root 0400) before the first start.
+install -m 0400 -o root -g root /dev/null /etc/guard/admin.token
+openssl rand -hex 32 > /etc/guard/admin.token
 # Edit /etc/default/guard before the first start.
 systemctl daemon-reload
 systemctl enable --now guard.service
@@ -121,10 +126,23 @@ Wide access raises the cost of instruction defects, so pair it with:
 Consequence gating adds holds for the irreversible tail once enabled; keep
 holds exceptional so each one gets real operator attention.
 
-Administrative RPCs authenticate the daemon uid, not the interactive operator's
-uid. Run them through the root-owned wrapper. It uses the `guard` account for
-the standard unit and root for the exec-as-caller unit, and refuses to run when
-both or neither packaged service is active:
+Administrative RPCs authenticate the admin bearer token, never a uid. The
+daemon's own uid grants no operator authority: brokered children inherit that
+uid and must not inherit its command surface. The token reaches the daemon
+only through stdin at startup (`StandardInput=file:` opens the root-held file
+as root and hands over the descriptor), so it never enters the daemon's
+environment, argv, or any file its children can read.
+
+Provision the token file once, as `root:root` mode `0400`:
+
+```bash
+install -m 0400 -o root -g root /dev/null /etc/guard/admin.token
+openssl rand -hex 32 > /etc/guard/admin.token
+```
+
+Run operator RPCs through the root-owned wrapper, which reads the token and
+presents it, and refuses to run when both or neither packaged service is
+active:
 
 ```bash
 sudo guard-operator access list
@@ -139,7 +157,10 @@ sudo guard-operator revert <provisional>
 ```
 
 On a console, `access approve` reviews each request interactively before
-deciding; add `--yes` for unattended runs.
+deciding; add `--yes` for unattended runs. `GUARD_ADMIN_TOKEN` in the
+daemon's own environment is supported for development only: a brokered child
+can read the daemon's `/proc/<pid>/environ`, so production daemons must take
+the token from stdin.
 
 Restrict `sudo` access to `/usr/local/sbin/guard-operator` to human operator
 accounts. Access to the wrapper grants the full daemon-principal command surface.
@@ -167,6 +188,9 @@ uses a transient Task Scheduler task under SYSTEM, whose authenticated named-pip
 SID Guard recognizes as a Windows operator. The interactive agent connects
 under its own SID and cannot satisfy this check or read daemon state.
 `--exec-as-caller` is unavailable; approved children run as the service account.
+Service mode requires exactly one named-pipe listener and rejects
+`GUARD_ADMIN_TOKEN` and `--admin-token-stdin`, so a brokered service child
+cannot inherit or recover operator authority.
 
 The installer maps explicit PowerShell actions to the Guard CLI and runs them as
 SYSTEM. Access requests use exact `gr-` plus 32-hex references. Provisionals use
@@ -207,10 +231,13 @@ time without following reparse points; any nested junction or link aborts the
 operation before that object is given administrative ownership or access.
 
 The stock named-pipe DACL permits authenticated local users to connect. Guard
-keeps those users separate by their kernel-authenticated SIDs and reserves
-administrative RPCs for the service SID and SYSTEM, but the installer does not
-configure a single-client-SID pipe DACL. This is local principal isolation, not
-exclusive pipe reachability. Use the stock installer only on a host where
+keeps those users separate by their kernel-authenticated SIDs. The packaged
+service reserves administrative RPCs for local SYSTEM, and the daemon service
+SID is not an operator. Guard clients explicitly request identification-level
+pipe security, which exposes their identity to the server without letting the
+server impersonate them. The installer does not configure a single-client-SID
+pipe DACL. This is local principal isolation, not exclusive pipe reachability.
+Use the stock installer only on a host where
 authenticated local accounts are inside the submission boundary, or isolate the
 agent in its own Windows host or VM.
 
@@ -222,9 +249,9 @@ admin envelope accepts only the current operation and field grammar, so removed
 or malformed authority operations fail closed instead of selecting a
 compatibility path.
 
-The state database uses schema version 9. Startup migrates an older database in
+The state database uses schema version 14. Startup migrates an older database in
 place. Treat the installed binary, configuration, API-revert body tree, and
-complete SQLite file set as one rollback unit. Before the first schema-9
+complete SQLite file set as one rollback unit. Before the first schema-14
 startup, resolve armed provisionals where practical, stop the service, verify
 that it is inactive, and create a consistent SQLite backup with the SQLite
 backup API. Copying only `state.db` while a process can write it can omit
@@ -240,8 +267,7 @@ rollback.
 On Unix, the packaged paths use this upgrade sequence:
 
 ```bash
-release_version=0.6.0
-backup_dir="/var/backups/guard-before-v${release_version}"
+release_version=0.8.1
 standard_state="$(systemctl is-active guard.service || true)"
 caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
 case "$standard_state:$caller_state" in
@@ -250,10 +276,12 @@ case "$standard_state:$caller_state" in
   *:active) guard_unit=guard-exec-as-caller.service ;;
   *) echo 'no packaged Guard service is active' >&2; exit 1 ;;
 esac
-test ! -e "$backup_dir"
 sha256sum --check BINARY-SHA256
 expected_binary_hash="$(awk '$2 == "guard" {print $1}' BINARY-SHA256)"
 test "${#expected_binary_hash}" -eq 64
+test ! -f /var/lib/guard/verbs.yaml || ./guard verb lint --file /var/lib/guard/verbs.yaml
+backup_dir="$(mktemp -d "/var/backups/guard-before-v${release_version}-XXXXXXXX")"
+printf 'GUARD_ROLLBACK_BACKUP_DIR=%q\n' "$backup_dir"
 install -d -o root -g root -m 0700 "$backup_dir"
 systemctl stop "$guard_unit"
 test "$(systemctl is-active "$guard_unit" || true)" = inactive
@@ -300,8 +328,8 @@ database and every WAL, SHM, or rollback-journal sidecar before installing the
 backup so SQLite cannot combine files from different snapshots:
 
 ```bash
-release_version=0.6.0
-backup_dir="/var/backups/guard-before-v${release_version}"
+: "${GUARD_ROLLBACK_BACKUP_DIR:?set it to the value printed by the upgrade sequence}"
+backup_dir="$GUARD_ROLLBACK_BACKUP_DIR"
 standard_state="$(systemctl is-active guard.service || true)"
 caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
 case "$standard_state:$caller_state" in
@@ -405,6 +433,9 @@ audit purposes.
 Guard runs approved commands in the caller's canonical working directory while
 retaining the daemon's clean environment, identity, SSH configuration, agent
 socket, and secret bindings. It does not stage or copy project files.
+The execution identity needs traversal and read access to the project tree.
+Tool-native configuration discovery remains rooted in that working directory,
+including discovery of files such as `ansible.cfg`.
 
 On Unix, a brokered command that cannot read one named non-secret file can enter
 the transparent read-grant path. The packaged system service grants the daemon

@@ -10,10 +10,11 @@ pub const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
 
 /// In-memory cache of evaluator decisions for the stateless per-command path.
 ///
-/// Key: the exact command line that gets evaluated. The cache is owned by a
-/// single Evaluator instance; the Evaluator's prompt and mode are fixed for
-/// its lifetime, so the command line alone is a sufficient key. Changing
-/// the prompt requires recreating the Evaluator, which gets a fresh cache.
+/// Keys are opaque canonical identities. Structured requests encode the
+/// binary and every argv element with explicit boundaries, then bind that
+/// command identity to prompt context and authorization scope. Unstructured
+/// callers receive the same prompt and scope binding around their command
+/// text. The cache never interprets or reconstructs a key.
 ///
 /// Eviction is FIFO on insertion time - a small LRU would be nicer but the
 /// cache is size-bounded and turnover is low, so the extra complexity is
@@ -141,7 +142,7 @@ mod tests {
 
     #[test]
     fn cache_ttl_expires_entry() {
-        let mut cache = EvalCache::new(4, Duration::from_millis(10));
+        let mut cache = EvalCache::new(4, Duration::ZERO);
         cache.insert(
             "ls".to_string(),
             CachedResult::Allow {
@@ -150,7 +151,6 @@ mod tests {
                 reversibility: None,
             },
         );
-        std::thread::sleep(Duration::from_millis(20));
         assert!(cache.get("ls").is_none(), "entry should have expired");
     }
 
@@ -165,7 +165,6 @@ mod tests {
                 reversibility: None,
             },
         );
-        std::thread::sleep(Duration::from_millis(2));
         cache.insert(
             "b".into(),
             CachedResult::Allow {
@@ -174,7 +173,11 @@ mod tests {
                 reversibility: None,
             },
         );
-        std::thread::sleep(Duration::from_millis(2));
+        cache
+            .entries
+            .get_mut("a")
+            .expect("oldest cache entry")
+            .inserted_at -= Duration::from_secs(1);
         cache.insert(
             "c".into(),
             CachedResult::Allow {

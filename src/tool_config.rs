@@ -18,7 +18,7 @@ pub struct ResolvedToolEnv {
     pub secret_sources: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct UserToolOverride {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
@@ -26,7 +26,7 @@ pub struct UserToolOverride {
     pub secrets: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ToolConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
@@ -36,12 +36,13 @@ pub struct ToolConfig {
     pub users: HashMap<String, UserToolOverride>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ToolConfigFile {
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }
 
+#[derive(Clone)]
 pub struct ToolRegistry {
     config: ToolConfigFile,
     path: PathBuf,
@@ -128,6 +129,15 @@ impl ToolRegistry {
 
     pub fn list(&self) -> impl Iterator<Item = (&str, &ToolConfig)> {
         self.config.tools.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Whether two snapshots represent the same executable environment
+    /// authority. Callers use this after asynchronous secret resolution to
+    /// reject a result produced from a superseded mapping.
+    pub fn same_authority(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.last_modified == other.last_modified
+            && self.config == other.config
     }
 
     pub fn reload_if_stale(&mut self) -> Result<bool> {

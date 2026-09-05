@@ -108,7 +108,7 @@ pub(super) fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
             path.display()
         );
     }
-    let result = file.write_all(bytes).and_then(|()| file.flush());
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
     if let Err(error) = result {
         drop(file);
         let _ = fs::remove_file(path);

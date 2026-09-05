@@ -8,36 +8,178 @@
 //! (which drives the consequence gate) and, for recoverable verbs, a
 //! structured rollback template.
 //!
-//! The catalog is the "slow clock": it is a file only the operator (daemon UID)
-//! controls; agents cannot add or change verbs at runtime. A trusted verb may
-//! skip the LLM evaluator entirely (a deterministic allow path, like a static
-//! policy allow), since its shape is already operator-reviewed.
+//! The catalog is the "slow clock": only operator-owned deployment paths and
+//! authenticated operator RPCs can change it. A trusted verb may skip the LLM
+//! evaluator entirely (a deterministic allow path, like a static policy allow),
+//! since its shape is already operator-reviewed.
 
 use super::coverage::reversibility_rank;
 use super::Reversibility;
+use crate::learned_rules::{
+    load_immutable_learning_file_snapshot, load_learning_file_snapshot,
+    rewrite_learning_file_bounded, write_learning_file_atomically_for_locked_snapshot,
+    AsyncDurableStore, LearningFileSnapshot,
+};
+use crate::redact::{
+    command_contains_sensitive_literals, named_value_contains_sensitive_literals,
+    text_contains_sensitive_literals, SENSITIVE_ARGV_REPLAY_GUIDANCE,
+};
 use anyhow::{bail, Context, Result};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// A single parameter's validation rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ParamSpec {
     /// Fully-anchored regex (`^...$`) the value must match. Rejected at load if
     /// not anchored, so a permissive pattern cannot silently allow a substring
     /// with shell metacharacters or a value that gets reinterpreted as a flag.
     pub pattern: String,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub required: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
     /// Allow a rendered value to begin with `-`. Off by default so a value can
     /// never pass itself off as an option flag (e.g. `-o ProxyCommand=...`).
-    #[serde(default, skip_serializing_if = "is_false")]
     pub allow_dash: bool,
+}
+
+/// How Guard interprets a parameter after regex validation.
+///
+/// `token` retains the conservative no-whitespace behavior. `single_argv`
+/// permits spaces inside one bounded argv element while rejecting shell
+/// control characters at render time. The latter is useful for exact
+/// JSONPath and field-selector values without introducing word splitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamValueType {
+    #[default]
+    Token,
+    SingleArgv,
+}
+
+const SINGLE_ARGV_PATTERN_PREFIX: &str = "\0guard-single-argv:";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParamSpecWire {
+    pattern: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_dash: bool,
+    #[serde(default, skip_serializing_if = "is_token_value_type")]
+    value_type: ParamValueType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_length: Option<usize>,
+}
+
+fn is_token_value_type(value_type: &ParamValueType) -> bool {
+    *value_type == ParamValueType::Token
+}
+
+impl ParamSpec {
+    fn encoded_single_argv(pattern: String, max_length: usize) -> String {
+        format!("{SINGLE_ARGV_PATTERN_PREFIX}{max_length}:{pattern}")
+    }
+
+    /// Construct the bounded one-argv form used by mechanically generated
+    /// matchers. The public YAML representation keeps this metadata separate
+    /// from the pattern, while the in-memory representation preserves the
+    /// existing `ParamSpec` struct shape for catalog callers.
+    pub(crate) fn bounded_single_argv(
+        pattern: String,
+        max_length: usize,
+        allow_dash: bool,
+    ) -> Self {
+        Self {
+            pattern: Self::encoded_single_argv(pattern, max_length),
+            required: true,
+            default: None,
+            allow_dash,
+        }
+    }
+
+    fn semantics(&self) -> (ParamValueType, Option<usize>, &str) {
+        let Some(encoded) = self.pattern.strip_prefix(SINGLE_ARGV_PATTERN_PREFIX) else {
+            return (ParamValueType::Token, None, &self.pattern);
+        };
+        let Some((length, pattern)) = encoded.split_once(':') else {
+            return (ParamValueType::SingleArgv, None, encoded);
+        };
+        (
+            ParamValueType::SingleArgv,
+            length.parse::<usize>().ok(),
+            pattern,
+        )
+    }
+
+    pub fn value_type(&self) -> ParamValueType {
+        self.semantics().0
+    }
+
+    pub fn max_length(&self) -> Option<usize> {
+        self.semantics().1
+    }
+
+    pub fn pattern_text(&self) -> &str {
+        self.semantics().2
+    }
+}
+
+impl Serialize for ParamSpec {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (value_type, max_length, pattern) = self.semantics();
+        ParamSpecWire {
+            pattern: pattern.to_string(),
+            required: self.required,
+            default: self.default.clone(),
+            allow_dash: self.allow_dash,
+            value_type,
+            max_length,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ParamSpec {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ParamSpecWire::deserialize(deserializer)?;
+        let pattern = match wire.value_type {
+            ParamValueType::Token => {
+                if wire.max_length.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "max_length requires value_type: single_argv",
+                    ));
+                }
+                wire.pattern
+            }
+            ParamValueType::SingleArgv => {
+                let max_length = wire.max_length.ok_or_else(|| {
+                    serde::de::Error::custom(
+                        "value_type: single_argv requires a positive max_length",
+                    )
+                })?;
+                Self::encoded_single_argv(wire.pattern, max_length)
+            }
+        };
+        Ok(Self {
+            pattern,
+            required: wire.required,
+            default: wire.default,
+            allow_dash: wire.allow_dash,
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -82,6 +224,7 @@ fn default_environment_source() -> EnvironmentBindingSource {
 /// anchored `pattern` supports bounded path-like inputs. Omitting both permits
 /// any value for this exact source and environment variable name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentConstraint {
     pub name: String,
     #[serde(
@@ -102,6 +245,7 @@ fn is_plain_source(source: &EnvironmentBindingSource) -> bool {
 /// Select one or more argv values either by option spelling or by exact argv
 /// position. Option spellings accept both `--name value` and `--name=value`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValueConstraint {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
@@ -122,13 +266,54 @@ pub struct ValueConstraint {
 }
 
 /// A bound on a list-valued target selector such as Ansible `--limit a,b`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FanoutConstraint {
     #[serde(flatten)]
     pub selector: ValueConstraint,
     pub max: usize,
     #[serde(default = "default_fanout_separator")]
     pub separator: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FanoutConstraintWire {
+    #[serde(default)]
+    options: Vec<String>,
+    #[serde(default)]
+    position: Option<usize>,
+    #[serde(default)]
+    values: Vec<String>,
+    #[serde(default)]
+    allow_dash: bool,
+    #[serde(default = "default_true")]
+    required: bool,
+    #[serde(default)]
+    allow_multiple: bool,
+    max: usize,
+    #[serde(default = "default_fanout_separator")]
+    separator: String,
+}
+
+impl<'de> Deserialize<'de> for FanoutConstraint {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FanoutConstraintWire::deserialize(deserializer)?;
+        Ok(Self {
+            selector: ValueConstraint {
+                options: wire.options,
+                position: wire.position,
+                values: wire.values,
+                allow_dash: wire.allow_dash,
+                required: wire.required,
+                allow_multiple: wire.allow_multiple,
+            },
+            max: wire.max,
+            separator: wire.separator,
+        })
+    }
 }
 
 fn default_fanout_separator() -> String {
@@ -138,6 +323,7 @@ fn default_fanout_separator() -> String {
 /// One typed region of a verb's command space. Constraints are conjunctive.
 /// Required and forbidden argv tokens are exact argv elements, never globs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerbCoverageCell {
     pub name: String,
     pub action: CoverageAction,
@@ -161,6 +347,13 @@ pub struct VerbCoverageCell {
     pub namespace: Option<ValueConstraint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fanout: Option<FanoutConstraint>,
+    /// Exact canonical caller working directory required by this cell. This
+    /// binds tools whose configuration, plugins, or input selection can be
+    /// discovered from the working directory to an operator-reviewed project
+    /// root. The path is validated as an existing canonical directory when the
+    /// catalog loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     /// Caller-controlled environment bindings this cell may preauthorize.
     /// Empty is migration-safe and means no `--env`, `--secret`, or
     /// `--secret-file` injection can skip evaluator review.
@@ -182,6 +375,7 @@ pub struct VerbCoverageCell {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoverageProvenance {
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -190,16 +384,36 @@ pub struct CoverageProvenance {
     pub prompt_stamp: String,
     pub model_stamp: String,
     pub generated_unix: u64,
+    /// Probes a generator actually executed against the finished matcher.
+    /// Generators that only replay evidence they already held record
+    /// `observation_replays` instead; a record here asserts that a real
+    /// match was run and observed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probes: Vec<CoverageProbe>,
+    /// Argv records replayed from evidence the generator already held: the
+    /// evaluator-approved samples a matcher was derived from, plus the
+    /// generator's own boundary example. `template_match` states what the
+    /// matcher's construction implies for the argv; nothing was executed or
+    /// independently probed to produce these records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observation_replays: Vec<CoverageObservationReplay>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoverageProbe {
     pub dimension: String,
     pub args: Vec<String>,
     pub expected_match: bool,
     pub observed_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageObservationReplay {
+    pub dimension: String,
+    pub args: Vec<String>,
+    pub template_match: bool,
 }
 
 /// One concrete reverse match before session/global precedence is resolved.
@@ -238,6 +452,7 @@ pub struct ValueDomain {
 
 /// A structured command template (binary + argv templates). No shell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerbCommand {
     pub binary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -246,6 +461,7 @@ pub struct VerbCommand {
 
 /// One catalog verb.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Verb {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -270,6 +486,10 @@ pub struct Verb {
     pub consequence: Reversibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revert: Option<VerbCommand>,
+    /// Require operator approval even when the declared consequence would
+    /// otherwise execute or enter containment immediately.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hold: bool,
     /// When true the rendered command skips the LLM evaluator (deterministic
     /// allow). The reversibility class still drives the gate.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -278,6 +498,10 @@ pub struct Verb {
     /// evaluated (untrusted verbs only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_context: Option<String>,
+    /// Optional wall-clock execution limit. A present value overrides the
+    /// daemon default, including zero to select unbounded execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_timeout_secs: Option<u64>,
     /// Operator prose this verb was generated from (`guard verb create
     /// --prompt`), stored for posterity. Metadata only; never used in rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,12 +539,62 @@ impl Verb {
             .map(|byte| format!("{byte:02x}"))
             .collect()
     }
+
+    /// Enumerate every parameter binding admitted by finite literal patterns.
+    /// `None` means at least one regex is non-finite or the Cartesian product
+    /// exceeds the admission-preview bound.
+    pub fn finite_parameter_sets(&self) -> Option<Vec<BTreeMap<String, String>>> {
+        enumerate_parameter_sets(self, self.params.keys().cloned().collect())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CatalogPlatform {
+    Unix,
+    Windows,
+}
+
+impl CatalogPlatform {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unix => "unix",
+            Self::Windows => "windows",
+        }
+    }
+
+    fn is_current(self) -> bool {
+        match self {
+            Self::Unix => cfg!(unix),
+            Self::Windows => cfg!(windows),
+        }
+    }
+}
+
+fn validate_catalog_platform(platform: Option<CatalogPlatform>) -> Result<()> {
+    if let Some(platform) = platform.filter(|platform| !platform.is_current()) {
+        bail!(
+            "verb catalog targets platform '{}', but this Guard binary targets '{}'",
+            platform.as_str(),
+            std::env::consts::FAMILY
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CatalogFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    platform: Option<CatalogPlatform>,
     #[serde(default)]
     verbs: Vec<Verb>,
+}
+
+fn is_synthesized_verb(verb: &Verb) -> bool {
+    verb.auto_promoted
+        || verb.source_prose.is_some()
+        || verb.evidence.is_some()
+        || verb.promotion_stamp.is_some()
 }
 
 /// The result of rendering a verb invocation: a concrete command ready to gate.
@@ -331,11 +605,14 @@ pub struct RenderedVerb {
     pub args: Vec<String>,
     pub consequence: Reversibility,
     pub revert: Option<(String, Vec<String>)>,
+    pub hold: bool,
     pub trusted: bool,
     pub prompt_context: Option<String>,
+    pub exec_timeout_secs: Option<u64>,
     pub baseline: bool,
     pub credential_plan: Option<String>,
-    /// Validated params, recorded into the approval snapshot for the binding.
+    /// Validated params used while rendering and resolving coverage. Approval
+    /// snapshots bind the resulting immutable argv and do not persist values.
     pub params: BTreeMap<String, String>,
     /// Mirrors `Verb::auto_promoted` / `Verb::promotion_stamp`. The caller
     /// (`server::execute_command_inner`) downgrades `trusted` to `false` when
@@ -345,19 +622,69 @@ pub struct RenderedVerb {
     pub promotion_stamp: Option<String>,
 }
 
-/// An operator-authored catalog of verbs plus a content version used to void
-/// approvals when the catalog changes.
+/// The daemon's effective verb catalog, composed from durable operator-owned
+/// definitions and runtime-only generated coverage. The content version
+/// fingerprints the effective set and voids approvals when either plane
+/// changes.
 #[derive(Debug, Clone, Default)]
 pub struct VerbCatalog {
     verbs: BTreeMap<String, Verb>,
     version: u64,
     path: Option<PathBuf>,
     mtime: Option<SystemTime>,
+    snapshot: Option<LearningFileSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerbCatalogFinding {
+    pub verb: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerbCatalogRepair {
+    pub verb: String,
+    pub changes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerbCatalogLintReport {
+    pub findings: Vec<VerbCatalogFinding>,
+    pub repairs: Vec<VerbCatalogRepair>,
+    pub verb_count: usize,
+    pub fixed: bool,
+    pub durability_warning: Option<String>,
+    canonical: Option<String>,
 }
 
 impl VerbCatalog {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Build an isolated catalog containing one synthesized candidate for a
+    /// non-executing admission preview. The temporary baseline flag makes the
+    /// candidate's Evaluate cell selectable without granting durable session
+    /// authority; the original candidate remains unchanged.
+    pub fn for_admission_preview(candidate: &Verb) -> Result<Self> {
+        let mut verb = candidate.clone();
+        if is_synthesized_verb(&verb) {
+            validate_canonical_synthesized_verb_envelope(&verb)?;
+        }
+        verb.baseline = true;
+        verb.trusted = false;
+        validate_verb(&verb)?;
+        let serialized = serde_json::to_vec(&verb).context("failed to fingerprint preview verb")?;
+        let digest = Sha256::digest(&serialized);
+        let mut version_bytes = [0u8; 8];
+        version_bytes.copy_from_slice(&digest[..8]);
+        Ok(Self {
+            verbs: BTreeMap::from([(verb.name.clone(), verb)]),
+            version: u64::from_be_bytes(version_bytes),
+            path: None,
+            mtime: None,
+            snapshot: None,
+        })
     }
 
     pub fn version(&self) -> u64 {
@@ -404,46 +731,111 @@ impl VerbCatalog {
     /// duplicate names, non-anchored param patterns, invalid regexes, and
     /// template placeholders that reference an undeclared param.
     pub fn from_yaml(text: &str) -> Result<Self> {
+        Self::from_yaml_with_repair(text).map(|(catalog, _)| catalog)
+    }
+
+    fn from_yaml_with_repair(text: &str) -> Result<(Self, Option<String>)> {
         let file: CatalogFile =
             serde_yaml_ng::from_str(text).context("failed to parse verb catalog")?;
+        validate_catalog_platform(file.platform)?;
         let mut verbs = BTreeMap::new();
-        for mut verb in file.verbs {
-            if verb.name.starts_with("grant-") {
-                bail!(
-                    "verb name '{}' uses the reserved saved-grant namespace",
-                    verb.name
-                );
-            }
-            if verb.name.starts_with("access-generated-") {
-                bail!(
-                    "verb name '{}' uses the reserved generated-access namespace",
-                    verb.name
-                );
-            }
-            normalize_operator_boundaries(&mut verb);
-            validate_verb(&verb)?;
+        let mut repaired = false;
+        for verb in file.verbs {
+            let (verb, repairs) = prepare_catalog_verb(verb)?;
+            repaired |= !repairs.is_empty();
             if verbs.insert(verb.name.clone(), verb.clone()).is_some() {
                 bail!("duplicate verb name: '{}'", verb.name);
             }
         }
-        let digest = Sha256::digest(text.as_bytes());
+        let canonical = repaired
+            .then(|| canonical_catalog_yaml(text, verbs.values()))
+            .transpose()?;
+        let version_text = canonical.as_deref().unwrap_or(text);
+        let digest = Sha256::digest(version_text.as_bytes());
         let mut version_bytes = [0u8; 8];
         version_bytes.copy_from_slice(&digest[..8]);
-        Ok(Self {
-            verbs,
-            version: u64::from_be_bytes(version_bytes),
-            path: None,
-            mtime: None,
-        })
+        Ok((
+            Self {
+                verbs,
+                version: u64::from_be_bytes(version_bytes),
+                path: None,
+                mtime: None,
+                snapshot: None,
+            },
+            canonical,
+        ))
+    }
+
+    /// Validate every independently decodable verb in a catalog. Unlike
+    /// `from_yaml`, this reports one structural failure per verb instead of
+    /// stopping at the first invalid definition.
+    pub fn lint_yaml(text: &str) -> VerbCatalogLintReport {
+        lint_catalog_yaml(text)
+    }
+
+    /// Validate one file without contacting a daemon. Canonical repairs are
+    /// committed through the same bounded atomic rewrite path used by daemon
+    /// catalog loading, and only when the complete catalog is otherwise valid.
+    pub fn lint_file(path: &Path, fix: bool) -> Result<VerbCatalogLintReport> {
+        if fix {
+            let (mut report, _snapshot, warning) =
+                rewrite_learning_file_bounded(path, |snapshot| {
+                    let bytes = snapshot.content().context("verb catalog does not exist")?;
+                    let text = std::str::from_utf8(bytes)
+                        .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
+                    let mut report = lint_catalog_yaml(text);
+                    let replacement = if report.findings.is_empty() {
+                        report.canonical.take()
+                    } else {
+                        None
+                    };
+                    report.fixed = replacement.is_some();
+                    Ok((replacement, report))
+                })?;
+            report.durability_warning = warning.map(|error| error.to_string());
+            return Ok(report);
+        }
+
+        let snapshot = load_immutable_learning_file_snapshot(path)?;
+        let bytes = snapshot.content().context("verb catalog does not exist")?;
+        let text = std::str::from_utf8(bytes)
+            .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
+        Ok(lint_catalog_yaml(text))
     }
 
     /// Load a catalog from a file, recording its path and mtime for reloads.
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read verb catalog {}", path.display()))?;
-        let mut catalog = Self::from_yaml(&text)?;
+        let (mut catalog, snapshot, warning) = rewrite_learning_file_bounded(path, |snapshot| {
+            let bytes = snapshot.content().context("verb catalog does not exist")?;
+            let text = std::str::from_utf8(bytes)
+                .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
+            let (catalog, repair) = Self::from_yaml_with_repair(text)?;
+            Ok((repair, catalog))
+        })?;
+        if let Some(error) = warning {
+            tracing::warn!("catalog repair committed with a durability warning: {error}");
+        }
         catalog.path = Some(path.to_path_buf());
-        catalog.mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        catalog.mtime = snapshot.modified();
+        catalog.snapshot = Some(snapshot);
+        Ok(catalog)
+    }
+
+    /// Load an operator-owned catalog as immutable process input. This mode
+    /// never creates a transaction lock beside the catalog and never observes
+    /// later path changes, so a read-only packaged configuration directory
+    /// does not become writable by the daemon.
+    pub fn load_immutable(path: &Path) -> Result<Self> {
+        let snapshot = load_immutable_learning_file_snapshot(path)?;
+        let bytes = snapshot.content().context("verb catalog does not exist")?;
+        let text = std::str::from_utf8(bytes)
+            .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
+        let (catalog, repair) = Self::from_yaml_with_repair(text)?;
+        if repair.is_some() {
+            anyhow::bail!(
+                "immutable verb catalog requires canonical repair; update it before starting the service"
+            );
+        }
         Ok(catalog)
     }
 
@@ -453,33 +845,58 @@ impl VerbCatalog {
         let Some(path) = self.path.clone() else {
             return Ok(false);
         };
-        let current = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        if current == self.mtime {
+        let current = load_learning_file_snapshot(&path)?;
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| current.same_authority(snapshot))
+        {
             return Ok(false);
         }
-        let runtime_verbs = self
+        let durable_catalog = Self::load(&path)?;
+        *self = self.effective_catalog_with_runtime_overlays(durable_catalog)?;
+        Ok(true)
+    }
+
+    #[doc(hidden)]
+    pub fn refreshed_copy(&self) -> Result<Self> {
+        let Some(path) = self.path.clone() else {
+            return Ok(self.clone());
+        };
+        let durable_catalog = Self::load(&path)?;
+        self.effective_catalog_with_runtime_overlays(durable_catalog)
+    }
+
+    #[doc(hidden)]
+    pub fn adopt_refreshed_file_authority(&mut self, mut refreshed: Self) -> Result<()> {
+        refreshed.verbs.retain(|name, _| !reserved_verb_name(name));
+        *self = self.effective_catalog_with_runtime_overlays(refreshed)?;
+        Ok(())
+    }
+
+    /// Build the effective daemon catalog from a durable operator document and
+    /// the runtime-only coverage already installed in this process. Keeping
+    /// these authority planes as separate values prevents generated grants from
+    /// entering an operator catalog serialization while preserving them across
+    /// file reloads and mutations.
+    fn effective_catalog_with_runtime_overlays(&self, mut durable_catalog: Self) -> Result<Self> {
+        let runtime_overlays = self
             .verbs
             .values()
-            .filter(|verb| {
-                verb.name.starts_with("grant-") || verb.name.starts_with("access-generated-")
-            })
+            .filter(|verb| reserved_verb_name(&verb.name))
             .cloned()
             .collect::<Vec<_>>();
-        let mut reloaded = Self::load(&path)?;
-        for mut verb in runtime_verbs {
+        for mut verb in runtime_overlays {
             if verb.name.starts_with("grant-") {
-                reloaded.upsert_saved_grant_verb(verb)?;
+                durable_catalog.upsert_saved_grant_verb(verb)?;
             } else {
                 // Approved generated coverage is trusted only in memory. Demote
-                // it back to its validated proposal form before reinstalling it.
+                // it to its validated proposal form before reinstalling it.
                 verb.trusted = false;
-                reloaded.upsert_access_verb(verb)?;
+                durable_catalog.upsert_access_verb(verb)?;
             }
         }
-        *self = reloaded;
-        Ok(true)
+        Ok(durable_catalog)
     }
 
     /// Render a verb invocation into a concrete, gated command. Each param is
@@ -510,14 +927,27 @@ impl VerbCatalog {
                     None => continue,
                 },
             };
-            let re = compile_anchored(&spec.pattern)
+            let re = compile_anchored(spec.pattern_text())
                 .with_context(|| format!("invalid pattern for param '{}'", pname))?;
             if !re.is_match(&value) {
                 bail!(
                     "value for '{}' does not match required pattern {}",
                     pname,
-                    spec.pattern
+                    spec.pattern_text()
                 );
+            }
+            if spec
+                .max_length()
+                .is_some_and(|maximum| value.chars().count() > maximum)
+            {
+                bail!(
+                    "value for '{}' exceeds its maximum length of {} characters",
+                    pname,
+                    spec.max_length().unwrap_or_default()
+                );
+            }
+            if spec.value_type() == ParamValueType::SingleArgv {
+                validate_single_argv_value(pname, &value)?;
             }
             if !spec.allow_dash && value.starts_with('-') {
                 bail!(
@@ -538,6 +968,23 @@ impl VerbCatalog {
             }
             None => None,
         };
+        validate_known_file_arguments(verb, &binary, &args, "rendered command")?;
+        if let Some((revert_binary, revert_args)) = &revert {
+            validate_known_file_arguments(
+                verb,
+                revert_binary,
+                revert_args,
+                "rendered revert command",
+            )?;
+        }
+        if verb.name.starts_with("access-generated-")
+            && (command_contains_sensitive_literals(&binary, &args)
+                || revert.as_ref().is_some_and(|(revert_binary, revert_args)| {
+                    command_contains_sensitive_literals(revert_binary, revert_args)
+                }))
+        {
+            bail!("{SENSITIVE_ARGV_REPLAY_GUIDANCE}");
+        }
 
         Ok(RenderedVerb {
             name: name.to_string(),
@@ -545,8 +992,10 @@ impl VerbCatalog {
             args,
             consequence: verb.consequence,
             revert,
+            hold: verb.hold,
             trusted: verb.trusted,
             prompt_context: verb.prompt_context.clone(),
+            exec_timeout_secs: verb.exec_timeout_secs,
             baseline: verb.baseline,
             credential_plan: verb.credential_plan.clone(),
             params: resolved,
@@ -586,9 +1035,42 @@ impl VerbCatalog {
         secrets: &BTreeMap<String, String>,
         secret_files: &BTreeMap<String, String>,
     ) -> Vec<CoverageMatch> {
+        self.match_command_all_inner(binary, args, plain, secrets, secret_files, None)
+    }
+
+    /// Collect coverage with a canonical caller working directory. Cells that
+    /// carry `cwd` match only that exact directory. The executor calls this
+    /// after canonicalizing a local request, so configuration discovered from
+    /// the current directory remains within operator-reviewed authority.
+    pub fn match_command_all_with_environment_and_cwd(
+        &self,
+        binary: &str,
+        args: &[String],
+        plain: &BTreeMap<String, String>,
+        secrets: &BTreeMap<String, String>,
+        secret_files: &BTreeMap<String, String>,
+        cwd: Option<&Path>,
+    ) -> Vec<CoverageMatch> {
+        self.match_command_all_inner(binary, args, plain, secrets, secret_files, cwd)
+    }
+
+    fn match_command_all_inner(
+        &self,
+        binary: &str,
+        args: &[String],
+        plain: &BTreeMap<String, String>,
+        secrets: &BTreeMap<String, String>,
+        secret_files: &BTreeMap<String, String>,
+        cwd: Option<&Path>,
+    ) -> Vec<CoverageMatch> {
         let mut matches = Vec::new();
         for verb in self.verbs.values() {
             if !binary_names_match(binary, &verb.binary) {
+                continue;
+            }
+            if verb.name.starts_with("access-generated-")
+                && command_contains_sensitive_literals(binary, args)
+            {
                 continue;
             }
 
@@ -606,6 +1088,16 @@ impl VerbCatalog {
             if verb.args.is_empty() && !verb.coverage.is_empty() {
                 rendered.binary = binary.to_string();
                 rendered.args = args.to_vec();
+            }
+            if validate_known_file_arguments(
+                verb,
+                &rendered.binary,
+                &rendered.args,
+                "matched command",
+            )
+            .is_err()
+            {
+                continue;
             }
 
             if verb.coverage.is_empty() {
@@ -632,7 +1124,7 @@ impl VerbCatalog {
             }
 
             for cell in &verb.coverage {
-                if let Some((features, specificity)) = coverage_cell_matches(cell, args) {
+                if let Some((features, specificity)) = coverage_cell_matches(cell, args, cwd) {
                     matches.push(CoverageMatch {
                         rendered: rendered.clone(),
                         cell: cell.name.clone(),
@@ -676,31 +1168,159 @@ impl VerbCatalog {
     }
 
     /// Validate, then persist, a new verb by appending it to the backing catalog
-    /// file, then reload so the in-memory catalog (and its content version)
-    /// reflect the write. Requires the catalog to be file-backed. Nothing is
-    /// written if validation fails.
+    /// file, then adopt the validated result so the in-memory catalog (and its
+    /// content version) reflect the write. Requires the catalog to be
+    /// file-backed. Nothing is written if validation fails.
     pub fn append_verb(&mut self, verb: &Verb) -> Result<()> {
-        self.validate_candidate(verb)?;
+        let canonical;
+        let verb = if is_synthesized_verb(verb) {
+            canonical = canonicalize_generated_authority_envelope(verb.clone())?;
+            &canonical
+        } else {
+            verb
+        };
+        // Reject an invalid candidate before reading a stale catalog through
+        // the repairing parser. A failed append must never canonicalize an
+        // externally changed file as a side effect.
+        validate_verb(verb)?;
         let path = self.path.clone().ok_or_else(|| {
             anyhow::anyhow!("verb catalog is not backed by a file; cannot persist a new verb")
         })?;
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let snapshot = load_learning_file_snapshot(&path)?;
+        let existing = snapshot
+            .content()
+            .map(std::str::from_utf8)
+            .transpose()
+            .context("verb catalog is not UTF-8")?
+            .unwrap_or_default()
+            .to_string();
+        // Compose against the current snapshot before parsing. Duplicate
+        // detection and canonical repair therefore observe concurrent edits,
+        // support every accepted empty-catalog shape, and remain read-only
+        // until the complete append transaction succeeds.
         let new_content = compose_appended_catalog(&existing, verb)?;
         // Validate the COMBINED catalog in memory BEFORE touching the file, so a
         // bad or duplicate verb can never corrupt the catalog on disk.
-        let validated = Self::from_yaml(&new_content)
+        let (durable_catalog, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("appending this verb would make the catalog invalid")?;
-        std::fs::write(&path, &new_content)
-            .with_context(|| format!("failed to write verb catalog {}", path.display()))?;
+        let durable_content = canonical.unwrap_or(new_content);
+        let mut effective_catalog =
+            self.effective_catalog_with_runtime_overlays(durable_catalog)?;
+        let outcome =
+            write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, &durable_content)?;
+        let (committed, warning) = outcome.into_parts();
         // Adopt the already-validated content rather than re-reading the file: a
         // post-write reload failure would otherwise report an error to the
         // operator even though the write landed, desyncing memory from disk.
-        self.verbs = validated.verbs;
-        self.version = validated.version;
-        self.mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
+        effective_catalog.path = Some(path);
+        effective_catalog.mtime = committed.modified();
+        effective_catalog.snapshot = Some(committed);
+        *self = effective_catalog;
+        if let Some(error) = warning {
+            tracing::warn!("catalog append committed with a durability warning: {error}");
+        }
         Ok(())
+    }
+
+    /// Persist one explicitly operator-authored verb without admitting a
+    /// runtime-reserved or automatically promoted identity through the file
+    /// import boundary.
+    pub fn append_operator_verb(&mut self, verb: &Verb) -> Result<Verb> {
+        if reserved_verb_name(&verb.name)
+            || verb.auto_promoted
+            || verb.promotion_stamp.is_some()
+            || verb.source_prose.is_some()
+            || verb.evidence.is_some()
+        {
+            bail!(
+                "generated or reserved verb '{}' cannot be added as an operator-authored verb",
+                verb.name
+            );
+        }
+        let mut normalized = verb.clone();
+        normalize_operator_boundaries(&mut normalized);
+        self.append_verb(&normalized)?;
+        self.get(&normalized.name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("persisted verb '{}' is unavailable", normalized.name))
+    }
+
+    /// Replace one operator-authored file verb only when its live definition
+    /// still matches `expected_digest`. Validation and whole-catalog
+    /// composition complete before the backing file is atomically replaced.
+    /// The in-memory catalog adopts that validated document plus its existing
+    /// runtime-only coverage after the durable replacement succeeds.
+    pub fn amend_verb_if_digest(
+        &mut self,
+        name: &str,
+        expected_digest: &str,
+        replacement: &Verb,
+    ) -> Result<Verb> {
+        if expected_digest.len() != 64
+            || !expected_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("expected verb digest must be 64 lowercase hexadecimal characters");
+        }
+        if replacement.name != name {
+            bail!(
+                "replacement verb name '{}' does not match '{}'; amend preserves the existing name",
+                replacement.name,
+                name
+            );
+        }
+        if reserved_verb_name(name) || replacement.auto_promoted {
+            bail!("generated or reserved verb '{}' cannot be amended", name);
+        }
+        validate_verb(replacement)?;
+
+        self.reload_if_stale()?;
+        let path = self.path.clone().ok_or_else(|| {
+            anyhow::anyhow!("verb catalog is not backed by a file; cannot amend a verb")
+        })?;
+        let snapshot = load_learning_file_snapshot(&path)?;
+        let existing =
+            std::str::from_utf8(snapshot.content().context("verb catalog does not exist")?)
+                .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?
+                .to_string();
+        let disk_catalog = Self::from_yaml(&existing)?;
+        let current = disk_catalog
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown verb: '{}'", name))?;
+        if current.auto_promoted || reserved_verb_name(&current.name) {
+            bail!("generated or reserved verb '{}' cannot be amended", name);
+        }
+        let current_digest = current.definition_digest();
+        if current_digest != expected_digest {
+            bail!(
+                "verb '{}' changed before amend: expected digest {}, found {}",
+                name,
+                expected_digest,
+                current_digest
+            );
+        }
+
+        let new_content = compose_replaced_catalog(&existing, name, replacement)?;
+        let (durable_catalog, canonical) = Self::from_yaml_with_repair(&new_content)
+            .context("amending this verb would make the catalog invalid")?;
+        let durable_content = canonical.unwrap_or(new_content);
+        let mut effective_catalog =
+            self.effective_catalog_with_runtime_overlays(durable_catalog)?;
+        // Every fallible catalog adoption step completes before the durable
+        // rewrite. After this point, success requires only the atomic file
+        // replacement and assigning the already validated state.
+        let outcome = atomic_replace_if_unchanged(&path, &snapshot, durable_content.as_bytes())?;
+        let (committed, warning) = outcome.into_parts();
+        effective_catalog.path = Some(path.clone());
+        effective_catalog.mtime = committed.modified();
+        effective_catalog.snapshot = Some(committed);
+        *self = effective_catalog;
+        if let Some(error) = warning {
+            tracing::warn!("catalog amendment committed with a durability warning: {error}");
+        }
+        Ok(current)
     }
 
     /// Install or replace a validated daemon-owned verb without writing the
@@ -708,6 +1328,7 @@ impl VerbCatalog {
     /// persisted with the grant definition rather than mixed into the catalog
     /// file. Names outside the reserved `grant-` namespace cannot be replaced.
     pub fn upsert_saved_grant_verb(&mut self, verb: Verb) -> Result<()> {
+        let verb = canonicalize_generated_authority_envelope(verb)?;
         validate_verb(&verb)?;
         if !verb.name.starts_with("grant-") {
             bail!(
@@ -730,33 +1351,31 @@ impl VerbCatalog {
         Ok(())
     }
 
-    /// Install approved prose-generated access coverage without writing the
+    /// Install approved generated access coverage without writing the
     /// operator-authored catalog. The exact candidate remains durable in its
     /// approved access request and is restored from SQLite at startup.
-    pub fn upsert_access_verb(&mut self, mut verb: Verb) -> Result<()> {
-        validate_synthesized_safety(&verb)?;
+    pub fn canonical_generated_access_verb(&self, verb: Verb) -> Result<Verb> {
+        let mut verb = normalize_generated_access_verb(verb)?;
         if verb.baseline {
             bail!("generated access coverage must not be baseline");
         }
-        if !verb.name.starts_with("access-generated-") {
-            bail!(
-                "generated access verb '{}' must use the reserved 'access-generated-' prefix",
-                verb.name
-            );
+        if verb.name != generated_access_verb_name(&verb) {
+            bail!("generated access coverage name does not match its matcher digest");
         }
-        // Synthesis proposes the matcher, not its safety class. Promotion may
-        // make the exact matcher deterministic, but consequence routing is
-        // derived locally so a model cannot label a mutation reversible. A
-        // matcher that provably wraps operator-reviewed catalog coverage
-        // inherits that coverage's class instead of the irreversible default,
-        // so wrapping a reversible verb does not hold every run for approval.
-        verb.consequence = if synthesized_access_is_statically_read_only(&verb) {
-            Reversibility::Reversible
-        } else {
-            self.wrapped_operator_consequence(&verb)
-                .unwrap_or(Reversibility::Irreversible)
-        };
-        verb.revert = None;
+        // Synthesis proposes the matcher, not its safety class. Consequence
+        // routing is derived locally from the matcher and exact operator
+        // coverage, so provenance and model metadata cannot affect it.
+        verb.consequence = canonical_generated_access_consequence(&verb);
+        if verb.consequence == Reversibility::Irreversible {
+            if let Some(inherited) = self.wrapped_operator_consequence(&verb) {
+                verb.consequence = inherited;
+            }
+        }
+        Ok(verb)
+    }
+
+    pub fn upsert_access_verb(&mut self, verb: Verb) -> Result<()> {
+        let mut verb = self.canonical_generated_access_verb(verb)?;
         verb.trusted = true;
         if let Some(existing) = self.verbs.get(&verb.name) {
             if serde_json::to_value(existing)? == serde_json::to_value(&verb)? {
@@ -772,57 +1391,10 @@ impl VerbCatalog {
         Ok(())
     }
 
-    pub fn remove_saved_grant_verbs(&mut self, grant_name: &str) -> Result<usize> {
-        let prefix = format!("grant-{grant_name}-");
-        let before = self.verbs.len();
-        self.verbs.retain(|name, _| !name.starts_with(&prefix));
-        let removed = before.saturating_sub(self.verbs.len());
-        if removed > 0 {
-            self.refresh_version()?;
-        }
-        Ok(removed)
-    }
-
-    /// Delete an operator catalog verb and atomically adopt the rewritten
-    /// catalog. Saved-grant generated verbs are deleted through their grant.
-    pub fn delete_verb(&mut self, name: &str) -> Result<Verb> {
-        let verb = self
-            .verbs
-            .get(name)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown verb: '{}'", name))?;
-        if name.starts_with("grant-") {
-            bail!(
-                "saved-grant coverage cannot be deleted directly; use `guard access revoke <session-or-agent>`"
-            );
-        }
-        let path = self.path.clone().ok_or_else(|| {
-            anyhow::anyhow!("verb catalog is not backed by a file; cannot delete a verb")
-        })?;
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let new_content = compose_removed_catalog(&existing, name)?;
-        let validated = Self::from_yaml(&new_content)
-            .context("deleting this verb would make the catalog invalid")?;
-        std::fs::write(&path, &new_content)
-            .with_context(|| format!("failed to write verb catalog {}", path.display()))?;
-        self.verbs = validated.verbs;
-        self.version = validated.version;
-        self.mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        Ok(verb)
-    }
-
-    /// Consequence inherited from operator catalog coverage that a generated
-    /// access matcher wraps. A wrap holds only when every concrete command
-    /// the matcher admits reverse-matches a non-generated catalog verb,
-    /// proven by enumerating the matcher's parameter space and replaying each
-    /// command through the catalog's own reverse match; a matcher broader
-    /// than the operator-reviewed coverage, or one whose parameters are not
-    /// plain literal enumerations, inherits nothing. Each command takes the
-    /// most conservative class among its matches and the wrap takes the most
-    /// conservative class across commands, so inheritance can never assign a
-    /// class less restrictive than the wrapped verb's own.
+    /// Inherit an operator-reviewed consequence only when every concrete argv
+    /// admitted by the generated matcher reverse-matches compatible catalog
+    /// coverage. Non-enumerable or broader matchers inherit nothing and stay
+    /// at the fail-closed generated default.
     fn wrapped_operator_consequence(&self, candidate: &Verb) -> Option<Reversibility> {
         if !candidate.coverage.is_empty() || candidate.binary.contains('{') {
             return None;
@@ -850,8 +1422,63 @@ impl VerbCatalog {
         inherited
     }
 
+    pub fn remove_saved_grant_verbs(&mut self, grant_name: &str) -> Result<usize> {
+        let prefix = format!("grant-{grant_name}-");
+        let before = self.verbs.len();
+        self.verbs.retain(|name, _| !name.starts_with(&prefix));
+        let removed = before.saturating_sub(self.verbs.len());
+        if removed > 0 {
+            self.refresh_version()?;
+        }
+        Ok(removed)
+    }
+
+    /// Delete an operator catalog verb and atomically adopt the rewritten
+    /// catalog. Saved-grant generated verbs are deleted through their grant.
+    pub fn delete_verb(&mut self, name: &str) -> Result<Verb> {
+        let verb = self
+            .verbs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown verb: '{}'", name))?;
+        if reserved_verb_name(name) {
+            bail!(
+                "runtime-generated coverage cannot be deleted directly; use its owning access or grant operation"
+            );
+        }
+        let path = self.path.clone().ok_or_else(|| {
+            anyhow::anyhow!("verb catalog is not backed by a file; cannot delete a verb")
+        })?;
+        let snapshot = load_learning_file_snapshot(&path)?;
+        let existing = snapshot
+            .content()
+            .map(std::str::from_utf8)
+            .transpose()
+            .context("verb catalog is not UTF-8")?
+            .unwrap_or_default()
+            .to_string();
+        let new_content = compose_removed_catalog(&existing, name)?;
+        let (durable_catalog, canonical) = Self::from_yaml_with_repair(&new_content)
+            .context("deleting this verb would make the catalog invalid")?;
+        let durable_content = canonical.unwrap_or(new_content);
+        let mut effective_catalog =
+            self.effective_catalog_with_runtime_overlays(durable_catalog)?;
+        let outcome =
+            write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, &durable_content)?;
+        let (committed, warning) = outcome.into_parts();
+        effective_catalog.path = Some(path);
+        effective_catalog.mtime = committed.modified();
+        effective_catalog.snapshot = Some(committed);
+        *self = effective_catalog;
+        if let Some(error) = warning {
+            tracing::warn!("catalog deletion committed with a durability warning: {error}");
+        }
+        Ok(verb)
+    }
+
     fn refresh_version(&mut self) -> Result<()> {
         let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
             verbs: self.verbs.values().cloned().collect(),
         })
         .context("failed to fingerprint verb catalog")?;
@@ -861,6 +1488,175 @@ impl VerbCatalog {
         self.version = u64::from_be_bytes(version_bytes);
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn catalog_repair_warning(
+    canonical: &str,
+    outcome: crate::learned_rules::LearningWriteOutcome,
+) -> Result<Option<anyhow::Error>> {
+    if outcome.committed_snapshot().content() != Some(canonical.as_bytes()) {
+        bail!("committed catalog repair does not match its canonical candidate");
+    }
+    let (_, warning) = outcome.into_parts();
+    let Some(error) = warning else {
+        return Ok(None);
+    };
+    Ok(Some(error))
+}
+
+fn prepare_catalog_verb(mut verb: Verb) -> Result<(Verb, Vec<String>)> {
+    if is_synthesized_verb(&verb) && text_contains_sensitive_literals(&verb.name) {
+        bail!("generated verb name contains sensitive material");
+    }
+    if verb.name.starts_with("grant-") {
+        bail!(
+            "verb name '{}' uses the reserved saved-grant namespace",
+            verb.name
+        );
+    }
+    if verb.name.starts_with("access-generated-") {
+        bail!(
+            "verb name '{}' uses the reserved generated-access namespace",
+            verb.name
+        );
+    }
+
+    let mut repairs = Vec::new();
+    if is_synthesized_verb(&verb) {
+        let before = serde_json::to_value(&verb)?;
+        verb = canonicalize_generated_authority_envelope(verb)?;
+        if before != serde_json::to_value(&verb)? {
+            repairs.push("canonicalize generated authority envelope".to_string());
+        }
+    }
+    let before_boundaries = serde_json::to_value(&verb)?;
+    normalize_operator_boundaries(&mut verb);
+    if before_boundaries != serde_json::to_value(&verb)? {
+        repairs.push("normalize operator boundaries".to_string());
+    }
+    validate_verb(&verb)?;
+    if verb.auto_promoted {
+        validate_auto_promoted_verb_durable_safety(&verb)?;
+    }
+    Ok((verb, repairs))
+}
+
+fn lint_catalog_yaml(text: &str) -> VerbCatalogLintReport {
+    let mut report = VerbCatalogLintReport {
+        findings: Vec::new(),
+        repairs: Vec::new(),
+        verb_count: 0,
+        fixed: false,
+        durability_warning: None,
+        canonical: None,
+    };
+    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let document: serde_yaml_ng::Value = match serde_yaml_ng::from_str(body) {
+        Ok(document) => document,
+        Err(error) => {
+            report.findings.push(VerbCatalogFinding {
+                verb: "<catalog>".to_string(),
+                message: format!("failed to parse verb catalog: {error}"),
+            });
+            return report;
+        }
+    };
+    let Some(mapping) = document.as_mapping() else {
+        report.findings.push(VerbCatalogFinding {
+            verb: "<catalog>".to_string(),
+            message: "verb catalog must be a YAML mapping".to_string(),
+        });
+        return report;
+    };
+    let platform_key = serde_yaml_ng::Value::String("platform".to_string());
+    if let Some(value) = mapping.get(&platform_key) {
+        let platform = match serde_yaml_ng::from_value::<CatalogPlatform>(value.clone()) {
+            Ok(platform) => platform,
+            Err(error) => {
+                report.findings.push(VerbCatalogFinding {
+                    verb: "<catalog>".to_string(),
+                    message: format!("invalid catalog platform: {error}"),
+                });
+                return report;
+            }
+        };
+        if let Err(error) = validate_catalog_platform(Some(platform)) {
+            report.findings.push(VerbCatalogFinding {
+                verb: "<catalog>".to_string(),
+                message: error.to_string(),
+            });
+            return report;
+        }
+    }
+    let key = serde_yaml_ng::Value::String("verbs".to_string());
+    let values = match mapping.get(&key) {
+        None => Vec::new(),
+        Some(serde_yaml_ng::Value::Sequence(values)) => values.clone(),
+        Some(_) => {
+            report.findings.push(VerbCatalogFinding {
+                verb: "<catalog>".to_string(),
+                message: "the catalog's `verbs` key is not a sequence".to_string(),
+            });
+            return report;
+        }
+    };
+    report.verb_count = values.len();
+
+    let mut names = BTreeSet::new();
+    let mut verbs = BTreeMap::new();
+    for (index, value) in values.into_iter().enumerate() {
+        let fallback = format!("<item {}>", index + 1);
+        let declared_name = value
+            .as_mapping()
+            .and_then(|mapping| mapping.get(serde_yaml_ng::Value::String("name".to_string())))
+            .and_then(serde_yaml_ng::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| fallback.clone());
+        let verb: Verb = match serde_yaml_ng::from_value(value) {
+            Ok(verb) => verb,
+            Err(error) => {
+                report.findings.push(VerbCatalogFinding {
+                    verb: declared_name,
+                    message: format!("failed to decode verb definition: {error}"),
+                });
+                continue;
+            }
+        };
+        let name = verb.name.clone();
+        if !names.insert(name.clone()) {
+            report.findings.push(VerbCatalogFinding {
+                verb: name.clone(),
+                message: format!("duplicate verb name: '{name}'"),
+            });
+        }
+        match prepare_catalog_verb(verb) {
+            Ok((verb, changes)) => {
+                if !changes.is_empty() {
+                    report.repairs.push(VerbCatalogRepair {
+                        verb: name.clone(),
+                        changes,
+                    });
+                }
+                verbs.entry(name).or_insert(verb);
+            }
+            Err(error) => report.findings.push(VerbCatalogFinding {
+                verb: name,
+                message: format!("{error:#}"),
+            }),
+        }
+    }
+
+    if report.findings.is_empty() && !report.repairs.is_empty() {
+        match canonical_catalog_yaml(text, verbs.values()) {
+            Ok(canonical) => report.canonical = Some(canonical),
+            Err(error) => report.findings.push(VerbCatalogFinding {
+                verb: "<catalog>".to_string(),
+                message: format!("failed to serialize canonical catalog: {error:#}"),
+            }),
+        }
+    }
+    report
 }
 
 /// Compose the new catalog text by adding one verb to the top-level `verbs:`
@@ -895,6 +1691,17 @@ fn compose_appended_catalog(existing: &str, verb: &Verb) -> Result<String> {
     let is_null_or_absent = matches!(map.get(&key), None | Some(serde_yaml_ng::Value::Null));
     if is_seq {
         if let Some(serde_yaml_ng::Value::Sequence(seq)) = map.get_mut(&key) {
+            if seq.iter().any(|value| {
+                value
+                    .as_mapping()
+                    .and_then(|candidate| {
+                        candidate.get(serde_yaml_ng::Value::String("name".to_string()))
+                    })
+                    .and_then(serde_yaml_ng::Value::as_str)
+                    == Some(verb.name.as_str())
+            }) {
+                bail!("a verb named '{}' already exists in the catalog", verb.name);
+            }
             seq.push(verb_value);
         }
     } else if is_null_or_absent {
@@ -903,6 +1710,27 @@ fn compose_appended_catalog(existing: &str, verb: &Verb) -> Result<String> {
         bail!("the catalog's `verbs` key is not a sequence");
     }
     serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
+}
+
+fn canonical_catalog_yaml<'a>(
+    existing: &str,
+    verbs: impl Iterator<Item = &'a Verb>,
+) -> Result<String> {
+    let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
+    let mut document: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(body).context("the existing verb catalog is not valid YAML")?;
+    let mapping = document
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("verb catalog is not a YAML mapping"))?;
+    let values = verbs
+        .map(serde_yaml_ng::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to serialize canonical verbs")?;
+    mapping.insert(
+        serde_yaml_ng::Value::String("verbs".to_string()),
+        serde_yaml_ng::Value::Sequence(values),
+    );
+    serde_yaml_ng::to_string(&document).context("failed to serialize the canonical catalog")
 }
 
 fn compose_removed_catalog(existing: &str, name: &str) -> Result<String> {
@@ -928,6 +1756,50 @@ fn compose_removed_catalog(existing: &str, name: &str) -> Result<String> {
         bail!("unknown verb: '{}'", name);
     }
     serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
+}
+
+fn compose_replaced_catalog(existing: &str, name: &str, replacement: &Verb) -> Result<String> {
+    let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
+    let mut doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(body).context("the existing verb catalog is not valid YAML")?;
+    let map = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("verb catalog is not a YAML mapping"))?;
+    let key = serde_yaml_ng::Value::String("verbs".to_string());
+    let Some(serde_yaml_ng::Value::Sequence(verbs)) = map.get_mut(&key) else {
+        bail!("the catalog's `verbs` key is not a sequence");
+    };
+    let replacement = serde_yaml_ng::to_value(replacement).context("failed to serialize verb")?;
+    let mut replaced = false;
+    for value in verbs {
+        let candidate_name = value
+            .as_mapping()
+            .and_then(|verb| verb.get(serde_yaml_ng::Value::String("name".to_string())))
+            .and_then(serde_yaml_ng::Value::as_str);
+        if candidate_name == Some(name) {
+            *value = replacement.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        bail!("unknown verb: '{}'", name);
+    }
+    serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
+}
+
+fn reserved_verb_name(name: &str) -> bool {
+    name.starts_with("grant-") || name.starts_with("access-generated-")
+}
+
+fn atomic_replace_if_unchanged(
+    path: &Path,
+    expected: &LearningFileSnapshot,
+    replacement: &[u8],
+) -> Result<crate::learned_rules::LearningWriteOutcome> {
+    let replacement =
+        std::str::from_utf8(replacement).context("catalog replacement is not UTF-8")?;
+    write_learning_file_atomically_for_locked_snapshot(path, expected, replacement)
 }
 
 /// Binaries a synthesized verb may not use: shells and interpreters where a
@@ -987,6 +1859,24 @@ const OVERBROAD_CANARIES: &[&str] = &[
     "a?b", "a[b", "a\\b", "a!b", "x y z",
 ];
 
+const SINGLE_ARGV_DANGEROUS_CANARIES: &[&str] = &[
+    "a\tb", "a\nb", "a\rb", "a;b", "a|b", "a&b", "a$b", "a`b", "a>b", "a<b",
+];
+
+const MAX_SINGLE_ARGV_LENGTH: usize = 4096;
+
+fn validate_single_argv_value(name: &str, value: &str) -> Result<()> {
+    if value.chars().any(|character| {
+        character.is_control() || matches!(character, ';' | '|' | '&' | '$' | '`' | '>' | '<')
+    }) {
+        bail!(
+            "value for '{}' contains a shell control character that single_argv parameters do not permit",
+            name
+        );
+    }
+    Ok(())
+}
+
 /// True if `name` is kebab-case (`^[a-z0-9][a-z0-9-]*$`), so it is unambiguously
 /// invokable on the `guard verb run <name>` command line. `pub(crate)`: also
 /// used by `gating::allow_promotion` to validate a model-proposed name before
@@ -1036,7 +1926,15 @@ fn legacy_template_features(args: &[String]) -> BTreeSet<String> {
 fn coverage_cell_matches(
     cell: &VerbCoverageCell,
     args: &[String],
+    cwd: Option<&Path>,
 ) -> Option<(BTreeSet<String>, CoverageSpecificity)> {
+    if cell
+        .cwd
+        .as_deref()
+        .is_some_and(|required| cwd != Some(required))
+    {
+        return None;
+    }
     if cell.min_args.is_some_and(|minimum| args.len() < minimum)
         || cell.max_args.is_some_and(|maximum| args.len() > maximum)
     {
@@ -1065,6 +1963,10 @@ fn coverage_cell_matches(
         requirements: features.clone(),
         ..CoverageSpecificity::default()
     };
+    if cell.cwd.is_some() {
+        features.insert("cwd:exact".to_string());
+        specificity.requirements.insert("cwd:exact".to_string());
+    }
     if let Some(minimum) = cell.min_args {
         features.insert(format!("argv:min={minimum}"));
         specificity
@@ -1286,17 +2188,12 @@ fn synthesized_access_is_statically_read_only(verb: &Verb) -> bool {
     };
 
     match binary.as_str() {
-        "kubectl" => matches!(
-            operation.as_str(),
-            "api-resources"
-                | "api-versions"
-                | "cluster-info"
-                | "describe"
-                | "explain"
-                | "get"
-                | "logs"
-                | "version"
-        ),
+        "kubectl" => match operation.as_str() {
+            "cluster-info" => !verb.args.iter().any(|argument| argument == "dump"),
+            "api-resources" | "api-versions" | "describe" | "explain" | "get" | "logs"
+            | "version" => true,
+            _ => false,
+        },
         "systemctl" => matches!(
             operation.as_str(),
             "is-active"
@@ -1318,20 +2215,55 @@ fn synthesized_access_is_statically_read_only(verb: &Verb) -> bool {
     }
 }
 
+/// Derive the fail-closed consequence permitted for generated access coverage
+/// before any exact operator coverage refinement is considered.
+///
+/// This function intentionally reads only executable matcher authority. It is
+/// shared by pending reductions, durable proposal parsing, approval
+/// projection, and installation, so provenance and model-supplied metadata
+/// cannot make the same matcher converge to different gate behavior.
+pub fn canonical_generated_access_consequence(verb: &Verb) -> Reversibility {
+    if synthesized_access_is_statically_read_only(verb) {
+        Reversibility::Reversible
+    } else {
+        Reversibility::Irreversible
+    }
+}
+
+/// Derive the only consequence an automatically promoted command may carry.
+/// Auto-promoted verbs also contain coverage metadata for display, but that
+/// metadata is not executable matcher authority and must not make a command
+/// appear safer than its binary and argv shape prove.
+pub fn canonical_auto_promoted_consequence(verb: &Verb) -> Reversibility {
+    let mut matcher = verb.clone();
+    matcher.coverage.clear();
+    canonical_generated_access_consequence(&matcher)
+}
+
 /// Every concrete argv a generated matcher's template admits, or `None` when
 /// a referenced parameter pattern is not a plain literal enumeration or the
 /// combination space exceeds the bound.
 fn enumerate_matcher_commands(candidate: &Verb) -> Option<Vec<Vec<String>>> {
-    const MAX_COMMANDS: usize = 64;
     let referenced: BTreeSet<String> = candidate
         .args
         .iter()
         .flat_map(|token| placeholders(token))
         .collect();
+    enumerate_parameter_sets(candidate, referenced)?
+        .iter()
+        .map(|params| render_args(&candidate.args, params, &candidate.name).ok())
+        .collect()
+}
+
+fn enumerate_parameter_sets(
+    candidate: &Verb,
+    referenced: BTreeSet<String>,
+) -> Option<Vec<BTreeMap<String, String>>> {
+    const MAX_COMMANDS: usize = 64;
     let mut combinations: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
     for name in &referenced {
         let spec = candidate.params.get(name)?;
-        let values = enumerate_pattern_literals(&spec.pattern)?;
+        let values = enumerate_pattern_literals(spec.pattern_text())?;
         if combinations.len().checked_mul(values.len())? > MAX_COMMANDS {
             return None;
         }
@@ -1346,10 +2278,7 @@ fn enumerate_matcher_commands(candidate: &Verb) -> Option<Vec<Vec<String>>> {
             })
             .collect();
     }
-    combinations
-        .iter()
-        .map(|params| render_args(&candidate.args, params, &candidate.name).ok())
-        .collect()
+    Some(combinations)
 }
 
 /// The literal branches of an anchored alternation such as `^(status|df)$`,
@@ -1364,16 +2293,28 @@ fn enumerate_pattern_literals(pattern: &str) -> Option<Vec<String>> {
     {
         inner = stripped;
     }
-    let branches: Vec<String> = inner.split('|').map(str::to_string).collect();
-    branches
-        .iter()
-        .all(|branch| {
-            !branch.is_empty()
-                && !branch
-                    .chars()
-                    .any(|character| r"\^$.?*+()[]{}|".contains(character))
-        })
-        .then_some(branches)
+    let mut branches = vec![String::new()];
+    let mut escaped = false;
+    for character in inner.chars() {
+        if escaped {
+            branches.last_mut()?.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '|' {
+            branches.push(String::new());
+            continue;
+        }
+        if r"^$.?*+()[]{}".contains(character) {
+            return None;
+        }
+        branches.last_mut()?.push(character);
+    }
+    (!escaped && branches.iter().all(|branch| !branch.is_empty())).then_some(branches)
 }
 
 fn constraint_selector(constraint: &ValueConstraint) -> String {
@@ -1405,16 +2346,1107 @@ fn validate_binary_not_shell(binary: &str, context: &str) -> Result<()> {
 /// Reject a parameter pattern broad enough to admit whitespace or shell
 /// metacharacters (see `OVERBROAD_CANARIES`). Shared by both synthesis paths.
 fn validate_param_not_overbroad(pname: &str, spec: &ParamSpec, context: &str) -> Result<()> {
-    let re =
-        compile_anchored(&spec.pattern).with_context(|| format!("param '{}' pattern", pname))?;
-    if let Some(canary) = OVERBROAD_CANARIES.iter().find(|c| re.is_match(c)) {
+    let re = compile_anchored(spec.pattern_text())
+        .with_context(|| format!("param '{}' pattern", pname))?;
+    let canaries = match spec.value_type() {
+        ParamValueType::Token => OVERBROAD_CANARIES,
+        ParamValueType::SingleArgv => SINGLE_ARGV_DANGEROUS_CANARIES,
+    };
+    if let Some(canary) = canaries.iter().find(|canary| re.is_match(canary)) {
         bail!(
             "{context} parameter '{}' pattern {:?} is too permissive (it matches {:?}); a verb \
-             parameter must be narrowly pinned and must not admit whitespace or shell metacharacters",
+             parameter must be narrowly pinned and must not admit shell control characters{}",
             pname,
-            spec.pattern,
-            canary
+            spec.pattern_text(),
+            canary,
+            if spec.value_type() == ParamValueType::Token {
+                " or whitespace"
+            } else {
+                ""
+            }
         );
+    }
+    Ok(())
+}
+
+/// Verify the generated representation of an exact finite parameter domain.
+/// Whitespace-bearing values stay one bounded argv element; all other values
+/// retain token semantics. Both forms reject control characters that could
+/// become shell syntax if a downstream tool ever reparsed the value.
+fn validate_auto_promoted_param_spec(pname: &str, spec: &ParamSpec) -> Result<Vec<String>> {
+    validate_param_not_overbroad(pname, spec, "auto-promoted verb")?;
+    let literals = enumerate_pattern_literals(spec.pattern_text()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "auto-promoted verb parameter '{}' must be a finite plain literal alternation",
+            pname
+        )
+    })?;
+    let contains_whitespace = literals
+        .iter()
+        .any(|value| value.chars().any(char::is_whitespace));
+    let expected_value_type = if contains_whitespace {
+        ParamValueType::SingleArgv
+    } else {
+        ParamValueType::Token
+    };
+    if spec.value_type() != expected_value_type {
+        bail!(
+            "auto-promoted verb parameter '{}' must use {} semantics for its exact observed values",
+            pname,
+            match expected_value_type {
+                ParamValueType::Token => "token",
+                ParamValueType::SingleArgv => "single_argv",
+            }
+        );
+    }
+    if expected_value_type == ParamValueType::SingleArgv {
+        let maximum = literals
+            .iter()
+            .map(|value| value.chars().count())
+            .max()
+            .expect("literal enumeration is non-empty");
+        if spec.max_length() != Some(maximum) {
+            bail!(
+                "auto-promoted verb parameter '{}' max_length must equal the longest exact observed value ({})",
+                pname,
+                maximum
+            );
+        }
+    }
+    for value in &literals {
+        if value.chars().any(|character| {
+            character.is_control() || matches!(character, ';' | '|' | '&' | '$' | '`' | '>' | '<')
+        }) {
+            bail!(
+                "auto-promoted verb parameter '{}' contains a shell control character in an exact observed value",
+                pname
+            );
+        }
+    }
+    Ok(literals)
+}
+
+fn path_is_absolute(value: &str) -> bool {
+    Path::new(value).is_absolute()
+}
+
+#[derive(Clone, Copy)]
+enum KnownFileArgument {
+    AbsolutePath,
+    AbsolutePathList,
+    AbsolutePathOrStdin,
+    KubectlFilename,
+    KeyEqualsPath,
+    HelmSetFile,
+    AnsibleInventory,
+    AnsibleExtraVars,
+    AnsibleVaultId,
+}
+
+impl KnownFileArgument {
+    fn accepts(self, value: &str) -> bool {
+        match self {
+            Self::AbsolutePath => path_is_absolute(value),
+            Self::AbsolutePathList => absolute_path_list(value),
+            Self::AbsolutePathOrStdin => value == "-" || path_is_absolute(value),
+            Self::KubectlFilename => {
+                !value.contains(',') && (value == "-" || path_is_absolute(value))
+            }
+            Self::KeyEqualsPath => key_equals_path_payload(value).is_some_and(path_is_absolute),
+            Self::HelmSetFile => helm_set_file_payload(value).is_some_and(path_is_absolute),
+            Self::AnsibleInventory => path_is_absolute(value) || value.ends_with(','),
+            Self::AnsibleExtraVars => value.strip_prefix('@').is_none_or(path_is_absolute),
+            Self::AnsibleVaultId => {
+                let source = value.rsplit_once('@').map_or(value, |(_, source)| source);
+                source == "prompt" || path_is_absolute(source)
+            }
+        }
+    }
+
+    fn requirement(self) -> &'static str {
+        match self {
+            Self::AbsolutePath => "an absolute path",
+            Self::AbsolutePathList => "a list containing only absolute paths",
+            Self::AbsolutePathOrStdin => "an absolute path or '-' for standard input",
+            Self::KubectlFilename => {
+                "one absolute path or '-' for standard input; repeat the option for multiple sources"
+            }
+            Self::KeyEqualsPath => "an absolute path, optionally prefixed with key=",
+            Self::HelmSetFile => "one key=absolute-path pair; repeat the option for multiple files",
+            Self::AnsibleInventory => "an absolute path or comma-terminated inline host list",
+            Self::AnsibleExtraVars => "an inline value or an @-prefixed absolute path",
+            Self::AnsibleVaultId => "a prompt source or an absolute vault client path",
+        }
+    }
+
+    /// Extract the local-path payload from the documented argument grammar.
+    /// `None` means the form is an allowed non-file value, such as an inline
+    /// Ansible variable assignment or a vault prompt.
+    fn path_payload_template(self, value: &str) -> Option<&str> {
+        match self {
+            Self::KeyEqualsPath => key_equals_path_payload(value),
+            Self::HelmSetFile => helm_set_file_payload(value),
+            Self::AnsibleExtraVars => value.strip_prefix('@'),
+            Self::AnsibleVaultId => {
+                let source = value.rsplit_once('@').map_or(value, |(_, source)| source);
+                (!source.is_empty() && source != "prompt").then_some(source)
+            }
+            _ => Some(value),
+        }
+    }
+
+    fn accepts_parameter_value(self, value: &str) -> bool {
+        match self {
+            Self::KeyEqualsPath | Self::HelmSetFile | Self::AnsibleExtraVars => {
+                path_is_absolute(value)
+            }
+            _ => self.accepts(value),
+        }
+    }
+}
+
+fn absolute_path_list(value: &str) -> bool {
+    !value.is_empty() && std::env::split_paths(value).all(|path| path.is_absolute())
+}
+
+fn key_equals_path_payload(value: &str) -> Option<&str> {
+    let path = value.split_once('=').map_or(value, |(_, payload)| payload);
+    (!path.is_empty()).then_some(path)
+}
+
+fn helm_set_file_payload(value: &str) -> Option<&str> {
+    let (key, path) = value.split_once('=')?;
+    (!key.is_empty() && !path.is_empty() && !value.contains(',')).then_some(path)
+}
+
+const ANSIBLE_OPERATOR_FIXED_OPTIONS: &[&str] = &[
+    "--ssh-common-args",
+    "--ssh-extra-args",
+    "--scp-extra-args",
+    "--sftp-extra-args",
+];
+
+fn validate_operator_fixed_options(
+    verb: &Verb,
+    binary: &str,
+    args: &[String],
+    command_label: &str,
+) -> Result<()> {
+    let options: &[&str] = match binary {
+        "ansible" | "ansible-playbook" => ANSIBLE_OPERATOR_FIXED_OPTIONS,
+        "helm" => &["--post-renderer"],
+        _ => &[],
+    };
+    let generic_coverage = verb.args.is_empty() && !verb.coverage.is_empty();
+
+    for (index, argument) in args.iter().enumerate() {
+        for option in options {
+            let value: Option<&str> = if argument == option {
+                Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "verb '{}' {command_label} option '{}' requires an operator-fixed value",
+                                verb.name,
+                                option
+                            )
+                        })?
+                        .as_str(),
+                )
+            } else {
+                argument.strip_prefix(&format!("{option}="))
+            };
+            let Some(value) = value else {
+                continue;
+            };
+            if generic_coverage {
+                bail!(
+                    "verb '{}' {command_label} option '{}' is executable authority and requires a fixed argv template",
+                    verb.name,
+                    option
+                );
+            }
+            if !placeholders(value).is_empty() {
+                bail!(
+                    "verb '{}' {command_label} option '{}' must use one operator-fixed literal value",
+                    verb.name,
+                    option
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_known_file_template(
+    verb: &Verb,
+    template: &str,
+    command_label: &str,
+    position: &str,
+    kind: KnownFileArgument,
+) -> Result<()> {
+    if kind.accepts(template) {
+        return Ok(());
+    }
+    let path_template = kind.path_payload_template(template).ok_or_else(|| {
+        anyhow::anyhow!(
+            "verb '{}' {command_label} file argument {position} must be {}, got {:?}",
+            verb.name,
+            kind.requirement(),
+            template
+        )
+    })?;
+    let names = placeholders(path_template);
+    if names.len() == 1 && path_template == format!("{{{}}}", names[0]) {
+        let spec = verb.params.get(&names[0]).ok_or_else(|| {
+            anyhow::anyhow!(
+                "verb '{}' {command_label} file argument {position} references undeclared parameter '{}'",
+                verb.name,
+                names[0]
+            )
+        })?;
+        if let Some(values) = enumerate_pattern_literals(spec.pattern_text()) {
+            if values
+                .iter()
+                .all(|value| kind.accepts_parameter_value(value))
+            {
+                return Ok(());
+            }
+            bail!(
+                "verb '{}' {command_label} file parameter '{}' enumerates a value that is not {}",
+                verb.name,
+                names[0],
+                kind.requirement()
+            );
+        }
+        if spec
+            .default
+            .as_deref()
+            .is_some_and(|value| !kind.accepts_parameter_value(value))
+        {
+            bail!(
+                "verb '{}' {command_label} file parameter '{}' has a default that is not {}",
+                verb.name,
+                names[0],
+                kind.requirement()
+            );
+        }
+        // Regex-language inclusion cannot be proven with representative
+        // samples. `render` checks every concrete value, and raw matching uses
+        // the same rendered-command check before granting coverage.
+        compile_anchored(spec.pattern_text()).with_context(|| {
+            format!(
+                "verb '{}' {command_label} file parameter '{}' has an invalid pattern",
+                verb.name, names[0]
+            )
+        })?;
+        return Ok(());
+    }
+    bail!(
+        "verb '{}' {command_label} file argument {position} must be {}, got {:?}",
+        verb.name,
+        kind.requirement(),
+        template
+    )
+}
+
+fn validate_known_file_arguments(
+    verb: &Verb,
+    binary: &str,
+    args: &[String],
+    command_label: &str,
+) -> Result<()> {
+    let binary = binary_match_key(binary);
+    const ABSOLUTE: KnownFileArgument = KnownFileArgument::AbsolutePath;
+    const ABSOLUTE_LIST: KnownFileArgument = KnownFileArgument::AbsolutePathList;
+    const PATH_OR_STDIN: KnownFileArgument = KnownFileArgument::AbsolutePathOrStdin;
+    const KUBECTL_FILE: KnownFileArgument = KnownFileArgument::KubectlFilename;
+    const KEY_PATH: KnownFileArgument = KnownFileArgument::KeyEqualsPath;
+    const HELM_SET_FILE: KnownFileArgument = KnownFileArgument::HelmSetFile;
+    const INVENTORY: KnownFileArgument = KnownFileArgument::AnsibleInventory;
+    const EXTRA_VARS: KnownFileArgument = KnownFileArgument::AnsibleExtraVars;
+    const VAULT_ID: KnownFileArgument = KnownFileArgument::AnsibleVaultId;
+    let file_options: &[(&str, KnownFileArgument)] = match binary.as_str() {
+        "ansible" | "ansible-playbook" => &[
+            ("-i", INVENTORY),
+            ("--inventory", INVENTORY),
+            ("--inventory-file", INVENTORY),
+            ("-e", EXTRA_VARS),
+            ("--extra-vars", EXTRA_VARS),
+            ("-M", ABSOLUTE_LIST),
+            ("--module-path", ABSOLUTE_LIST),
+            ("--playbook-dir", ABSOLUTE),
+            ("--vault-id", VAULT_ID),
+            ("--private-key", ABSOLUTE),
+            ("--key-file", ABSOLUTE),
+            ("--become-password-file", ABSOLUTE),
+            ("--become-pass-file", ABSOLUTE),
+            ("--connection-password-file", ABSOLUTE),
+            ("--conn-pass-file", ABSOLUTE),
+            ("--vault-password-file", ABSOLUTE),
+            ("--vault-pass-file", ABSOLUTE),
+        ],
+        "kubectl" => &[
+            ("-f", KUBECTL_FILE),
+            ("--filename", KUBECTL_FILE),
+            ("-k", ABSOLUTE),
+            ("--kustomize", ABSOLUTE),
+            ("--kubeconfig", ABSOLUTE),
+            ("--kuberc", ABSOLUTE),
+            ("--cache-dir", ABSOLUTE),
+            ("--profile-output", ABSOLUTE),
+            ("--output-directory", PATH_OR_STDIN),
+            ("--from-file", KEY_PATH),
+            ("--from-env-file", ABSOLUTE),
+            ("--cert", ABSOLUTE),
+            ("--key", ABSOLUTE),
+            ("--patch-file", ABSOLUTE),
+            ("--certificate-authority", ABSOLUTE),
+            ("--client-certificate", ABSOLUTE),
+            ("--client-key", ABSOLUTE),
+        ],
+        "helm" => &[
+            ("-f", ABSOLUTE),
+            ("--values", ABSOLUTE),
+            ("--kubeconfig", ABSOLUTE),
+            ("--repository-config", ABSOLUTE),
+            ("--registry-config", ABSOLUTE),
+            ("--repository-cache", ABSOLUTE),
+            ("--content-cache", ABSOLUTE),
+            ("--kube-ca-file", ABSOLUTE),
+            ("--ca-file", ABSOLUTE),
+            ("--cert-file", ABSOLUTE),
+            ("--key-file", ABSOLUTE),
+            ("--keyring", ABSOLUTE),
+            ("--set-file", HELM_SET_FILE),
+            ("--post-renderer", ABSOLUTE),
+            ("--output-dir", ABSOLUTE),
+            ("--destination", ABSOLUTE),
+            ("--untardir", ABSOLUTE),
+            ("--merge", ABSOLUTE),
+            ("--passphrase-file", PATH_OR_STDIN),
+        ],
+        _ => &[],
+    };
+
+    validate_operator_fixed_options(verb, &binary, args, command_label)?;
+
+    // Cobra stops parsing kubectl's local options at `--`; later tokens are
+    // command arguments, including the remote argv accepted by `kubectl exec`.
+    let local_args = if binary == "kubectl" {
+        &args[..args
+            .iter()
+            .position(|argument| argument == "--")
+            .unwrap_or(args.len())]
+    } else {
+        args
+    };
+
+    if matches!(binary.as_str(), "ansible" | "ansible-playbook") {
+        for argument in args {
+            let option = argument
+                .split_once('=')
+                .map_or(argument.as_str(), |pair| pair.0);
+            if option.starts_with("--")
+                && !file_options.iter().any(|(known, _)| *known == option)
+                && file_options
+                    .iter()
+                    .map(|(known, _)| *known)
+                    .chain(ANSIBLE_OPERATOR_FIXED_OPTIONS.iter().copied())
+                    .filter(|known| known.starts_with("--"))
+                    .any(|known| known != option && known.starts_with(option))
+            {
+                bail!(
+                    "verb '{}' {command_label} uses abbreviated Ansible file option '{}'; spell the option in full",
+                    verb.name,
+                    option
+                );
+            }
+            if let Some(cluster) = option
+                .strip_prefix('-')
+                .filter(|value| !value.starts_with('-'))
+            {
+                let clustered_value_option = cluster
+                    .strip_prefix('v')
+                    .and_then(|rest| rest.trim_start_matches('v').chars().next())
+                    .is_some_and(|flag| matches!(flag, 'i' | 'e' | 'M'));
+                if clustered_value_option {
+                    bail!(
+                        "verb '{}' {command_label} clusters a protected Ansible value option in '{}'; pass value options separately",
+                        verb.name,
+                        option
+                    );
+                }
+            }
+        }
+    }
+
+    for (index, argument) in local_args.iter().enumerate() {
+        if let Some((_, kind)) = file_options.iter().find(|(option, _)| *option == argument) {
+            let value = local_args.get(index + 1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "verb '{}' {command_label} option '{}' requires {}",
+                    verb.name,
+                    argument,
+                    kind.requirement()
+                )
+            })?;
+            validate_known_file_template(
+                verb,
+                value,
+                command_label,
+                &format!("after {argument}"),
+                *kind,
+            )?;
+        }
+        for (option, kind) in file_options {
+            if option.len() == 2 {
+                if let Some(value) = argument
+                    .strip_prefix(option)
+                    .filter(|value| !value.is_empty())
+                {
+                    let value = value.strip_prefix('=').unwrap_or(value);
+                    validate_known_file_template(
+                        verb,
+                        value,
+                        command_label,
+                        &format!("attached to {option}"),
+                        *kind,
+                    )?;
+                }
+            } else if let Some(value) = argument.strip_prefix(&format!("{option}=")) {
+                validate_known_file_template(
+                    verb,
+                    value,
+                    command_label,
+                    &format!("in {option}=..."),
+                    *kind,
+                )?;
+            }
+        }
+    }
+
+    if binary == "kubectl" {
+        validate_kubectl_profile_output(verb, local_args, command_label)?;
+        validate_kubectl_output_files(verb, local_args, command_label)?;
+    }
+    validate_known_positional_file_arguments(verb, &binary, local_args, command_label)?;
+
+    if binary == "ansible-playbook" {
+        const VALUE_OPTIONS: &[&str] = &[
+            "-i",
+            "--inventory",
+            "--inventory-file",
+            "-l",
+            "--limit",
+            "-e",
+            "--extra-vars",
+            "-t",
+            "--tags",
+            "--skip-tags",
+            "--start-at-task",
+            "--vault-id",
+            "--vault-password-file",
+            "--vault-pass-file",
+            "--private-key",
+            "--key-file",
+            "--become-password-file",
+            "--become-pass-file",
+            "--connection-password-file",
+            "--conn-pass-file",
+            "--playbook-dir",
+            "-u",
+            "--user",
+            "-f",
+            "--forks",
+            "-M",
+            "--module-path",
+            "-c",
+            "--connection",
+            "-T",
+            "--timeout",
+            "--ssh-common-args",
+            "--ssh-extra-args",
+            "--sftp-extra-args",
+            "--scp-extra-args",
+            "--become-method",
+            "--become-user",
+        ];
+        let mut skip_value = false;
+        for argument in args {
+            if skip_value {
+                skip_value = false;
+                continue;
+            }
+            if argument.starts_with('-') {
+                skip_value = VALUE_OPTIONS.contains(&argument.as_str());
+                continue;
+            }
+            validate_known_file_template(
+                verb,
+                argument,
+                command_label,
+                "playbook",
+                KnownFileArgument::AbsolutePath,
+            )?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubectl_profile_output(
+    verb: &Verb,
+    args: &[String],
+    command_label: &str,
+) -> Result<()> {
+    let mut selected_profile = None;
+    let mut output_is_explicit = false;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--profile" {
+            let value = args.get(index + 1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "verb '{}' {command_label} option '--profile' requires a profile name",
+                    verb.name
+                )
+            })?;
+            selected_profile = Some(value.as_str());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--profile=") {
+            if value.is_empty() {
+                bail!(
+                    "verb '{}' {command_label} option '--profile' requires a profile name",
+                    verb.name
+                );
+            }
+            selected_profile = Some(value);
+        }
+        if argument == "--profile-output" || argument.starts_with("--profile-output=") {
+            output_is_explicit = true;
+        }
+        index += 1;
+    }
+
+    if selected_profile.is_some_and(|profile| profile != "none") && !output_is_explicit {
+        bail!(
+            "verb '{}' {command_label} enables kubectl profiling without an explicit absolute --profile-output path",
+            verb.name
+        );
+    }
+    Ok(())
+}
+
+fn kubectl_option_value<'a>(
+    verb: &Verb,
+    args: &'a [String],
+    short: Option<&str>,
+    long: &str,
+    command_label: &str,
+) -> Result<Option<&'a str>> {
+    let mut selected = None;
+    for (index, argument) in args.iter().enumerate() {
+        if argument == long || short.is_some_and(|option| argument == option) {
+            selected = Some(
+                args.get(index + 1)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "verb '{}' {command_label} option '{}' requires a value",
+                            verb.name,
+                            argument
+                        )
+                    })?
+                    .as_str(),
+            );
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix(&format!("{long}=")) {
+            selected = Some(value);
+            continue;
+        }
+        if let Some(option) = short {
+            if let Some(value) = argument
+                .strip_prefix(option)
+                .filter(|value| !value.is_empty())
+            {
+                selected = Some(value.strip_prefix('=').unwrap_or(value));
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn validate_kubectl_output_files(verb: &Verb, args: &[String], command_label: &str) -> Result<()> {
+    let Some(output) = kubectl_option_value(verb, args, Some("-o"), "--output", command_label)?
+    else {
+        return Ok(());
+    };
+
+    for prefix in [
+        "custom-columns-file=",
+        "jsonpath-file=",
+        "go-template-file=",
+        "templatefile=",
+    ] {
+        if let Some(path) = output.strip_prefix(prefix) {
+            return validate_known_file_template(
+                verb,
+                path,
+                command_label,
+                &format!("in output format {prefix}..."),
+                KnownFileArgument::AbsolutePath,
+            );
+        }
+    }
+
+    if matches!(output, "custom-columns-file" | "jsonpath-file") {
+        bail!(
+            "verb '{}' {command_label} output format '{}' requires an absolute file payload",
+            verb.name,
+            output
+        );
+    }
+    if matches!(output, "go-template-file" | "templatefile") {
+        let template = kubectl_option_value(verb, args, None, "--template", command_label)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "verb '{}' {command_label} output format '{}' requires an absolute --template path",
+                    verb.name,
+                    output
+                )
+            })?;
+        validate_known_file_template(
+            verb,
+            template,
+            command_label,
+            "kubectl output template",
+            KnownFileArgument::AbsolutePath,
+        )?;
+    }
+    Ok(())
+}
+
+const KUBECTL_GLOBAL_VALUE_OPTIONS: &[&str] = &[
+    "--as",
+    "--as-group",
+    "--as-uid",
+    "--as-user-extra",
+    "--cache-dir",
+    "--certificate-authority",
+    "--client-certificate",
+    "--client-key",
+    "--cluster",
+    "--context",
+    "--kuberc",
+    "--kubeconfig",
+    "-n",
+    "--namespace",
+    "--password",
+    "--profile",
+    "--profile-output",
+    "--request-timeout",
+    "-s",
+    "--server",
+    "--storage-driver-buffer-duration",
+    "--storage-driver-db",
+    "--storage-driver-host",
+    "--storage-driver-password",
+    "--storage-driver-table",
+    "--storage-driver-user",
+    "--tls-server-name",
+    "--token",
+    "--user",
+    "--username",
+    "-v",
+    "--v",
+    "--vmodule",
+];
+
+const KUBECTL_GLOBAL_BOOLEAN_OPTIONS: &[&str] = &[
+    "--disable-compression",
+    "--insecure-skip-tls-verify",
+    "--match-server-version",
+    "--storage-driver-secure",
+    "--warnings-as-errors",
+];
+
+fn kubectl_subcommand_index(
+    verb: &Verb,
+    args: &[String],
+    command_label: &str,
+) -> Result<Option<usize>> {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            return Ok(None);
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            return Ok(Some(index));
+        }
+        if argument.contains('=') || KUBECTL_GLOBAL_BOOLEAN_OPTIONS.contains(&argument.as_str()) {
+            index += 1;
+            continue;
+        }
+        if KUBECTL_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str()) {
+            if args.get(index + 1).is_none() {
+                bail!(
+                    "verb '{}' {command_label} kubectl global option '{}' requires a value",
+                    verb.name,
+                    argument
+                );
+            }
+            index += 2;
+            continue;
+        }
+        if ["-n", "-s", "-v"]
+            .iter()
+            .any(|option| argument.starts_with(option) && argument.len() > option.len())
+        {
+            index += 1;
+            continue;
+        }
+        bail!(
+            "verb '{}' {command_label} uses unrecognized kubectl global option '{}' before the subcommand",
+            verb.name,
+            argument
+        );
+    }
+    Ok(None)
+}
+
+fn kubectl_cp_remote_endpoint(value: &str) -> bool {
+    if path_is_absolute(value) {
+        return false;
+    }
+    value
+        .split_once(':')
+        .is_some_and(|(pod, path)| !pod.is_empty() && !path.is_empty() && !pod.contains('\\'))
+}
+
+fn validate_kubectl_cp_operands(
+    verb: &Verb,
+    args: &[String],
+    subcommand_index: usize,
+    command_label: &str,
+) -> Result<()> {
+    let mut operands = Vec::new();
+    let mut index = subcommand_index + 1;
+    while index < args.len() {
+        let argument = &args[index];
+        if matches!(argument.as_str(), "-c" | "--container" | "--retries")
+            || KUBECTL_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str())
+        {
+            if args.get(index + 1).is_none() {
+                bail!(
+                    "verb '{}' {command_label} kubectl cp option '{}' requires a value",
+                    verb.name,
+                    argument
+                );
+            }
+            index += 2;
+            continue;
+        }
+        if argument.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        operands.push(argument.as_str());
+        index += 1;
+    }
+    if operands.len() != 2 {
+        bail!(
+            "verb '{}' {command_label} kubectl cp requires exactly two endpoints",
+            verb.name
+        );
+    }
+    let remote = operands
+        .iter()
+        .map(|operand| kubectl_cp_remote_endpoint(operand))
+        .collect::<Vec<_>>();
+    if remote.iter().filter(|remote| **remote).count() != 1 {
+        bail!(
+            "verb '{}' {command_label} kubectl cp requires one remote and one local endpoint",
+            verb.name
+        );
+    }
+    let local_index = usize::from(remote[0]);
+    validate_known_file_template(
+        verb,
+        operands[local_index],
+        command_label,
+        "kubectl cp local endpoint",
+        KnownFileArgument::AbsolutePath,
+    )
+}
+
+/// Validate only positional forms whose local-file grammar is explicit in the
+/// relevant CLI documentation. This is deliberately not a complete parser for
+/// kubectl or Helm: ambiguous chart references and arbitrary option grammar
+/// remain outside this bounded file-path check.
+fn validate_known_positional_file_arguments(
+    verb: &Verb,
+    binary: &str,
+    args: &[String],
+    command_label: &str,
+) -> Result<()> {
+    match binary {
+        "kubectl" => {
+            if !args
+                .iter()
+                .any(|argument| matches!(argument.as_str(), "kustomize" | "cp"))
+            {
+                return Ok(());
+            }
+            let Some(index) = kubectl_subcommand_index(verb, args, command_label)? else {
+                return Ok(());
+            };
+            match args[index].as_str() {
+                "kustomize" => {
+                    let directory = args.get(index + 1).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "verb '{}' {command_label} kubectl kustomize requires an absolute directory",
+                            verb.name
+                        )
+                    })?;
+                    validate_known_file_template(
+                        verb,
+                        directory,
+                        command_label,
+                        "kubectl kustomize directory",
+                        KnownFileArgument::AbsolutePath,
+                    )?;
+                }
+                "cp" => validate_kubectl_cp_operands(verb, args, index, command_label)?,
+                _ => {}
+            }
+        }
+        "helm" if verb.args.is_empty() && !verb.coverage.is_empty() => {
+            // Generic coverage accepts only the unambiguous local-operand
+            // forms below. Operator-authored argv templates retain Helm's
+            // broader positional grammar and are reviewed as exact commands.
+            for (index, argument) in args.iter().enumerate() {
+                let operand_index = match argument.as_str() {
+                    "verify" | "package" | "lint" => Some(index + 1),
+                    "build" | "update"
+                        if index > 0
+                            && args
+                                .get(index - 1)
+                                .is_some_and(|previous| previous == "dependency") =>
+                    {
+                        Some(index + 1)
+                    }
+                    _ => None,
+                };
+                let Some(operand_index) = operand_index else {
+                    continue;
+                };
+                let operand = args.get(operand_index).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "verb '{}' {command_label} Helm subcommand '{}' requires an absolute local operand",
+                        verb.name,
+                        argument
+                    )
+                })?;
+                if operand.starts_with('-') {
+                    bail!(
+                        "verb '{}' {command_label} Helm subcommand '{}' must place its local operand immediately after the subcommand",
+                        verb.name,
+                        argument
+                    );
+                }
+                validate_known_file_template(
+                    verb,
+                    operand,
+                    command_label,
+                    &format!("Helm {argument} operand"),
+                    KnownFileArgument::AbsolutePath,
+                )?;
+            }
+
+            // `install`, `upgrade`, and `template` accept both chart
+            // references and local paths. Their full positional grammar is
+            // intentionally not modeled here, but an explicit relative path
+            // is unambiguously caller-local and cannot be preauthorized.
+            if let Some(relative) = args.iter().find(|argument| {
+                matches!(argument.as_str(), "." | "..")
+                    || argument.starts_with("./")
+                    || argument.starts_with("../")
+            }) {
+                bail!(
+                    "verb '{}' {command_label} contains explicit relative Helm path operand {:?}; use an absolute path",
+                    verb.name,
+                    relative
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_inventory_constraint_paths(
+    verb: &Verb,
+    cell: &VerbCoverageCell,
+    constraint: &ValueConstraint,
+) -> Result<()> {
+    if !matches!(
+        binary_match_key(&verb.binary).as_str(),
+        "ansible" | "ansible-playbook"
+    ) {
+        return Ok(());
+    }
+    if constraint.values.is_empty() {
+        bail!(
+            "verb '{}' coverage cell '{}': Ansible inventory coverage must enumerate absolute paths or inline host lists",
+            verb.name,
+            cell.name
+        );
+    }
+    for value in &constraint.values {
+        if !path_is_absolute(value) && !value.ends_with(',') {
+            bail!(
+                "verb '{}' coverage cell '{}': Ansible inventory value must be an absolute path or inline host list, got {:?}",
+                verb.name,
+                cell.name,
+                value
+            );
+        }
+    }
+    Ok(())
+}
+
+fn kubectl_exec_interactive_flag(argument: &str) -> bool {
+    matches!(argument, "--stdin" | "--tty")
+        || argument.starts_with("--stdin=")
+        || argument.starts_with("--tty=")
+        || argument
+            .strip_prefix('-')
+            .filter(|flags| !flags.is_empty())
+            .is_some_and(|flags| flags.chars().all(|flag| matches!(flag, 'i' | 't')))
+}
+
+fn validate_synthesized_kubectl_exec(verb: &Verb, args: &[String], label: &str) -> Result<()> {
+    let Some(exec_index) = args.iter().position(|argument| argument == "exec") else {
+        return Ok(());
+    };
+    if let Some(flag) = args[exec_index + 1..]
+        .iter()
+        .find(|argument| kubectl_exec_interactive_flag(argument))
+    {
+        bail!(
+            "synthesized verb '{}' {label} requests an interactive exec stream ('{}'); guard refuses interactive stdin/tty",
+            verb.name,
+            flag
+        );
+    }
+    let separator = args
+        .iter()
+        .enumerate()
+        .skip(exec_index + 1)
+        .find_map(|(index, argument)| (argument == "--").then_some(index))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "synthesized verb '{}' {label} kubectl exec must separate its command with '--'",
+                verb.name
+            )
+        })?;
+    let value_options = [
+        "-c",
+        "--container",
+        "-n",
+        "--namespace",
+        "--pod-running-timeout",
+    ];
+    let mut skip_value = false;
+    let target = args[exec_index + 1..separator]
+        .iter()
+        .find(|argument| {
+            if skip_value {
+                skip_value = false;
+                return false;
+            }
+            if value_options.contains(&argument.as_str()) {
+                skip_value = true;
+                return false;
+            }
+            !argument.starts_with('-')
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "synthesized verb '{}' {label} kubectl exec has no target",
+                verb.name
+            )
+        })?;
+    let target_prefix = target.split_once('/').map(|(prefix, _)| prefix);
+    if !matches!(
+        target_prefix,
+        Some(
+            "pod"
+                | "pods"
+                | "deploy"
+                | "deployment"
+                | "deployments"
+                | "statefulset"
+                | "statefulsets"
+                | "daemonset"
+                | "daemonsets"
+                | "job"
+                | "jobs"
+                | "service"
+                | "services"
+        )
+    ) {
+        bail!(
+            "synthesized verb '{}' {label} kubectl exec target {:?} must be an explicit resource reference such as deploy/<name>, not a bare generated pod assumption",
+            verb.name,
+            target
+        );
+    }
+    let executable = args.get(separator + 1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "synthesized verb '{}' {label} kubectl exec has no executable after '--'",
+            verb.name
+        )
+    })?;
+    if executable.chars().any(char::is_whitespace)
+        || placeholders(executable).iter().any(|name| {
+            verb.params
+                .get(name)
+                .is_some_and(|spec| spec.value_type() == ParamValueType::SingleArgv)
+        })
+    {
+        bail!(
+            "synthesized verb '{}' {label} kubectl exec executable {:?} must be one whitespace-free argv token",
+            verb.name,
+            executable
+        );
+    }
+    Ok(())
+}
+
+fn validate_synthesized_command_shape(
+    verb: &Verb,
+    binary: &str,
+    args: &[String],
+    label: &str,
+) -> Result<()> {
+    validate_binary_not_shell(binary, &format!("synthesized verb {label}"))?;
+    if let Some(operator) = args
+        .iter()
+        .find(|argument| matches!(argument.as_str(), ";" | "&&" | "||" | "|" | ">" | "<"))
+    {
+        bail!(
+            "synthesized verb '{}' {label} has argv element {:?}, a literal shell operator; guard runs no shell, so the element cannot chain or redirect",
+            verb.name,
+            operator
+        );
+    }
+    if binary_match_key(binary) == "kubectl" {
+        validate_synthesized_kubectl_exec(verb, args, label)?;
     }
     Ok(())
 }
@@ -1426,6 +3458,7 @@ fn validate_param_not_overbroad(pname: &str, spec: &ParamSpec, context: &str) ->
 /// enough to admit whitespace or shell metacharacters. Structural validation
 /// (anchored patterns, single-argv rendering) is still enforced by `validate_verb`.
 pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
+    validate_verb(verb)?;
     if verb.trusted {
         bail!(
             "a synthesized verb may not be `trusted`; promote a verb to trusted only with a \
@@ -1438,7 +3471,10 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
             verb.name
         );
     }
-    validate_binary_not_shell(&verb.binary, "synthesized verb")?;
+    validate_synthesized_command_shape(verb, &verb.binary, &verb.args, "forward command")?;
+    if let Some(revert) = &verb.revert {
+        validate_synthesized_command_shape(verb, &revert.binary, &revert.args, "revert command")?;
+    }
     let binary_name = std::path::Path::new(&verb.binary)
         .file_name()
         .and_then(|name| name.to_str())
@@ -1457,32 +3493,6 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
             verb.binary
         );
     }
-    if let Some(operator) = verb
-        .args
-        .iter()
-        .find(|argument| matches!(argument.as_str(), ";" | "&&" | "||" | "|" | ">" | "<"))
-    {
-        bail!(
-            "synthesized verb '{}' has argv element {:?}, a literal shell operator; guard runs no \
-             shell, so the element can never chain or redirect and the verb is non-functional",
-            verb.name,
-            operator
-        );
-    }
-    if binary_name == "kubectl" && verb.args.iter().any(|argument| argument == "exec") {
-        if let Some(flag) = verb
-            .args
-            .iter()
-            .find(|argument| matches!(argument.as_str(), "-i" | "-t" | "-it" | "-ti"))
-        {
-            bail!(
-                "synthesized verb '{}' requests an interactive exec stream ('{}'); guard refuses \
-                 interactive stdin/tty at run time, so storing the flag only sets a trap",
-                verb.name,
-                flag
-            );
-        }
-    }
     for (pname, spec) in &verb.params {
         validate_param_not_overbroad(pname, spec, "synthesized verb")?;
     }
@@ -1494,6 +3504,294 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
         bail!("a synthesized verb may not mint override markers");
     }
     Ok(())
+}
+
+/// Canonical authority-bearing fields for generated access coverage. This
+/// stable shape identifies the matcher shown to an operator.
+pub fn generated_access_matcher_shape(verb: &Verb) -> serde_json::Value {
+    let coverage = verb
+        .coverage
+        .iter()
+        .cloned()
+        .map(|mut cell| {
+            cell.provenance = None;
+            cell
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "binary": verb.binary,
+        "args": verb.args,
+        "coverage": coverage,
+        "credential_plan": verb.credential_plan,
+        "params": verb.params,
+        "hold": verb.hold,
+    })
+}
+
+pub fn generated_access_matcher_digest(matcher: &serde_json::Value) -> String {
+    Sha256::digest(serde_json::to_vec(matcher).expect("access matcher serializes"))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn generated_access_verb_name(verb: &Verb) -> String {
+    let digest = generated_access_matcher_digest(&generated_access_matcher_shape(verb));
+    format!("access-generated-{}", &digest[..16])
+}
+
+/// Deterministic operator-facing description derived only from the generated
+/// matcher's authority-bearing shape.
+pub fn generated_access_description(verb: &Verb) -> String {
+    let pinned = verb
+        .args
+        .iter()
+        .filter(|argument| !argument.contains('{'))
+        .cloned()
+        .collect::<Vec<_>>();
+    let parameters = verb.params.keys().cloned().collect::<Vec<_>>();
+    let mut description = format!("Runs {}", verb.binary);
+    if !pinned.is_empty() {
+        description.push_str(&format!(" with pinned arguments {}", pinned.join(" ")));
+    }
+    match parameters.len() {
+        0 => description.push_str(" and no caller-supplied values"),
+        1 => description.push_str(&format!(
+            " and one caller-supplied value ({})",
+            parameters[0]
+        )),
+        count => description.push_str(&format!(
+            " and {count} caller-supplied values ({})",
+            parameters.join(", ")
+        )),
+    }
+    description.push('.');
+    description
+}
+
+fn value_constraint_contains_sensitive_literal(constraint: &ValueConstraint) -> bool {
+    constraint
+        .options
+        .iter()
+        .any(|option| text_contains_sensitive_literals(option))
+        || constraint.values.iter().any(|value| {
+            text_contains_sensitive_literals(value)
+                || constraint.options.iter().any(|option| {
+                    command_contains_sensitive_literals(
+                        "generated-access-parameter",
+                        &[option.clone(), value.clone()],
+                    )
+                })
+        })
+}
+
+fn generated_authority_contains_sensitive_literal(verb: &Verb) -> bool {
+    if text_contains_sensitive_literals(&verb.name)
+        || command_contains_sensitive_literals(&verb.binary, &verb.args)
+        || verb
+            .revert
+            .as_ref()
+            .is_some_and(|revert| command_contains_sensitive_literals(&revert.binary, &revert.args))
+        || verb
+            .credential_plan
+            .as_deref()
+            .is_some_and(text_contains_sensitive_literals)
+        || verb
+            .promotion_stamp
+            .as_deref()
+            .is_some_and(text_contains_sensitive_literals)
+    {
+        return true;
+    }
+    for (name, specification) in &verb.params {
+        if named_value_contains_sensitive_literals(name, specification.pattern_text())
+            || specification.default.as_deref().is_some_and(|value| {
+                named_value_contains_sensitive_literals(name, value)
+                    || text_contains_sensitive_literals(value)
+            })
+        {
+            return true;
+        }
+    }
+    verb.coverage.iter().any(|cell| {
+        text_contains_sensitive_literals(&cell.name)
+            || command_contains_sensitive_literals(&verb.binary, &cell.required_args)
+            || command_contains_sensitive_literals(&verb.binary, &cell.forbidden_args)
+            || cell
+                .options
+                .iter()
+                .any(value_constraint_contains_sensitive_literal)
+            || cell
+                .target
+                .as_ref()
+                .is_some_and(value_constraint_contains_sensitive_literal)
+            || cell
+                .inventory
+                .as_ref()
+                .is_some_and(value_constraint_contains_sensitive_literal)
+            || cell
+                .namespace
+                .as_ref()
+                .is_some_and(value_constraint_contains_sensitive_literal)
+            || cell.fanout.as_ref().is_some_and(|fanout| {
+                text_contains_sensitive_literals(&fanout.separator)
+                    || value_constraint_contains_sensitive_literal(&fanout.selector)
+            })
+            || cell
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| text_contains_sensitive_literals(&cwd.to_string_lossy()))
+            || cell
+                .override_marker
+                .as_deref()
+                .is_some_and(text_contains_sensitive_literals)
+            || cell.environment.iter().any(|environment| {
+                text_contains_sensitive_literals(&environment.name)
+                    || environment.values.iter().any(|value| {
+                        text_contains_sensitive_literals(value)
+                            || named_value_contains_sensitive_literals(&environment.name, value)
+                    })
+                    || environment.pattern.as_deref().is_some_and(|pattern| {
+                        text_contains_sensitive_literals(pattern)
+                            || named_value_contains_sensitive_literals(&environment.name, pattern)
+                    })
+            })
+            || cell.provenance.as_ref().is_some_and(|provenance| {
+                text_contains_sensitive_literals(&provenance.source)
+                    || provenance
+                        .evidence
+                        .iter()
+                        .any(|evidence| text_contains_sensitive_literals(evidence))
+                    || text_contains_sensitive_literals(&provenance.regime_stamp)
+                    || text_contains_sensitive_literals(&provenance.prompt_stamp)
+                    || text_contains_sensitive_literals(&provenance.model_stamp)
+                    || provenance
+                        .probes
+                        .iter()
+                        .any(|probe| command_contains_sensitive_literals(&verb.binary, &probe.args))
+                    || provenance.observation_replays.iter().any(|replay| {
+                        command_contains_sensitive_literals(&verb.binary, &replay.args)
+                    })
+            })
+    })
+}
+
+/// Canonicalize the explanatory envelope of a model-synthesized verb and
+/// reject literal-sensitive authority without changing what the verb can run.
+/// This invariant is applied before preview identity, persistence, reload, and
+/// projection.
+fn sanitize_synthesized_verb_prose(verb: &mut Verb) {
+    verb.description = crate::redact::redact_output_text(&verb.description);
+    verb.prompt_context = verb
+        .prompt_context
+        .take()
+        .map(|value| crate::redact::redact_output_text(&value));
+    verb.source_prose = verb
+        .source_prose
+        .take()
+        .map(|value| crate::redact::redact_output_text(&value));
+    verb.evidence = verb
+        .evidence
+        .take()
+        .map(|value| crate::redact::redact_output_text(&value));
+    for cell in &mut verb.coverage {
+        if let Some(provenance) = &mut cell.provenance {
+            provenance.source = crate::redact::redact_output_text(&provenance.source);
+            for evidence in &mut provenance.evidence {
+                *evidence = crate::redact::redact_output_text(evidence);
+            }
+            for probe in &mut provenance.probes {
+                probe.dimension = crate::redact::redact_output_text(&probe.dimension);
+            }
+            for replay in &mut provenance.observation_replays {
+                replay.dimension = crate::redact::redact_output_text(&replay.dimension);
+            }
+        }
+    }
+}
+
+pub fn canonicalize_synthesized_verb_envelope(mut verb: Verb) -> Result<Verb> {
+    verb = canonicalize_generated_authority_envelope(verb)?;
+    validate_synthesized_safety(&verb)?;
+    Ok(verb)
+}
+
+/// Canonicalize the complete generated-authority envelope without changing
+/// executable authority. Saved grants and catalog synthesis share this gate.
+pub fn canonicalize_generated_authority_envelope(mut verb: Verb) -> Result<Verb> {
+    sanitize_synthesized_verb_prose(&mut verb);
+    if generated_authority_contains_sensitive_literal(&verb) {
+        bail!(
+            "generated verb contains sensitive authority metadata or literal credential argv and cannot be persisted"
+        );
+    }
+    Ok(verb)
+}
+
+pub fn validate_canonical_synthesized_verb_envelope(verb: &Verb) -> Result<()> {
+    let canonical = canonicalize_synthesized_verb_envelope(verb.clone())?;
+    if serde_json::to_value(canonical)? != serde_json::to_value(verb)? {
+        bail!("generated verb metadata is not in canonical sanitized form");
+    }
+    Ok(())
+}
+
+/// Normalize and validate a matcher proposed for a principal-bound access
+/// request. Model-authored rollback commands are never part of generated
+/// access authority, so remove that untrusted envelope before any structural
+/// validation, canonicalization, persistence, or installation. Ordinary
+/// operator-authored verbs continue to use `validate_verb` and retain their
+/// rollback semantics.
+pub fn normalize_generated_access_verb(mut verb: Verb) -> Result<Verb> {
+    verb.revert = None;
+    verb.baseline = false;
+    verb.trusted = false;
+    verb.prompt_context = None;
+    verb.source_prose = None;
+    verb.evidence = None;
+    verb.auto_promoted = false;
+    verb.promotion_stamp = None;
+    if generated_authority_contains_sensitive_literal(&verb) {
+        bail!(
+            "generated access coverage contains sensitive authority metadata or literal argv and cannot be persisted"
+        );
+    }
+    sanitize_synthesized_verb_prose(&mut verb);
+    if generated_authority_contains_sensitive_literal(&verb) {
+        bail!(
+            "generated access coverage is not in canonical secret-free form and cannot be persisted"
+        );
+    }
+    verb.description = generated_access_description(&verb);
+    validate_synthesized_safety(&verb)?;
+    Ok(verb)
+}
+
+/// Parse one durable generated-access proposal and prove that its serialized
+/// form already satisfies every normalization and namespace invariant. Durable
+/// state is rejected rather than rewritten because normalization can change
+/// authority.
+pub fn parse_normalized_generated_access_verb(value: &serde_json::Value) -> Result<Verb> {
+    let verb =
+        serde_json::from_value::<Verb>(value.clone()).context("decode proposed access coverage")?;
+    let normalized = normalize_generated_access_verb(verb)?;
+    if normalized.baseline {
+        bail!("generated access coverage must not be baseline");
+    }
+    if normalized.name != generated_access_verb_name(&normalized) {
+        bail!("generated access coverage name does not match its matcher digest");
+    }
+    if canonical_generated_access_consequence(&normalized) != normalized.consequence {
+        bail!(
+            "generated access coverage consequence does not match the locally derived matcher consequence"
+        );
+    }
+    if serde_json::to_value(&normalized).context("encode normalized proposed access coverage")?
+        != *value
+    {
+        bail!("proposed access coverage is not in normalized form");
+    }
+    Ok(normalized)
 }
 
 /// One sentence of operator guidance for a terminal synthesis-gate rejection.
@@ -1541,10 +3839,9 @@ pub fn gate_rejection_guidance(reason: &str) -> Option<&'static str> {
 ///   for operator approval regardless of `trusted`, so promoting one buys no
 ///   latency and only discards the per-instance LLM reasoning a human would
 ///   otherwise see in the hold queue.
-/// - A `Recoverable` verb must carry a `revert`, and the revert's binary is
-///   held to the same shell/interpreter denylist as the forward command --
-///   the auto-revert envelope is what makes trusting a recoverable shape
-///   defensible, so an unverified or shell-based revert defeats the point.
+/// - Model-generated rollback authority is never auto-promoted. Recoverable
+///   candidates are declined here; caller-driven recoverable commands remain
+///   under live inverse assessment or operator review.
 /// - Every parameter pattern must be a plain alternation of the exact,
 ///   regex-escaped values observed in `evidence` (never a model-authored
 ///   regex) and every evidence sample must re-match its own template -- this
@@ -1561,12 +3858,23 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
              LLM reasoning a human reviewer would otherwise see"
         );
     }
+    if verb.consequence == Reversibility::Recoverable {
+        bail!(
+            "a recoverable verb may not be auto-promoted; its rollback requires live assessment or operator review"
+        );
+    }
     if verb
         .coverage
         .iter()
         .any(|cell| !cell.environment.is_empty())
     {
         bail!("an auto-promoted verb may not authorize caller environment bindings");
+    }
+    if canonical_auto_promoted_consequence(verb) != verb.consequence {
+        bail!(
+            "auto-promoted verb '{}' consequence does not match its independently derived matcher safety",
+            verb.name
+        );
     }
     if !is_kebab_name(&verb.name) {
         bail!(
@@ -1575,24 +3883,21 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
         );
     }
     validate_binary_not_shell(&verb.binary, "auto-promoted verb")?;
+    if command_contains_sensitive_literals(&verb.binary, &verb.args) {
+        bail!("an auto-promoted verb may not contain literal credential argv");
+    }
     for (pname, spec) in &verb.params {
-        validate_param_not_overbroad(pname, spec, "auto-promoted verb")?;
+        validate_auto_promoted_param_spec(pname, spec)?;
     }
-    match verb.consequence {
-        Reversibility::Recoverable => {
-            let Some(revert) = &verb.revert else {
-                bail!("a recoverable verb may not be auto-promoted without a validated revert");
-            };
-            validate_binary_not_shell(&revert.binary, "auto-promoted verb revert")?;
-        }
-        Reversibility::Reversible => {}
-        Reversibility::Irreversible => unreachable!("rejected above"),
-    }
+    debug_assert_eq!(verb.consequence, Reversibility::Reversible);
     // Re-render every evidence sample against the verb's own template and
     // confirm it reproduces exactly that sample -- never trust that the
     // caller-supplied template and params actually correspond to the
     // evidence they were derived from.
     for sample in evidence {
+        if command_contains_sensitive_literals(&verb.binary, sample) {
+            bail!("auto-promotion evidence may not contain literal credential argv");
+        }
         let rendered = render_args(&verb.args, &render_map_for(verb, sample)?, &verb.name)?;
         if &rendered != sample {
             bail!(
@@ -1604,6 +3909,101 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
             );
         }
     }
+    Ok(())
+}
+
+/// Validate the subset of promotion safety that can be proven from a durable
+/// catalog row without replaying model evidence. Durable auto-promotion is
+/// deliberately narrower than the in-memory evidence proof: it admits only
+/// the mechanically generated preauthorized read shape and never persists a
+/// model-proposed rollback or caller-controlled boundary.
+pub fn validate_auto_promoted_verb_durable_safety(verb: &Verb) -> Result<()> {
+    validate_auto_promoted_verb_safety(verb, &[])?;
+    if verb.revert.is_some() {
+        bail!(
+            "auto-promoted verb '{}' may not persist rollback authority",
+            verb.name
+        );
+    }
+    let referenced: BTreeSet<String> = verb
+        .args
+        .iter()
+        .flat_map(|token| placeholders(token))
+        .collect();
+    if referenced.len() != verb.params.len() {
+        bail!(
+            "auto-promoted verb '{}' durable matcher must reference every declared parameter",
+            verb.name
+        );
+    }
+    for pname in &referenced {
+        let spec = verb.params.get(pname).ok_or_else(|| {
+            anyhow::anyhow!(
+                "auto-promoted verb '{}' durable matcher references undeclared parameter '{}'",
+                verb.name,
+                pname
+            )
+        })?;
+        if !spec.required || spec.default.is_some() {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' must be required and have no default",
+                verb.name,
+                pname
+            );
+        }
+        let literals = validate_auto_promoted_param_spec(pname, spec).with_context(|| {
+            format!(
+                "auto-promoted verb '{}' durable parameter '{}' is invalid",
+                verb.name, pname
+            )
+        })?;
+        let canonical_pattern = format!(
+            "^({})$",
+            literals
+                .iter()
+                .map(|value| regex::escape(value))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        if spec.pattern_text() != canonical_pattern {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' pattern does not match the generator-canonical exact pattern",
+                verb.name,
+                pname
+            );
+        }
+        if spec.allow_dash != literals.iter().any(|value| value.starts_with('-')) {
+            bail!(
+                "auto-promoted verb '{}' durable parameter '{}' has inconsistent allow_dash generator metadata",
+                verb.name,
+                pname
+            );
+        }
+    }
+    let concrete_commands = enumerate_matcher_commands(verb).ok_or_else(|| {
+        anyhow::anyhow!(
+            "auto-promoted verb '{}' durable matcher must have a bounded finite command set",
+            verb.name
+        )
+    })?;
+    for args in concrete_commands {
+        let mut concrete = verb.clone();
+        concrete.args = args;
+        concrete.params.clear();
+        concrete.coverage.clear();
+        if !synthesized_access_is_statically_read_only(&concrete) {
+            bail!(
+                "auto-promoted verb '{}' durable matcher expands to a command that is not independently read-only",
+                verb.name
+            );
+        }
+    }
+    // Coverage is display and matching metadata, not an independent source
+    // of executable consequence. Existing durable promotions may omit it;
+    // when present, the ordinary catalog validator has already checked its
+    // structure and the checks above reject caller-controlled environment
+    // bindings. The executable matcher and its parameters remain the source
+    // of the independently derived consequence.
     Ok(())
 }
 
@@ -1630,29 +4030,81 @@ fn validate_verb(verb: &Verb) -> Result<()> {
     if verb.credential_plan.as_deref().is_some_and(str::is_empty) {
         bail!("verb '{}' has an empty credential_plan", verb.name);
     }
+    if verb.auto_promoted {
+        if command_contains_sensitive_literals(&verb.binary, &verb.args) {
+            bail!(
+                "auto-promoted verb '{}' contains literal credential argv",
+                verb.name
+            );
+        }
+        if verb
+            .revert
+            .as_ref()
+            .is_some_and(|revert| command_contains_sensitive_literals(&revert.binary, &revert.args))
+        {
+            bail!(
+                "auto-promoted verb '{}' revert contains literal credential argv",
+                verb.name
+            );
+        }
+    }
     if !verb.coverage.is_empty() && verb.args.is_empty() && !verb.params.is_empty() {
         bail!(
             "verb '{}' uses generic coverage with parameters but has no argv template to capture them",
             verb.name
         );
     }
+    validate_known_file_arguments(verb, &verb.binary, &verb.args, "forward command")?;
+    if let Some(revert) = &verb.revert {
+        validate_known_file_arguments(verb, &revert.binary, &revert.args, "revert command")?;
+    }
     for (pname, spec) in &verb.params {
-        if !(spec.pattern.starts_with('^') && spec.pattern.ends_with('$')) {
+        if spec.value_type() == ParamValueType::SingleArgv
+            && !matches!(spec.max_length(), Some(1..=MAX_SINGLE_ARGV_LENGTH))
+        {
+            bail!(
+                "verb '{}' param '{}': single_argv requires max_length between 1 and {}",
+                verb.name,
+                pname,
+                MAX_SINGLE_ARGV_LENGTH
+            );
+        }
+        if !(spec.pattern_text().starts_with('^') && spec.pattern_text().ends_with('$')) {
             bail!(
                 "verb '{}' param '{}': pattern must be fully anchored (^...$), got {:?}",
                 verb.name,
                 pname,
-                spec.pattern
+                spec.pattern_text()
             );
         }
         // Compile the anchored form so an invalid regex - or one whose
         // alternation would escape the anchors - is rejected at load time.
-        compile_anchored(&spec.pattern).with_context(|| {
+        compile_anchored(spec.pattern_text()).with_context(|| {
             format!(
                 "verb '{}' param '{}' has an invalid regex",
                 verb.name, pname
             )
         })?;
+        if let Some(default) = spec.default.as_deref() {
+            if spec
+                .max_length()
+                .is_some_and(|maximum| default.chars().count() > maximum)
+            {
+                bail!(
+                    "verb '{}' param '{}': default exceeds max_length",
+                    verb.name,
+                    pname
+                );
+            }
+            if spec.value_type() == ParamValueType::SingleArgv {
+                validate_single_argv_value(pname, default).with_context(|| {
+                    format!(
+                        "verb '{}' param '{}' has an invalid default",
+                        verb.name, pname
+                    )
+                })?;
+            }
+        }
     }
     // Every placeholder referenced by the templates must be a declared param,
     // and every declared param must be referenced by some template token: an
@@ -1791,6 +4243,12 @@ fn validate_verb(verb: &Verb) -> Result<()> {
         {
             validate_value_constraint(&verb.name, &cell.name, constraint)?;
         }
+        if let Some(inventory) = &cell.inventory {
+            validate_inventory_constraint_paths(verb, cell, inventory)?;
+        }
+        if let Some(cwd) = &cell.cwd {
+            validate_coverage_cwd(&verb.name, &cell.name, cwd)?;
+        }
         if let Some(fanout) = &cell.fanout {
             if fanout.max == 0 {
                 bail!(
@@ -1864,6 +4322,52 @@ fn validate_verb(verb: &Verb) -> Result<()> {
                 })?;
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_coverage_cwd(verb: &str, cell: &str, cwd: &Path) -> Result<()> {
+    if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
+        bail!(
+            "verb '{}' coverage cell '{}': cwd must be an absolute canonical directory",
+            verb,
+            cell
+        );
+    }
+    let canonical = std::fs::canonicalize(cwd).with_context(|| {
+        format!(
+            "verb '{}' coverage cell '{}': cannot canonicalize cwd '{}'",
+            verb,
+            cell,
+            cwd.display()
+        )
+    })?;
+    if canonical != cwd {
+        bail!(
+            "verb '{}' coverage cell '{}': cwd '{}' is not canonical (use '{}')",
+            verb,
+            cell,
+            cwd.display(),
+            canonical.display()
+        );
+    }
+    if !std::fs::metadata(cwd)
+        .with_context(|| {
+            format!(
+                "verb '{}' coverage cell '{}': cannot stat cwd '{}'",
+                verb,
+                cell,
+                cwd.display()
+            )
+        })?
+        .is_dir()
+    {
+        bail!(
+            "verb '{}' coverage cell '{}': cwd '{}' is not a directory",
+            verb,
+            cell,
+            cwd.display()
+        );
     }
     Ok(())
 }
@@ -2071,6 +4575,55 @@ fn match_args_template(
     Some(params)
 }
 
+impl VerbCatalog {
+    fn same_file_generation(&self, other: &Self) -> bool {
+        match (&self.snapshot, &other.snapshot) {
+            (Some(left), Some(right)) => left.same_authority(right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn same_catalog_epoch(&self, other: &Self) -> bool {
+        self.same_file_generation(other)
+            && self.version == other.version
+            && serde_json::to_vec(&self.verbs).ok() == serde_json::to_vec(&other.verbs).ok()
+    }
+}
+
+impl AsyncDurableStore for VerbCatalog {
+    fn authority_name(&self) -> &'static str {
+        "verb catalog"
+    }
+
+    fn durable_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    fn same_durable_snapshot(&self, snapshot: &LearningFileSnapshot) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|current| current.same_authority(snapshot))
+    }
+
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.same_catalog_epoch(other)
+    }
+
+    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
+        if self.same_catalog_epoch(&result) {
+            return Ok(());
+        }
+        if self.same_catalog_epoch(baseline) || self.same_file_generation(baseline) {
+            return self.adopt_refreshed_file_authority(result);
+        }
+        if self.same_file_generation(&result) {
+            return Ok(());
+        }
+        anyhow::bail!("verb catalog authority changed during asynchronous file I/O")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2100,6 +4653,73 @@ verbs:
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn catalog_lint_collects_named_findings_across_verbs() {
+        let report = VerbCatalog::lint_yaml(
+            r#"
+verbs:
+  - name: inspect-first
+    binary: fixturectl
+    args: ["show", "{target}"]
+    params:
+      target: { pattern: "[a-z]+" }
+    consequence: reversible
+  - name: inspect-second
+    binary: fixturectl
+    args: ["show", "{resource}"]
+    params:
+      resource: { pattern: "[0-9]+" }
+    consequence: reversible
+"#,
+        );
+
+        assert_eq!(report.findings.len(), 2, "{:#?}", report.findings);
+        for (verb, parameter) in [("inspect-first", "target"), ("inspect-second", "resource")] {
+            let finding = report
+                .findings
+                .iter()
+                .find(|finding| finding.verb == verb)
+                .unwrap_or_else(|| panic!("missing finding for {verb}"));
+            assert!(finding.message.contains(verb), "{}", finding.message);
+            assert!(finding.message.contains(parameter), "{}", finding.message);
+        }
+    }
+
+    #[test]
+    fn catalog_lint_fix_is_explicit_and_round_trips() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        let original = r#"metadata: preserved
+verbs:
+  - name: guarded-inspect
+    binary: fixturectl
+    consequence: reversible
+    coverage:
+      - name: blocked
+        action: deny
+"#;
+        crate::learned_rules::write_authority_file(&path, original).unwrap();
+
+        let pending = VerbCatalog::lint_file(&path, false).unwrap();
+        assert!(pending.findings.is_empty());
+        assert_eq!(pending.repairs.len(), 1);
+        assert!(!pending.fixed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let fixed = VerbCatalog::lint_file(&path, true).unwrap();
+        assert!(fixed.findings.is_empty());
+        assert!(fixed.fixed);
+        assert_eq!(fixed.repairs[0].verb, "guarded-inspect");
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(repaired.contains("metadata: preserved"));
+        assert!(repaired.contains("sticky: true"));
+
+        let clean = VerbCatalog::lint_file(&path, false).unwrap();
+        assert!(clean.findings.is_empty());
+        assert!(clean.repairs.is_empty());
+        assert!(!clean.fixed);
     }
 
     #[test]
@@ -2278,9 +4898,9 @@ verbs:
 
     #[test]
     fn append_verb_persists_provenance_and_pins() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             "verbs:\n  - name: existing\n    binary: echo\n    consequence: reversible\n",
         )
@@ -2308,17 +4928,37 @@ verbs:
             params: p,
             consequence: Reversibility::Reversible,
             revert: None,
+            hold: false,
             trusted: true,
             prompt_context: None,
+            exec_timeout_secs: None,
             source_prose: Some("read-only cmk listing of zones, networks, vms".to_string()),
             evidence: Some("read-only; resource pinned to an allow-list; reversible".to_string()),
             auto_promoted: false,
             promotion_stamp: None,
         };
+        let mut runtime_saved = synth_verb("true", None, false, "grant-runtime");
+        runtime_saved.name = "grant-runtime".to_string();
+        cat.upsert_saved_grant_verb(runtime_saved).unwrap();
+        let runtime_access = cat
+            .canonical_generated_access_verb(toolbox_wrapper("^(status)$"))
+            .unwrap();
+        let runtime_access_name = runtime_access.name.clone();
+        cat.upsert_access_verb(runtime_access).unwrap();
         cat.append_verb(&verb).unwrap();
+        assert!(cat.get("grant-runtime").is_some());
+        assert!(cat.get(&runtime_access_name).is_some());
+        let durable_content = std::fs::read_to_string(&path).unwrap();
+        assert!(!durable_content.contains("grant-runtime"));
+        assert!(!durable_content.contains(&runtime_access_name));
 
         // Reload independently: persisted, provenance kept, pinning enforced.
         let reloaded = VerbCatalog::load(&path).unwrap();
+        assert_ne!(cat.version(), reloaded.version());
+        let refreshed = cat.refreshed_copy().unwrap();
+        assert_eq!(cat.version(), refreshed.version());
+        assert!(refreshed.get("grant-runtime").is_some());
+        assert!(refreshed.get(&runtime_access_name).is_some());
         assert!(reloaded.names().contains(&"cmk-list".to_string()));
         assert!(reloaded.names().contains(&"existing".to_string()));
         let got = reloaded.get("cmk-list").unwrap();
@@ -2338,11 +4978,58 @@ verbs:
     }
 
     #[test]
+    fn catalog_mutations_keep_runtime_overlays_out_of_the_durable_document() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(
+            &path,
+            r#"verbs:
+  - name: editable
+    binary: echo
+    consequence: reversible
+  - name: removable
+    binary: true
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let mut catalog = VerbCatalog::load(&path).unwrap();
+        let mut saved_grant = synth_verb("true", None, false, "grant-runtime");
+        saved_grant.name = "grant-runtime".to_string();
+        catalog.upsert_saved_grant_verb(saved_grant).unwrap();
+        let access = catalog
+            .canonical_generated_access_verb(toolbox_wrapper("^(status)$"))
+            .unwrap();
+        let access_name = access.name.clone();
+        catalog.upsert_access_verb(access).unwrap();
+
+        let original_digest = catalog.verb_definition_digest("editable").unwrap();
+        let mut replacement = catalog.get("editable").unwrap().clone();
+        replacement.description = "Edited operator verb".to_string();
+        catalog
+            .amend_verb_if_digest("editable", &original_digest, &replacement)
+            .unwrap();
+        assert!(catalog.get("grant-runtime").is_some());
+        assert!(catalog.get(&access_name).is_some());
+
+        catalog.delete_verb("removable").unwrap();
+        assert!(catalog.get("grant-runtime").is_some());
+        assert!(catalog.get(&access_name).is_some());
+        assert!(catalog.delete_verb(&access_name).is_err());
+
+        let durable_content = std::fs::read_to_string(&path).unwrap();
+        assert!(!durable_content.contains("grant-runtime"));
+        assert!(!durable_content.contains(&access_name));
+        assert!(durable_content.contains("Edited operator verb"));
+        assert!(!durable_content.contains("removable"));
+    }
+
+    #[test]
     fn append_verb_rejects_duplicate_and_invalid_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
         let initial = "verbs:\n  - name: dup\n    binary: echo\n    consequence: reversible\n";
-        std::fs::write(&path, initial).unwrap();
+        crate::learned_rules::write_authority_file(&path, initial).unwrap();
         let mut cat = VerbCatalog::load(&path).unwrap();
 
         let mk = |name: &str, pattern: Option<&str>| {
@@ -2371,8 +5058,10 @@ verbs:
                 params,
                 consequence: Reversibility::Reversible,
                 revert: None,
+                hold: false,
                 trusted: false,
                 prompt_context: None,
+                exec_timeout_secs: None,
                 source_prose: None,
                 evidence: None,
                 auto_promoted: false,
@@ -2386,17 +5075,36 @@ verbs:
         assert!(cat.append_verb(&mk("bad", Some("[a-z]+"))).is_err());
         // Neither failed append touched the file.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
+
+        let repairable_stale = "verbs:\n  - name: external\n    binary: echo\n    consequence: reversible\n    coverage:\n      - name: blocked\n        action: deny\n";
+        crate::learned_rules::write_authority_file(&path, repairable_stale).unwrap();
+        assert!(cat.append_verb(&mk("bad-stale", Some("[a-z]+"))).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            repairable_stale,
+            "invalid append must not repair a stale catalog"
+        );
+        assert!(cat.append_verb(&mk("external", None)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            repairable_stale,
+            "duplicate append must not repair a stale catalog"
+        );
+
+        crate::learned_rules::write_authority_file(&path, "verbs: []\n").unwrap();
+        cat.append_verb(&mk("dup", None)).unwrap();
+        assert!(VerbCatalog::load(&path).unwrap().get("dup").is_some());
     }
 
     #[test]
     fn append_tolerates_bom_and_keeps_one_verbs_key() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
         // Seed with a leading UTF-8 BOM, as a Windows editor or PowerShell's
         // utf8 mode would write it.
         let seed =
             "\u{feff}verbs:\n  - name: existing\n    binary: echo\n    consequence: reversible\n";
-        std::fs::write(&path, seed).unwrap();
+        crate::learned_rules::write_authority_file(&path, seed).unwrap();
         let mut cat = VerbCatalog::load(&path).unwrap();
 
         let v = Verb {
@@ -2410,8 +5118,10 @@ verbs:
             params: BTreeMap::new(),
             consequence: Reversibility::Reversible,
             revert: None,
+            hold: false,
             trusted: false,
             prompt_context: None,
+            exec_timeout_secs: None,
             source_prose: None,
             evidence: None,
             auto_promoted: false,
@@ -2460,13 +5170,304 @@ verbs:
             params,
             consequence: Reversibility::Reversible,
             revert: None,
+            hold: false,
             trusted,
             prompt_context: None,
+            exec_timeout_secs: None,
             source_prose: None,
             evidence: None,
             auto_promoted: false,
             promotion_stamp: None,
         }
+    }
+
+    #[test]
+    fn successful_synthesis_canonicalizes_all_explanatory_metadata_before_identity() {
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
+        verb.description = contaminated.clone();
+        verb.prompt_context = Some(contaminated.clone());
+        verb.source_prose = Some(contaminated.clone());
+        verb.evidence = Some(contaminated.clone());
+        verb.coverage.push(VerbCoverageCell {
+            name: "safe".to_string(),
+            action: CoverageAction::Evaluate,
+            required_args: Vec::new(),
+            forbidden_args: Vec::new(),
+            min_args: None,
+            max_args: None,
+            options: Vec::new(),
+            target: None,
+            inventory: None,
+            namespace: None,
+            fanout: None,
+            cwd: None,
+            environment: Vec::new(),
+            override_marker: None,
+            sticky: false,
+            provenance: Some(CoverageProvenance {
+                source: contaminated.clone(),
+                evidence: vec![contaminated.clone()],
+                regime_stamp: "safe-regime".to_string(),
+                prompt_stamp: "safe-prompt".to_string(),
+                model_stamp: "safe-model".to_string(),
+                generated_unix: 1,
+                probes: vec![CoverageProbe {
+                    dimension: contaminated.clone(),
+                    args: vec!["status".to_string()],
+                    expected_match: true,
+                    observed_match: true,
+                }],
+                observation_replays: Vec::new(),
+            }),
+        });
+
+        let canonical = canonicalize_synthesized_verb_envelope(verb).unwrap();
+        validate_canonical_synthesized_verb_envelope(&canonical).unwrap();
+        let serialized = serde_json::to_string(&canonical).unwrap();
+        assert!(!serialized.contains(&value));
+        let digest = canonical.definition_digest();
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![canonical],
+        })
+        .unwrap();
+        let reloaded = VerbCatalog::from_yaml(&yaml).unwrap();
+        let reloaded = reloaded.get("inspect-fixture").unwrap();
+        assert_eq!(reloaded.definition_digest(), digest);
+        assert!(!serde_json::to_string(reloaded).unwrap().contains(&value));
+    }
+
+    #[test]
+    fn catalog_load_durably_repairs_synthesized_metadata_and_is_idempotent() {
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
+        verb.source_prose = Some(contaminated.clone());
+        verb.evidence = Some(contaminated.clone());
+        verb.promotion_stamp = Some("regime-safe".to_string());
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![verb],
+        })
+        .unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+
+        let mut first = VerbCatalog::load(&path).unwrap();
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(!repaired.contains(&value));
+        assert!(!serde_json::to_string(&first.list())
+            .unwrap()
+            .contains(&value));
+        assert_eq!(
+            first
+                .get("inspect-fixture")
+                .unwrap()
+                .promotion_stamp
+                .as_deref(),
+            Some("regime-safe")
+        );
+
+        let second = VerbCatalog::load(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
+        assert_eq!(first.list().len(), second.list().len());
+
+        let appended = synth_verb("true", None, false, "safe-appended");
+        first.append_verb(&appended).unwrap();
+        assert!(!std::fs::read_to_string(path).unwrap().contains(&value));
+    }
+
+    #[test]
+    fn safe_catalog_load_preserves_exact_bytes() {
+        let yaml = "# operator comment\nverbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+        VerbCatalog::load(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn immutable_catalog_load_creates_no_sibling_state_and_retains_no_live_path() {
+        let yaml = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
+
+        let mut catalog = VerbCatalog::load_immutable(&path).unwrap();
+        assert!(catalog.get("safe").is_some());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        std::fs::write(&path, "verbs: []\n").unwrap();
+        assert!(!catalog.reload_if_stale().unwrap());
+        assert!(catalog.get("safe").is_some());
+        assert!(catalog
+            .append_verb(&synth_verb("true", None, false, "later"))
+            .unwrap_err()
+            .to_string()
+            .contains("not backed by a file"));
+    }
+
+    #[test]
+    fn immutable_catalog_rejects_required_repair_without_writing() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
+        verb.source_prose = Some(format!("password={value}"));
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![verb],
+        })
+        .unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, &yaml).unwrap();
+
+        let error = VerbCatalog::load_immutable(&path).unwrap_err();
+        assert!(error.to_string().contains("requires canonical repair"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn committed_catalog_repair_warning_adopts_only_verified_canonical_bytes() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        let canonical = "verbs: []\n";
+        crate::learned_rules::write_authority_file(&path, canonical).unwrap();
+        let snapshot = load_learning_file_snapshot(&path).unwrap();
+        let warning = catalog_repair_warning(
+            canonical,
+            crate::learned_rules::LearningWriteOutcome::committed_with_warning_for_test(
+                snapshot,
+                anyhow::anyhow!("simulated cleanup warning"),
+            ),
+        )
+        .unwrap();
+        assert!(warning.is_some());
+        assert!(VerbCatalog::from_yaml(canonical).is_ok());
+
+        crate::learned_rules::write_authority_file(&path, "verbs:\n  - invalid\n").unwrap();
+        let snapshot = load_learning_file_snapshot(&path).unwrap();
+        assert!(catalog_repair_warning(
+            canonical,
+            crate::learned_rules::LearningWriteOutcome::committed_with_warning_for_test(
+                snapshot,
+                anyhow::anyhow!("simulated cleanup warning"),
+            ),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stale_catalog_instances_reapply_nonconflicting_appends() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, "verbs: []\n").unwrap();
+        let mut first = VerbCatalog::load(&path).unwrap();
+        let mut second = VerbCatalog::load(&path).unwrap();
+
+        first
+            .append_verb(&synth_verb(
+                "fixturectl",
+                Some("^(one)$"),
+                false,
+                "safe-one",
+            ))
+            .unwrap();
+        second
+            .append_verb(&synth_verb(
+                "fixturectl",
+                Some("^(two)$"),
+                false,
+                "safe-two",
+            ))
+            .unwrap();
+
+        let loaded = VerbCatalog::load(&path).unwrap();
+        assert!(loaded.get("safe-one").is_some());
+        assert!(loaded.get("safe-two").is_some());
+    }
+
+    #[test]
+    fn successor_catalog_commit_does_not_turn_the_first_commit_into_failure() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, "verbs: []\n").unwrap();
+        let mut first = VerbCatalog::load(&path).unwrap();
+        let mut successor = VerbCatalog::load(&path).unwrap();
+        let (committed, release) =
+            crate::learned_rules::pause_post_commit_adoption_for_test("safe-race-first");
+        let first_thread = std::thread::spawn(move || {
+            first
+                .append_verb(&synth_verb(
+                    "fixturectl",
+                    Some("^(first)$"),
+                    false,
+                    "safe-race-first",
+                ))
+                .unwrap();
+            first
+        });
+        committed.wait();
+        successor
+            .append_verb(&synth_verb(
+                "fixturectl",
+                Some("^(second)$"),
+                false,
+                "safe-race-second",
+            ))
+            .unwrap();
+        release.wait();
+        let first = first_thread.join().unwrap();
+        assert!(first.get("safe-race-first").is_some());
+
+        let loaded = VerbCatalog::load(&path).unwrap();
+        assert!(loaded.get("safe-race-first").is_some());
+        assert!(loaded.get("safe-race-second").is_some());
+    }
+
+    #[test]
+    fn sensitive_synthesized_name_fails_before_preview_or_catalog_load() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "safe");
+        verb.name = format!("password={value}");
+        verb.source_prose = Some("generated inspection".to_string());
+        assert!(generated_authority_contains_sensitive_literal(&verb));
+        assert!(VerbCatalog::for_admission_preview(&verb).is_err());
+
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![verb],
+        })
+        .unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, &yaml).unwrap();
+        assert!(VerbCatalog::load(&path).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn generated_catalog_envelope_rejects_sensitive_stamps_and_unknown_metadata() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "safe");
+        verb.promotion_stamp = Some(format!("password={value}"));
+        assert!(canonicalize_generated_authority_envelope(verb.clone()).is_err());
+
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![verb],
+        })
+        .unwrap();
+        assert!(VerbCatalog::from_yaml(&yaml).is_err());
+
+        let unknown_nested = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n    future_metadata: true\n";
+        assert!(VerbCatalog::from_yaml(unknown_nested).is_err());
+        assert!(
+            serde_yaml_ng::from_str::<FanoutConstraint>("max: 2\nfuture_metadata: true\n").is_err()
+        );
     }
 
     #[test]
@@ -2539,6 +5540,7 @@ verbs:
             inventory: None,
             namespace: None,
             fanout: None,
+            cwd: None,
             environment: Vec::new(),
             override_marker: Some("operator:k-check".to_string()),
             sticky: true,
@@ -2567,7 +5569,7 @@ verbs:
 
     #[test]
     fn synthesized_interactive_kubectl_exec_flags_are_rejected() {
-        for flag in ["-i", "-t", "-it", "-ti"] {
+        for flag in ["-i", "-t", "-it", "-ti", "--stdin", "--tty=true"] {
             let mut verb = synth_verb("kubectl", None, false, "k-exec");
             verb.args = args_vec(&["exec", flag, "deploy/tools", "--", "ceph", "status"]);
             let error = validate_synthesized_safety(&verb).unwrap_err();
@@ -2582,6 +5584,1018 @@ verbs:
         let mut other = synth_verb("fixturectl", None, false, "fixture-exec");
         other.args = args_vec(&["exec", "-it", "target"]);
         assert!(validate_synthesized_safety(&other).is_ok());
+
+        let mut bare_target = synth_verb("kubectl", None, false, "k-exec-bare");
+        bare_target.args = args_vec(&["exec", "generated-tools-pod", "--", "ceph", "status"]);
+        let error = validate_synthesized_safety(&bare_target).unwrap_err();
+        assert!(
+            error.to_string().contains("bare generated pod"),
+            "got: {error}"
+        );
+
+        let mut packed = synth_verb("kubectl", None, false, "k-exec-packed");
+        packed.args = args_vec(&["exec", "deploy/tools", "--", "ceph status"]);
+        let error = validate_synthesized_safety(&packed).unwrap_err();
+        assert!(
+            error.to_string().contains("whitespace-free"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn file_paths_use_daemon_host_semantics() {
+        #[cfg(unix)]
+        let (native, foreign, native_list, foreign_list) = (
+            "/srv/automation/manifest.yaml",
+            r"C:\caller\manifest.yaml",
+            "/srv/automation/modules:/opt/ansible/modules",
+            r"C:\caller\modules;D:\shared\modules",
+        );
+        #[cfg(windows)]
+        let (native, foreign, native_list, foreign_list) = (
+            r"C:\automation\manifest.yaml",
+            "/srv/automation/manifest.yaml",
+            r"C:\automation\modules;D:\shared\modules",
+            "/srv/automation/modules:/opt/ansible/modules",
+        );
+
+        assert!(path_is_absolute(native));
+        assert!(!path_is_absolute(foreign));
+        assert!(absolute_path_list(native_list));
+        assert!(!absolute_path_list(foreign_list));
+
+        let generic = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-file
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: apply
+        action: preauthorized
+        required_args: ["apply"]
+"#,
+        )
+        .unwrap();
+        assert!(!generic
+            .match_command_all("kubectl", &args_vec(&["apply", "-f", native]))
+            .is_empty());
+        assert!(generic
+            .match_command_all("kubectl", &args_vec(&["apply", "-f", foreign]))
+            .is_empty());
+
+        let generic_ansible = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-file-boundaries
+    binary: ansible-playbook
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: check
+        action: preauthorized
+        required_args: ["--check"]
+"#,
+        )
+        .unwrap();
+        let inventory = format!("--inventory={native}");
+        let modules = format!("--module-path={native_list}");
+        let vault = format!("--vault-id=production@{native}");
+        assert!(!generic_ansible
+            .match_command_all(
+                "ansible-playbook",
+                &args_vec(&[&inventory, &modules, &vault, native, "--check"]),
+            )
+            .is_empty());
+
+        let generic_kubectl_file = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: create-file-backed-resource
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: create
+        action: preauthorized
+        required_args: ["create"]
+"#,
+        )
+        .unwrap();
+        let keyed_file = format!("--from-file=payload={native}");
+        assert!(!generic_kubectl_file
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["create", "configmap", "fixture", &keyed_file]),
+            )
+            .is_empty());
+
+        let generic_helm = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: render-values
+    binary: helm
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: template
+        action: preauthorized
+        required_args: ["template"]
+"#,
+        )
+        .unwrap();
+        let set_file = format!("--set-file=payload={native}");
+        assert!(!generic_helm
+            .match_command_all(
+                "helm",
+                &args_vec(&["template", "fixture", "repo/chart", &set_file]),
+            )
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_arguments_require_absolute_paths_only_in_known_file_positions() {
+        let relative_forward = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-manifest
+    binary: kubectl
+    args: ["apply", "-f", "manifests/app.yaml"]
+    consequence: irreversible
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            relative_forward
+                .to_string()
+                .contains("must be one absolute path"),
+            "got: {relative_forward}"
+        );
+
+        let relative_revert = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-playbook
+    binary: ansible-playbook
+    args: ["/srv/guard/playbooks/apply.yaml", "-i", "/srv/guard/inventory/production"]
+    consequence: recoverable
+    revert:
+      binary: ansible-playbook
+      args: ["rollback.yaml", "-i", "production"]
+"#,
+        )
+        .unwrap_err();
+        assert!(relative_revert.to_string().contains("revert command"));
+
+        let relative_parameter = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-selected-manifest
+    binary: kubectl
+    args: ["apply", "-f", "{path}"]
+    params:
+      path: { pattern: "^[A-Za-z0-9._/-]+$" }
+    consequence: irreversible
+"#,
+        )
+        .expect("dynamic file patterns are checked after rendering");
+        let error = relative_parameter
+            .render(
+                "apply-selected-manifest",
+                &params(&[("path", "manifests/app.yaml")]),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("must be one absolute path"),
+            "got: {error}"
+        );
+        assert!(relative_parameter
+            .match_command_all("kubectl", &args_vec(&["apply", "-f", "manifests/app.yaml"]),)
+            .is_empty());
+
+        let keyed_file_parameter = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: create-selected-secret
+    binary: kubectl
+    args: ["create", "secret", "generic", "fixture", "--from-file=payload={path}"]
+    params:
+      path: { pattern: "^[A-Za-z0-9._/-]+$" }
+    consequence: irreversible
+"#,
+        )
+        .expect("the key= payload is rechecked after rendering");
+        assert!(keyed_file_parameter
+            .render("create-selected-secret", &params(&[("path", "./payload")]),)
+            .is_err());
+        assert!(keyed_file_parameter
+            .render(
+                "create-selected-secret",
+                &params(&[("path", "/srv/automation/payload")]),
+            )
+            .is_ok());
+
+        let vault_source_parameter = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-vault-source
+    binary: ansible-playbook
+    args: ["--vault-id=production@{source}", "/srv/automation/site.yml", "--check"]
+    params:
+      source: { pattern: "^(prompt|[A-Za-z0-9._/-]+)$" }
+    consequence: reversible
+"#,
+        )
+        .expect("the label@ payload is rechecked after rendering");
+        assert!(vault_source_parameter
+            .render(
+                "check-vault-source",
+                &params(&[("source", "./vault-client")]),
+            )
+            .is_err());
+        assert!(vault_source_parameter
+            .render(
+                "check-vault-source",
+                &params(&[("source", "/srv/automation/vault-client")]),
+            )
+            .is_ok());
+
+        let fixed_post_renderer = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: render-with-filter
+    binary: helm
+    args: ["template", "fixture", "repo/chart", "--post-renderer=/srv/automation/renderer"]
+    consequence: reversible
+"#,
+        )
+        .expect("a fixed post-renderer is operator-reviewed executable authority");
+        assert!(fixed_post_renderer
+            .render("render-with-filter", &BTreeMap::new())
+            .is_ok());
+        let dynamic_post_renderer = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: render-with-dynamic-filter
+    binary: helm
+    args: ["template", "fixture", "repo/chart", "--post-renderer={renderer}"]
+    params:
+      renderer: { pattern: "^[A-Za-z0-9._/-]+$" }
+    consequence: reversible
+"#,
+        )
+        .unwrap_err();
+        assert!(dynamic_post_renderer
+            .to_string()
+            .contains("operator-fixed literal"));
+        let path_resolved_post_renderer = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: render-with-path-filter
+    binary: helm
+    args: ["template", "fixture", "repo/chart", "--post-renderer=renderer"]
+    consequence: reversible
+"#,
+        )
+        .unwrap_err();
+        assert!(path_resolved_post_renderer
+            .to_string()
+            .contains("must be an absolute path"));
+
+        let remote_manifest = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-remote-manifest
+    binary: kubectl
+    args: ["apply", "--filename=https://example.invalid/manifest.yaml"]
+    consequence: irreversible
+"#,
+        )
+        .unwrap_err();
+        assert!(remote_manifest.to_string().contains("absolute path"));
+
+        let exact_kubeconfig = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-with-kubeconfig
+    binary: kubectl
+    args: ["--kubeconfig", "{kubeconfig}", "get", "pods"]
+    params:
+      kubeconfig: { pattern: "^/etc/guard/kubeconfig$" }
+    consequence: reversible
+"#,
+        )
+        .expect("one exact absolute kubeconfig is a valid file parameter");
+        let rendered = exact_kubeconfig
+            .render(
+                "inspect-with-kubeconfig",
+                &params(&[("kubeconfig", "/etc/guard/kubeconfig")]),
+            )
+            .unwrap();
+        assert_eq!(rendered.args[1], "/etc/guard/kubeconfig");
+
+        let mixed_exact_paths = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-with-mixed-kubeconfig
+    binary: kubectl
+    args: ["--kubeconfig", "{kubeconfig}", "get", "pods"]
+    params:
+      kubeconfig: { pattern: "^(/etc/guard/kubeconfig|kubeconfig)$" }
+    consequence: reversible
+"#,
+        )
+        .unwrap_err();
+        assert!(mixed_exact_paths
+            .to_string()
+            .contains("enumerates a value that is not an absolute path"));
+
+        let inline_inventory = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-inline-inventory
+    binary: ansible-playbook
+    args: ["-i", "{inventory}", "/srv/automation/site.yml", "--check"]
+    params:
+      inventory: { pattern: "^(localhost,|web.example,)$" }
+    consequence: reversible
+"#,
+        )
+        .expect("Ansible inline inventories are not caller-relative files");
+        assert!(inline_inventory
+            .render(
+                "check-inline-inventory",
+                &params(&[("inventory", "localhost,")]),
+            )
+            .is_ok());
+
+        let generic_ansible_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-playbook
+    binary: ansible-playbook
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: check
+        action: preauthorized
+        required_args: ["--check"]
+"#,
+        )
+        .unwrap();
+        for relative_inventory in [
+            "-i./inventory",
+            "--inventory-file=inventory",
+            "-vi./inventory",
+            "--inventory-f=inventory",
+            "--private-k=key",
+            "--module-path=./modules",
+            "-M./modules",
+            "--extra-vars=@./vars.yml",
+            "-ve@./vars.yml",
+            "--vault-id=dev@./vault-client",
+        ] {
+            assert!(generic_ansible_coverage
+                .match_command_all(
+                    "ansible-playbook",
+                    &args_vec(&[relative_inventory, "/srv/automation/site.yml", "--check",]),
+                )
+                .is_empty());
+        }
+        for inline_inventory in ["-ilocalhost,", "--inventory=localhost,"] {
+            assert!(!generic_ansible_coverage
+                .match_command_all(
+                    "ansible-playbook",
+                    &args_vec(&[inline_inventory, "/srv/automation/site.yml", "--check"]),
+                )
+                .is_empty());
+        }
+        assert!(!generic_ansible_coverage
+            .match_command_all(
+                "ansible-playbook",
+                &args_vec(&[
+                    "--inventory-file",
+                    "localhost,",
+                    "/srv/automation/site.yml",
+                    "--check",
+                ]),
+            )
+            .is_empty());
+        for safe_value in [
+            "--module-path=/srv/automation/modules:/opt/ansible/modules",
+            "-M/srv/automation/modules:/opt/ansible/modules",
+            "--extra-vars=@/srv/automation/vars.yml",
+            "-e@/srv/automation/vars.yml",
+            "--vault-id=dev@/srv/automation/vault-client",
+            "--vault-id=dev@prompt",
+        ] {
+            assert!(!generic_ansible_coverage
+                .match_command_all(
+                    "ansible-playbook",
+                    &args_vec(&[safe_value, "/srv/automation/site.yml", "--check"]),
+                )
+                .is_empty());
+        }
+        for (option, value) in [
+            ("--key-file", "/srv/automation/id_ed25519"),
+            ("--vault-pass-file", "/srv/automation/vault-password"),
+            ("--playbook-dir", "/srv/automation"),
+        ] {
+            assert!(generic_ansible_coverage
+                .match_command_all(
+                    "ansible-playbook",
+                    &args_vec(&[option, value, "relative-site.yml", "--check"]),
+                )
+                .is_empty());
+        }
+        assert!(!generic_ansible_coverage
+            .match_command_all(
+                "ansible-playbook",
+                &args_vec(&[
+                    "-i/srv/automation/inventory",
+                    "/srv/automation/site.yml",
+                    "--check",
+                ]),
+            )
+            .is_empty());
+        assert!(generic_ansible_coverage
+            .match_command_all(
+                "ansible-playbook",
+                &args_vec(&[
+                    "--ssh-common-args=ProxyCommand=/srv/automation/proxy",
+                    "/srv/automation/site.yml",
+                    "--check",
+                ]),
+            )
+            .is_empty());
+        let fixed_ssh_transport = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-through-fixed-proxy
+    binary: ansible-playbook
+    args: ["--ssh-common-args=ProxyCommand=/srv/automation/proxy", "/srv/automation/site.yml", "--check"]
+    consequence: reversible
+"#,
+        )
+        .expect("an exact template may select an operator-reviewed SSH transport");
+        assert!(fixed_ssh_transport
+            .render("check-through-fixed-proxy", &BTreeMap::new())
+            .is_ok());
+
+        let generic_kubectl_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-kustomization
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: apply
+        action: preauthorized
+        required_args: ["apply"]
+"#,
+        )
+        .unwrap();
+        for relative_kustomization in ["-k.", "-k=.", "--kustomize=."] {
+            assert!(generic_kubectl_coverage
+                .match_command_all("kubectl", &args_vec(&["apply", relative_kustomization]),)
+                .is_empty());
+        }
+        for relative_manifest in [
+            "-f=./manifest.yaml",
+            "--filename=./manifest.yaml",
+            "-f=/srv/automation/one.yaml,./two.yaml",
+        ] {
+            assert!(generic_kubectl_coverage
+                .match_command_all("kubectl", &args_vec(&["apply", relative_manifest]),)
+                .is_empty());
+        }
+        assert!(!generic_kubectl_coverage
+            .match_command_all("kubectl", &args_vec(&["apply", "-f=-"]),)
+            .is_empty());
+        assert!(generic_kubectl_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["apply", "--filename=https://example.invalid/manifest.yaml"]),
+            )
+            .is_empty());
+        let generic_kubectl_patch_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: patch-resource
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: patch
+        action: preauthorized
+        required_args: ["patch"]
+"#,
+        )
+        .unwrap();
+        assert!(generic_kubectl_patch_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["patch", "deployment/app", "--patch-file=patch.json"]),
+            )
+            .is_empty());
+        assert!(!generic_kubectl_patch_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&[
+                    "patch",
+                    "deployment/app",
+                    "--patch-file=/srv/automation/patch.json",
+                ]),
+            )
+            .is_empty());
+
+        let generic_kubectl_file_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: create-file-backed-resource
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: create
+        action: preauthorized
+        required_args: ["create"]
+"#,
+        )
+        .unwrap();
+        for relative_file in [
+            "--from-file=payload=./payload",
+            "--from-env-file=./vars.env",
+            "--cert=./tls.crt",
+            "--key=./tls.key",
+        ] {
+            assert!(generic_kubectl_file_coverage
+                .match_command_all(
+                    "kubectl",
+                    &args_vec(&["create", "secret", "generic", "fixture", relative_file]),
+                )
+                .is_empty());
+        }
+        assert!(generic_kubectl_file_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&[
+                    "create",
+                    "secret",
+                    "generic",
+                    "fixture",
+                    "--from-file",
+                    "payload=./payload",
+                ]),
+            )
+            .is_empty());
+        for absolute_file in [
+            "--from-file=payload=/srv/automation/payload",
+            "--from-env-file=/srv/automation/vars.env",
+            "--cert=/srv/automation/tls.crt",
+            "--key=/srv/automation/tls.key",
+        ] {
+            assert!(!generic_kubectl_file_coverage
+                .match_command_all(
+                    "kubectl",
+                    &args_vec(&["create", "secret", "generic", "fixture", absolute_file]),
+                )
+                .is_empty());
+        }
+
+        let generic_kubectl_kustomize_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: render-kustomization
+    binary: kubectl
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: render
+        action: preauthorized
+        required_args: ["kustomize"]
+"#,
+        )
+        .unwrap();
+        assert!(generic_kubectl_kustomize_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["kustomize", "./overlays/production"])
+            )
+            .is_empty());
+        assert!(!generic_kubectl_kustomize_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["kustomize", "/srv/automation/overlays/production"]),
+            )
+            .is_empty());
+        assert!(generic_kubectl_kustomize_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["kustomize", "https://example.invalid/overlays/production",]),
+            )
+            .is_empty());
+        assert!(!generic_kubectl_kustomize_coverage
+            .match_command_all("kubectl", &args_vec(&["get", "pods", "kustomize"]),)
+            .is_empty());
+
+        let generic_kubectl_cp_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: copy-file
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: cp
+        action: preauthorized
+        required_args: ["cp"]
+"#,
+        )
+        .unwrap();
+        assert!(generic_kubectl_cp_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["cp", "../../sensitive", "pod:/tmp/sensitive"]),
+            )
+            .is_empty());
+        assert!(!generic_kubectl_cp_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["cp", "/srv/automation/input", "pod:/tmp/input"]),
+            )
+            .is_empty());
+
+        let generic_kubectl_output_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-output
+    binary: kubectl
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: get
+        action: preauthorized
+        required_args: ["get"]
+"#,
+        )
+        .unwrap();
+        for relative_output in [
+            args_vec(&[
+                "get",
+                "pods",
+                "-o",
+                "go-template-file",
+                "--template=./template",
+            ]),
+            args_vec(&["get", "pods", "-o=custom-columns-file=./columns"]),
+        ] {
+            assert!(generic_kubectl_output_coverage
+                .match_command_all("kubectl", &relative_output)
+                .is_empty());
+        }
+        for absolute_output in [
+            args_vec(&[
+                "get",
+                "pods",
+                "-o",
+                "go-template-file",
+                "--template=/srv/automation/template",
+            ]),
+            args_vec(&[
+                "get",
+                "pods",
+                "-o=custom-columns-file=/srv/automation/columns",
+            ]),
+        ] {
+            assert!(!generic_kubectl_output_coverage
+                .match_command_all("kubectl", &absolute_output)
+                .is_empty());
+        }
+        let generic_cluster_dump = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: cluster-dump
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: dump
+        action: preauthorized
+        required_args: ["cluster-info", "dump"]
+"#,
+        )
+        .unwrap();
+        assert!(generic_cluster_dump
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["cluster-info", "dump", "--output-directory=./dump",]),
+            )
+            .is_empty());
+        assert!(!generic_cluster_dump
+            .match_command_all(
+                "kubectl",
+                &args_vec(&[
+                    "cluster-info",
+                    "dump",
+                    "--output-directory=/srv/automation/dump",
+                ]),
+            )
+            .is_empty());
+
+        let mut cluster_info = synth_verb("kubectl", None, false, "cluster-info");
+        cluster_info.args = args_vec(&["cluster-info"]);
+        assert!(synthesized_access_is_statically_read_only(&cluster_info));
+        cluster_info.args.push("dump".to_string());
+        assert!(!synthesized_access_is_statically_read_only(&cluster_info));
+
+        let generic_kubectl_profile_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: profile-read
+    binary: kubectl
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: get
+        action: preauthorized
+        required_args: ["get"]
+"#,
+        )
+        .unwrap();
+        for unsafe_profile in [
+            args_vec(&["get", "pods", "--profile=cpu"]),
+            args_vec(&[
+                "get",
+                "pods",
+                "--profile=cpu",
+                "--profile-output=./profile.pprof",
+            ]),
+        ] {
+            assert!(generic_kubectl_profile_coverage
+                .match_command_all("kubectl", &unsafe_profile)
+                .is_empty());
+        }
+        assert!(!generic_kubectl_profile_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&[
+                    "get",
+                    "pods",
+                    "--profile=cpu",
+                    "--profile-output=/srv/automation/profile.pprof",
+                ]),
+            )
+            .is_empty());
+        assert!(!generic_kubectl_profile_coverage
+            .match_command_all("kubectl", &args_vec(&["get", "pods", "--profile=none"]),)
+            .is_empty());
+
+        let generic_kubectl_exec_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: exec-helper
+    binary: kubectl
+    consequence: irreversible
+    trusted: true
+    coverage:
+      - name: exec
+        action: preauthorized
+        required_args: ["exec"]
+"#,
+        )
+        .unwrap();
+        assert!(!generic_kubectl_exec_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&[
+                    "exec",
+                    "deploy/tool",
+                    "--",
+                    "helper",
+                    "--from-file=./remote-input",
+                    "kustomize",
+                    "./remote-directory",
+                ]),
+            )
+            .is_empty());
+
+        let generic_helm_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: helm-file-backed-operation
+    binary: helm
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: any
+        action: preauthorized
+"#,
+        )
+        .unwrap();
+        for relative_file in [
+            "--ca-file=./ca.pem",
+            "--cert-file=./client.pem",
+            "--key-file=./client.key",
+            "--keyring=./pubring.gpg",
+            "--set-file=payload=./values.txt",
+            "--set-file=first=/srv/first,second=./second",
+            "--post-renderer=./renderer",
+            "--output-dir=./rendered",
+            "-f=./values.yaml",
+        ] {
+            assert!(generic_helm_coverage
+                .match_command_all("helm", &args_vec(&["pull", "repo/chart", relative_file]))
+                .is_empty());
+        }
+        assert!(generic_helm_coverage
+            .match_command_all("helm", &args_vec(&["verify", "./chart-1.0.0.tgz"]),)
+            .is_empty());
+        assert!(generic_helm_coverage
+            .match_command_all("helm", &args_vec(&["install", "fixture", "./chart"]))
+            .is_empty());
+        for absolute_file in [
+            "--ca-file=/srv/automation/ca.pem",
+            "--cert-file=/srv/automation/client.pem",
+            "--key-file=/srv/automation/client.key",
+            "--keyring=/srv/automation/pubring.gpg",
+            "--set-file=payload=/srv/automation/values.txt",
+            "--output-dir=/srv/automation/rendered",
+        ] {
+            assert!(!generic_helm_coverage
+                .match_command_all("helm", &args_vec(&["pull", "repo/chart", absolute_file]))
+                .is_empty());
+        }
+        for renderer in [
+            "--post-renderer=/srv/automation/renderer",
+            "--post-renderer=renderer",
+        ] {
+            assert!(generic_helm_coverage
+                .match_command_all(
+                    "helm",
+                    &args_vec(&["template", "fixture", "repo/chart", renderer]),
+                )
+                .is_empty());
+        }
+        assert!(!generic_helm_coverage
+            .match_command_all(
+                "helm",
+                &args_vec(&["verify", "/srv/automation/chart-1.0.0.tgz"]),
+            )
+            .is_empty());
+        assert!(!generic_helm_coverage
+            .match_command_all(
+                "helm",
+                &args_vec(&["install", "fixture", "/srv/automation/chart"]),
+            )
+            .is_empty());
+
+        for kuberc in ["--kuberc=preferences.yaml", "--kuberc=./preferences.yaml"] {
+            assert!(generic_kubectl_patch_coverage
+                .match_command_all("kubectl", &args_vec(&["patch", "deployment/app", kuberc]),)
+                .is_empty());
+        }
+        assert!(!generic_kubectl_patch_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["patch", "deployment/app", "--kuberc=/etc/guard/kuberc.yaml",]),
+            )
+            .is_empty());
+        assert!(!generic_kubectl_coverage
+            .match_command_all(
+                "kubectl",
+                &args_vec(&["apply", "-k/srv/automation/kustomization"]),
+            )
+            .is_empty());
+
+        let relative_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-inventory
+    binary: ansible
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: bounded
+        action: preauthorized
+        inventory:
+          options: ["-i", "--inventory"]
+          values: ["inventory/production"]
+"#,
+        )
+        .unwrap_err();
+        assert!(relative_coverage
+            .to_string()
+            .contains("inventory value must be an absolute path"));
+
+        let portable = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-selected-manifest
+    binary: kubectl
+    args: ["apply", "-f", "{path}"]
+    params:
+      path: { pattern: "^/srv/guard/manifests/[a-z0-9-]+\\.yaml$" }
+    consequence: irreversible
+  - name: inspect-controller
+    binary: kubectl
+    args: ["exec", "deploy/tools", "--", "ceph", "status"]
+    consequence: reversible
+"#,
+        )
+        .expect("absolute file operands and fixed non-path resource tokens remain valid");
+        assert_eq!(portable.names().len(), 2);
+    }
+
+    #[test]
+    fn single_argv_parameters_render_bounded_jsonpath_and_field_selectors() {
+        let catalog = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-pods
+    binary: kubectl
+    args: ["get", "pods", "-o", "jsonpath={jsonpath}", "--field-selector", "{selector}"]
+    params:
+      jsonpath:
+        pattern: '^\{\.metadata\.name\} \{\.status\.phase\}$'
+        value_type: single_argv
+        max_length: 96
+      selector:
+        pattern: '^status\.phase=Running, metadata\.name=api$'
+        value_type: single_argv
+        max_length: 96
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let verb = catalog.get("inspect-pods").unwrap();
+        validate_synthesized_safety(verb).unwrap();
+        let params = BTreeMap::from([
+            (
+                "jsonpath".to_string(),
+                "{.metadata.name} {.status.phase}".to_string(),
+            ),
+            (
+                "selector".to_string(),
+                "status.phase=Running, metadata.name=api".to_string(),
+            ),
+        ]);
+        let rendered = catalog.render("inspect-pods", &params).unwrap();
+        assert_eq!(
+            rendered.args[3],
+            "jsonpath={.metadata.name} {.status.phase}"
+        );
+        assert_eq!(rendered.args[5], "status.phase=Running, metadata.name=api");
+        assert_eq!(rendered.args.len(), 6, "spaces must not split argv");
+        assert_eq!(verb.finite_parameter_sets().unwrap().len(), 1);
+
+        let encoded = serde_yaml_ng::to_string(verb).unwrap();
+        assert!(encoded.contains("value_type: single_argv"));
+        assert!(encoded.contains("max_length: 96"));
+    }
+
+    #[test]
+    fn single_argv_parameters_reject_shell_controls_and_require_a_bound() {
+        let dangerous = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-pods
+    binary: kubectl
+    args: ["get", "pods", "--field-selector", "{selector}"]
+    params:
+      selector:
+        pattern: '^[a-z; ]{1,32}$'
+        value_type: single_argv
+        max_length: 32
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let error =
+            validate_synthesized_safety(dangerous.get("inspect-pods").unwrap()).unwrap_err();
+        assert!(error.to_string().contains("shell control"), "got: {error}");
+
+        let missing_bound = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-pods
+    binary: kubectl
+    args: ["get", "pods", "--field-selector", "{selector}"]
+    params:
+      selector:
+        pattern: '^status\.phase=Running$'
+        value_type: single_argv
+    consequence: reversible
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{missing_bound:#}").contains("requires a positive max_length"),
+            "got: {missing_bound:#}"
+        );
     }
 
     #[test]
@@ -2589,64 +6603,60 @@ verbs:
         let mut catalog = VerbCatalog::default();
         let candidate = |name: &str, binary: &str, args: &[&str], consequence| {
             let mut verb = synth_verb(binary, None, false, name);
-            verb.name = format!("access-generated-{name}");
             verb.args = args
                 .iter()
                 .map(|argument| (*argument).to_string())
                 .collect();
             verb.baseline = false;
             verb.consequence = consequence;
-            verb
+            canonical_generated_access_verb(verb)
         };
 
-        catalog
-            .upsert_access_verb(candidate(
-                "kubectl-delete",
-                "kubectl",
-                &["delete", "pod", "fixture"],
-                Reversibility::Reversible,
-            ))
-            .unwrap();
-        catalog
-            .upsert_access_verb(candidate(
-                "systemctl-stop",
-                "systemctl",
-                &["stop", "fixture.service"],
-                Reversibility::Reversible,
-            ))
-            .unwrap();
-        catalog
-            .upsert_access_verb(candidate(
-                "kubectl-get",
-                "kubectl",
-                &["get", "pods"],
+        let cases = [
+            (
+                candidate(
+                    "kubectl-delete",
+                    "kubectl",
+                    &["delete", "pod", "fixture"],
+                    Reversibility::Reversible,
+                ),
                 Reversibility::Irreversible,
-            ))
-            .unwrap();
-        catalog
-            .upsert_access_verb(candidate(
-                "rustc-version",
-                "rustc",
-                &["--version"],
+            ),
+            (
+                candidate(
+                    "systemctl-stop",
+                    "systemctl",
+                    &["stop", "fixture.service"],
+                    Reversibility::Reversible,
+                ),
                 Reversibility::Irreversible,
-            ))
-            .unwrap();
-
-        for name in [
-            "access-generated-kubectl-delete",
-            "access-generated-systemctl-stop",
-        ] {
-            let installed = catalog.get(name).unwrap();
+            ),
+            (
+                candidate(
+                    "kubectl-get",
+                    "kubectl",
+                    &["get", "pods"],
+                    Reversibility::Irreversible,
+                ),
+                Reversibility::Reversible,
+            ),
+            (
+                candidate(
+                    "rustc-version",
+                    "rustc",
+                    &["--version"],
+                    Reversibility::Irreversible,
+                ),
+                Reversibility::Reversible,
+            ),
+        ];
+        for (candidate, expected) in cases {
+            let candidate = catalog.canonical_generated_access_verb(candidate).unwrap();
+            let name = candidate.name.clone();
+            catalog.upsert_access_verb(candidate).unwrap();
+            let installed = catalog.get(&name).unwrap();
             assert!(installed.trusted);
-            assert_eq!(installed.consequence, Reversibility::Irreversible);
-        }
-        for name in [
-            "access-generated-kubectl-get",
-            "access-generated-rustc-version",
-        ] {
-            let diagnostic = catalog.get(name).unwrap();
-            assert!(diagnostic.trusted);
-            assert_eq!(diagnostic.consequence, Reversibility::Reversible);
+            assert_eq!(installed.consequence, expected);
         }
     }
 
@@ -2683,53 +6693,163 @@ verbs:
             },
         );
         wrapper.consequence = Reversibility::Irreversible;
-        wrapper
+        canonical_generated_access_verb(wrapper)
     }
 
     #[test]
-    fn generated_access_matcher_wrapping_catalog_verb_inherits_its_consequence() {
+    fn generated_access_matcher_inherits_exact_catalog_consequence() {
         let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
-        catalog
-            .upsert_access_verb(toolbox_wrapper("^(status|df)$"))
-            .unwrap();
+        let wrapper = toolbox_wrapper("^(status|df)$");
+        let wrapper = catalog.canonical_generated_access_verb(wrapper).unwrap();
+        let name = wrapper.name.clone();
+        catalog.upsert_access_verb(wrapper).unwrap();
         assert_eq!(
-            catalog
-                .get("access-generated-ceph-read")
-                .unwrap()
-                .consequence,
+            catalog.get(&name).unwrap().consequence,
             Reversibility::Reversible,
             "every admitted command reverse-matches the reversible catalog verb"
         );
     }
 
     #[test]
-    fn generated_access_matcher_broader_than_catalog_coverage_stays_irreversible() {
-        // One admitted value escapes the wrapped verb's own pattern, so the
-        // matcher is broader than the operator-reviewed coverage and keeps
-        // the fail-closed default.
-        let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
-        catalog
-            .upsert_access_verb(toolbox_wrapper("^(status|osd-purge)$"))
-            .unwrap();
+    fn generated_access_rejects_a_forged_consequence_after_normalization() {
+        let mut verb = synth_verb("kubectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = args_vec(&["get", "pods"]);
+        verb.consequence = Reversibility::Irreversible;
+        verb.name = generated_access_verb_name(&verb);
+        let mut serialized = serde_json::to_value(canonical_generated_access_verb(verb)).unwrap();
+        serialized["consequence"] = serde_json::json!("irreversible");
+        assert!(parse_normalized_generated_access_verb(&serialized)
+            .unwrap_err()
+            .to_string()
+            .contains("locally derived matcher consequence"));
+
+        let mut destructive = synth_verb("kubectl", None, false, "access-generated-fixture");
+        destructive.baseline = false;
+        destructive.args = args_vec(&["delete", "pods"]);
+        destructive.consequence = Reversibility::Reversible;
+        destructive.name = generated_access_verb_name(&destructive);
+        let mut serialized =
+            serde_json::to_value(canonical_generated_access_verb(destructive)).unwrap();
+        serialized["consequence"] = serde_json::json!("reversible");
+        assert!(parse_normalized_generated_access_verb(&serialized)
+            .unwrap_err()
+            .to_string()
+            .contains("locally derived matcher consequence"));
+    }
+
+    #[test]
+    fn generated_access_identity_converges_when_all_provenance_fields_vary() {
+        let mut first = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        first.baseline = false;
+        first.args = args_vec(&["inspect", "{item}"]);
+        first.params.insert(
+            "item".to_string(),
+            ParamSpec {
+                pattern: "^[a-z]+$".to_string(),
+                required: true,
+                default: None,
+                allow_dash: false,
+            },
+        );
+        let mut second = first.clone();
+        for (verb, source, evidence, regime, prompt, model, dimension, generated_unix) in [
+            (
+                &mut first,
+                "source-one",
+                "evidence-one",
+                "regime-one",
+                "prompt-one",
+                "model-one",
+                "dimension-one",
+                1,
+            ),
+            (
+                &mut second,
+                "source-two",
+                "evidence-two",
+                "regime-two",
+                "prompt-two",
+                "model-two",
+                "dimension-two",
+                2,
+            ),
+        ] {
+            verb.coverage = vec![VerbCoverageCell {
+                name: "item".to_string(),
+                action: CoverageAction::Evaluate,
+                required_args: Vec::new(),
+                forbidden_args: Vec::new(),
+                min_args: None,
+                max_args: None,
+                options: Vec::new(),
+                target: None,
+                inventory: None,
+                namespace: None,
+                fanout: None,
+                cwd: None,
+                environment: Vec::new(),
+                override_marker: None,
+                sticky: false,
+                provenance: Some(CoverageProvenance {
+                    source: source.to_string(),
+                    evidence: vec![evidence.to_string()],
+                    regime_stamp: regime.to_string(),
+                    prompt_stamp: prompt.to_string(),
+                    model_stamp: model.to_string(),
+                    generated_unix,
+                    probes: vec![CoverageProbe {
+                        dimension: dimension.to_string(),
+                        args: args_vec(&["inspect", "item"]),
+                        expected_match: true,
+                        observed_match: true,
+                    }],
+                    observation_replays: Vec::new(),
+                }),
+            }];
+            verb.consequence = Reversibility::Irreversible;
+            verb.name = generated_access_verb_name(verb);
+        }
+        let first = canonical_generated_access_verb(first);
+        let second = canonical_generated_access_verb(second);
         assert_eq!(
-            catalog
-                .get("access-generated-ceph-read")
-                .unwrap()
-                .consequence,
+            generated_access_matcher_shape(&first),
+            generated_access_matcher_shape(&second)
+        );
+        assert_eq!(
+            generated_access_verb_name(&first),
+            generated_access_verb_name(&second)
+        );
+        assert_eq!(
+            generated_access_matcher_digest(&generated_access_matcher_shape(&first)),
+            generated_access_matcher_digest(&generated_access_matcher_shape(&second))
+        );
+        assert_eq!(first.consequence, second.consequence);
+    }
+
+    #[test]
+    fn generated_access_matcher_with_mutating_shape_stays_irreversible() {
+        // A kubectl exec wrapper is not one of the statically proven read-only
+        // shapes, so the local consequence remains fail-closed regardless of
+        // the operator catalog's unrelated coverage.
+        let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
+        let wrapper = toolbox_wrapper("^(status|osd-purge)$");
+        let wrapper = catalog.canonical_generated_access_verb(wrapper).unwrap();
+        let name = wrapper.name.clone();
+        catalog.upsert_access_verb(wrapper).unwrap();
+        assert_eq!(
+            catalog.get(&name).unwrap().consequence,
             Reversibility::Irreversible
         );
 
-        // A free-text parameter is not enumerable, so nothing is inherited
-        // even though every actually-valid value would match the catalog verb.
+        // The same rule applies to a free-text parameter.
         let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
-        catalog
-            .upsert_access_verb(toolbox_wrapper("^[a-z]+$"))
-            .unwrap();
+        let wrapper = toolbox_wrapper("^[a-z]+$");
+        let wrapper = catalog.canonical_generated_access_verb(wrapper).unwrap();
+        let name = wrapper.name.clone();
+        catalog.upsert_access_verb(wrapper).unwrap();
         assert_eq!(
-            catalog
-                .get("access-generated-ceph-read")
-                .unwrap()
-                .consequence,
+            catalog.get(&name).unwrap().consequence,
             Reversibility::Irreversible
         );
     }
@@ -2768,6 +6888,27 @@ verbs:
     }
 
     #[test]
+    fn catalog_platform_is_enforced_by_production_loading() {
+        let incompatible = if cfg!(windows) { "unix" } else { "windows" };
+        let incompatible_catalog = format!(
+            "platform: {incompatible}\nverbs:\n  - name: inspect\n    binary: true\n    consequence: reversible\n"
+        );
+        let error = VerbCatalog::from_yaml(&incompatible_catalog).unwrap_err();
+        assert!(error.to_string().contains("verb catalog targets platform"));
+        let lint = VerbCatalog::lint_yaml(&incompatible_catalog);
+        assert_eq!(lint.findings.len(), 1);
+        assert!(lint.findings[0]
+            .message
+            .contains("verb catalog targets platform"));
+
+        let compatible = if cfg!(windows) { "windows" } else { "unix" };
+        VerbCatalog::from_yaml(&format!(
+            "platform: {compatible}\nverbs:\n  - name: inspect\n    binary: true\n    consequence: reversible\n"
+        ))
+        .expect("catalog for the running platform loads");
+    }
+
+    #[test]
     fn example_verb_catalogs_parse_and_validate() {
         // Guards against example/doc drift: every shipped examples/verbs*.yaml
         // must actually load (anchored patterns, declared placeholders, no
@@ -2779,8 +6920,21 @@ verbs:
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy();
             if name.starts_with("verbs") && name.ends_with(".yaml") {
-                VerbCatalog::load(&path)
-                    .unwrap_or_else(|e| panic!("{} failed to load: {e}", path.display()));
+                let yaml = std::fs::read_to_string(&path).unwrap();
+                let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+                let platform = document
+                    .as_mapping()
+                    .and_then(|mapping| mapping.get("platform"))
+                    .and_then(serde_yaml_ng::Value::as_str);
+                match VerbCatalog::from_yaml(&yaml) {
+                    Ok(_) => {}
+                    Err(error)
+                        if platform.is_some_and(|platform| {
+                            (platform == "unix" && cfg!(windows))
+                                || (platform == "windows" && cfg!(unix))
+                        }) && error.to_string().contains("verb catalog targets platform") => {}
+                    Err(error) => panic!("{} failed to load: {error}", path.display()),
+                }
                 checked += 1;
             }
         }
@@ -2799,9 +6953,9 @@ verbs:
             "verbs:\n  - name: a\n    binary: echo\n    consequence: reversible\ndefaults:\n  timeout: 30\n",
         ];
         for seed in seeds {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::learned_rules::authority_tempdir();
             let path = dir.path().join("verbs.yaml");
-            std::fs::write(&path, seed).unwrap();
+            crate::learned_rules::write_authority_file(&path, seed).unwrap();
             let mut cat = VerbCatalog::load(&path).unwrap();
             cat.append_verb(&v)
                 .unwrap_or_else(|e| panic!("append failed for seed {seed:?}: {e}"));
@@ -3027,7 +7181,12 @@ verbs:
 
     #[test]
     fn typed_coverage_matches_conjunctive_command_dimensions() {
-        let cat = VerbCatalog::from_yaml(
+        let inventory = if cfg!(windows) {
+            r"C:\guard\inventory\prod"
+        } else {
+            "/srv/guard/inventory/prod"
+        };
+        let catalog = format!(
             r#"
 verbs:
   - name: ansible-check
@@ -3047,7 +7206,7 @@ verbs:
           values: ["web"]
         inventory:
           options: ["-i", "--inventory"]
-          values: ["inventory/prod"]
+          values: ['{inventory}']
         namespace:
           options: ["--namespace"]
           values: ["prod"]
@@ -3055,15 +7214,15 @@ verbs:
           options: ["--limit"]
           max: 2
 "#,
-        )
-        .unwrap();
+        );
+        let cat = VerbCatalog::from_yaml(&catalog).unwrap();
 
         let matching = args_vec(&[
             "web",
             "-m",
             "ping",
             "-i",
-            "inventory/prod",
+            inventory,
             "--namespace=prod",
             "--limit",
             "one,two",
@@ -3082,10 +7241,11 @@ verbs:
             .collect::<Vec<_>>();
         assert!(cat.match_command_all("ansible", &without_check).is_empty());
 
+        let inventory_option = format!("--inventory={inventory}");
         let too_many = args_vec(&[
             "web",
             "--module-name=ping",
-            "--inventory=inventory/prod",
+            &inventory_option,
             "--namespace=prod",
             "--limit=one,two,three",
             "--check",
@@ -3097,7 +7257,7 @@ verbs:
             "-m",
             "ping",
             "-i",
-            "inventory/prod",
+            inventory,
             "--namespace",
             "prod",
             "--limit=one",
@@ -3114,7 +7274,7 @@ verbs:
             "-m",
             "ping",
             "-i",
-            "inventory/prod",
+            inventory,
             "--namespace",
             "prod",
             "--limit",
@@ -3166,7 +7326,12 @@ verbs:
 "#,
         )
         .unwrap();
-        let command = args_vec(&["--check", "site.yml"]);
+        let playbook = if cfg!(windows) {
+            r"C:\automation\site.yml"
+        } else {
+            "/srv/automation/site.yml"
+        };
+        let command = args_vec(&["--check", playbook]);
         let mut plain = BTreeMap::new();
         plain.insert(
             "ANSIBLE_CONFIG".to_string(),
@@ -3314,7 +7479,7 @@ verbs:
 
     #[test]
     fn auto_promoted_verb_cannot_authorize_caller_environment() {
-        let catalog = VerbCatalog::from_yaml(
+        let error = VerbCatalog::from_yaml(
             r#"
 verbs:
   - name: generated-check
@@ -3331,13 +7496,321 @@ verbs:
             values: ["/srv/automation/ansible.cfg"]
 "#,
         )
-        .unwrap();
-        let verb = catalog.get("generated-check").unwrap();
-
-        let error = validate_auto_promoted_verb_safety(verb, &[]).unwrap_err();
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("may not authorize caller environment bindings"));
+    }
+
+    #[test]
+    fn auto_promoted_verb_rejects_literal_sensitive_authority() {
+        let value = ["q", "7"].concat();
+        let yaml = format!(
+            r#"
+verbs:
+  - name: generated-auth
+    binary: redis-cli
+    args: ["-a", "{value}"]
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+"#
+        );
+        let error = VerbCatalog::from_yaml(&yaml).unwrap_err();
+        assert!(error.to_string().contains("literal credential argv"));
+    }
+
+    #[test]
+    fn forged_auto_promoted_consequence_is_rejected_at_catalog_load() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-delete
+    binary: kubectl
+    args: ["delete", "pods"]
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+    coverage:
+      - name: evidence-backed
+        action: preauthorized
+        required_args: ["delete", "pods"]
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("consequence does not match"));
+    }
+
+    #[test]
+    fn forged_auto_promoted_parameter_cannot_smuggle_a_mutating_subcommand() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-pod-read
+    binary: kubectl
+    args: ["--namespace", "get", "{operation}", "pods", "--all"]
+    params:
+      operation:
+        pattern: "^(delete)$"
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("expands to a command that is not independently read-only"));
+    }
+
+    #[test]
+    fn auto_promoted_safe_finite_parameter_commands_remain_valid() {
+        let catalog = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-pod-read
+    binary: kubectl
+    args: ["get", "pods", "--namespace", "{namespace}"]
+    params:
+      namespace:
+        pattern: "^(dev|staging)$"
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap();
+        assert!(catalog.get("generated-pod-read").is_some());
+    }
+
+    #[test]
+    fn auto_promoted_spaced_promql_values_render_reverse_match_and_reload() {
+        let api_query = r#"sum(rate(http_requests_total{job="api"}[5m])) by (job)"#;
+        let worker_query = r#"sum(rate(http_requests_total{job="worker"}[5m])) by (job)"#;
+        let pattern = format!(
+            "^({}|{})$",
+            regex::escape(api_query),
+            regex::escape(worker_query)
+        );
+        let mut verb = synth_verb("kubectl", None, true, "generated-prom-query");
+        verb.args = args_vec(&["get", "pods", "--field-selector", "{query}"]);
+        verb.params.insert(
+            "query".to_string(),
+            ParamSpec::bounded_single_argv(
+                pattern,
+                api_query.chars().count().max(worker_query.chars().count()),
+                false,
+            ),
+        );
+        verb.auto_promoted = true;
+        verb.promotion_stamp = Some("test-stamp".to_string());
+
+        let evidence = vec![
+            args_vec(&["get", "pods", "--field-selector", api_query]),
+            args_vec(&["get", "pods", "--field-selector", worker_query]),
+        ];
+        validate_auto_promoted_verb_safety(&verb, &evidence).unwrap();
+
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            platform: None,
+            verbs: vec![verb],
+        })
+        .unwrap();
+        assert!(yaml.contains("value_type: single_argv"));
+        assert!(yaml.contains("max_length:"));
+        let catalog = VerbCatalog::from_yaml(&yaml).unwrap();
+        let rendered = catalog
+            .render("generated-prom-query", &params(&[("query", api_query)]))
+            .unwrap();
+        assert_eq!(rendered.args, evidence[0]);
+        assert_eq!(
+            catalog.match_command_all("kubectl", &rendered.args).len(),
+            1,
+            "the reloaded matcher must reverse-match one spaced argv element"
+        );
+        let outside = args_vec(&[
+            "get",
+            "pods",
+            "--field-selector",
+            r#"sum(rate(http_requests_total[5m])) by (job)"#,
+        ]);
+        assert!(catalog.match_command_all("kubectl", &outside).is_empty());
+    }
+
+    #[test]
+    fn auto_promoted_spaced_values_reject_shell_controls_and_unbounded_text() {
+        let spaced_query = r#"sum(rate(http_requests_total[5m])) by (job)"#;
+        let mut unsafe_verb = synth_verb("kubectl", None, true, "generated-prom-query");
+        unsafe_verb.args = args_vec(&["get", "pods", "--field-selector", "{query}"]);
+        unsafe_verb.params.insert(
+            "query".to_string(),
+            ParamSpec {
+                pattern: format!("^({})$", regex::escape(spaced_query)),
+                required: true,
+                default: None,
+                allow_dash: false,
+            },
+        );
+        unsafe_verb.auto_promoted = true;
+        unsafe_verb.promotion_stamp = Some("test-stamp".to_string());
+        let error = validate_auto_promoted_verb_safety(
+            &unsafe_verb,
+            &[args_vec(&["get", "pods", "--field-selector", spaced_query])],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("single_argv"), "got: {error}");
+
+        let unsafe_query = r#"sum(rate(http_requests_total[5m])) by (job); delete"#;
+        unsafe_verb.params.insert(
+            "query".to_string(),
+            ParamSpec::bounded_single_argv(
+                format!("^({})$", regex::escape(unsafe_query)),
+                unsafe_query.chars().count(),
+                false,
+            ),
+        );
+        let error = validate_auto_promoted_verb_safety(
+            &unsafe_verb,
+            &[args_vec(&["get", "pods", "--field-selector", unsafe_query])],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("shell control"), "got: {error}");
+
+        unsafe_verb.params.insert(
+            "query".to_string(),
+            ParamSpec::bounded_single_argv("^.+$".to_string(), 4096, false),
+        );
+        let error = validate_auto_promoted_verb_safety(&unsafe_verb, &[]).unwrap_err();
+        assert!(error.to_string().contains("too permissive"), "got: {error}");
+    }
+
+    #[test]
+    fn forged_auto_promoted_broad_regex_is_rejected_at_catalog_load() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-prod-get
+    binary: kubectl
+    args: ["get", "pods", "{target}"]
+    params:
+      target:
+        pattern: "^prod-[a-z]+$"
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("finite plain literal alternation"));
+    }
+
+    #[test]
+    fn forged_auto_promoted_regex_escape_is_rejected_at_catalog_load() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-digit-get
+    binary: kubectl
+    args: ["get", "pods", "{target}"]
+    params:
+      target:
+        pattern: '^(\d)$'
+        required: true
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    promotion_stamp: test-stamp
+"#,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("generator-canonical exact pattern"));
+    }
+
+    #[test]
+    fn cwd_coverage_matches_only_the_operator_approved_canonical_directory() {
+        let root = crate::learned_rules::authority_tempdir();
+        let root = root.path().canonicalize().unwrap();
+        let other = crate::learned_rules::authority_tempdir();
+        let root_yaml = serde_yaml_ng::to_string(&root.to_string_lossy().to_string()).unwrap();
+        let yaml = format!(
+            r#"
+verbs:
+  - name: project-status
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: project-root
+        action: preauthorized
+        cwd: {}
+"#,
+            root_yaml.trim()
+        );
+        let catalog = VerbCatalog::from_yaml(&yaml).unwrap();
+        let empty = BTreeMap::new();
+
+        assert_eq!(
+            catalog
+                .match_command_all_with_environment_and_cwd(
+                    "true",
+                    &[],
+                    &empty,
+                    &empty,
+                    &empty,
+                    Some(&root),
+                )
+                .len(),
+            1
+        );
+        assert!(catalog
+            .match_command_all_with_environment_and_cwd(
+                "true",
+                &[],
+                &empty,
+                &empty,
+                &empty,
+                Some(other.path()),
+            )
+            .is_empty());
+        assert!(catalog.match_command_all("true", &[]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cwd_coverage_rejects_a_symlink_instead_of_approving_its_target() {
+        let parent = crate::learned_rules::authority_tempdir();
+        let project = parent.path().join("project");
+        let alias = parent.path().join("project-link");
+        std::fs::create_dir(&project).unwrap();
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let yaml = format!(
+            r#"
+verbs:
+  - name: project-status
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: project-root
+        action: preauthorized
+        cwd: "{}"
+"#,
+            alias.display()
+        );
+
+        let error = VerbCatalog::from_yaml(&yaml).unwrap_err();
+        assert!(error.to_string().contains("is not canonical"), "{error:#}");
     }
 
     #[test]
@@ -3400,9 +7873,9 @@ verbs:
 
     #[test]
     fn hot_reload_preserves_daemon_owned_coverage() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             "verbs:\n  - name: operator-one\n    binary: uptime\n    consequence: reversible\n",
         )
@@ -3420,9 +7893,11 @@ verbs:
         );
         access.name = "access-generated-live".to_string();
         access.baseline = false;
+        access = canonical_generated_access_verb(access);
+        let access_name = access.name.clone();
         catalog.upsert_access_verb(access).unwrap();
 
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             "verbs:\n  - name: operator-two\n    binary: hostname\n    consequence: reversible\n",
         )
@@ -3433,8 +7908,13 @@ verbs:
         assert!(catalog.get("operator-two").is_some());
         assert!(catalog.get("grant-live").is_some());
         assert!(catalog
-            .get("access-generated-live")
+            .get(&access_name)
             .is_some_and(|verb| verb.trusted && !verb.baseline));
+    }
+
+    fn canonical_generated_access_verb(mut verb: Verb) -> Verb {
+        verb.name = generated_access_verb_name(&verb);
+        verb
     }
 
     fn args_vec(v: &[&str]) -> Vec<String> {
@@ -3475,6 +7955,309 @@ verbs:
     revert: { binary: systemctl, args: ["disable", "--{scope}", "{unit}"] }
 "#;
         assert!(VerbCatalog::from_yaml(yaml).is_ok());
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_rollback_only_parameters() {
+        let mut verb = synth_verb("kubectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = args_vec(&["annotate", "pod/example"]);
+        verb.params.insert(
+            "overwrite".to_string(),
+            ParamSpec {
+                pattern: "^(true|false)$".to_string(),
+                required: false,
+                default: Some("true".to_string()),
+                allow_dash: false,
+            },
+        );
+        verb.revert = Some(VerbCommand {
+            binary: "kubectl".to_string(),
+            args: args_vec(&["annotate", "pod/example", "--overwrite={overwrite}"]),
+        });
+        assert!(normalize_generated_access_verb(verb).is_err());
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_unknown_forward_placeholders() {
+        let mut verb = synth_verb("kubectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = args_vec(&["apply", "-f", "{manifest}"]);
+        assert!(normalize_generated_access_verb(verb).is_err());
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_sensitive_literals_without_echoing_them() {
+        let sensitive = ["sk-", &"Ab1".repeat(8)].concat();
+        let mut argument = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        argument.baseline = false;
+        argument.args = vec![sensitive.clone()];
+        let argument_error = normalize_generated_access_verb(argument).unwrap_err();
+        assert!(!argument_error.to_string().contains(&sensitive));
+
+        let mut binary = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        binary.baseline = false;
+        binary.binary = sensitive.clone();
+        let binary_error = normalize_generated_access_verb(binary).unwrap_err();
+        assert!(!binary_error.to_string().contains(&sensitive));
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_sensitive_parameter_authority() {
+        let value = ["q", "7"].concat();
+
+        let mut default = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        default.baseline = false;
+        default.args = vec!["inspect".to_string(), "{password}".to_string()];
+        default.params.insert(
+            "password".to_string(),
+            ParamSpec {
+                pattern: "^[a-z0-9]+$".to_string(),
+                required: false,
+                default: Some(value.clone()),
+                allow_dash: false,
+            },
+        );
+        let error = normalize_generated_access_verb(default).unwrap_err();
+        assert!(error.to_string().contains("sensitive authority metadata"));
+        assert!(!error.to_string().contains(&value));
+
+        let mut pattern = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        pattern.baseline = false;
+        pattern.args = vec!["inspect".to_string(), "{target}".to_string()];
+        pattern.params.insert(
+            "target".to_string(),
+            ParamSpec {
+                pattern: format!("^--password={value}$"),
+                required: true,
+                default: None,
+                allow_dash: true,
+            },
+        );
+        let error = normalize_generated_access_verb(pattern).unwrap_err();
+        assert!(error.to_string().contains("sensitive authority metadata"));
+        assert!(!error.to_string().contains(&value));
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_sensitive_constraint_values() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = vec!["inspect".to_string()];
+        verb.coverage.push(VerbCoverageCell {
+            name: "bounded".to_string(),
+            action: CoverageAction::Evaluate,
+            required_args: Vec::new(),
+            forbidden_args: Vec::new(),
+            min_args: None,
+            max_args: None,
+            options: vec![ValueConstraint {
+                options: vec!["--password".to_string()],
+                position: None,
+                values: vec![value.clone()],
+                allow_dash: false,
+                required: true,
+                allow_multiple: false,
+            }],
+            target: None,
+            inventory: None,
+            namespace: None,
+            fanout: None,
+            cwd: None,
+            environment: Vec::new(),
+            override_marker: None,
+            sticky: false,
+            provenance: None,
+        });
+        let error = normalize_generated_access_verb(verb).unwrap_err();
+        assert!(error.to_string().contains("sensitive authority metadata"));
+        assert!(!error.to_string().contains(&value));
+    }
+
+    #[test]
+    fn sensitive_generated_defaults_cannot_install_or_render() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = vec!["inspect".to_string(), "{password}".to_string()];
+        verb.params.insert(
+            "password".to_string(),
+            ParamSpec {
+                pattern: "^[a-z0-9]+$".to_string(),
+                required: false,
+                default: Some(value.clone()),
+                allow_dash: false,
+            },
+        );
+        verb.name = generated_access_verb_name(&verb);
+        let name = verb.name.clone();
+        let mut catalog = VerbCatalog::empty();
+        let error = catalog.upsert_access_verb(verb).unwrap_err();
+        assert!(!error.to_string().contains(&value));
+        assert!(catalog.render(&name, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn generated_access_reclassifies_concrete_parameter_argv_before_use() {
+        fn install(
+            binary: &str,
+            templates: Vec<String>,
+            params: BTreeMap<String, ParamSpec>,
+        ) -> (VerbCatalog, String) {
+            let mut verb = synth_verb(binary, None, false, "access-generated-fixture");
+            verb.baseline = false;
+            verb.args = templates;
+            verb.params = params;
+            verb.consequence = canonical_generated_access_consequence(&verb);
+            verb.name = generated_access_verb_name(&verb);
+            let name = verb.name.clone();
+            let mut catalog = VerbCatalog::empty();
+            catalog.upsert_access_verb(verb).unwrap();
+            (catalog, name)
+        }
+        fn spec(pattern: &str, allow_dash: bool) -> ParamSpec {
+            ParamSpec {
+                pattern: pattern.to_string(),
+                required: true,
+                default: None,
+                allow_dash,
+            }
+        }
+
+        let value = ["q", "7"].concat();
+        let (split_catalog, split_name) = install(
+            "fixturectl",
+            args_vec(&["{option}", "{operand}"]),
+            BTreeMap::from([
+                ("option".to_string(), spec("^--[a-z]{8}$", true)),
+                ("operand".to_string(), spec("^[a-z0-9]{2}$", false)),
+            ]),
+        );
+        let split_params = BTreeMap::from([
+            ("option".to_string(), "--password".to_string()),
+            ("operand".to_string(), value.clone()),
+        ]);
+        assert!(split_catalog.render(&split_name, &split_params).is_err());
+        assert!(split_catalog
+            .match_command("fixturectl", &["--password".to_string(), value.clone()])
+            .is_none());
+        let benign_params = BTreeMap::from([
+            ("option".to_string(), "--endpoint".to_string()),
+            ("operand".to_string(), value.clone()),
+        ]);
+        assert!(split_catalog.render(&split_name, &benign_params).is_ok());
+
+        for (binary, pattern, argument) in [
+            (
+                "fixturectl",
+                "^--[a-z]{8}=[a-z0-9]{2}$",
+                format!("--password={value}"),
+            ),
+            ("mysql", "^-[a-z][a-z0-9]{2}$", format!("-p{value}")),
+        ] {
+            let (catalog, name) = install(
+                binary,
+                args_vec(&["{argument}"]),
+                BTreeMap::from([("argument".to_string(), spec(pattern, true))]),
+            );
+            let params = BTreeMap::from([("argument".to_string(), argument.clone())]);
+            assert!(catalog.render(&name, &params).is_err());
+            assert!(catalog.match_command(binary, &[argument]).is_none());
+        }
+    }
+
+    #[test]
+    fn generated_access_rejects_sensitive_provenance_stamps() {
+        let value = ["q", "7"].concat();
+        for stamp in ["source", "evidence", "regime", "prompt", "model"] {
+            let mut verb = synth_verb("fixturectl", None, false, "access-generated-fixture");
+            verb.baseline = false;
+            verb.args = args_vec(&["status"]);
+            verb.coverage = vec![VerbCoverageCell {
+                name: "exact".to_string(),
+                action: CoverageAction::Evaluate,
+                required_args: Vec::new(),
+                forbidden_args: Vec::new(),
+                min_args: Some(1),
+                max_args: Some(1),
+                options: Vec::new(),
+                target: None,
+                inventory: None,
+                namespace: None,
+                fanout: None,
+                cwd: None,
+                environment: Vec::new(),
+                override_marker: None,
+                sticky: false,
+                provenance: Some(CoverageProvenance {
+                    source: if stamp == "source" {
+                        format!("password={value}")
+                    } else {
+                        "fixture".to_string()
+                    },
+                    evidence: (stamp == "evidence")
+                        .then(|| format!("password={value}"))
+                        .into_iter()
+                        .collect(),
+                    regime_stamp: if stamp == "regime" {
+                        format!("password={value}")
+                    } else {
+                        "safe-regime".to_string()
+                    },
+                    prompt_stamp: if stamp == "prompt" {
+                        format!("password={value}")
+                    } else {
+                        "safe-prompt".to_string()
+                    },
+                    model_stamp: if stamp == "model" {
+                        format!("password={value}")
+                    } else {
+                        "safe-model".to_string()
+                    },
+                    generated_unix: 1,
+                    probes: Vec::new(),
+                    observation_replays: Vec::new(),
+                }),
+            }];
+            let error = normalize_generated_access_verb(verb).unwrap_err();
+            assert!(!error.to_string().contains(&value));
+        }
+    }
+
+    #[test]
+    fn generated_access_normalization_preserves_argv_elements_exactly() {
+        let mut verb = synth_verb("ansible", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.consequence = Reversibility::Irreversible;
+        verb.args = vec![
+            "host".to_string(),
+            "-m".to_string(),
+            "shell".to_string(),
+            "-a".to_string(),
+            "echo one \"two\" \\ three, UTF-8 π".to_string(),
+        ];
+        let normalized =
+            canonical_generated_access_verb(normalize_generated_access_verb(verb).unwrap());
+        let mut catalog = VerbCatalog::empty();
+        catalog.upsert_access_verb(normalized).unwrap();
+        let original = vec![
+            "host".to_string(),
+            "-m".to_string(),
+            "shell".to_string(),
+            "-a".to_string(),
+            "echo one \"two\" \\ three, UTF-8 π".to_string(),
+        ];
+        assert_eq!(catalog.match_command_all("ansible", &original).len(), 1);
+        assert!(catalog
+            .match_command_all(
+                "ansible",
+                &original
+                    .iter()
+                    .flat_map(|arg| arg.split_whitespace().map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )
+            .is_empty());
     }
 
     #[test]
@@ -3535,5 +8318,133 @@ verbs:
         );
 
         assert_eq!(gate_rejection_guidance("the daemon has no LLM key"), None);
+    }
+}
+#[cfg(test)]
+mod asynchronous_adoption_tests {
+    use super::*;
+    use crate::learned_rules::{
+        acquire_async_authority_use_lease, run_async_durable_store_operation,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn delayed_refresh_cannot_restore_a_durably_deleted_verb() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(
+            &path,
+            r#"verbs:
+  - name: inspect-object
+    binary: fixturectl
+    args: ["status"]
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let baseline = VerbCatalog::load(&path).unwrap();
+        let delayed_refresh = baseline.clone();
+        let mut current = baseline.clone();
+        current.delete_verb("inspect-object").unwrap();
+
+        assert!(current
+            .adopt_async_result(&baseline, delayed_refresh)
+            .is_err());
+        assert!(current.get("inspect-object").is_none());
+    }
+
+    fn file_backed_catalog() -> (tempfile::TempDir, PathBuf, VerbCatalog) {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(
+            &path,
+            r#"verbs:
+  - name: inspect-object
+    description: Inspect an object
+    binary: fixturectl
+    args: ["status"]
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let catalog = VerbCatalog::load(&path).unwrap();
+        (directory, path, catalog)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_lease_linearizes_against_external_verb_deletion() {
+        let (_directory, path, catalog) = file_backed_catalog();
+        let store = Arc::new(RwLock::new(catalog));
+        let lease = acquire_async_authority_use_lease(&store, "verb execution test")
+            .await
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut independent = VerbCatalog::load(&path).unwrap();
+            independent.delete_verb("inspect-object").unwrap();
+            send.send(()).unwrap();
+        });
+
+        assert!(receive.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(lease.render("inspect-object", &BTreeMap::new()).is_ok());
+        drop(lease);
+        // Generous: this wait proves completion, not latency; slow Windows
+        // runners exceed small bounds on the reload-and-delete round trip.
+        receive.recv_timeout(Duration::from_secs(30)).unwrap();
+        writer.join().unwrap();
+
+        assert!(
+            acquire_async_authority_use_lease(&store, "stale verb execution")
+                .await
+                .is_err()
+        );
+        run_async_durable_store_operation(&store, "verb refresh test", |candidate| {
+            *candidate = candidate.refreshed_copy()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(store.read().await.get("inspect-object").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_lease_linearizes_against_external_verb_amendment() {
+        let (_directory, path, catalog) = file_backed_catalog();
+        let original_digest = catalog.verb_definition_digest("inspect-object").unwrap();
+        let store = Arc::new(RwLock::new(catalog));
+        let lease = acquire_async_authority_use_lease(&store, "verb execution test")
+            .await
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut independent = VerbCatalog::load(&path).unwrap();
+            let mut replacement = independent.get("inspect-object").unwrap().clone();
+            replacement.description = "Inspect one object safely".to_string();
+            independent
+                .amend_verb_if_digest("inspect-object", &original_digest, &replacement)
+                .unwrap();
+            send.send(()).unwrap();
+        });
+
+        assert!(receive.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(
+            lease
+                .get("inspect-object")
+                .map(|verb| verb.description.as_str()),
+            Some("Inspect an object")
+        );
+        drop(lease);
+        // This proves completion after lease release, not latency. Keep the
+        // deadlock bound generous for filesystem work on loaded runners.
+        receive.recv_timeout(Duration::from_secs(30)).unwrap();
+        writer.join().unwrap();
+
+        assert!(
+            acquire_async_authority_use_lease(&store, "stale verb execution")
+                .await
+                .is_err()
+        );
     }
 }

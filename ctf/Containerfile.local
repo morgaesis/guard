@@ -1,5 +1,8 @@
 FROM ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb
 
+ARG AGENT_UID=1000
+ARG GUARD_UID=1001
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     curl \
@@ -8,42 +11,43 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim \
     git \
     procps \
+    python3-minimal \
+    iproute2 \
     net-tools \
     ca-certificates \
+    util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-# Ubuntu ships a stock `ubuntu` user at UID 1000; drop it so the agent
-# can take a predictable UID for bind-mount ownership.
+# The daemon and the attack principal must remain distinct. Both belong to the
+# socket group, which grants the agent access only to the daemon's socket.
 RUN userdel -r ubuntu 2>/dev/null || true && \
-    useradd -m -u 1000 -s /bin/bash agent
+    useradd -m -u "$AGENT_UID" -s /bin/bash agent && \
+    useradd -m -u "$GUARD_UID" -s /usr/sbin/nologin guard && \
+    groupadd guard-clients && \
+    usermod -aG guard-clients agent && \
+    usermod -aG guard-clients guard && \
+    mkdir -p /home/agent/.config/guard /home/agent/.ssh /home/agent/.claude /home/agent/work /home/guard/.ssh /home/guard/.local && \
+    chown -R agent:agent /home/agent && \
+    chown -R guard:guard /home/guard && \
+    chmod 700 /home/agent/.ssh /home/agent/.claude /home/guard/.ssh
 
-# Install guard binary
 COPY guard /usr/local/bin/guard
-RUN chmod 755 /usr/local/bin/guard
-
-# Install claude (Claude Code CLI) - copied verbatim from host
 COPY .claude-bin /usr/local/bin/claude
-RUN chmod 755 /usr/local/bin/claude
-
-# Set up guard client config and agent home dirs
-RUN mkdir -p /home/agent/.config/guard /home/agent/.guard/shims /home/agent/.ssh /home/agent/.claude /home/agent/work && \
-    chmod 700 /home/agent/.ssh /home/agent/.claude
+RUN chmod 755 /usr/local/bin/guard /usr/local/bin/claude
 
 COPY client.yaml /home/agent/.config/guard/client.yaml
-
-# Minimal claude settings: no MCP servers, no inherited project config
-COPY .claude-settings.json /home/agent/.claude/settings.json
-
-# Launcher script copied in for `podman exec` invocation
 COPY run-claude-attack.sh /usr/local/bin/run-claude-attack
+COPY egress-proxy.py /usr/local/lib/guard/egress-proxy.py
 COPY ctf-prompt.md /home/agent/ctf-prompt.md
-RUN chmod +x /usr/local/bin/run-claude-attack
-
-RUN chown -R agent:agent /home/agent
+RUN chmod 755 /usr/local/bin/run-claude-attack \
+ && chmod 644 /usr/local/lib/guard/egress-proxy.py \
+ && chown -R agent:agent /home/agent
 
 COPY entrypoint-local.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod 755 /entrypoint.sh
 
+# The image default keeps `podman exec` sessions unprivileged. `run.sh` starts
+# PID 1 as root only long enough to set up the private daemon state.
 USER agent
 WORKDIR /home/agent/work
 

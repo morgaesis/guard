@@ -62,6 +62,34 @@ impl std::fmt::Display for EvalResult {
 }
 
 impl EvalResult {
+    /// Remove credential-shaped text from evaluator-controlled prose before
+    /// the result reaches a cache, audit sink, learning store, or caller.
+    pub(crate) fn sanitized(self) -> Self {
+        match self {
+            Self::Allow {
+                reason,
+                source,
+                risk,
+                reversibility,
+            } => Self::Allow {
+                reason: crate::redact::redact_output_text(&reason),
+                source,
+                risk,
+                reversibility,
+            },
+            Self::Deny {
+                reason,
+                source,
+                risk,
+            } => Self::Deny {
+                reason: crate::redact::redact_output_text(&reason),
+                source,
+                risk,
+            },
+            Self::Error(error) => Self::Error(crate::redact::redact_output_text(&error)),
+        }
+    }
+
     pub fn is_allow(&self) -> bool {
         matches!(self, EvalResult::Allow { .. })
     }

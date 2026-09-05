@@ -3,7 +3,8 @@
 Verbs are Guard's typed operation interface. A verb fixes a binary, validates
 parameters, describes credential and execution plans, declares consequence, and
 optionally supplies rollback. The daemon loads an operator catalog through
-`--verbs` or `GUARD_VERBS` and hot-reloads it on change.
+`--verbs` or `GUARD_VERBS`. Foreground servers hot-reload catalog changes. The
+packaged Windows service loads its administrator-owned catalog once at startup.
 
 ```bash
 guard verb list
@@ -12,7 +13,61 @@ guard verb run restart-service --param unit=nginx
 ```
 
 [`examples/verbs.yaml`](../examples/verbs.yaml) contains command-template and
-coverage-cell examples.
+coverage-cell examples. A catalog may declare `platform: unix` or
+`platform: windows`; Guard rejects a catalog for a different platform during
+linting and startup.
+
+On file-backed deployments, operators add one catalog entry from a YAML file
+containing exactly one verb definition:
+
+```bash
+guard verb add --file inspect-service.yaml
+```
+
+The daemon validates the candidate and the complete catalog before atomically
+appending it. The command fails without changing the catalog when the name
+already exists or the definition is invalid. Generated and reserved verb
+identities are not accepted through this operator-authored boundary. Adding a
+verb requires operator authentication.
+
+Operators replace one catalog entry from a YAML file containing exactly one
+verb definition:
+
+```bash
+guard verb amend restart-service --file restart-service.yaml
+```
+
+The client reads the live definition first and binds the amendment to its
+definition digest. The daemon rejects the write if another catalog edit lands
+between that read and the replacement. It validates the candidate and complete
+catalog before atomically replacing the catalog file. The replacement must
+retain the requested name. Runtime-generated, automatically promoted, and
+reserved-namespace verbs cannot be amended through this command. Like other
+catalog mutations, amend requires the admin bearer.
+
+The packaged Windows service treats the installed catalog as immutable process
+input and disables automatic promotion. Administrators update that catalog
+while the service is stopped, then restart the service to load the new bytes.
+
+## Linting a catalog
+
+`guard verb lint` validates a catalog file directly, without contacting or
+starting a daemon. It reports every invalid verb, naming the verb and the
+failing parameter, instead of stopping at the first failure, and exits 1 when
+findings exist. Linting a catalog with the new binary before swapping binaries
+turns a would-be startup abort into a pre-upgrade report:
+
+```bash
+guard verb lint --file /var/lib/guard/verbs.yaml
+guard verb lint --fix
+```
+
+Without `--file`, lint reads `GUARD_VERBS` or the daemon's default catalog
+path. A structurally valid catalog whose verbs are not in canonical form also
+exits 1 and names each verb needing repair; `--fix` applies the same
+canonicalization the daemon performs at load time (operator-boundary
+normalization and generated-authority envelopes) and rewrites the file through
+the same atomic replacement path, printing each repaired verb.
 
 ## Command templates
 
@@ -37,11 +92,25 @@ verbs:
 skip the consequence gate or hard invariants. Untrusted verbs keep the evaluator
 as a backstop.
 
+Parameters use `token` semantics by default and cannot contain whitespace.
+Use `value_type: single_argv` with a required `max_length` only for a narrow,
+bounded value that must retain ordinary spaces inside one argv element, such as
+an exact query or selector. `single_argv` values remain unsplit and reject
+control characters and shell operators. Automatically promoted verbs use this
+form only when their finite observed values contain whitespace, with the bound
+derived from those values.
+
+`hold: true` routes every matching operation to operator approval after policy
+admission, including operations declared `reversible`. Use it for reads whose
+scope or sensitivity requires review, such as bulk account enumeration. The
+field defaults to `false` when omitted.
+
 ## Coverage cells
 
 Coverage cells describe regions of ordinary tool argv. They can constrain exact
 required and forbidden tokens, option spellings and values, positional targets,
-inventory, namespace, bounded fanout, and caller-requested environment bindings.
+inventory, namespace, bounded fanout, an exact canonical working directory, and
+caller-requested environment bindings.
 Their actions are `preauthorized`, `evaluate`, or `deny`; preauthorization
 requires a trusted verb.
 
@@ -57,7 +126,7 @@ requires a trusted verb.
         required_args: [--check]
         inventory:
           options: [-i, --inventory]
-          values: [inventory/production]
+          values: [/srv/guard/inventory/production]
         fanout:
           options: [--limit]
           max: 2
@@ -78,11 +147,33 @@ A non-matching cell has no decision. The check cell above allows its bounded
 region and does not deny apply mode, SSH inspection, or any other command. Those
 areas follow their own matching cells or evaluator path.
 
+Recognized local-file operands in command and rollback templates must be
+absolute. The bounded grammar covers documented option values and attached
+short forms, including `key=path` and `label@path` payloads. It preserves
+Ansible's non-file forms: inventories may be comma-terminated inline host
+lists, extra variables may be inline values, and vault IDs may use `prompt`.
+Referenced variable files, vault clients, module-path entries, credentials, and
+configuration files must be absolute under the daemon host's path semantics.
+Kubernetes file and kustomization sources are local absolute paths or standard
+input, not caller-selected URLs. Executable selectors such as Helm post-renderers
+must be fixed absolute paths. Transport passthroughs are fixed literals in exact
+templates, never caller-selected generic coverage. Ambiguous command grammars
+that cannot be modeled safely do not receive file-path coverage. If an explicit-inventory
+Ansible process reports that no inventory was parsed, or that every supplied
+source was unusable, Guard converts exit 0 to a failure and emits a diagnostic.
+
 Environment sources are `plain`, `secret`, and `secret-file`. A constraint may
 name exact `values` or a fully anchored `pattern`. A cell with no environment
 constraints cannot preauthorize a request that adds caller-controlled bindings;
 that request returns to the evaluator. Automatically promoted cells never
 preauthorize environment bindings.
+
+`cwd` binds a cell to one existing, absolute canonical directory. Guard
+canonicalizes the caller directory before coverage resolution and revalidates it
+immediately before execution, so a changed directory or symlink retarget cannot
+reuse the cell. This bounds tools that discover configuration, plugins, or input
+files from a project tree. Cwd-dependent opaque carriers do not enter automatic
+verb promotion; an operator-authored typed verb supplies their durable authority.
 
 ## Reverse matching
 
@@ -124,10 +215,20 @@ mode on one host without making broad apply authority global.
 
 ## Generation and promotion
 
+`guard verb create --preview` safety-checks and validates a synthesized
+candidate, then keeps it only in a bounded in-memory review cache. The preview
+does not enter the active catalog. Direct creation and
+`guard verb create --from-preview` enumerate every finite parameter binding and
+run each rendered command through the production evaluator admission path with
+execution disabled. A denial, non-finite pattern, or candidate set above the
+admission bound prevents catalog persistence.
+
 `guard access request` synthesizes typed coverage when no existing verb matches
 the normalized intent. Proposed verbs cannot be baseline or trusted, use a
-shell or interpreter binary, or accept patterns with whitespace and shell
-metacharacters. Approval promotes only the reviewed matcher to trusted
+shell or interpreter binary, or accept unbounded whitespace or shell-control
+patterns. A bounded `single_argv` parameter may carry an exact finite value
+with ordinary spaces inside one argv element. Approval promotes only the
+reviewed matcher to trusted
 session-scoped coverage. The durable request stores the proposal and restores
 it from SQLite while its access session is active. Guard derives consequence
 locally, so unknown or mutating generated shapes remain irreversible holds. The
@@ -135,14 +236,27 @@ operator-authored catalog is unchanged. Equivalent typed shapes are reused
 instead of duplicated.
 
 With consequence gating active, repeated eligible evaluator approvals can
-promote exact observed shapes into trusted verbs. Parameter patterns contain
-only escaped values supported by evidence. Irreversible shapes are ineligible;
-recoverable shapes require validated rollback. Promotion records the evaluator
-regime, and a model or prompt change sends stale coverage back to evaluation.
+promote exact observed, statically read-only shapes into trusted verbs. Parameter
+patterns contain only escaped values supported by evidence. Irreversible and
+recoverable shapes are not auto-promoted: mutating commands remain under
+consequence gating or operator review, and a model-proposed rollback never
+creates unattended authority. An auto-promoted verb never carries a consequence
+above `reversible`. Promotion records the evaluator regime, and a
+model or prompt change sends stale coverage back to evaluation.
+
+Auto-promoted verbs are marked `auto_promoted` in `guard verb list`, and their
+coverage provenance states how it was produced: `observation_replays` record
+the observed evaluator decisions a matcher was derived from, plus the
+generator's own boundary example. Provenance `probes` are reserved for checks a
+generator actually executed against the finished matcher; automatic promotion
+records none.
 
 API traffic uses the same verb vocabulary. Generated API cells bind endpoint,
-session fingerprint, operation, namespace, body shape, regime, and expiry.
-Value-bearing mutations remain evaluator-routed. Inspect or reset them with:
+session fingerprint, full session revision, operation, namespace, body shape,
+protocol authority selectors, evaluator regime, and expiry. Authority selector
+identity includes attached option aliases, so changing an attached alias or the
+session revision requires a fresh evaluation. Value-bearing mutations remain
+evaluator-routed. Inspect or reset generated cells with:
 
 ```bash
 guard verb coverage list

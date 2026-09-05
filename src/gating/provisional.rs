@@ -16,14 +16,48 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use super::{DecisionTrace, GateError};
+use super::{sanitize_gate_text, DecisionTrace, GateError};
 use crate::principal::{scope_eq, PrincipalKey};
+
+/// Packaged operator action for preserving a provisional result.
+#[cfg(unix)]
+pub fn operator_confirm_command(handle: &str) -> String {
+    format!("sudo guard-operator confirm {handle}")
+}
+
+/// Packaged operator action for preserving a provisional result.
+#[cfg(windows)]
+pub fn operator_confirm_command(handle: &str) -> String {
+    format!(r"& 'C:\Program Files\Guard\guard-operator.ps1' -Action confirm -Reference {handle}")
+}
+
+/// Packaged operator action for reverting a provisional result.
+#[cfg(unix)]
+pub fn operator_revert_command(handle: &str) -> String {
+    format!("sudo guard-operator revert {handle}")
+}
+
+/// Packaged operator action for reverting a provisional result.
+#[cfg(windows)]
+pub fn operator_revert_command(handle: &str) -> String {
+    format!(r"& 'C:\Program Files\Guard\guard-operator.ps1' -Action revert -Reference {handle}")
+}
+
+/// Marks a terminal row whose rollback body still requires durable deletion.
+pub const REVERT_BODY_CLEANUP_PREFIX: &str = "rollback body cleanup pending; ";
 
 /// Lifecycle of a provisional execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvisionalStatus {
-    /// Forward command ran; the auto-revert timer is counting down.
+    /// A proxy rollback is durable, but no upstream handoff marker is durable.
+    /// This internal row is inert and is retired on restart.
+    Staged,
+    /// The durable handoff marker was written immediately before the finite
+    /// upstream send. This internal row remains inert while the daemon is live.
+    Dispatching,
+    /// The forward command is running, or it completed successfully and the
+    /// auto-revert timer is counting down. `forward_done` distinguishes them.
     Armed,
     /// The sweeper has claimed this for revert and the revert is in flight.
     /// In-memory transient; if seen on startup it means a revert was
@@ -49,7 +83,12 @@ impl ProvisionalStatus {
     pub fn is_outstanding(self) -> bool {
         matches!(
             self,
-            Self::Armed | Self::Reverting | Self::RevertFailed | Self::NeedsOperatorDecision
+            Self::Staged
+                | Self::Dispatching
+                | Self::Armed
+                | Self::Reverting
+                | Self::RevertFailed
+                | Self::NeedsOperatorDecision
         )
     }
 
@@ -57,8 +96,16 @@ impl ProvisionalStatus {
         matches!(self, Self::Confirmed | Self::Reverted)
     }
 
+    /// Whether this status is final for lifecycle persistence. Failed reverts
+    /// remain outstanding and queryable, so they are not prunable terminals.
+    pub fn is_lifecycle_final(self) -> bool {
+        matches!(self, Self::Confirmed | Self::Reverted | Self::RevertFailed)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Staged => "staged",
+            Self::Dispatching => "dispatching",
             Self::Armed => "armed",
             Self::Reverting => "reverting",
             Self::Confirmed => "confirmed",
@@ -70,7 +117,7 @@ impl ProvisionalStatus {
 }
 
 /// One provisional execution and its revert.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provisional {
     pub handle: String,
     /// Principal of the caller that created this, used to reconstruct the exec
@@ -84,6 +131,12 @@ pub struct Provisional {
         deserialize_with = "crate::principal::principal_from_legacy"
     )]
     pub principal: Option<PrincipalKey>,
+    /// Principal that owned the session which admitted an API-proxy mutation.
+    /// This is attribution only: API reverts continue to use `principal` as
+    /// their daemon execution identity. Command provisionals and unbound API
+    /// requests leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_principal: Option<PrincipalKey>,
     pub binary: String,
     pub args: Vec<String>,
     /// Canonical working directory used by the forward command and its
@@ -136,10 +189,30 @@ pub struct Provisional {
     pub created_unix: u64,
     /// Auto-revert fires at or after this wall-clock unix-seconds value.
     pub deadline_unix: u64,
+    /// Confirmation window the envelope was armed with, in seconds. Retained
+    /// alongside the deadline so a later message can state the window an
+    /// operator actually got rather than only the instant it expired. Zero on
+    /// rows written before the window was recorded.
+    #[serde(default)]
+    pub window_secs: u64,
+    /// When the deadline sweeper's automatic rollback ran. `None` while the
+    /// envelope is live and after operator-initiated reversion, so it
+    /// distinguishes "the timer fired" from "somebody reverted this".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_reverted_unix: Option<u64>,
     /// Set once the forward command has actually run. A provisional persisted
     /// before exec with `forward_done=false` that survives a restart is
     /// indeterminate and routes to `NeedsOperatorDecision`.
     pub forward_done: bool,
+    /// Exit status observed from the forward command. `None` means the
+    /// process was interrupted before a normal exit was observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_exit: Option<i32>,
+    /// The live forward outcome could not be committed after execution.
+    /// Operator action first converges this row with the durable pre-forward
+    /// record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forward_persistence_failed: bool,
     pub status: ProvisionalStatus,
     /// Exit code of the revert, once it has run.
     pub revert_exit: Option<i32>,
@@ -148,14 +221,155 @@ pub struct Provisional {
 }
 
 impl Provisional {
+    /// Internal pre-classification rows stay hidden. A staged row becomes
+    /// visible, but remains inert, when durable cleanup needs a bounded retry.
+    pub fn is_operator_visible(&self) -> bool {
+        (self.status == ProvisionalStatus::Staged && self.revert_detail.is_some())
+            || !matches!(
+                self.status,
+                ProvisionalStatus::Staged | ProvisionalStatus::Dispatching
+            )
+    }
+
+    pub fn command_line(&self) -> String {
+        crate::redact::redact_command_line(&self.binary, &self.args)
+    }
+
+    /// Canonicalize all non-authoritative text before it reaches a registry,
+    /// durable store, audit projection, or wire response.
+    pub fn sanitize_explanatory_text(&mut self) -> bool {
+        fn sanitize(value: &mut String) -> bool {
+            let sanitized = sanitize_gate_text(value);
+            if sanitized == *value {
+                return false;
+            }
+            *value = sanitized;
+            true
+        }
+
+        let mut changed = sanitize(&mut self.reason);
+        if let Some(control_path) = self.control_path.as_mut() {
+            changed |= sanitize(control_path);
+        }
+        if let Some(trace) = self.decision_trace.as_mut() {
+            changed |= trace.sanitize_explanatory_text();
+        }
+        if let Some(detail) = self.revert_detail.as_mut() {
+            changed |= sanitize(detail);
+        }
+        changed
+    }
+
     pub fn revert_command_line(&self) -> String {
         if let Some(api) = &self.api_revert {
-            return format!("{} {} {}", api.protocol, api.method, api.path);
+            return crate::redact::redact_output_text(&format!(
+                "{} {} {}",
+                api.protocol, api.method, api.path
+            ));
         }
-        if self.revert_args.is_empty() {
-            self.revert_binary.clone()
+        crate::redact::redact_command_line(&self.revert_binary, &self.revert_args)
+    }
+
+    pub fn confirm_check_command_line(&self) -> Option<String> {
+        self.confirm_check_binary
+            .as_ref()
+            .map(|binary| crate::redact::redact_command_line(binary, &self.confirm_check_args))
+    }
+
+    pub fn contains_sensitive_literals(&self) -> bool {
+        crate::redact::command_contains_sensitive_literals(&self.binary, &self.args)
+            || (self.api_revert.is_none()
+                && crate::redact::command_contains_sensitive_literals(
+                    &self.revert_binary,
+                    &self.revert_args,
+                ))
+            || self.confirm_check_binary.as_ref().is_some_and(|binary| {
+                crate::redact::command_contains_sensitive_literals(binary, &self.confirm_check_args)
+            })
+    }
+
+    /// Remove literal-sensitive command fields after replay has been disabled.
+    pub fn scrub_sensitive_literals(&mut self) -> bool {
+        let mut changed = false;
+        if crate::redact::command_contains_sensitive_literals(&self.binary, &self.args) {
+            self.binary = "<unavailable>".to_string();
+            self.args.clear();
+            changed = true;
+        }
+        if self.api_revert.is_none()
+            && crate::redact::command_contains_sensitive_literals(
+                &self.revert_binary,
+                &self.revert_args,
+            )
+        {
+            self.revert_binary = "<unavailable>".to_string();
+            self.revert_args.clear();
+            changed = true;
+        }
+        if self.confirm_check_binary.as_ref().is_some_and(|binary| {
+            crate::redact::command_contains_sensitive_literals(binary, &self.confirm_check_args)
+        }) {
+            self.confirm_check_binary = Some("<unavailable>".to_string());
+            self.confirm_check_args.clear();
+            changed = true;
+        }
+        changed
+    }
+
+    /// Why a lifecycle transition is refused from this row's current state.
+    /// An automatic rollback names when it ran and the window that elapsed: a
+    /// bare "already reverted" reads as a fault, when it is the envelope doing
+    /// exactly what `--confirm-within` armed it to do.
+    pub fn transition_block_detail(&self) -> String {
+        if self.status == ProvisionalStatus::Reverted && !self.forward_done {
+            return "forward command did not execute".to_string();
+        }
+        match self.auto_reverted_unix {
+            Some(at) if self.status == ProvisionalStatus::Reverted => {
+                let at = crate::env::unix_seconds_to_utc(at);
+                if self.window_secs > 0 {
+                    format!(
+                        "auto-reverted at {at} (deadline {}s elapsed)",
+                        self.window_secs
+                    )
+                } else {
+                    format!("auto-reverted at {at}")
+                }
+            }
+            _ => format!("already {}", self.status.as_str()),
+        }
+    }
+
+    /// Durable forward-side outcome derived from the lifecycle fields. This is
+    /// separate from the rollback status exposed by [`ProvisionalStatus`].
+    pub fn forward_outcome(&self) -> &'static str {
+        if self.forward_persistence_failed {
+            "persistence_failed"
+        } else if !self.forward_done {
+            if self.status == ProvisionalStatus::Staged {
+                if self.revert_detail.is_some() {
+                    "cleanup_pending"
+                } else {
+                    "staged"
+                }
+            } else if self.status == ProvisionalStatus::Dispatching {
+                "dispatching"
+            } else if self.status == ProvisionalStatus::Armed {
+                "running"
+            } else if self.status == ProvisionalStatus::Reverted {
+                "not_executed"
+            } else {
+                "interrupted"
+            }
+        } else if self.api_revert.is_some()
+            && self.forward_exit.is_none()
+            && self.status == ProvisionalStatus::NeedsOperatorDecision
+        {
+            "indeterminate"
+        } else if self.forward_exit.is_some_and(|exit| exit != 0) {
+            "failed"
         } else {
-            format!("{} {}", self.revert_binary, self.revert_args.join(" "))
+            "completed"
         }
     }
 }
@@ -171,6 +385,16 @@ pub struct ApiRevertPlan {
     pub upstream_identity: String,
     pub method: String,
     pub path: String,
+    /// A create rollback is executable only after the proxy binds it to the
+    /// exact resource UID returned or resolved after the create handoff.
+    #[serde(default)]
+    pub requires_uid_precondition: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_uid: Option<String>,
+    /// Guard-generated marker carried by the admitted create body and the
+    /// authoritative response object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_provenance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_file: Option<PathBuf>,
 }
@@ -191,23 +415,54 @@ impl ProvisionalRegistry {
     /// due. The daemon applies a startup grace before the sweeper can claim it.
     /// An interrupted rollback or a row persisted before the forward outcome
     /// became known is ambiguous and therefore needs an operator decision.
-    pub fn from_rows(rows: Vec<Provisional>) -> (Self, Vec<String>) {
+    pub fn recover_rows(rows: Vec<Provisional>) -> (Self, Vec<String>, Vec<String>) {
         let mut items = HashMap::new();
         let mut moved = Vec::new();
+        let mut retired = Vec::new();
         for mut row in rows {
+            row.sanitize_explanatory_text();
+            if row.status == ProvisionalStatus::Staged && row.revert_detail.is_none() {
+                retired.push(row.handle);
+                continue;
+            }
+            let interrupted_api_handoff = row.status == ProvisionalStatus::Dispatching;
             let needs_recovery = row.status == ProvisionalStatus::Reverting
+                || interrupted_api_handoff
                 || (row.status == ProvisionalStatus::Armed && !row.forward_done);
             if needs_recovery {
                 row.status = ProvisionalStatus::NeedsOperatorDecision;
+                if interrupted_api_handoff {
+                    row.forward_done = true;
+                    row.forward_exit = None;
+                    row.deadline_unix = 0;
+                    row.window_secs = 0;
+                    row.revert_detail = Some(
+                        "the API handoff was interrupted; the mutation outcome is indeterminate"
+                            .to_string(),
+                    );
+                } else if !row.forward_done {
+                    row.deadline_unix = 0;
+                    row.revert_detail = Some(
+                        "daemon restarted while the forward command was running; outcome unknown"
+                            .to_string(),
+                    );
+                }
                 moved.push(row.handle.clone());
             }
             items.insert(row.handle.clone(), row);
         }
         moved.sort();
-        (Self { items }, moved)
+        retired.sort();
+        (Self { items }, moved, retired)
     }
 
-    pub fn insert(&mut self, p: Provisional) {
+    pub fn from_rows(rows: Vec<Provisional>) -> (Self, Vec<String>) {
+        let (registry, moved, _) = Self::recover_rows(rows);
+        (registry, moved)
+    }
+
+    pub fn insert(&mut self, mut p: Provisional) {
+        p.sanitize_explanatory_text();
         self.items.insert(p.handle.clone(), p);
     }
 
@@ -222,6 +477,7 @@ impl ProvisionalRegistry {
     ) -> Option<Provisional> {
         let provisional = self.items.get_mut(handle)?;
         provisional.decision_trace = Some(trace);
+        provisional.sanitize_explanatory_text();
         Some(provisional.clone())
     }
 
@@ -240,6 +496,25 @@ impl ProvisionalRegistry {
                 .then(a.handle.cmp(&b.handle))
         });
         v
+    }
+
+    /// Operator-facing rows, newest first. Ordinary pre-handoff staging and
+    /// the finite dispatch classification window remain internal; unresolved
+    /// staged cleanup is visible as inert recovery state.
+    pub fn visible_list(&self) -> Vec<Provisional> {
+        self.list()
+            .into_iter()
+            .filter(Provisional::is_operator_visible)
+            .collect()
+    }
+
+    /// Outstanding rows that are meaningful on status and metrics surfaces.
+    /// Internal rows still count toward admission quotas via [`Self::outstanding`].
+    pub fn visible_outstanding(&self) -> usize {
+        self.items
+            .values()
+            .filter(|p| p.status.is_outstanding() && p.is_operator_visible())
+            .count()
     }
 
     /// Count of outstanding (non-terminal) provisionals, for the global cap.
@@ -261,11 +536,91 @@ impl ProvisionalRegistry {
             .count()
     }
 
-    pub fn mark_forward_done(&mut self, handle: &str, exit: Option<i32>) {
-        if let Some(p) = self.items.get_mut(handle) {
-            p.forward_done = true;
-            let _ = exit; // forward exit is recorded by the caller's response path
+    /// Record a completed forward process. A successful exit starts the
+    /// confirmation window at `finished_unix`. A non-zero or signal exit has
+    /// no confirmation deadline and requires an explicit operator decision.
+    pub fn mark_forward_done(
+        &mut self,
+        handle: &str,
+        exit: Option<i32>,
+        finished_unix: u64,
+        window_secs: u64,
+    ) -> Option<Provisional> {
+        let p = self.items.get_mut(handle)?;
+        p.forward_done = true;
+        p.forward_exit = exit;
+        p.forward_persistence_failed = false;
+        if exit == Some(0) {
+            p.deadline_unix = finished_unix.saturating_add(window_secs);
+            p.window_secs = window_secs;
+            p.revert_detail = None;
+        } else {
+            p.deadline_unix = 0;
+            p.window_secs = 0;
+            p.status = ProvisionalStatus::NeedsOperatorDecision;
+            p.revert_detail = Some(format!(
+                "forward command exited with code {exit:?}; confirmation window was not started"
+            ));
         }
+        Some(p.clone())
+    }
+
+    /// Record a launched forward command whose transport or wait path failed.
+    /// Its partial effects are unknown, so no timer is fabricated from the
+    /// command's start time and the row remains available for operator action.
+    pub fn mark_forward_interrupted(
+        &mut self,
+        handle: &str,
+        detail: String,
+    ) -> Option<Provisional> {
+        let p = self.items.get_mut(handle)?;
+        p.forward_done = false;
+        p.forward_exit = None;
+        p.forward_persistence_failed = false;
+        p.deadline_unix = 0;
+        p.status = ProvisionalStatus::NeedsOperatorDecision;
+        p.revert_detail = Some(detail);
+        p.sanitize_explanatory_text();
+        Some(p.clone())
+    }
+
+    /// Mark an interrupted live row whose durable interruption update failed.
+    /// Operator action converges this row with the durable pre-forward record
+    /// before applying the requested decision.
+    pub fn mark_forward_interrupted_persistence_failed(
+        &mut self,
+        handle: &str,
+    ) -> Option<Provisional> {
+        let p = self.items.get_mut(handle)?;
+        if p.status != ProvisionalStatus::NeedsOperatorDecision || p.forward_done {
+            return None;
+        }
+        p.forward_exit = None;
+        p.forward_persistence_failed = true;
+        p.deadline_unix = 0;
+        p.window_secs = 0;
+        Some(p.clone())
+    }
+
+    /// Record that the forward command completed but its durable outcome could
+    /// not be committed. The pre-forward row remains the restart recovery
+    /// authority, while the live registry must not leave a timer eligible for
+    /// automatic rollback.
+    pub fn mark_forward_persistence_failed(
+        &mut self,
+        handle: &str,
+        exit: Option<i32>,
+    ) -> Option<Provisional> {
+        let p = self.items.get_mut(handle)?;
+        p.forward_done = true;
+        p.forward_exit = exit;
+        p.forward_persistence_failed = true;
+        p.deadline_unix = 0;
+        p.window_secs = 0;
+        p.status = ProvisionalStatus::NeedsOperatorDecision;
+        p.revert_detail =
+            Some("forward command completed but its durable outcome was not recorded".to_string());
+        Some(p.clone())
     }
 
     /// Operator confirms: keep the change, cancel the timer. Allowed from
@@ -275,14 +630,20 @@ impl ProvisionalRegistry {
             .items
             .get_mut(handle)
             .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if p.status == ProvisionalStatus::Armed && !p.forward_done {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: "forward command is still running".to_string(),
+            });
+        }
         match p.status {
             ProvisionalStatus::Armed | ProvisionalStatus::NeedsOperatorDecision => {
                 p.status = ProvisionalStatus::Confirmed;
                 Ok(p.clone())
             }
-            other => Err(GateError::WrongState {
+            _ => Err(GateError::WrongState {
                 handle: handle.to_string(),
-                detail: format!("already {}", other.as_str()),
+                detail: p.transition_block_detail(),
             }),
         }
     }
@@ -296,7 +657,7 @@ impl ProvisionalRegistry {
         if p.status != ProvisionalStatus::Reverting {
             return Err(GateError::WrongState {
                 handle: handle.to_string(),
-                detail: format!("already {}", p.status.as_str()),
+                detail: p.transition_block_detail(),
             });
         }
         p.status = ProvisionalStatus::Confirmed;
@@ -305,7 +666,7 @@ impl ProvisionalRegistry {
         Ok(p.clone())
     }
 
-    /// Claim a handle for revert (operator-initiated `guard revert`, allowed
+    /// Claim a handle for operator-initiated reversion (allowed
     /// from `Armed`/`NeedsOperatorDecision`). Transitions to `Reverting` and
     /// returns the row so the daemon can run the revert.
     pub fn begin_revert(&mut self, handle: &str) -> Result<Provisional, GateError> {
@@ -313,14 +674,30 @@ impl ProvisionalRegistry {
             .items
             .get_mut(handle)
             .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if p.api_revert.as_ref().is_some_and(|api| {
+            api.requires_uid_precondition
+                && (api.resource_uid.is_none() || api.create_provenance.is_none())
+        }) {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: "rollback is unavailable until the created resource identity is verified"
+                    .to_string(),
+            });
+        }
+        if p.status == ProvisionalStatus::Armed && !p.forward_done {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: "forward command is still running".to_string(),
+            });
+        }
         match p.status {
             ProvisionalStatus::Armed | ProvisionalStatus::NeedsOperatorDecision => {
                 p.status = ProvisionalStatus::Reverting;
                 Ok(p.clone())
             }
-            other => Err(GateError::WrongState {
+            _ => Err(GateError::WrongState {
                 handle: handle.to_string(),
-                detail: format!("already {}", other.as_str()),
+                detail: p.transition_block_detail(),
             }),
         }
     }
@@ -334,6 +711,41 @@ impl ProvisionalRegistry {
             .values()
             .filter(|p| {
                 p.status == ProvisionalStatus::Armed && p.forward_done && now >= p.deadline_unix
+            })
+            .map(|p| p.handle.clone())
+            .collect::<Vec<_>>();
+        due.sort();
+        due
+    }
+
+    /// Inert staging rows whose bounded cleanup retry is due. Dispatch markers
+    /// are excluded because they may represent an upstream side effect.
+    pub fn staged_cleanup_due_handles(&self, now: u64, max_age_secs: u64) -> Vec<String> {
+        let mut due = self
+            .items
+            .values()
+            .filter(|p| {
+                p.status == ProvisionalStatus::Staged
+                    && !p.forward_done
+                    && now.saturating_sub(p.created_unix) >= max_age_secs
+            })
+            .map(|p| p.handle.clone())
+            .collect::<Vec<_>>();
+        due.sort();
+        due
+    }
+
+    /// Dispatch markers older than the finite upstream handoff bound need a
+    /// durable indeterminate classification. They are never cancelled because
+    /// the upstream may have accepted the mutation.
+    pub fn dispatch_classification_due_handles(&self, now: u64, max_age_secs: u64) -> Vec<String> {
+        let mut due = self
+            .items
+            .values()
+            .filter(|p| {
+                p.status == ProvisionalStatus::Dispatching
+                    && !p.forward_done
+                    && now.saturating_sub(p.created_unix) >= max_age_secs
             })
             .map(|p| p.handle.clone())
             .collect::<Vec<_>>();
@@ -360,11 +772,20 @@ impl ProvisionalRegistry {
     }
 
     /// Record a successful revert (`Reverting` -> `Reverted`).
-    pub fn set_reverted(&mut self, handle: &str, exit: Option<i32>) {
+    /// `auto_reverted_unix` is `Some(now)` when the deadline sweeper drove the
+    /// rollback and `None` when an operator asked for it, so a later refusal
+    /// can say which happened.
+    pub fn set_reverted(
+        &mut self,
+        handle: &str,
+        exit: Option<i32>,
+        auto_reverted_unix: Option<u64>,
+    ) {
         if let Some(p) = self.items.get_mut(handle) {
             p.status = ProvisionalStatus::Reverted;
             p.revert_exit = exit;
             p.revert_detail = None;
+            p.auto_reverted_unix = auto_reverted_unix;
         }
     }
 
@@ -375,6 +796,7 @@ impl ProvisionalRegistry {
             p.status = ProvisionalStatus::RevertFailed;
             p.revert_exit = exit;
             p.revert_detail = Some(detail);
+            p.sanitize_explanatory_text();
         }
     }
 
@@ -386,6 +808,7 @@ impl ProvisionalRegistry {
         if let Some(p) = self.items.get_mut(handle) {
             p.status = ProvisionalStatus::NeedsOperatorDecision;
             p.revert_detail = Some(detail);
+            p.sanitize_explanatory_text();
         }
     }
 
@@ -415,6 +838,7 @@ mod tests {
         Provisional {
             handle: handle.to_string(),
             principal,
+            requester_principal: None,
             binary: "systemctl".into(),
             args: vec!["restart".into(), "app".into()],
             cwd: None,
@@ -433,7 +857,11 @@ mod tests {
             decision_trace: None,
             created_unix: 100,
             deadline_unix: deadline,
+            window_secs: 0,
+            auto_reverted_unix: None,
             forward_done: true,
+            forward_exit: Some(0),
+            forward_persistence_failed: false,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
             revert_detail: None,
@@ -448,6 +876,240 @@ mod tests {
         assert_eq!(p.status, ProvisionalStatus::Confirmed);
         // A confirmed provisional is never due.
         assert!(r.take_due(9999).is_empty());
+    }
+
+    #[test]
+    fn dispatching_rows_are_inert_until_the_handoff_is_classified() {
+        let mut row = armed("dispatching", Some(PrincipalKey::from_uid(1001)), 0);
+        row.status = ProvisionalStatus::Dispatching;
+        row.forward_done = false;
+        row.forward_exit = None;
+        row.api_revert = Some(ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "PUT".to_string(),
+            path: "/api/v1/namespaces/dev/configmaps/example".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
+            body_file: None,
+        });
+        let mut registry = ProvisionalRegistry::new();
+        registry.insert(row.clone());
+        assert!(registry.confirm(&row.handle).is_err());
+        assert!(registry.begin_revert(&row.handle).is_err());
+        assert!(registry.due_handles(u64::MAX).is_empty());
+        assert!(registry
+            .dispatch_classification_due_handles(189, 90)
+            .is_empty());
+        assert_eq!(
+            registry.dispatch_classification_due_handles(190, 90),
+            vec![row.handle.clone()]
+        );
+
+        let (recovered, moved) = ProvisionalRegistry::from_rows(vec![row]);
+        assert_eq!(moved, vec!["dispatching".to_string()]);
+        assert_eq!(
+            recovered.get("dispatching").unwrap().status,
+            ProvisionalStatus::NeedsOperatorDecision
+        );
+        assert_eq!(
+            recovered.get("dispatching").unwrap().forward_outcome(),
+            "indeterminate"
+        );
+    }
+
+    #[test]
+    fn staged_rows_are_hidden_and_retired_without_becoming_actionable() {
+        let mut row = armed("staged", Some(PrincipalKey::from_uid(1001)), 0);
+        row.status = ProvisionalStatus::Staged;
+        row.forward_done = false;
+        row.forward_exit = None;
+        row.api_revert = Some(ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "PUT".to_string(),
+            path: "/api/v1/namespaces/dev/configmaps/example".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
+            body_file: None,
+        });
+        let mut live = ProvisionalRegistry::new();
+        live.insert(row.clone());
+        assert_eq!(live.outstanding(), 1);
+        assert_eq!(live.visible_outstanding(), 0);
+        assert!(live.visible_list().is_empty());
+        assert!(live.confirm(&row.handle).is_err());
+        assert!(live.begin_revert(&row.handle).is_err());
+        assert!(live.staged_cleanup_due_handles(129, 30).is_empty());
+        assert_eq!(
+            live.staged_cleanup_due_handles(130, 30),
+            vec![row.handle.clone()]
+        );
+
+        let (recovered, moved, retired) = ProvisionalRegistry::recover_rows(vec![row]);
+        assert!(moved.is_empty());
+        assert_eq!(retired, vec!["staged".to_string()]);
+        assert!(recovered.get("staged").is_none());
+    }
+
+    #[test]
+    fn uncertain_api_handoff_is_not_reported_as_a_forward_failure() {
+        let mut row = armed("uncertain", Some(PrincipalKey::from_uid(1001)), 0);
+        row.status = ProvisionalStatus::NeedsOperatorDecision;
+        row.forward_exit = None;
+        row.api_revert = Some(ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "PUT".to_string(),
+            path: "/api/v1/namespaces/dev/configmaps/example".to_string(),
+            requires_uid_precondition: false,
+            resource_uid: None,
+            create_provenance: None,
+            body_file: None,
+        });
+        assert_eq!(row.forward_outcome(), "indeterminate");
+    }
+
+    #[test]
+    fn created_resource_revert_is_inert_without_an_exact_uid() {
+        let mut row = armed("created", Some(PrincipalKey::from_uid(1001)), 0);
+        row.status = ProvisionalStatus::NeedsOperatorDecision;
+        row.forward_exit = None;
+        row.api_revert = Some(ApiRevertPlan {
+            endpoint: "cluster".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: "https://cluster.invalid".to_string(),
+            upstream_identity: "identity".to_string(),
+            method: "DELETE".to_string(),
+            path: "/api/v1/namespaces/dev/pods/example".to_string(),
+            requires_uid_precondition: true,
+            resource_uid: None,
+            create_provenance: Some("provenance".to_string()),
+            body_file: None,
+        });
+        let mut registry = ProvisionalRegistry::new();
+        registry.insert(row.clone());
+        assert!(registry.begin_revert(&row.handle).is_err());
+
+        row.api_revert.as_mut().unwrap().resource_uid = Some("resource-uid".to_string());
+        registry.insert(row.clone());
+        assert!(registry.begin_revert(&row.handle).is_ok());
+    }
+
+    #[test]
+    fn running_forward_blocks_decisions_but_recovery_state_remains_actionable() {
+        for action in ["confirm", "revert"] {
+            let mut registry = ProvisionalRegistry::new();
+            let mut running = armed("running", Some(PrincipalKey::from_uid(1001)), 0);
+            running.forward_done = false;
+            running.forward_exit = None;
+            registry.insert(running);
+
+            let error = if action == "confirm" {
+                registry.confirm("running").unwrap_err()
+            } else {
+                registry.begin_revert("running").unwrap_err()
+            };
+            assert_eq!(
+                error.to_string(),
+                "handle 'running' cannot transition: forward command is still running"
+            );
+            assert_eq!(
+                registry.get("running").unwrap().status,
+                ProvisionalStatus::Armed
+            );
+
+            let mut row = registry.remove("running").unwrap();
+            row.status = ProvisionalStatus::NeedsOperatorDecision;
+            registry.insert(row);
+            let recovered = if action == "confirm" {
+                registry.confirm("running")
+            } else {
+                registry.begin_revert("running")
+            };
+            assert!(recovered.is_ok());
+        }
+    }
+
+    #[test]
+    fn confirming_after_the_deadline_names_the_automatic_revert_and_its_window() {
+        let mut r = ProvisionalRegistry::new();
+        let mut p = armed("h1", Some(PrincipalKey::from_uid(1001)), 1_700_000_300);
+        p.window_secs = 300;
+        r.insert(p);
+        r.take_due(1_700_000_301);
+        r.set_reverted("h1", Some(0), Some(1_700_000_301));
+
+        let error = r.confirm("h1").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "handle 'h1' cannot transition: auto-reverted at 2023-11-14T22:18:21Z \
+             (deadline 300s elapsed)"
+        );
+        // Another reversion attempt on the same spent handle explains itself the same way.
+        assert_eq!(r.begin_revert("h1").unwrap_err(), error);
+    }
+
+    #[test]
+    fn an_operator_revert_is_not_reported_as_an_automatic_one() {
+        let mut r = ProvisionalRegistry::new();
+        let mut p = armed("h1", Some(PrincipalKey::from_uid(1001)), 1_700_000_300);
+        p.window_secs = 300;
+        r.insert(p);
+        r.begin_revert("h1")
+            .expect("operator revert claims the row");
+        r.set_reverted("h1", Some(0), None);
+
+        let error = r.confirm("h1").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "handle 'h1' cannot transition: already reverted"
+        );
+    }
+
+    #[test]
+    fn a_row_without_a_recorded_window_still_names_the_automatic_revert() {
+        let mut r = ProvisionalRegistry::new();
+        r.insert(armed(
+            "h1",
+            Some(PrincipalKey::from_uid(1001)),
+            1_700_000_300,
+        ));
+        r.take_due(1_700_000_301);
+        r.set_reverted("h1", Some(0), Some(1_700_000_301));
+
+        assert_eq!(
+            r.confirm("h1").unwrap_err().to_string(),
+            "handle 'h1' cannot transition: auto-reverted at 2023-11-14T22:18:21Z"
+        );
+    }
+
+    #[test]
+    fn a_successful_forward_command_records_the_window_behind_its_deadline() {
+        let mut r = ProvisionalRegistry::new();
+        let mut armed_row = armed("h1", Some(PrincipalKey::from_uid(1001)), 0);
+        armed_row.forward_done = false;
+        r.insert(armed_row);
+
+        let updated = r.mark_forward_done("h1", Some(0), 1_000, 300).unwrap();
+        assert_eq!(updated.deadline_unix, 1_300);
+        assert_eq!(updated.window_secs, 300);
+
+        // A forward command that failed arms no timer, so it advertises none.
+        let mut failed = armed("h2", Some(PrincipalKey::from_uid(1001)), 0);
+        failed.forward_done = false;
+        r.insert(failed);
+        let updated = r.mark_forward_done("h2", Some(1), 1_000, 300).unwrap();
+        assert_eq!(updated.deadline_unix, 0);
+        assert_eq!(updated.window_secs, 0);
     }
 
     #[test]
@@ -473,7 +1135,7 @@ mod tests {
         r.insert(armed("ok", Some(PrincipalKey::from_uid(1001)), 150));
         r.insert(armed("bad", Some(PrincipalKey::from_uid(1001)), 150));
         let _ = r.take_due(200);
-        r.set_reverted("ok", Some(0));
+        r.set_reverted("ok", Some(0), Some(250));
         r.set_revert_failed("bad", Some(1), "boom".into());
         assert_eq!(r.get("ok").unwrap().status, ProvisionalStatus::Reverted);
         assert_eq!(

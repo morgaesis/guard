@@ -94,14 +94,40 @@ creates new review state.
 `guard access list` prints one compact line per request, hold, and session with
 requester, target, effective scope, expiry, remaining uses, state, and next
 action. `guard access show` includes typed capability coverage and evidence.
-Both commands support `--json` with `schema_version: 1`.
+`guard access status` adds activity statistics, recent decisions, approvals,
+provisionals, and authority requests for one access-managed session. These
+commands support `--json` with `schema_version: 1` and never return a raw
+session bearer.
 
 ```bash
 guard access list
 guard access list --json
 guard access show <request-or-session>
+guard access show <request-or-session> --raw
 guard access show <request-or-session> --json
+guard access status <session>
+guard access status <session> --json
 ```
+
+`guard access show` and the interactive approval prompt describe each capability
+in the terms an approval decision needs: a plain-language description of the
+access the matcher admits, the command line it pins with caller-supplied values
+shown as `<param>`, one line per parameter carrying its anchored pattern and, for
+a pinned literal or a closed enumeration, a reading of the values it accepts, and
+the coverage cells, credential plan, consequence class, trusted flag, and revert
+availability. The matcher digest stays on its own line because held approvals
+bind to it. `--raw` adds the exact matcher JSON beneath that rendering.
+
+A catalog verb shows its operator-authored description. Generated access
+matchers always use a description derived from their canonical matcher shape,
+including matchers synthesized from prose and exact matchers minted from
+structured denied argv. Description generation does not delay a request.
+
+A pending request reports the budget a bare `guard access approve` would apply
+rather than the internal `unselected` state: `unlimited` unless the request asked
+for a bound, and a single use for a consequence hold, which accepts no other
+budget. `--json` keeps `use_policy: unselected` and carries the default in
+`default_use_policy` and `default_uses`.
 
 Denied operations that can be represented as missing typed authority return one
 durable request identifier. Consequence-gated holds use the immutable hold

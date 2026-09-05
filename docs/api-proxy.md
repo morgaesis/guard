@@ -27,23 +27,24 @@ client certificate. Exec and auth-provider plugins are rejected. The brokered
 kubeconfig points only to Guard, trusts its local CA, and contains no upstream
 credential.
 
-`--brokered-kubeconfig-out` is an operator/bootstrap output for a trusted local
-or single-tenant API client. Guard does not export caller-scoped session
-credentials. Access-managed sessions are command-only and cannot authenticate
-to this listener. Kubernetes, Helm, and credential-backed API access grants run
-through approved typed command verbs, preserving request-scoped admission
-counts.
+`--brokered-kubeconfig-out` produces read-only anonymous access. A permissive
+API policy cannot turn that kubeconfig into mutation authority. Guard does not
+export caller-scoped session credentials through the public CLI. Kubernetes,
+Helm, and credential-backed API access grants use approved typed command verbs,
+preserving request-scoped admission counts.
 
 ## Client boundary and attribution
 
 The operator-generated kubeconfig carries only the anonymous placeholder
 bearer `guard-anonymous`, which identifies nothing and is stripped by the
 proxy; client-go refuses to send requests from a config whose user has no
-credential field at all. Its requests are unattributed and are safe only
-within the listener's trusted local or single-tenant boundary. Incoming client authorization is never forwarded to the
-upstream. A Guard-session authorization header that does not resolve to live
-internally integrated state fails closed; the public CLI does not create that
-state.
+credential field at all. Anonymous requests can read policy-permitted objects
+but cannot create, update, patch, or delete them. Incoming client authorization
+is never forwarded to the upstream. A Guard-session authorization header that
+does not resolve to live internally integrated state fails closed; the public
+CLI does not create that state. Session-attributed mutations carry the session
+fingerprint and immutable authority revision into request summaries, audit
+records, and rollback envelopes.
 
 Each request also binds the complete API policy and evaluator-intent generation
 before classification. A hot reload that changes any policy field or evaluator
@@ -55,7 +56,7 @@ The client submits a fresh request under the new authority.
 Load a hot-reloaded YAML policy with `--api-policy`; absence is default deny.
 [`examples/api-policy.yaml`](../examples/api-policy.yaml) documents the schema.
 Rules match typed protocol fields such as operation verb, resource, namespace,
-and subresource. Actions are:
+subresource, object name, and request-body metadata. Actions are:
 
 | Action | Behavior |
 |---|---|
@@ -65,14 +66,85 @@ and subresource. Actions are:
 | `evaluate` | Ask the evaluator under policy and live-session intent. |
 
 Explicit policy denies and protocol hard-denies are absolute. A readonly
-listener baseline rejects unattributed writes. Evaluated traffic cannot
-override those absolute boundaries.
+listener is the default. Every Kubernetes mutation requires a live attributable
+session even on an explicitly configured policy-mode listener. Policy `allow`,
+operator approval, and evaluator judgment cannot grant anonymous mutation
+authority. Evaluated traffic cannot override those absolute boundaries.
+
+`names` is an OR-list of case-sensitive globs. For named requests, Guard uses
+the path name; for collection creates, it uses `metadata.name` from the request
+body. `annotations` and `labels` are key-to-glob maps, and every configured map
+entry must match the object-shaped `metadata` carried by the request. The glob
+syntax supports `*`, `?`, and character classes such as `[abc]`.
+
+```yaml
+rules:
+  - verbs: [delete]
+    resources: [jobs]
+    namespaces: [dev]
+    names: ["*-admission*"]
+    action: allow
+
+  - verbs: [create]
+    resources: [jobs]
+    namespaces: [dev]
+    names: ["*-admission*"]
+    annotations:
+      "helm.sh/hook": "pre-*"
+    labels:
+      "app.kubernetes.io/managed-by": Helm
+    action: allow
+```
+
+The requesting agent controls object metadata. Annotation and label predicates
+are convenience selectors for ephemeral, tool-managed objects, not a trust
+boundary. Pair them with narrow `names`, resource, and namespace predicates.
+Delete bodies normally carry `DeleteOptions`, not the deleted object's
+metadata, so annotation and label predicates do not match deletes. Use a name
+predicate for Helm's `before-hook-creation` cleanup. JSON Patch arrays likewise
+do not expose object-shaped metadata to these predicates.
 
 Kubernetes interactive subresources (`exec`, `attach`, `portforward`, and
 `proxy`), `pods/ephemeralcontainers`, and Secret watches are hard-denied. Writes
 to other subresources require an explicit matching subresource rule. Allowed
 Secret reads redact values regardless of policy wording, and an unparseable
-secret-bearing response fails closed.
+secret-bearing response fails closed. Raw upgraded streams cannot be inspected,
+bounded, or redacted after the protocol upgrade. An operator-approved typed verb
+with a fixed noninteractive command shape is the sanctioned path for Kubernetes
+container diagnostics.
+
+## Write arbitration
+
+A successful session-attributed read of one named Kubernetes object records its
+UID, `resourceVersion`, and a digest of the object state. The observation is
+bound to the endpoint, session fingerprint, complete session revision, API
+group and version, resource, subresource, namespace, name, and UID. Successful
+mutation responses refresh only that same session's observation. Anonymous
+reads, lists, and watches establish no write authority.
+
+Before update, patch, or delete, Guard fetches the live object and returns HTTP
+409 unless the same session observed the same UID and a compatible version.
+Guard then adds a Kubernetes-native atomic precondition to the forwarded
+request: updates and merge, strategic, or apply patches carry
+`metadata.resourceVersion`; JSON Patch begins with UID and resourceVersion
+`test` operations; delete carries UID and resourceVersion preconditions. A race
+after Guard's comparison therefore resolves as an upstream conflict rather than
+an unguarded overwrite.
+
+For a parent-object write, Guard ignores `status` and server-managed
+`managedFields` while comparing object state. This permits controller status
+updates to advance `resourceVersion` without falsely treating the desired state
+as changed; the forwarded request still uses the latest live version as its
+strict precondition. Status-subresource writes include status in the comparison.
+Changes to spec or user-managed metadata conflict.
+
+Observations are process-local and bounded. A daemon restart, registry eviction,
+object recreation, unreadable object, collection mutation, unsupported patch
+media type, or response without UID and `resourceVersion` requires a fresh
+named-object read or fails with HTTP 409. Secret redaction does not establish an
+observation. Typed command verbs are a separate deterministic authority path;
+when they bypass the API proxy, concurrency behavior comes from the invoked tool
+and verb contract rather than this observation registry.
 
 ## Multiple listeners
 
@@ -123,8 +195,18 @@ The persisted plan binds endpoint, protocol, canonical target, attribution, and
 upstream credential identity. A create and its cleanup are correlated only
 inside the same connection and attribution context, and explicit policy deny
 still wins.
-`guard provisionals`, `guard confirm`, and `guard revert` manage API and command
-envelopes through the same interface.
+Every successful contained write returns `X-Guard-Provisional: <handle>` and an
+HTTP `Warning` that identifies the provisional. Kubernetes clients display the
+warning on standard error, and automation can read the header before treating
+the write as durable. Unix operators use `sudo guard-operator confirm <handle>`
+or `sudo guard-operator revert <handle>`; Windows operators use the installer
+script installed at `C:\Program Files\Guard\guard-operator.ps1` from an elevated
+PowerShell. `guard provisionals`
+manages API and command envelopes through the same interface.
+
+A held request that returns HTTP 403 includes its approval reference in the
+Kubernetes status message and in `X-Guard-Approval`. Client error output can
+name the request, and automation can poll it with `guard approval show <ref>`.
 
 ## Generated coverage and evaluator limits
 

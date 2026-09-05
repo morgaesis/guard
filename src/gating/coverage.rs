@@ -24,18 +24,42 @@ use crate::gating::Reversibility;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+/// Whether a learned deny remains authoritative at process start for a routed
+/// verb. Evaluator-reviewed routes enforce it. Only the execution path for an
+/// exact operator-authored typed verb may install the explicit preemption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearnedDenyMatchPolicy {
+    Enforce,
+    TypedVerbPreempts,
+}
+
 /// Resolved verb context threaded into gate routing.
 #[derive(Debug, Clone)]
 pub struct VerbContext {
     pub name: String,
     pub class: Reversibility,
+    /// At least one selected verb requires operator approval even when its
+    /// consequence class would otherwise permit immediate execution.
+    pub hold: bool,
     pub trusted: bool,
+    pub exec_timeout_secs: Option<u64>,
     pub params: std::collections::BTreeMap<String, String>,
     pub catalog_version: u64,
     /// Definition digest of the matched verb, captured by the caller from the
     /// same catalog read that produced `catalog_version`. Held approvals bind
     /// to it so unrelated catalog changes do not void them.
     pub verb_digest: Option<String>,
+    /// Canonical digest of the complete composed matcher result, including
+    /// every applicable coverage cell and every selected verb definition.
+    pub composition_digest: Option<String>,
+    /// Set to `TypedVerbPreempts` only after this exact typed authority has
+    /// preauthorized the command. Evaluator-reviewed contexts remain
+    /// `Enforce` so a newly learned deny can close the process-start race.
+    pub learned_deny_match_policy: LearnedDenyMatchPolicy,
+    /// True only when every selected cell is an operator-approved session
+    /// `evaluate` cell. The executor may then honor the access grant without
+    /// asking the evaluator to decide the same typed operation again.
+    pub access_evaluation_override_eligible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -60,7 +84,7 @@ pub struct VerbMatchInfo {
     pub overridden: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum VerbDecision {
     None,
     Preauthorized,
@@ -259,20 +283,42 @@ pub fn resolve_scoped_matches(
 
     let (context, revert) = if !plan_conflict {
         let first = selected[0];
+        let access_evaluation_override_eligible = decision == VerbDecision::Evaluate
+            && selected.iter().all(|matched| {
+                matched.scope == VerbMatchScope::Session
+                    && matched.matched.action == CoverageAction::Evaluate
+                    && matched.effective_action == CoverageAction::Evaluate
+                    && matched.matched.environment_authorized
+            });
         let class = selected
             .iter()
             .map(|matched| matched.matched.rendered.consequence)
             .max_by_key(|class| reversibility_rank(*class))
             .expect("selected matches are non-empty");
+        // Hold is a conservative requirement, not a precedence choice. Any
+        // active matching verb can require review even when a more specific
+        // session cell supplies the executable plan.
+        let hold = scoped
+            .iter()
+            .any(|matched| !matched.overridden && matched.matched.rendered.hold);
         let revert = selected[0].matched.rendered.revert.clone();
+        let exec_timeout_secs = selected
+            .iter()
+            .filter_map(|matched| matched.matched.rendered.exec_timeout_secs)
+            .min_by_key(|timeout| if *timeout == 0 { u64::MAX } else { *timeout });
         (
             Some(VerbContext {
                 name: first.matched.rendered.name.clone(),
                 class,
+                hold,
                 trusted: true,
+                exec_timeout_secs,
                 params: first.matched.rendered.params.clone(),
                 catalog_version,
                 verb_digest: None,
+                composition_digest: None,
+                learned_deny_match_policy: LearnedDenyMatchPolicy::Enforce,
+                access_evaluation_override_eligible,
             }),
             revert,
         )
@@ -426,6 +472,7 @@ fn canonical_conflict_prompt(
                 "execution": {
                     "binary": scoped.matched.rendered.binary,
                     "args": scoped.matched.rendered.args,
+                    "exec_timeout_secs": scoped.matched.rendered.exec_timeout_secs,
                 },
                 "revert": scoped.matched.rendered.revert,
             })
@@ -469,8 +516,10 @@ mod verb_resolution_tests {
                             args.iter().map(|arg| (*arg).to_string()).collect(),
                         )
                     }),
+                    hold: false,
                     trusted: true,
                     prompt_context: None,
+                    exec_timeout_secs: None,
                     baseline: scope == VerbMatchScope::Baseline,
                     credential_plan: credential_plan.map(str::to_string),
                     params: BTreeMap::new(),
@@ -536,6 +585,74 @@ mod verb_resolution_tests {
         assert_eq!(resolution.context.unwrap().name, "session-apply");
         assert!(!resolution.matches[0].selected);
         assert!(resolution.matches[1].selected);
+    }
+
+    #[test]
+    fn composed_verbs_use_the_shortest_explicit_timeout() {
+        let mut unbounded = scoped(
+            "unbounded",
+            "inspect",
+            VerbMatchScope::Baseline,
+            CoverageAction::Preauthorized,
+            &[],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        unbounded.matched.rendered.exec_timeout_secs = Some(0);
+        let mut bounded = scoped(
+            "bounded",
+            "inspect",
+            VerbMatchScope::Baseline,
+            CoverageAction::Preauthorized,
+            &[],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        bounded.matched.rendered.exec_timeout_secs = Some(5);
+
+        let resolution = resolve_scoped_matches(vec![unbounded, bounded], 17);
+
+        assert_eq!(resolution.decision, VerbDecision::Preauthorized);
+        assert_eq!(resolution.context.unwrap().exec_timeout_secs, Some(5));
+    }
+
+    #[test]
+    fn matching_hold_survives_more_specific_session_coverage() {
+        let mut sensitive_read = scoped(
+            "sensitive-read",
+            "all-accounts",
+            VerbMatchScope::Baseline,
+            CoverageAction::Preauthorized,
+            &[],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        sensitive_read.matched.rendered.hold = true;
+        let session = scoped(
+            "session-read",
+            "bounded-account",
+            VerbMatchScope::Session,
+            CoverageAction::Preauthorized,
+            &["target:account-a"],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        let resolution = resolve_scoped_matches(vec![sensitive_read, session], 17);
+
+        assert!(resolution.context.expect("resolved verb context").hold);
     }
 
     #[test]
@@ -913,8 +1030,10 @@ mod verb_resolution_properties {
                     args: vec!["get".to_string(), "pods".to_string()],
                     consequence: Reversibility::Recoverable,
                     revert: None,
+                    hold: false,
                     trusted: true,
                     prompt_context: None,
+                    exec_timeout_secs: None,
                     baseline: scope == VerbMatchScope::Baseline,
                     credential_plan: None,
                     params: BTreeMap::new(),

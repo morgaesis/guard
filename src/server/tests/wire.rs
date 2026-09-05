@@ -3,10 +3,11 @@ use crate::server::gate_runtime::reconstruct_caller;
 #[cfg(windows)]
 use crate::server::transport::winplat;
 use crate::server::wire::{
-    CallerIdentity, ExecOutcome, ExecuteResult, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD,
+    authorize_session_use, CallerIdentity, ContainmentFailureKind, ContainmentOutcome, ExecOutcome,
+    ExecuteResult, ExecuteStreamMessage, IncomingMessage, SessionAuthz, EXECUTE_FEATURE_LOCAL_CWD,
     EXECUTE_PROTOCOL_VERSION,
 };
-#[cfg(windows)]
+use crate::session::SessionOwner;
 use guard::principal::PrincipalKey;
 
 /// `IncomingMessage` is untagged, and a versioned execute envelope resolves to
@@ -40,7 +41,7 @@ fn remaining_session_scoped_batch_read_carries_distinct_owner_bearers() {
             cwd: None,
         }],
     };
-    assert!(!batch.requires_daemon_uid());
+    assert!(!batch.requires_admin_token());
     let json = serde_json::to_value(&batch).unwrap();
     assert_eq!(json["session_token"], "target");
     assert_eq!(json["caller_token"], "owner");
@@ -68,7 +69,7 @@ fn access_wire_shapes_are_stable_and_requester_is_not_caller_selected() {
     let request = crate::server::wire::AdminRequest::AccessRequest {
         intent: "Inspect fixture".to_string(),
     };
-    assert!(!request.requires_daemon_uid());
+    assert!(!request.requires_admin_token());
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["intent"], "Inspect fixture");
     assert!(json.get("requester").is_none());
@@ -82,7 +83,10 @@ fn access_wire_shapes_are_stable_and_requester_is_not_caller_selected() {
         effective_scope: vec!["inspect".to_string()],
         expires_unix: Some(123),
         remaining_uses: Some(1),
-        use_policy: "unselected".to_string(),
+        use_policy: "not-yet-granted".to_string(),
+        consequence: crate::server::wire::CONSEQUENCE_GRANT.to_string(),
+        default_use_policy: Some("unlimited".to_string()),
+        default_uses: None,
         state: "pending".to_string(),
         next_action: "guard access approve gr-example".to_string(),
         approval_options: Vec::new(),
@@ -122,6 +126,19 @@ fn execute_response_carries_stable_decision_source_and_trace() {
 }
 
 #[test]
+fn execute_response_sanitizes_gate_reason_guidance_and_trace() {
+    let value = ["q", "7"].concat();
+    let contaminated = format!("password={value}");
+    let response = ExecuteResult::denied(contaminated.clone())
+        .with_verb_resolution(Vec::new(), Some(contaminated))
+        .into_response();
+    let encoded = serde_json::to_vec(&response).unwrap();
+    assert!(!encoded
+        .windows(value.len())
+        .any(|window| window == value.as_bytes()));
+}
+
+#[test]
 fn structured_guidance_preserves_access_commands_and_coverage_detail() {
     let response = ExecuteResult::denied("missing authority")
         .with_verb_resolution(
@@ -130,6 +147,7 @@ fn structured_guidance_preserves_access_commands_and_coverage_detail() {
         )
         .with_verb_resolution(Vec::new(), Some("coverage conflict".to_string()))
         .with_access_request(Some("gr-example".to_string()))
+        .with_operator_guidance(true)
         .into_response();
     assert_eq!(
         response.verb_guidance.as_deref(),
@@ -204,6 +222,19 @@ fn windows_system_operator_check_never_elevates_unix_or_tcp_callers() {
     .is_windows_system_operator());
 }
 
+#[test]
+fn daemon_principal_is_not_implicit_cross_session_authority() {
+    let owner = SessionOwner::Principal(PrincipalKey::from_raw("principal:owner"));
+    assert!(matches!(
+        authorize_session_use(&owner, &CallerIdentity::Unix { uid: 777 }, false),
+        SessionAuthz::Mismatch
+    ));
+    assert!(matches!(
+        authorize_session_use(&owner, &CallerIdentity::UnixAdmin { uid: 777 }, false),
+        SessionAuthz::Allowed
+    ));
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_system_sid_is_the_only_named_pipe_system_operator() {
@@ -215,6 +246,19 @@ fn windows_system_sid_is_the_only_named_pipe_system_operator() {
         sid: "S-1-5-19".into()
     }
     .is_windows_system_operator());
+
+    let owner = SessionOwner::Principal(PrincipalKey::from_raw("principal:owner"));
+    let system = CallerIdentity::Windows {
+        sid: "S-1-5-18".into(),
+    };
+    assert!(matches!(
+        authorize_session_use(&owner, &system, false),
+        SessionAuthz::Mismatch
+    ));
+    assert!(matches!(
+        authorize_session_use(&owner, &system, true),
+        SessionAuthz::Allowed
+    ));
 }
 
 #[test]
@@ -289,6 +333,85 @@ fn into_response_for_completed_carries_exit_and_streams() {
     assert!(resp.allowed);
     assert_eq!(resp.exit_code, Some(7));
     assert_eq!(resp.stdout.as_deref(), Some("hi"));
+}
+
+#[test]
+fn containment_failure_is_parseable_by_origin_main_clients_in_both_response_shapes() {
+    let response = ExecuteResult::completed("approved", Some(0), None, None)
+        .containment_failed(
+            "command executed, but durable containment state was unavailable",
+            Some("containment-handle".to_string()),
+            guard::gating::Coverage::contain(),
+            ContainmentOutcome::PersistenceFailure {
+                command_started: true,
+                forward_exit_code: Some(0),
+            },
+            Some(0),
+            None,
+            None,
+        )
+        .into_response();
+
+    assert!(!response.allowed);
+    assert_eq!(response.status, None);
+    assert_eq!(response.auto_revert_durable, Some(false));
+    let failure = response
+        .containment_failure
+        .as_ref()
+        .expect("typed failure detail");
+    assert_eq!(failure.kind, ContainmentFailureKind::PersistenceFailure);
+    assert!(failure.command_may_have_run);
+    assert_eq!(failure.forward_exit_code, Some(0));
+
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyGateStatus {
+        Executed,
+        Provisional,
+        Held,
+        Reverted,
+        DryRun,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    struct LegacyResponse {
+        allowed: bool,
+        reason: String,
+        exit_code: Option<i32>,
+        status: Option<LegacyGateStatus>,
+        handle: Option<String>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum LegacyStreamMessage {
+        Stdout { data: String },
+        Stderr { data: String },
+        PolicyDecision { allowed: bool, reason: String },
+        Keepalive,
+        Result { response: LegacyResponse },
+    }
+
+    let json = serde_json::to_value(&response).expect("response serializes");
+    assert_eq!(json["containment_failure"]["kind"], "persistence_failure");
+    let legacy: LegacyResponse = serde_json::from_value(json).expect("origin/main response parses");
+    assert!(!legacy.allowed);
+    assert!(legacy.status.is_none());
+    assert_eq!(legacy.handle.as_deref(), Some("containment-handle"));
+
+    let stream = ExecuteStreamMessage::Result { response };
+    let legacy_stream: LegacyStreamMessage =
+        serde_json::from_value(serde_json::to_value(stream).expect("stream response serializes"))
+            .expect("origin/main streaming response parses");
+    let LegacyStreamMessage::Result { response } = legacy_stream else {
+        panic!("expected streaming result");
+    };
+    assert!(!response.allowed);
+    assert!(response.status.is_none());
+    assert_eq!(response.handle.as_deref(), Some("containment-handle"));
 }
 
 // ---- Audit emission end-to-end tests ------------------------------------

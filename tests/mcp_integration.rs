@@ -81,6 +81,84 @@ async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
     start_daemon_with_gate(tmp, false).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn run_socket_flag_overrides_environment_endpoint() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_daemon, socket_path) = start_daemon(&tmp).await;
+    let output = timeout(
+        Duration::from_secs(10),
+        Command::new(GUARD_BIN)
+            .args(["run", "--json", "--socket"])
+            .arg(&socket_path)
+            .args(["echo", "socket-ok"])
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .env("GUARD_SOCKET", tmp.path().join("wrong.sock"))
+            .output(),
+    )
+    .await
+    .expect("guard run timed out")
+    .expect("run guard command");
+    assert!(
+        output.status.success(),
+        "guard run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse run envelope");
+    assert_eq!(envelope["type"], "run_result");
+    assert_eq!(envelope["response"]["allowed"], true);
+    assert!(envelope["response"]["stdout"]
+        .as_str()
+        .is_some_and(|value| value.contains("socket-ok")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verb_lint_reports_every_named_failure_and_exits_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restrict tempdir");
+    let catalog = tmp.path().join("verbs.yaml");
+    std::fs::write(
+        &catalog,
+        r#"verbs:
+  - name: inspect-first
+    binary: fixturectl
+    args: ["show", "{target}"]
+    params:
+      target: { pattern: "[a-z]+" }
+    consequence: reversible
+  - name: inspect-second
+    binary: fixturectl
+    args: ["show", "{resource}"]
+    params:
+      resource: { pattern: "[0-9]+" }
+    consequence: reversible
+"#,
+    )
+    .expect("write catalog");
+    std::fs::set_permissions(&catalog, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict catalog");
+
+    let output = timeout(
+        Duration::from_secs(10),
+        Command::new(GUARD_BIN)
+            .args(["verb", "lint", "--file"])
+            .arg(&catalog)
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .output(),
+    )
+    .await
+    .expect("verb lint timed out")
+    .expect("run verb lint");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in ["inspect-first", "target", "inspect-second", "resource"] {
+        assert!(stderr.contains(expected), "missing {expected}: {stderr}");
+    }
+    assert!(stderr.contains("2 finding(s)"), "{stderr}");
+}
+
 async fn start_daemon_with_gate(
     tmp: &TempDir,
     consequence_gate: bool,
@@ -99,7 +177,9 @@ async fn start_daemon_with_gate(
     let verbs_path = tmp.path().join("verbs.yaml");
     std::fs::write(&policy_path, POLICY_YAML).expect("write policy yaml");
     std::fs::write(&verbs_path, VERBS_YAML).expect("write verbs yaml");
-    let test_secret_env = format!("GUARD_SECRET_U{}_mcp-test-secret", current_uid());
+    std::fs::set_permissions(&verbs_path, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict verb catalog permissions");
+    let test_secret_env = format!("GUARD_SECRET_U{}_mcp-test-placeholder", current_uid());
 
     let mut command = Command::new(GUARD_BIN);
     command
@@ -118,7 +198,7 @@ async fn start_daemon_with_gate(
         .env("HOME", tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path())
         .env("GUARD_BACKEND", "env")
-        .env(&test_secret_env, "test-value")
+        .env(&test_secret_env, "synthetic-sensitive-marker")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // Pass the daemon's stderr through: when startup fails, the daemon's
@@ -306,24 +386,38 @@ async fn stop_test_daemon(mut daemon: DaemonGuard, socket_path: &std::path::Path
 }
 
 async fn restart_output(tmp: &TempDir, socket_path: &std::path::Path) -> std::process::Output {
-    timeout(
-        Duration::from_secs(10),
-        Command::new(GUARD_BIN)
-            .args(["server", "start", "--no-llm", "--policy"])
-            .arg(tmp.path().join("policy.yaml"))
-            .arg("--socket")
-            .arg(socket_path)
-            .arg("--state-db")
-            .arg(tmp.path().join("state.db"))
-            .arg("--verbs")
-            .arg(tmp.path().join("verbs.yaml"))
-            .env("HOME", tmp.path())
-            .env("XDG_CONFIG_HOME", tmp.path())
-            .output(),
-    )
-    .await
-    .expect("daemon restart validation timed out")
-    .expect("run daemon restart")
+    let mut child = Command::new(GUARD_BIN)
+        .args(["server", "start", "--no-llm", "--policy"])
+        .arg(tmp.path().join("policy.yaml"))
+        .arg("--socket")
+        .arg(socket_path)
+        .arg("--state-db")
+        .arg(tmp.path().join("state.db"))
+        .arg("--verbs")
+        .arg(tmp.path().join("verbs.yaml"))
+        .env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn daemon restart");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("poll daemon restart").is_some() {
+            return child
+                .wait_with_output()
+                .await
+                .expect("collect daemon restart output");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            panic!("daemon restart validation timed out");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -549,7 +643,7 @@ async fn mcp_process_rejects_a_built_in_custom_tool_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn typed_verb_denial_prints_every_exact_access_command() {
+async fn typed_verb_denial_prints_requester_safe_access_guidance() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_daemon, socket_path) = start_daemon_with_gate(&tmp, true).await;
     let output = timeout(
@@ -572,9 +666,10 @@ async fn typed_verb_denial_prints_every_exact_access_command() {
         .find_map(|line| line.trim().strip_prefix("request: "))
         .unwrap_or_else(|| panic!("durable request reference missing from stderr: {stderr}"));
     assert!(reference.starts_with("gr-"));
-    assert!(stderr.contains(&format!("guard access approve {reference}\n")));
-    assert!(stderr.contains(&format!("guard access approve {reference} --once")));
-    assert!(stderr.contains(&format!("guard access approve {reference} --uses 3")));
+    assert!(stderr.contains(&format!(
+        "ask your admin to approve request {reference} (see guard access show {reference})"
+    )));
+    assert!(!stderr.contains("guard access approve"));
     assert!(stderr.contains(&format!("guard access show {reference}")));
 }
 
@@ -595,6 +690,34 @@ async fn mcp_threads_execution_and_session_tokens_without_operator_authority() {
     .unwrap();
 
     let daemon = tokio::spawn(async move {
+        for expected_attempt in ["endpoint probe", "capability Ping"] {
+            let (admin_stream, _) = listener.accept().await.unwrap();
+            let (admin_reader, mut admin_writer) = tokio::io::split(admin_stream);
+            let mut admin_lines = BufReader::new(admin_reader).lines();
+            let admin: Value = serde_json::from_str(
+                &admin_lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{expected_attempt} request")),
+            )
+            .unwrap();
+            assert_eq!(admin["admin"]["op"], "ping");
+            assert!(admin.get("admin_token").is_none());
+            let response = json!({
+                "result": "ping",
+                "version": "fixture",
+                "uptime_secs": 1,
+                "mode": "enforce",
+                "dry_run": false,
+                "capabilities": []
+            })
+            .to_string();
+            admin_writer.write_all(response.as_bytes()).await.unwrap();
+            admin_writer.write_all(b"\n").await.unwrap();
+            admin_writer.flush().await.unwrap();
+        }
+
         let (execute_stream, _) = listener.accept().await.unwrap();
         let (execute_reader, mut execute_writer) = tokio::io::split(execute_stream);
         let mut execute_lines = BufReader::new(execute_reader).lines();
@@ -699,6 +822,9 @@ async fn mcp_end_to_end_initialize_list_call() {
             "guard_access_list",
             "guard_evaluate_batch",
             "guard_access_show",
+            "guard_access_status",
+            "guard_approval_show",
+            "guard_approval_resume",
         ],
         "MCP must advertise the complete intentional tool contract"
     );
@@ -775,8 +901,13 @@ async fn mcp_end_to_end_initialize_list_call() {
     assert_eq!(access_item["state"], "pending");
     assert_eq!(access_item["intent"], "inspect-identity");
     assert_eq!(access_item["effective_scope"], json!(["inspect-identity"]));
-    assert_eq!(access_item["approval_options"].as_array().unwrap().len(), 3);
     let reference = access_item["reference"].as_str().expect("access reference");
+    assert_eq!(
+        access_item["approval_options"],
+        json!([format!(
+            "ask your admin to approve request {reference} (see guard access show {reference})"
+        )])
+    );
 
     // 4. tools/call for the same authenticated caller's scoped access list
     let access_list = mcp
@@ -877,8 +1008,8 @@ async fn mcp_end_to_end_initialize_list_call() {
                 "name": "guard_run",
                 "arguments": {
                     "binary": "sh",
-                    "args": ["-lc", "[ -n \"$MCP_TEST_SECRET\" ] && echo set"],
-                    "secrets": ["mcp-test-secret"]
+                    "args": ["-lc", "[ -n \"$MCP_TEST_PLACEHOLDER\" ] && echo set"],
+                    "secrets": ["mcp-test-placeholder"]
                 }
             }),
         )
@@ -1076,7 +1207,7 @@ async fn mcp_http_transport_keepalive_pair_on_one_connection() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert!(names.contains(&"guard_run"));
+    assert!(names.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

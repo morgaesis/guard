@@ -15,6 +15,7 @@
 use guard::evaluate::{EvalConfig, EvalResult, EvalSource, Evaluator};
 use guard::policy::PolicyMode;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Deserialize)]
 struct Case {
@@ -25,6 +26,16 @@ struct Case {
     #[serde(default)]
     #[allow(dead_code)]
     reason: String,
+    #[serde(default = "one_sample")]
+    samples: usize,
+    #[serde(default)]
+    max_median_risk_deviation: Option<i32>,
+    #[serde(default)]
+    risk_not_greater_than: Option<String>,
+}
+
+fn one_sample() -> usize {
+    1
 }
 
 fn load_cases() -> Vec<Case> {
@@ -37,6 +48,70 @@ fn resolve_api_key() -> Option<String> {
         .ok()
         .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
         .filter(|k| !k.is_empty())
+}
+
+fn median(values: &[i32]) -> Option<i32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut ordered = values.to_vec();
+    ordered.sort_unstable();
+    Some(ordered[ordered.len() / 2])
+}
+
+fn median_absolute_deviation(values: &[i32]) -> Option<i32> {
+    let value_median = median(values)?;
+    let deviations = values
+        .iter()
+        .map(|value| (value - value_median).abs())
+        .collect::<Vec<_>>();
+    median(&deviations)
+}
+
+#[test]
+fn risk_stability_tolerates_one_outlier_but_rejects_dispersion() {
+    assert_eq!(median_absolute_deviation(&[4, 4, 7]), Some(0));
+    assert_eq!(median_absolute_deviation(&[6, 7, 4]), Some(1));
+    assert_eq!(median_absolute_deviation(&[0, 5, 10]), Some(5));
+}
+
+#[test]
+fn prompt_regression_risk_contracts_are_well_formed() {
+    let cases = load_cases();
+    let mut ids = HashSet::new();
+    for case in &cases {
+        assert!(
+            ids.insert(case.id.as_str()),
+            "duplicate case id: {}",
+            case.id
+        );
+        assert!(case.samples > 0, "case {} has no samples", case.id);
+        if let Some(deviation) = case.max_median_risk_deviation {
+            assert!(
+                (0..=10).contains(&deviation),
+                "case {} has invalid max_median_risk_deviation {deviation}",
+                case.id
+            );
+        }
+    }
+    for case in &cases {
+        if let Some(reference) = &case.risk_not_greater_than {
+            let referenced = cases
+                .iter()
+                .find(|candidate| candidate.id == *reference)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {} references missing risk baseline {reference}",
+                        case.id
+                    )
+                });
+            assert_eq!(
+                case.mode, referenced.mode,
+                "risk comparison {} crosses policy modes",
+                case.id
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -59,42 +134,114 @@ async fn prompt_regression_corpus_matches_expected_decisions() {
     assert!(!cases.is_empty(), "corpus should not be empty");
 
     let mut failures = Vec::new();
+    let mut observed_risks = HashMap::<String, Vec<i32>>::new();
     for case in &cases {
         let mode = PolicyMode::parse(&case.mode)
             .unwrap_or_else(|| panic!("case {}: unknown mode '{}'", case.id, case.mode));
-        let evaluator = Evaluator::new(
-            EvalConfig::default()
-                .mode(mode)
-                .llm_enabled(true)
-                .llm_api_key(api_key.clone()),
-        )
-        .unwrap_or_else(|e| panic!("case {}: failed to build evaluator: {e}", case.id));
+        let mut eval_config = EvalConfig::default()
+            .mode(mode)
+            .llm_enabled(true)
+            .cache_enabled(false)
+            .llm_api_key(api_key.clone());
+        // Honor the daemon's model/effort env vars so the corpus can be run
+        // against a candidate model before changing the shipped default.
+        if let Ok(model) = std::env::var("GUARD_LLM_MODEL") {
+            if !model.is_empty() {
+                eval_config = eval_config.llm_model(model);
+            }
+        }
+        if let Ok(effort) = std::env::var("GUARD_LLM_REASONING_EFFORT") {
+            if !effort.is_empty() {
+                eval_config = eval_config.llm_reasoning_effort(effort);
+            }
+        }
+        let evaluator = Evaluator::new(eval_config)
+            .unwrap_or_else(|e| panic!("case {}: failed to build evaluator: {e}", case.id));
 
         let command_line = case.command.join(" ");
-        let result = evaluator.evaluate(&command_line).await;
+        for sample in 0..case.samples {
+            let result = evaluator
+                .evaluate_with_reevaluate(&command_line, None, sample > 0)
+                .await;
 
-        let matched = matches!(
-            (case.expect.as_str(), &result),
-            (
-                "ALLOW",
-                EvalResult::Allow {
-                    source: EvalSource::Llm,
-                    ..
-                }
-            ) | (
-                "DENY",
-                EvalResult::Deny {
-                    source: EvalSource::Llm,
-                    ..
-                }
-            )
-        );
+            let matched = matches!(
+                (case.expect.as_str(), &result),
+                (
+                    "ALLOW",
+                    EvalResult::Allow {
+                        source: EvalSource::Llm,
+                        ..
+                    }
+                ) | (
+                    "DENY",
+                    EvalResult::Deny {
+                        source: EvalSource::Llm,
+                        ..
+                    }
+                )
+            );
 
-        if !matched {
-            failures.push(format!(
-                "[{}] {}: expected {}, got {:?}",
-                case.id, command_line, case.expect, result
-            ));
+            if !matched {
+                failures.push(format!(
+                    "[{} sample {}] {}: expected {}, got {:?}",
+                    case.id,
+                    sample + 1,
+                    command_line,
+                    case.expect,
+                    result
+                ));
+            }
+            if let Some(risk) = result.risk() {
+                observed_risks
+                    .entry(case.id.clone())
+                    .or_default()
+                    .push(risk);
+            } else if case.max_median_risk_deviation.is_some()
+                || case.risk_not_greater_than.is_some()
+            {
+                failures.push(format!(
+                    "[{} sample {}] response omitted the risk required by this contract",
+                    case.id,
+                    sample + 1
+                ));
+            }
+        }
+    }
+
+    for case in &cases {
+        let risks = observed_risks
+            .get(&case.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if let Some(max_deviation) = case.max_median_risk_deviation {
+            if risks.len() == case.samples {
+                let median_deviation = median_absolute_deviation(risks).unwrap();
+                if median_deviation > max_deviation {
+                    failures.push(format!(
+                        "[{}] risk samples {risks:?} have median absolute deviation {median_deviation}, exceeding {max_deviation}",
+                        case.id,
+                    ));
+                }
+            }
+        }
+        if let Some(reference) = &case.risk_not_greater_than {
+            let reference_risks = observed_risks
+                .get(reference)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if let (Some(actual), Some(baseline)) = (median(risks), median(reference_risks)) {
+                if actual > baseline {
+                    failures.push(format!(
+                        "[{}] median risk {actual} exceeds {} median risk {baseline}; samples={risks:?}, baseline_samples={reference_risks:?}",
+                        case.id, reference
+                    ));
+                }
+            } else {
+                failures.push(format!(
+                    "[{}] risk comparison with {reference} lacks complete risk observations",
+                    case.id
+                ));
+            }
         }
     }
 

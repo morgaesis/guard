@@ -1,5 +1,8 @@
 # guard
 
+[![CI](https://github.com/morgaesis/guard/actions/workflows/ci.yml/badge.svg)](https://github.com/morgaesis/guard/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/morgaesis/guard/badge)](https://scorecard.dev/viewer/?uri=github.com/morgaesis/guard)
+
 Guard is a policy-gated command and API broker for AI agents. Agents submit
 ordinary commands or API requests and describe missing access in prose. The
 Guard daemon applies policy, reduces approved intent to bounded enforcement
@@ -12,6 +15,8 @@ $ guard run uptime
 
 $ guard run rm -rf /etc/nginx
 DENIED: Recursive deletion of system configuration.
+  source:  static-policy
+  appeal:  operator-authored policy deny; absolute -- --reevaluate never skips it
 ```
 
 Guard combines operator policy and prose-first access requests with an LLM
@@ -29,6 +34,9 @@ cargo install --path .
 
 Release archives are available for Linux x86-64, Linux ARM64, and Windows
 x86-64. See [INSTALL.md](INSTALL.md) for release and service installation.
+Bug reports, development setup, and the pull-request process are documented in
+[DEVELOPMENT.md](DEVELOPMENT.md). Security reports follow
+[SECURITY.md](SECURITY.md).
 
 ## Quick start
 
@@ -43,6 +51,10 @@ guard run rm -rf /tmp/example
 
 The daemon reads its mode, policy, and credentials at startup. Client-side
 environment changes do not alter daemon policy.
+
+The packaged execution-capable systemd services share the host `/tmp` namespace
+with brokered children, so their temporary files remain visible to the caller
+subject to normal file permissions.
 
 | Mode | Intended use |
 |---|---|
@@ -103,9 +115,10 @@ An operator approves one or more durable requests with `guard access approve`.
 On a terminal, approve reviews each request first with a colored card and an
 approve, deny, skip, or quit prompt; `--yes` skips the review. Each approval
 retains its own scope and count. Denied results offer ordinary, one-time, and
-bounded approval. A held result offers only `--once` because it executes one
-immutable reviewed snapshot. Operators remove an active access session with
-`guard access revoke <session-or-agent>`.
+bounded approval. A held result offers only `--once` because it represents one
+immutable reviewed snapshot. Approval arms that snapshot, and its original
+requester executes it with `guard approval resume <request>`. Operators remove an active
+access session with `guard access revoke <session-or-agent>`.
 
 Structured execution results include a versioned decision trace with a stable
 source, every applicable typed cell, conflicts, and bounded next-step guidance.
@@ -128,11 +141,19 @@ guard server start --gate consequence \
   --verbs /etc/guard/verbs.yaml
 
 guard access request 'Restart nginx and verify that it is healthy.'
+guard access whoami
 guard access approve <request> --once
+guard approval resume <request>
+guard access status <session>
+guard approval show <request>
 guard run systemctl restart nginx
 guard provisionals
-guard confirm <handle>
+sudo guard-operator confirm <handle>
 ```
+
+On Windows, run
+`& 'C:\Program Files\Guard\guard-operator.ps1' -Action confirm -Reference <handle>`
+from an elevated PowerShell instead of using the Unix wrapper.
 
 Guard preserves the command's argv, working directory, exit behavior, and tool
 semantics. It does not reinterpret Ansible, Helm, SSH, or another tool. See

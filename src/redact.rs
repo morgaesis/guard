@@ -1,12 +1,163 @@
 use regex::Regex;
 use std::borrow::Cow;
-use std::sync::OnceLock;
+use std::collections::BTreeMap;
+use std::sync::{OnceLock, RwLock};
+
+/// Hard resource limits for daemon-scoped exact literals. These bounds cap the
+/// work of every prose scan and the carry retained by every stream redactor.
+const MAX_TRUSTED_EXACT_SECRET_SCOPES: usize = 64;
+const MAX_TRUSTED_EXACT_SECRET_ENTRIES: usize = 256;
+const MAX_TRUSTED_EXACT_SECRET_BYTES: usize = 64 * 1024;
+const MAX_TRUSTED_EXACT_SECRET_LITERAL_BYTES: usize = 4 * 1024;
+const MAX_EXACT_REDACTION_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EXACT_REDACTION_COMPARISONS: usize = 4 * 1024 * 1024 * 1024;
+
+#[derive(Default)]
+struct TrustedExactSecretRegistry {
+    next_scope: u64,
+    scopes: BTreeMap<u64, Vec<String>>,
+    references: BTreeMap<String, usize>,
+    total_bytes: usize,
+}
+
+fn trusted_exact_secrets() -> &'static RwLock<TrustedExactSecretRegistry> {
+    static SECRETS: OnceLock<RwLock<TrustedExactSecretRegistry>> = OnceLock::new();
+    SECRETS.get_or_init(|| RwLock::new(TrustedExactSecretRegistry::default()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedExactSecretLimitExceeded;
+
+impl std::fmt::Display for TrustedExactSecretLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("trusted exact-secret resource limit exceeded")
+    }
+}
+
+impl std::error::Error for TrustedExactSecretLimitExceeded {}
+
+/// Lifetime token for one bounded exact-secret set. Clones share ownership;
+/// the plaintext leaves the process registry when the final owner is dropped.
+#[derive(Clone, Default)]
+pub struct TrustedExactSecretScope {
+    _registration: Option<std::sync::Arc<TrustedExactSecretRegistration>>,
+}
+
+struct TrustedExactSecretRegistration {
+    scope: u64,
+}
+
+impl Drop for TrustedExactSecretRegistration {
+    fn drop(&mut self) {
+        let mut registered = trusted_exact_secrets()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(secrets) = registered.scopes.remove(&self.scope) {
+            for secret in secrets {
+                let remove = registered.references.get_mut(&secret).is_some_and(|count| {
+                    *count -= 1;
+                    *count == 0
+                });
+                if remove {
+                    registered.references.remove(&secret);
+                    registered.total_bytes = registered.total_bytes.saturating_sub(secret.len());
+                }
+            }
+        }
+    }
+}
+
+/// Register daemon-lifetime exact literals. Per-operation credentials stay in
+/// the caller's explicit redaction context and are never registered here.
+pub fn register_trusted_exact_secrets(
+    secrets: &[String],
+) -> Result<TrustedExactSecretScope, TrustedExactSecretLimitExceeded> {
+    let mut scope_secrets = secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    scope_secrets.sort();
+    scope_secrets.dedup();
+    if scope_secrets
+        .iter()
+        .any(|secret| secret.len() > MAX_TRUSTED_EXACT_SECRET_LITERAL_BYTES)
+    {
+        return Err(TrustedExactSecretLimitExceeded);
+    }
+    if scope_secrets.is_empty() {
+        return Ok(TrustedExactSecretScope::default());
+    }
+    let mut registered = trusted_exact_secrets()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let new_entries = scope_secrets
+        .iter()
+        .filter(|secret| !registered.references.contains_key(*secret))
+        .count();
+    let new_bytes = scope_secrets
+        .iter()
+        .filter(|secret| !registered.references.contains_key(*secret))
+        .map(String::len)
+        .sum::<usize>();
+    if registered.scopes.len() >= MAX_TRUSTED_EXACT_SECRET_SCOPES
+        || registered.references.len().saturating_add(new_entries)
+            > MAX_TRUSTED_EXACT_SECRET_ENTRIES
+        || registered.total_bytes.saturating_add(new_bytes) > MAX_TRUSTED_EXACT_SECRET_BYTES
+    {
+        return Err(TrustedExactSecretLimitExceeded);
+    }
+    let scope = registered.next_scope;
+    let next_scope = registered
+        .next_scope
+        .checked_add(1)
+        .ok_or(TrustedExactSecretLimitExceeded)?;
+    registered.next_scope = next_scope;
+    for secret in &scope_secrets {
+        if !registered.references.contains_key(secret) {
+            registered.total_bytes += secret.len();
+        }
+        *registered.references.entry(secret.clone()).or_default() += 1;
+    }
+    registered.scopes.insert(scope, scope_secrets);
+    Ok(TrustedExactSecretScope {
+        _registration: Some(std::sync::Arc::new(TrustedExactSecretRegistration {
+            scope,
+        })),
+    })
+}
+
+fn with_trusted_exact_secret_refs<T>(operation: impl FnOnce(&[&str]) -> T) -> T {
+    let mut references = trusted_exact_secrets()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .references
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    references.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    let references = references.iter().map(String::as_str).collect::<Vec<_>>();
+    operation(&references)
+}
+
+pub fn redact_registered_exact_secrets(text: &str) -> String {
+    redact_exact_and_registered_secrets(text, &[])
+}
+
+pub fn redact_exact_and_registered_secrets(text: &str, secrets: &[&str]) -> String {
+    with_trusted_exact_secret_refs(|registered| {
+        let mut combined = secrets.to_vec();
+        combined.extend_from_slice(registered);
+        redact_exact_secrets(text, &combined)
+    })
+}
 
 /// Render a command as one display line: the binary followed by its arguments,
 /// space-separated. This is the single renderer for operator-facing and audit
 /// surfaces (approval snapshots, session rules, audit records). It performs no
-/// escaping or redaction; those are applied separately at the audit boundary
-/// (see [`audit_escape`] and [`redact_output`]).
+/// escaping or redaction. Callers with structured argv use
+/// [`redact_command_line`] before flattening, and plain-text audit projections
+/// use [`audit_escape`].
 pub fn command_line(binary: &str, args: &[String]) -> String {
     if args.is_empty() {
         binary.to_string()
@@ -151,6 +302,11 @@ fn redact_bare_long_tokens(text: &str) -> String {
 /// `token:` in kubeconfigs) that redaction wins the trade.
 const SECRET_NAME_SUBPATTERN: &str = r"(?:[A-Za-z0-9_.-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|CREDS?|AUTHORIZATION|AUTH|BEARER)|[A-Za-z0-9_.-]+(?:KEY|PASS))";
 
+fn secret_name_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(&format!(r"(?i)^(?:{SECRET_NAME_SUBPATTERN})$")).unwrap())
+}
+
 /// Value shape consumed after a secret-bearing name, in preference order: a
 /// full double-quoted string (backslash escapes included), a full
 /// single-quoted string (YAML `''` doubling included), an UNTERMINATED
@@ -203,6 +359,13 @@ const NAMED_SECRET_STOPLIST: &[&str] = &[
     "sacred",
 ];
 
+fn is_secret_bearing_name(name: &str) -> bool {
+    secret_name_pattern().is_match(name)
+        && !NAMED_SECRET_STOPLIST
+            .iter()
+            .any(|stop| name.eq_ignore_ascii_case(stop))
+}
+
 /// Replacement for a consumed value, preserving the value's quote style so
 /// redacted JSON/YAML stays parseable (`"apikey": "[REDACTED]"`).
 fn redacted_value_like(value: &str) -> &'static str {
@@ -222,10 +385,7 @@ fn redact_named_secrets(text: &str) -> String {
     named_secret_pattern()
         .replace_all(text, |caps: &regex::Captures| {
             let name = &caps[2];
-            if NAMED_SECRET_STOPLIST
-                .iter()
-                .any(|stop| name.eq_ignore_ascii_case(stop))
-            {
+            if !is_secret_bearing_name(name) {
                 caps[0].to_string()
             } else {
                 format!(
@@ -317,10 +477,7 @@ fn redact_flow_with(pattern: &Regex, text: &str, name_group: usize, value_group:
     pattern
         .replace_all(text, |caps: &regex::Captures| {
             let name = &caps[name_group];
-            if NAMED_SECRET_STOPLIST
-                .iter()
-                .any(|stop| name.eq_ignore_ascii_case(stop))
-            {
+            if !is_secret_bearing_name(name) {
                 return caps[0].to_string();
             }
             let mut out = String::new();
@@ -456,7 +613,8 @@ pub fn redact_output(text: &str) -> String {
     let result = redact_flow_name_values(&result);
     let result = redact_named_secrets(&result);
     let result = redact_bare_long_tokens(&result);
-    redact_catchall(&result)
+    let result = redact_catchall(&result);
+    redact_registered_exact_secrets(&result)
 }
 
 #[derive(Debug, Default)]
@@ -490,8 +648,9 @@ pub fn redact_output_with_state(line: &str, state: &mut RedactionState) -> Strin
 
 pub fn redact_output_text(text: &str) -> String {
     let had_trailing_newline = text.ends_with('\n');
+    let exact_redacted = redact_registered_exact_secrets(text);
     let mut state = RedactionState::default();
-    let mut redacted = text
+    let mut redacted = exact_redacted
         .lines()
         .map(|line| redact_output_with_state(line, &mut state))
         .collect::<Vec<_>>()
@@ -504,16 +663,1018 @@ pub fn redact_output_text(text: &str) -> String {
     redacted
 }
 
+/// Whether free-form explanatory text contains a literal the shared output
+/// redactor would replace. This is suitable for rejecting synthesized prose
+/// that becomes authority, such as a learned regular expression.
+pub fn text_contains_sensitive_literals(text: &str) -> bool {
+    redact_output_text(text) != text
+}
+
+/// Whether a value becomes sensitive when interpreted under a field or
+/// parameter name. This preserves the shared free-text classifier semantics
+/// for low-entropy literals whose meaning comes from their named context.
+pub fn named_value_contains_sensitive_literals(name: &str, value: &str) -> bool {
+    let projection = format!("{name}={value}");
+    redact_output_text(&projection) != projection
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OptionValueKind {
+    Credential,
+    NamedField,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OptionArity {
+    Required,
+    AttachedOnly,
+}
+
+struct BinaryOptionAlias {
+    binaries: &'static [&'static str],
+    required_subcommand: Option<&'static str>,
+    options: &'static [&'static str],
+    value_kind: OptionValueKind,
+    arity: OptionArity,
+}
+
+struct BinaryValuelessOption {
+    binaries: &'static [&'static str],
+    required_subcommand: Option<&'static str>,
+    options: &'static [&'static str],
+}
+
+struct DatabaseClientPasswordGrammar {
+    binary: &'static str,
+    attached_options: &'static [&'static str],
+    valueless_options: &'static [&'static str],
+}
+
+const MYSQL_MFA_PASSWORD_OPTIONS: &[&str] = &[
+    "-p",
+    "--password",
+    "--password1",
+    "--password2",
+    "--password3",
+];
+
+const MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS: &[&str] = &[
+    "-p",
+    "--password",
+    "--password1",
+    "--password2",
+    "--password3",
+    "--skip-password",
+    "--skip-password1",
+    "--skip-password2",
+    "--skip-password3",
+];
+
+const BASE_PASSWORD_OPTIONS: &[&str] = &["-p", "--password"];
+const BASE_VALUELESS_PASSWORD_OPTIONS: &[&str] = &["-p", "--password", "--skip-password"];
+const MYSQLSH_VALUELESS_PASSWORD_OPTIONS: &[&str] = &[
+    "-p",
+    "--password",
+    "--password1",
+    "--password2",
+    "--password3",
+    "--no-password",
+];
+const ACCESS_VALUELESS_PASSWORD_OPTIONS: &[&str] = &["-p", "--password"];
+const MYSQL_CONFIG_EDITOR_PASSWORD_OPTIONS: &[&str] = &["-p", "--password"];
+
+/// Official client password grammars. Optional password values use attached
+/// syntax; a bare spelling prompts and never consumes the next operand.
+const DATABASE_CLIENT_PASSWORD_GRAMMARS: &[DatabaseClientPasswordGrammar] = &[
+    DatabaseClientPasswordGrammar {
+        binary: "mysql",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqladmin",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlcheck",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqldump",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlimport",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlpump",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlshow",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlslap",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlsh",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQLSH_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlbinlog",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-admin",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-binlog",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-check",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-dump",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-import",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-show",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-slap",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-access",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: ACCESS_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlaccess",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: ACCESS_VALUELESS_PASSWORD_OPTIONS,
+    },
+];
+
+/// Opaque credential-taking options whose spelling does not carry enough
+/// meaning for lexical classification. The table stays deliberately bounded:
+/// aliases are binary-specific, and subcommand-specific where a short option
+/// has a benign meaning elsewhere. SSH `-p` and Ansible `-a` are intentionally
+/// absent because they carry a port and a module payload, respectively.
+const BINARY_OPTION_ALIASES: &[BinaryOptionAlias] = &[
+    BinaryOptionAlias {
+        binaries: &["curl"],
+        required_subcommand: None,
+        options: &["-u", "--user", "--proxy-user"],
+        value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
+    },
+    BinaryOptionAlias {
+        binaries: &["curl"],
+        required_subcommand: None,
+        options: &["-H", "--header", "--proxy-header"],
+        value_kind: OptionValueKind::NamedField,
+        arity: OptionArity::Required,
+    },
+    BinaryOptionAlias {
+        binaries: &["http", "https"],
+        required_subcommand: None,
+        options: &["-a", "--auth"],
+        value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
+    },
+    BinaryOptionAlias {
+        binaries: &["mariadb-access", "mysqlaccess"],
+        required_subcommand: None,
+        options: &["-P", "--spassword"],
+        value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
+    },
+    BinaryOptionAlias {
+        binaries: &["redis-cli"],
+        required_subcommand: None,
+        options: &["-a"],
+        value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
+    },
+    BinaryOptionAlias {
+        binaries: &["sshpass"],
+        required_subcommand: None,
+        options: &["-p"],
+        value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
+    },
+    BinaryOptionAlias {
+        binaries: &["docker", "podman"],
+        required_subcommand: Some("login"),
+        options: &["-p"],
+        value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
+    },
+];
+
+/// Secret-related options that acquire values outside argv, such as an
+/// interactive prompt or stdin. They do not consume the following argument.
+const BINARY_VALUELESS_OPTIONS: &[BinaryValuelessOption] = &[
+    BinaryValuelessOption {
+        binaries: &["ansible", "ansible-playbook", "ansible-galaxy"],
+        required_subcommand: None,
+        options: &[
+            "-k",
+            "-K",
+            "--ask-pass",
+            "--ask-become-pass",
+            "--ask-vault-pass",
+        ],
+    },
+    BinaryValuelessOption {
+        binaries: &["docker", "podman"],
+        required_subcommand: Some("login"),
+        options: &["--password-stdin"],
+    },
+];
+
+struct ParsedOption<'a> {
+    name: &'a str,
+    value_start: Option<usize>,
+}
+
+struct ClassifiedCommand {
+    sensitive: bool,
+    binary: String,
+    args: Vec<String>,
+}
+
+pub const SENSITIVE_ARGV_REPLAY_GUIDANCE: &str =
+    "command was not stored: replayable argv contains a literal credential; use managed --secret or --secret-file bindings";
+
+fn parse_leading_option(argument: &str) -> Option<ParsedOption<'_>> {
+    if !argument.starts_with('-') {
+        return None;
+    }
+    let name_start = argument.len() - argument.trim_start_matches('-').len();
+    if name_start == argument.len() {
+        return None;
+    }
+    let suffix = &argument[name_start..];
+    let delimiter = suffix
+        .char_indices()
+        .find(|(_, character)| matches!(character, '=' | ':') || character.is_control())
+        .map(|(offset, _)| name_start + offset);
+    let name_end = delimiter.unwrap_or(argument.len());
+    Some(ParsedOption {
+        name: &argument[..name_end],
+        value_start: delimiter,
+    })
+}
+
+fn strict_cli_secret_name(option: &str) -> bool {
+    let name = option.trim_start_matches('-');
+    is_secret_bearing_name(name)
+        || ["key", "pass", "passphrase"]
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+fn binary_lookup_name(binary: &str) -> String {
+    let basename = binary.rsplit(['/', '\\']).next().unwrap_or(binary);
+    let lowercase = basename.to_ascii_lowercase();
+    [".exe", ".cmd", ".bat", ".com"]
+        .iter()
+        .find_map(|suffix| lowercase.strip_suffix(suffix))
+        .unwrap_or(&lowercase)
+        .to_string()
+}
+
+fn container_subcommand<'a>(binary: &str, args: &'a [String]) -> Option<(usize, &'a str)> {
+    const DOCKER_VALUE_OPTIONS: &[&str] = &[
+        "--config",
+        "-c",
+        "--context",
+        "-H",
+        "--host",
+        "-l",
+        "--log-level",
+        "--tlscacert",
+        "--tlscert",
+        "--tlskey",
+    ];
+    const PODMAN_VALUE_OPTIONS: &[&str] = &[
+        "--cdi-spec-dir",
+        "--cgroup-manager",
+        "--config",
+        "--conmon",
+        "-c",
+        "--connection",
+        "--events-backend",
+        "--hooks-dir",
+        "--identity",
+        "--imagestore",
+        "--log-level",
+        "--module",
+        "--network-cmd-path",
+        "--network-config-dir",
+        "--out",
+        "--root",
+        "--runroot",
+        "--runtime",
+        "--runtime-flag",
+        "--ssh",
+        "--storage-driver",
+        "--storage-opt",
+        "--tls-ca",
+        "--tls-cert",
+        "--tls-details",
+        "--tls-key",
+        "--tmpdir",
+        "--url",
+        "--volumepath",
+    ];
+    let value_options = match binary {
+        "docker" => DOCKER_VALUE_OPTIONS,
+        "podman" => PODMAN_VALUE_OPTIONS,
+        _ => return None,
+    };
+    let mut consumes_next = false;
+    for (index, argument) in args.iter().enumerate() {
+        if consumes_next {
+            consumes_next = false;
+            continue;
+        }
+        if argument == "--" {
+            return args.get(index + 1).map(|value| (index + 1, value.as_str()));
+        }
+        if !argument.starts_with('-') {
+            return Some((index, argument));
+        }
+        if value_options.contains(&argument.as_str()) {
+            consumes_next = true;
+            continue;
+        }
+        if value_options.iter().any(|option| {
+            argument.strip_prefix(option).is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && (option.len() == 2
+                        || suffix.starts_with('=')
+                        || suffix.starts_with(':')
+                        || suffix.starts_with(char::is_control))
+            })
+        }) {
+            continue;
+        }
+    }
+    None
+}
+
+fn parsed_subcommand<'a>(binary: &str, args: &'a [String]) -> Option<(usize, &'a str)> {
+    match binary_lookup_name(binary).as_str() {
+        "docker" | "podman" => container_subcommand(&binary_lookup_name(binary), args),
+        "mysql_config_editor" => mysql_config_editor_subcommand(args),
+        _ => args
+            .iter()
+            .enumerate()
+            .find(|(_, argument)| !argument.starts_with('-'))
+            .map(|(index, argument)| (index, argument.as_str())),
+    }
+}
+
+fn mysql_config_editor_subcommand(args: &[String]) -> Option<(usize, &str)> {
+    const COMMANDS: &[&str] = &["help", "print", "remove", "reset", "set"];
+    let mut short_debug_value = false;
+    for (index, argument) in args.iter().enumerate() {
+        if short_debug_value {
+            short_debug_value = false;
+            continue;
+        }
+        if argument == "-#" {
+            short_debug_value = true;
+            continue;
+        }
+        if argument.starts_with("-#") || argument.starts_with("--debug=") {
+            continue;
+        }
+        if argument.starts_with('-') {
+            continue;
+        }
+        return COMMANDS
+            .contains(&argument.as_str())
+            .then_some((index, argument.as_str()));
+    }
+    None
+}
+
+fn alias_context_matches(
+    binary: &str,
+    args: &[String],
+    option_index: usize,
+    binaries: &[&str],
+    required_subcommand: Option<&str>,
+) -> bool {
+    let binary = binary_lookup_name(binary);
+    binaries.contains(&binary.as_str())
+        && required_subcommand.is_none_or(|required| {
+            parsed_subcommand(&binary, args)
+                .is_some_and(|(index, subcommand)| index < option_index && subcommand == required)
+        })
+}
+
+fn database_client_password_grammar(
+    binary: &str,
+) -> Option<&'static DatabaseClientPasswordGrammar> {
+    let binary = binary_lookup_name(binary);
+    DATABASE_CLIENT_PASSWORD_GRAMMARS
+        .iter()
+        .find(|grammar| grammar.binary == binary.as_str())
+}
+
+fn parse_database_client_password_option<'a>(
+    binary: &str,
+    argument: &'a str,
+) -> Option<ParsedOption<'a>> {
+    if binary_lookup_name(binary) == "mysql_config_editor" {
+        return parse_attached_password_option(MYSQL_CONFIG_EDITOR_PASSWORD_OPTIONS, argument);
+    }
+    let grammar = database_client_password_grammar(binary)?;
+    parse_attached_password_option(grammar.attached_options, argument)
+}
+
+fn parse_attached_password_option<'a>(
+    options: &[&str],
+    argument: &'a str,
+) -> Option<ParsedOption<'a>> {
+    for option in options {
+        if argument == *option {
+            return Some(ParsedOption {
+                name: argument,
+                value_start: None,
+            });
+        }
+        let Some(suffix) = argument.strip_prefix(option) else {
+            continue;
+        };
+        let short_option = option.len() == 2 && option.starts_with('-');
+        let separated_long = suffix
+            .chars()
+            .next()
+            .is_some_and(|character| matches!(character, '=' | ':') || character.is_control());
+        if !suffix.is_empty() && (short_option || separated_long) {
+            return Some(ParsedOption {
+                name: &argument[..option.len()],
+                value_start: Some(option.len()),
+            });
+        }
+    }
+    None
+}
+
+fn parse_binary_alias_option<'a>(
+    binary: &str,
+    args: &[String],
+    option_index: usize,
+    argument: &'a str,
+) -> Option<(ParsedOption<'a>, OptionValueKind, OptionArity)> {
+    if let Some(option) = parse_database_client_password_option(binary, argument) {
+        return Some((
+            option,
+            OptionValueKind::Credential,
+            OptionArity::AttachedOnly,
+        ));
+    }
+    for alias in BINARY_OPTION_ALIASES {
+        if !alias_context_matches(
+            binary,
+            args,
+            option_index,
+            alias.binaries,
+            alias.required_subcommand,
+        ) {
+            continue;
+        }
+        for option in alias.options {
+            if argument == *option {
+                return Some((
+                    ParsedOption {
+                        name: argument,
+                        value_start: None,
+                    },
+                    alias.value_kind,
+                    alias.arity,
+                ));
+            }
+            let Some(suffix) = argument.strip_prefix(option) else {
+                continue;
+            };
+            let short_alias = option.len() == 2 && option.starts_with('-');
+            let separated_long = suffix
+                .chars()
+                .next()
+                .is_some_and(|character| matches!(character, '=' | ':') || character.is_control());
+            if !suffix.is_empty() && (short_alias || separated_long) {
+                return Some((
+                    ParsedOption {
+                        name: option,
+                        value_start: Some(option.len()),
+                    },
+                    alias.value_kind,
+                    alias.arity,
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn is_known_valueless_option(
+    binary: &str,
+    args: &[String],
+    option_index: usize,
+    option: &ParsedOption<'_>,
+) -> bool {
+    option.value_start.is_none()
+        && ((binary_lookup_name(binary) == "mysql_config_editor"
+            && MYSQL_CONFIG_EDITOR_PASSWORD_OPTIONS.contains(&option.name)
+            && parsed_subcommand(binary, args).is_some_and(|(subcommand_index, subcommand)| {
+                subcommand_index < option_index && matches!(subcommand, "set" | "remove")
+            }))
+            || database_client_password_grammar(binary)
+                .is_some_and(|grammar| grammar.valueless_options.contains(&option.name))
+            || BINARY_VALUELESS_OPTIONS.iter().any(|rule| {
+                alias_context_matches(
+                    binary,
+                    args,
+                    option_index,
+                    rule.binaries,
+                    rule.required_subcommand,
+                ) && rule.options.contains(&option.name)
+            }))
+}
+
+fn named_secret_value_start(argument: &str) -> Option<usize> {
+    let (index, _) = argument
+        .char_indices()
+        .find(|(_, character)| matches!(character, '=' | ':'))?;
+    let name = argument[..index]
+        .trim()
+        .trim_matches(|character| matches!(character, '\'' | '"'));
+    is_secret_bearing_name(name).then_some(index)
+}
+
+fn redact_suffix(argument: &str, value_start: usize) -> String {
+    let separator = argument[value_start..].chars().next();
+    match separator {
+        Some(separator @ ('=' | ':')) => {
+            format!("{}{}[REDACTED]", &argument[..value_start], separator)
+        }
+        _ => format!("{}=[REDACTED]", &argument[..value_start]),
+    }
+}
+
+fn classify_command(binary: &str, args: &[String]) -> ClassifiedCommand {
+    let redacted_binary = redact_output_text(binary);
+    let mut sensitive = redacted_binary != binary;
+    let mut redacted_args = Vec::with_capacity(args.len());
+    let mut pending_value_kind = None;
+
+    for (index, argument) in args.iter().enumerate() {
+        if let Some(value_kind) = pending_value_kind.take() {
+            let value_is_sensitive = value_kind == OptionValueKind::Credential
+                || named_secret_value_start(argument).is_some();
+            if value_is_sensitive {
+                sensitive = true;
+                redacted_args.push("[REDACTED]".to_string());
+                continue;
+            }
+        }
+
+        let parsed_alias = parse_binary_alias_option(binary, args, index, argument);
+        let parsed_option = parsed_alias
+            .as_ref()
+            .map(|(option, _, _)| ParsedOption {
+                name: option.name,
+                value_start: option.value_start,
+            })
+            .or_else(|| parse_leading_option(argument));
+        if let Some(option) = parsed_option {
+            let value_kind = parsed_alias
+                .as_ref()
+                .map(|(_, value_kind, _)| *value_kind)
+                .or_else(|| {
+                    strict_cli_secret_name(option.name).then_some(OptionValueKind::Credential)
+                });
+            if let Some(value_kind) = value_kind {
+                if is_known_valueless_option(binary, args, index, &option) {
+                    let redacted = redact_output_text(argument);
+                    sensitive |= redacted != *argument;
+                    redacted_args.push(redacted);
+                    continue;
+                }
+                if let Some(value_start) = option.value_start {
+                    let delimiter = argument[value_start..]
+                        .chars()
+                        .next()
+                        .expect("parsed option delimiter exists");
+                    let suffix = &argument[value_start + delimiter.len_utf8()..];
+                    if delimiter.is_control() {
+                        sensitive = true;
+                        redacted_args.push(redact_suffix(argument, value_start));
+                        if index + 1 < args.len() {
+                            pending_value_kind = Some(value_kind);
+                        }
+                        continue;
+                    }
+                    let value_is_sensitive = value_kind == OptionValueKind::Credential
+                        || named_secret_value_start(suffix).is_some();
+                    if value_is_sensitive {
+                        sensitive = true;
+                        redacted_args.push(redact_suffix(argument, value_start));
+                        continue;
+                    }
+                } else if parsed_alias
+                    .as_ref()
+                    .is_none_or(|(_, _, arity)| *arity == OptionArity::Required)
+                    && index + 1 < args.len()
+                {
+                    pending_value_kind = Some(value_kind);
+                }
+            }
+        }
+
+        if let Some(value_start) = named_secret_value_start(argument) {
+            sensitive = true;
+            redacted_args.push(redact_suffix(argument, value_start));
+            continue;
+        }
+
+        let redacted = redact_output_text(argument);
+        sensitive |= redacted != *argument;
+        redacted_args.push(redacted);
+    }
+
+    ClassifiedCommand {
+        sensitive,
+        binary: redacted_binary,
+        args: redacted_args,
+    }
+}
+
+/// Whether an executable or literal argv vector contains credential material.
+/// Classification happens on original argv elements so separators, adjacency,
+/// and embedded control characters remain available to the classifier.
+pub fn command_contains_sensitive_literals(binary: &str, args: &[String]) -> bool {
+    classify_command(binary, args).sensitive
+}
+
+/// Conservatively classify a legacy space-joined argv tail. Both shell-style
+/// and whitespace tokenization are checked because historical records did not
+/// retain enough information to recover authoritative argv boundaries.
+pub fn flattened_args_contain_sensitive_literals(binary: &str, flattened_args: &str) -> bool {
+    let whitespace = flattened_args
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if command_contains_sensitive_literals(binary, &whitespace) {
+        return true;
+    }
+    shell_words::split(flattened_args)
+        .ok()
+        .is_some_and(|args| command_contains_sensitive_literals(binary, &args))
+}
+
+/// Conservatively classify a legacy flattened command. This is for purging
+/// historical evidence only and never reconstructs matcher authority.
+pub fn flattened_command_contains_sensitive_literals(command: &str) -> bool {
+    fn classify(tokens: Vec<String>) -> bool {
+        tokens
+            .split_first()
+            .is_some_and(|(binary, args)| command_contains_sensitive_literals(binary, args))
+    }
+
+    let whitespace = command
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    classify(whitespace) || shell_words::split(command).ok().is_some_and(classify)
+}
+
+/// Redact one structured command without discarding executable or argv
+/// boundaries.
+fn redact_command_argv(binary: &str, args: &[String]) -> (String, Vec<String>) {
+    let command = classify_command(binary, args);
+    (command.binary, command.args)
+}
+
+/// Render one command for display while retaining argv context during
+/// redaction. This is display-only and never feeds matcher authority.
+pub fn redact_command_line(binary: &str, args: &[String]) -> String {
+    let (binary, args) = redact_command_argv(binary, args);
+    command_line(&binary, &args)
+}
+
+/// Redact configured exact literals from one structured command in addition
+/// to the shared argv-aware classifier. This explicit form is useful at
+/// boundaries that receive a scoped secret set before daemon registration.
+pub fn redact_command_line_with_exact_secrets(
+    binary: &str,
+    args: &[String],
+    secrets: &[&str],
+) -> String {
+    let binary = redact_exact_and_registered_secrets(binary, secrets);
+    let args = args
+        .iter()
+        .map(|argument| redact_exact_and_registered_secrets(argument, secrets))
+        .collect::<Vec<_>>();
+    redact_command_line(&binary, &args)
+}
+
+pub fn command_contains_exact_secrets(binary: &str, args: &[String], secrets: &[&str]) -> bool {
+    secrets
+        .iter()
+        .copied()
+        .filter(|secret| !secret.is_empty())
+        .any(|secret| {
+            binary.contains(secret) || args.iter().any(|argument| argument.contains(secret))
+        })
+}
+
+pub fn json_contains_exact_secrets(value: &serde_json::Value, secrets: &[&str]) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            redact_registered_exact_secrets(value) != *value
+                || secrets
+                    .iter()
+                    .copied()
+                    .filter(|secret| !secret.is_empty())
+                    .any(|secret| value.contains(secret))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_exact_secrets(value, secrets)),
+        serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+            redact_registered_exact_secrets(key) != *key
+                || secrets
+                    .iter()
+                    .copied()
+                    .filter(|secret| !secret.is_empty())
+                    .any(|secret| key.contains(secret))
+                || json_contains_exact_secrets(value, secrets)
+        }),
+        _ => false,
+    }
+}
+
+pub fn redact_json_exact_secrets(value: &mut serde_json::Value, secrets: &[&str]) {
+    match value {
+        serde_json::Value::String(value) => {
+            *value = redact_exact_and_registered_secrets(value, secrets);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_exact_secrets(value, secrets);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            let original = std::mem::take(values);
+            for (key, mut value) in original {
+                redact_json_exact_secrets(&mut value, secrets);
+                let key = redact_exact_and_registered_secrets(&key, secrets);
+                values.insert(key, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Derive command learning metadata without retaining the binary or literal argv.
+///
+/// Learning stores use the digest only to distinguish observations. It is not
+/// matcher authority and cannot be reversed into the original arguments.
+pub fn command_metadata(binary: &str, args: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let encoded =
+        serde_json::to_vec(&(binary, args)).expect("structured command metadata always serializes");
+    format!(
+        "[argv-sha256:{}]",
+        Sha256::digest(encoded)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+/// Scrub a historical flattened command field without trying to recover argv
+/// boundaries. Existing canonical metadata is left byte-for-byte unchanged.
+pub fn scrub_flattened_command_metadata(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    static CANONICAL: OnceLock<Regex> = OnceLock::new();
+    let canonical = CANONICAL.get_or_init(|| {
+        Regex::new(r"^\[(?:argv|legacy-command)-sha256:[0-9a-f]{64}\]$")
+            .expect("valid metadata regex")
+    });
+    if canonical.is_match(value) {
+        return value.to_string();
+    }
+    format!(
+        "[legacy-command-sha256:{}]",
+        Sha256::digest(value.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
 /// Redact exact secret values from output. This catches cases the regex patterns miss,
 /// like bare `env` output or `echo $VAR` where there's no `KEY=` prefix.
 pub fn redact_exact_secrets(text: &str, secrets: &[&str]) -> String {
     let mut result = text.to_string();
-    for secret in secrets {
-        if secret.len() >= 8 && result.contains(*secret) {
-            result = result.replace(*secret, "[REDACTED]");
+    let mut literals = secrets
+        .iter()
+        .copied()
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    literals.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    literals.dedup();
+    if text.len() > MAX_EXACT_REDACTION_INPUT_BYTES
+        || literals.len().saturating_mul(text.len()) > MAX_EXACT_REDACTION_COMPARISONS
+    {
+        // The caller asked for exact redaction but the bounded synchronous
+        // path cannot prove it within its work budget. Returning only a
+        // marker is fail-closed and never exposes the unredacted input.
+        return "[REDACTED]".to_string();
+    }
+    let marker = ["[REDACTED]", "[FILTERED]", "<hidden>", "***", ""]
+        .into_iter()
+        .find(|candidate| !literals.iter().any(|secret| candidate.contains(secret)))
+        .expect("empty exact-redaction marker is always safe");
+    for secret in literals {
+        if result.contains(secret) {
+            result = result.replace(secret, marker);
         }
     }
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExactRedactionLimitExceeded;
+
+/// Boundary-safe exact-byte redaction for streamed output. The redactor keeps
+/// only the suffix that can still begin a configured literal, and enforces the
+/// limit on emitted bytes after replacement expansion.
+pub struct ExactSecretStreamRedactor {
+    secrets: Vec<Vec<u8>>,
+    marker: &'static [u8],
+    carry: Vec<u8>,
+    keep: usize,
+    received: usize,
+    emitted: usize,
+    limit: usize,
+    comparisons: usize,
+}
+
+impl ExactSecretStreamRedactor {
+    pub fn new(
+        secrets: impl IntoIterator<Item = Vec<u8>>,
+        limit: usize,
+    ) -> Result<Self, ExactRedactionLimitExceeded> {
+        let mut secrets = secrets
+            .into_iter()
+            .filter(|secret| !secret.is_empty())
+            .collect::<Vec<_>>();
+        with_trusted_exact_secret_refs(|registered| {
+            secrets.extend(registered.iter().map(|secret| secret.as_bytes().to_vec()));
+        });
+        secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        secrets.dedup();
+        if secrets.len() > MAX_TRUSTED_EXACT_SECRET_ENTRIES
+            || secrets
+                .iter()
+                .any(|secret| secret.len() > MAX_TRUSTED_EXACT_SECRET_LITERAL_BYTES)
+            || secrets.iter().map(Vec::len).sum::<usize>() > MAX_TRUSTED_EXACT_SECRET_BYTES
+        {
+            return Err(ExactRedactionLimitExceeded);
+        }
+        let marker = [
+            b"[REDACTED]".as_slice(),
+            b"[FILTERED]".as_slice(),
+            b"<hidden>".as_slice(),
+            b"***".as_slice(),
+            b"".as_slice(),
+        ]
+        .into_iter()
+        .find(|candidate| {
+            !secrets.iter().any(|secret| {
+                !secret.is_empty()
+                    && candidate
+                        .windows(secret.len())
+                        .any(|window| window == secret)
+            })
+        })
+        .expect("empty exact-redaction marker is always safe");
+        let keep = secrets
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        Ok(Self {
+            secrets,
+            marker,
+            carry: Vec::new(),
+            keep,
+            received: 0,
+            emitted: 0,
+            limit: limit.min(MAX_EXACT_REDACTION_INPUT_BYTES),
+            comparisons: 0,
+        })
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, ExactRedactionLimitExceeded> {
+        self.received = self
+            .received
+            .checked_add(chunk.len())
+            .filter(|received| *received <= self.limit)
+            .ok_or(ExactRedactionLimitExceeded)?;
+        self.carry.extend_from_slice(chunk);
+        let safe_end = self.carry.len().saturating_sub(self.keep);
+        self.emit_through(safe_end)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<u8>, ExactRedactionLimitExceeded> {
+        self.emit_through(self.carry.len())
+    }
+
+    fn emit_through(&mut self, safe_end: usize) -> Result<Vec<u8>, ExactRedactionLimitExceeded> {
+        let mut output = Vec::new();
+        let mut position = 0;
+        while position < safe_end {
+            self.comparisons = self
+                .comparisons
+                .checked_add(self.secrets.len())
+                .filter(|comparisons| *comparisons <= MAX_EXACT_REDACTION_COMPARISONS)
+                .ok_or(ExactRedactionLimitExceeded)?;
+            let (replacement, consumed) = if let Some(secret) = self
+                .secrets
+                .iter()
+                .find(|secret| self.carry[position..].starts_with(secret))
+            {
+                (self.marker, secret.len())
+            } else {
+                (&self.carry[position..position + 1], 1)
+            };
+            if self.emitted.saturating_add(replacement.len()) > self.limit {
+                return Err(ExactRedactionLimitExceeded);
+            }
+            output.extend_from_slice(replacement);
+            self.emitted += replacement.len();
+            position += consumed;
+        }
+        self.carry.drain(..position);
+        Ok(output)
+    }
+
+    pub fn redact_all(
+        secrets: impl IntoIterator<Item = Vec<u8>>,
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<Vec<u8>, ExactRedactionLimitExceeded> {
+        let mut redactor = Self::new(secrets, limit)?;
+        let mut output = redactor.push(bytes)?;
+        output.extend_from_slice(&redactor.finish()?);
+        Ok(output)
+    }
 }
 
 #[cfg(test)]
@@ -535,6 +1696,525 @@ mod tests {
         assert_eq!(escaped, "x\\n[AUDIT] ALLOWED forged");
         assert!(!escaped.contains('\n'));
         assert!(!escaped.contains('\r'));
+    }
+
+    #[test]
+    fn trusted_exact_literals_redact_from_structured_argv_without_shape_heuristics() {
+        let value = ["z", "!"].concat();
+        let args = vec!["inspect".to_string(), value.clone()];
+        assert!(command_contains_exact_secrets(
+            "fixturectl",
+            &args,
+            &[value.as_str()]
+        ));
+        let rendered =
+            redact_command_line_with_exact_secrets("fixturectl", &args, &[value.as_str()]);
+        assert!(!rendered.contains(&value));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn registered_exact_literals_redact_across_free_text_line_boundaries() {
+        let value = ["§", "\n", "¶"].concat();
+        let _scope = register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
+        let rendered = redact_output_text(&format!("prefix {value} suffix"));
+        assert!(!rendered.contains(&value));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn trusted_exact_secret_scope_releases_literals_and_enforces_bounds() {
+        let value = "scope-lifecycle-fixture".to_string();
+        let scope = register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
+        assert_eq!(redact_output_text(&value), "[REDACTED]");
+        drop(scope);
+        assert_eq!(redact_output_text(&value), value);
+
+        let too_many = (0..=MAX_TRUSTED_EXACT_SECRET_ENTRIES)
+            .map(|index| format!("registry-fixture-{index}"))
+            .collect::<Vec<_>>();
+        assert!(register_trusted_exact_secrets(&too_many).is_err());
+        assert!(register_trusted_exact_secrets(&[
+            "x".repeat(MAX_TRUSTED_EXACT_SECRET_LITERAL_BYTES + 1,)
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn exact_stream_redaction_is_boundary_safe_and_bounds_expansion() {
+        let value = *b"z!";
+        let mut redactor = ExactSecretStreamRedactor::new(vec![value.to_vec()], 64).unwrap();
+        let mut output = redactor.push(b"prefix z").unwrap();
+        output.extend_from_slice(&redactor.push(b"! suffix").unwrap());
+        output.extend_from_slice(&redactor.finish().unwrap());
+        assert!(!output.windows(value.len()).any(|window| window == value));
+
+        let repeated = value.repeat(4);
+        assert!(
+            ExactSecretStreamRedactor::redact_all(vec![value.to_vec()], &repeated, 8,).is_err()
+        );
+        assert!(ExactSecretStreamRedactor::redact_all(Vec::new(), &[b'x'; 9], 8).is_err());
+    }
+
+    #[test]
+    fn exact_stream_redaction_includes_registered_literals_without_explicit_copying() {
+        let value = ["registered", "-stream-fixture"].concat();
+        let _scope = register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
+        let split = value.len() / 2;
+        let mut redactor = ExactSecretStreamRedactor::new(Vec::new(), 64).unwrap();
+        let mut output = redactor.push(&value.as_bytes()[..split]).unwrap();
+        output.extend(redactor.push(&value.as_bytes()[split..]).unwrap());
+        output.extend(redactor.finish().unwrap());
+        assert_eq!(output, b"[REDACTED]");
+        assert!(!output
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+    }
+
+    #[test]
+    fn trusted_exact_registry_rejects_literal_entry_and_byte_limits() {
+        assert!(register_trusted_exact_secrets(&["x".repeat(4097)]).is_err());
+        let entries = (0..257)
+            .map(|index| format!("entry-{index:03}"))
+            .collect::<Vec<_>>();
+        assert!(register_trusted_exact_secrets(&entries).is_err());
+        let bytes = (0..65)
+            .map(|index| format!("byte-{index:02}-{}", "x".repeat(1024)))
+            .collect::<Vec<_>>();
+        assert!(register_trusted_exact_secrets(&bytes).is_err());
+    }
+
+    #[test]
+    fn exact_redaction_fails_closed_when_synchronous_work_is_over_budget() {
+        let text = "x".repeat(MAX_EXACT_REDACTION_INPUT_BYTES + 1);
+        assert_eq!(redact_exact_secrets(&text, &["fixture"]), "[REDACTED]");
+    }
+
+    #[test]
+    fn exact_redaction_marker_never_reintroduces_a_short_trusted_literal() {
+        let value = "A";
+        let text = redact_exact_secrets(value, &[value]);
+        assert!(!text.contains(value));
+        let streamed = ExactSecretStreamRedactor::redact_all(
+            vec![value.as_bytes().to_vec()],
+            value.as_bytes(),
+            64,
+        )
+        .unwrap();
+        assert!(!streamed.contains(&value.as_bytes()[0]));
+    }
+
+    #[test]
+    fn command_literal_classifier_retains_argv_secret_context() {
+        fn assert_redacted(binary: &str, args: Vec<String>, value: &str) {
+            assert!(command_contains_sensitive_literals(binary, &args));
+            let rendered = redact_command_line(binary, &args);
+            assert!(!rendered.contains(value));
+            assert!(!rendered.chars().any(char::is_control));
+        }
+
+        let value = ["q", "7"].concat();
+        assert_redacted(
+            "fixturectl",
+            vec!["--api-token".to_string(), value.clone()],
+            &value,
+        );
+        assert_redacted("fixturectl", vec![format!("--api-token={value}")], &value);
+        assert_redacted(
+            "fixturectl",
+            vec!["--key".to_string(), value.clone()],
+            &value,
+        );
+        assert_redacted("fixturectl", vec![format!("--pass={value}")], &value);
+        assert_redacted(
+            "fixturectl",
+            vec![format!("--passphrase=\n{value}\u{1}")],
+            &value,
+        );
+        assert_redacted("curl", vec!["-u".to_string(), value.clone()], &value);
+        assert_redacted("curl", vec![format!("--user={value}")], &value);
+        assert_redacted(
+            "curl",
+            vec!["-H".to_string(), format!("Authorization: {value}")],
+            &value,
+        );
+        assert_redacted(
+            "curl",
+            vec![format!("--header=Authorization:\n{value}")],
+            &value,
+        );
+
+        assert!(!command_contains_sensitive_literals(
+            "fixturectl",
+            &["--output".to_string(), value.clone()]
+        ));
+        assert!(!command_contains_sensitive_literals(
+            "ssh",
+            &["-p".to_string(), "2222".to_string()]
+        ));
+        assert!(!command_contains_sensitive_literals(
+            "ansible",
+            &["-a".to_string(), "echo ordinary payload".to_string()]
+        ));
+    }
+
+    #[test]
+    fn binary_alias_matrix_covers_platform_and_value_spellings() {
+        let value = ["q", "7"].concat();
+        let suffixes = ["", ".EXE", ".cmd", ".Bat", ".cOm"];
+        for alias in BINARY_OPTION_ALIASES {
+            for binary in alias.binaries {
+                for option in alias.options {
+                    for executable_suffix in suffixes {
+                        let spelling = if executable_suffix.is_empty() {
+                            (*binary).to_string()
+                        } else {
+                            format!(
+                                "C:\\Tools\\{}{}",
+                                binary.to_ascii_uppercase(),
+                                executable_suffix
+                            )
+                        };
+                        let credential = match alias.value_kind {
+                            OptionValueKind::Credential => value.clone(),
+                            OptionValueKind::NamedField => {
+                                format!("Authorization: {value}")
+                            }
+                        };
+                        let prefix = alias
+                            .required_subcommand
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        let mut spellings = vec![
+                            vec![format!("{option}={credential}")],
+                            vec![format!("{option}:{credential}")],
+                            vec![format!("{option}\n{credential}")],
+                        ];
+                        if alias.arity == OptionArity::Required {
+                            spellings.push(vec![option.to_string(), credential.clone()]);
+                        }
+                        if option.len() == 2 {
+                            spellings.push(vec![format!("{option}{credential}")]);
+                        }
+                        for mut option_args in spellings {
+                            let mut args = prefix.clone();
+                            args.append(&mut option_args);
+                            assert!(command_contains_sensitive_literals(&spelling, &args));
+                            assert!(!redact_command_line(&spelling, &args).contains(&value));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alias_context_and_valueless_options_preserve_benign_argv() {
+        let value = ["q", "7"].concat();
+        assert!(!command_contains_sensitive_literals(
+            "docker",
+            &[
+                "run".to_string(),
+                "login".to_string(),
+                "-p".to_string(),
+                "8080".to_string(),
+            ]
+        ));
+        assert!(!command_contains_sensitive_literals(
+            "docker.exe",
+            &[
+                "--config".to_string(),
+                "login".to_string(),
+                "run".to_string(),
+                "-p".to_string(),
+                "8080".to_string(),
+            ]
+        ));
+        assert!(command_contains_sensitive_literals(
+            "docker.com",
+            &["login".to_string(), "-p".to_string(), value,]
+        ));
+        for (binary, args) in [
+            (
+                "ansible",
+                vec!["--ask-pass".to_string(), "host-a".to_string()],
+            ),
+            (
+                "ansible-playbook.exe",
+                vec!["--ask-vault-pass".to_string(), "site.yml".to_string()],
+            ),
+            (
+                "docker",
+                vec![
+                    "login".to_string(),
+                    "--password-stdin".to_string(),
+                    "registry.example".to_string(),
+                ],
+            ),
+            (
+                "mysql",
+                vec!["-p".to_string(), "ordinary_database".to_string()],
+            ),
+            (
+                "mariadb",
+                vec!["--password".to_string(), "ordinary_database".to_string()],
+            ),
+            (
+                "mysqldump",
+                vec![
+                    "--skip-password".to_string(),
+                    "ordinary_database".to_string(),
+                ],
+            ),
+        ] {
+            assert!(!command_contains_sensitive_literals(binary, &args));
+        }
+
+        for (binary, argument) in [
+            ("mysql", format!("-p{}", ["q", "7"].concat())),
+            ("mariadb.exe", format!("--password={}", ["q", "7"].concat())),
+            (
+                "mysqldump.com",
+                format!("--password:{}", ["q", "7"].concat()),
+            ),
+        ] {
+            assert!(command_contains_sensitive_literals(binary, &[argument]));
+        }
+    }
+
+    #[test]
+    fn database_client_password_grammar_matches_each_binary_and_platform_spelling() {
+        let value = ["q", "7"].concat();
+        for grammar in DATABASE_CLIENT_PASSWORD_GRAMMARS {
+            for suffix in ["", ".EXE", ".cmd", ".Bat", ".cOm"] {
+                let binary = if suffix.is_empty() {
+                    grammar.binary.to_string()
+                } else {
+                    format!(
+                        "C:\\Tools\\{}{}",
+                        grammar.binary.to_ascii_uppercase(),
+                        suffix
+                    )
+                };
+                for option in grammar.valueless_options {
+                    assert!(!command_contains_sensitive_literals(
+                        &binary,
+                        &[option.to_string(), "ordinary_database".to_string()]
+                    ));
+                }
+                for option in grammar.attached_options {
+                    assert!(!command_contains_sensitive_literals(
+                        &binary,
+                        &[option.to_string(), "ordinary_database".to_string()]
+                    ));
+                    let mut forms = vec![
+                        format!("{option}={value}"),
+                        format!("{option}:{value}"),
+                        format!("{option}\n{value}"),
+                    ];
+                    if option.len() == 2 {
+                        forms.push(format!("{option}{value}"));
+                    }
+                    for form in forms {
+                        assert!(command_contains_sensitive_literals(&binary, &[form]));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_config_editor_password_prompts_are_subcommand_aware_and_valueless() {
+        let value = ["q", "7"].concat();
+        for suffix in ["", ".EXE", ".cmd", ".Bat", ".cOm"] {
+            let binary = format!("C:\\Tools\\MYSQL_CONFIG_EDITOR{suffix}");
+            for args in [
+                vec![
+                    "set".to_string(),
+                    "-p".to_string(),
+                    "--host".to_string(),
+                    "ordinary-host".to_string(),
+                ],
+                vec![
+                    "--verbose".to_string(),
+                    "remove".to_string(),
+                    "--password".to_string(),
+                    "--login-path".to_string(),
+                    "ordinary-path".to_string(),
+                ],
+                vec![
+                    "-#".to_string(),
+                    "ordinary-debug".to_string(),
+                    "set".to_string(),
+                    "--password".to_string(),
+                    "--user".to_string(),
+                    "ordinary-user".to_string(),
+                ],
+            ] {
+                assert!(!command_contains_sensitive_literals(&binary, &args));
+            }
+
+            for argument in [
+                format!("-p{value}"),
+                format!("--password={value}"),
+                format!("--password:{value}"),
+                format!("--password\n{value}"),
+            ] {
+                let args = vec!["set".to_string(), argument];
+                assert!(command_contains_sensitive_literals(&binary, &args));
+                assert!(!redact_command_line(&binary, &args).contains(&value));
+            }
+        }
+    }
+
+    #[test]
+    fn mariadb_access_superuser_password_aliases_have_required_arity() {
+        let value = ["q", "7"].concat();
+        for binary in ["mariadb-access", "MYSQLACCESS.EXE"] {
+            for option in ["-P", "--spassword"] {
+                assert!(command_contains_sensitive_literals(
+                    binary,
+                    &[option.to_string(), value.clone()]
+                ));
+                let mut forms = vec![
+                    format!("{option}={value}"),
+                    format!("{option}:{value}"),
+                    format!("{option}\n{value}"),
+                ];
+                if option.len() == 2 {
+                    forms.push(format!("{option}{value}"));
+                }
+                for form in forms {
+                    assert!(command_contains_sensitive_literals(binary, &[form]));
+                }
+            }
+            assert!(!command_contains_sensitive_literals(
+                binary,
+                &["-p".to_string(), "ordinary_database".to_string()]
+            ));
+        }
+    }
+
+    #[test]
+    fn container_global_value_options_preserve_login_subcommand() {
+        const DOCKER_OPTIONS: &[&str] = &[
+            "--config",
+            "-c",
+            "--context",
+            "-H",
+            "--host",
+            "-l",
+            "--log-level",
+            "--tlscacert",
+            "--tlscert",
+            "--tlskey",
+        ];
+        const PODMAN_OPTIONS: &[&str] = &[
+            "--cdi-spec-dir",
+            "--cgroup-manager",
+            "--config",
+            "--conmon",
+            "-c",
+            "--connection",
+            "--events-backend",
+            "--hooks-dir",
+            "--identity",
+            "--imagestore",
+            "--log-level",
+            "--module",
+            "--network-cmd-path",
+            "--network-config-dir",
+            "--out",
+            "--root",
+            "--runroot",
+            "--runtime",
+            "--runtime-flag",
+            "--ssh",
+            "--storage-driver",
+            "--storage-opt",
+            "--tls-ca",
+            "--tls-cert",
+            "--tls-details",
+            "--tls-key",
+            "--tmpdir",
+            "--url",
+            "--volumepath",
+        ];
+
+        for (binary, options) in [("docker", DOCKER_OPTIONS), ("podman", PODMAN_OPTIONS)] {
+            for option in options {
+                let separate = vec![
+                    option.to_string(),
+                    "ordinary-setting".to_string(),
+                    "login".to_string(),
+                ];
+                assert_eq!(container_subcommand(binary, &separate), Some((2, "login")));
+
+                let attached = if option.len() == 2 {
+                    format!("{option}ordinary-setting")
+                } else {
+                    format!("{option}=ordinary-setting")
+                };
+                let attached_args = vec![attached, "login".to_string()];
+                assert_eq!(
+                    container_subcommand(binary, &attached_args),
+                    Some((1, "login"))
+                );
+                if binary == "podman" {
+                    let value = ["q", "7"].concat();
+                    let mut login_args = separate;
+                    login_args.extend(["-p".to_string(), value.clone()]);
+                    assert!(command_contains_sensitive_literals(binary, &login_args));
+                    let mut attached_login_args = attached_args;
+                    attached_login_args.extend(["-p".to_string(), value]);
+                    assert!(command_contains_sensitive_literals(
+                        binary,
+                        &attached_login_args
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn podman_network_global_options_preserve_login_alias_context() {
+        let value = ["q", "7"].concat();
+        for binary in ["podman", "PODMAN.EXE", "C:\\Tools\\podman.CMD"] {
+            for prefix in [
+                vec![
+                    "--network-cmd-path".to_string(),
+                    "ordinary-helper".to_string(),
+                ],
+                vec!["--network-cmd-path=ordinary-helper".to_string()],
+                vec![
+                    "--network-config-dir".to_string(),
+                    "ordinary-config".to_string(),
+                ],
+                vec!["--network-config-dir=ordinary-config".to_string()],
+            ] {
+                let mut args = prefix;
+                args.extend(["login".to_string(), "-p".to_string(), value.clone()]);
+                assert!(command_contains_sensitive_literals(binary, &args));
+                assert!(!redact_command_line(binary, &args).contains(&value));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_flattened_classification_is_conservative() {
+        let value = ["q", "7"].concat();
+        let split = format!("curl -u {value}");
+        let malformed = format!("curl --user='{value}");
+        assert!(flattened_command_contains_sensitive_literals(&split));
+        assert!(flattened_command_contains_sensitive_literals(&malformed));
+        assert!(flattened_args_contain_sensitive_literals(
+            "docker",
+            &format!("login -p {value}")
+        ));
+        assert!(!flattened_command_contains_sensitive_literals(
+            "ssh -p 2222 host"
+        ));
     }
 
     #[test]
@@ -1093,5 +2773,27 @@ mod tests {
         let input = "PORT=8080 \nCOUNT=42 \n";
         let output = redact_output(input);
         assert_eq!(output, input, "numeric values should not be redacted");
+    }
+
+    #[test]
+    fn trusted_exact_literals_redact_even_when_short_and_bare() {
+        let value = ['q', '7'].iter().collect::<String>();
+        let longer = format!("{value}x");
+        let output = redact_exact_secrets(
+            &format!("prefix {value} {longer} suffix"),
+            &[&value, &longer],
+        );
+        assert!(!output.contains(&value));
+        assert_eq!(output, "prefix [REDACTED] [REDACTED] suffix");
+    }
+
+    #[test]
+    fn command_metadata_never_retains_literal_argv_and_is_boundary_sensitive() {
+        let opaque = ["opaque", " value"].concat();
+        let joined = command_metadata("tool", std::slice::from_ref(&opaque));
+        let split = command_metadata("tool", &["opaque".to_string(), "value".to_string()]);
+        assert!(!joined.contains(&opaque));
+        assert_ne!(joined, split);
+        assert_eq!(scrub_flattened_command_metadata(&joined), joined);
     }
 }

@@ -1,28 +1,35 @@
 FROM ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb
 
-ARG CLAUDE_PATH=.claude-bin
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         iproute2 \
         jq \
+        nodejs \
+        npm \
         procps \
         python3-minimal \
         python3-yaml \
         openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
+# The attacker agent is the Codex CLI against a dedicated OpenRouter key with
+# an open-weight model; nothing Anthropic or OpenAI is installed or mounted.
+RUN npm install -g @openai/codex && npm cache clean --force
+
 # Drop stock `ubuntu` user so our UIDs line up with the scenarios doc.
 RUN userdel -r ubuntu 2>/dev/null || true
 
 RUN groupadd -g 900 guard && useradd -m -u 900 -g 900 -s /bin/bash guard \
  && useradd -m -u 1000 -s /bin/bash victim \
- && useradd -m -u 1001 -s /bin/bash attacker
+ && useradd -m -u 1001 -s /bin/bash attacker \
+ && groupadd guard-clients \
+ && usermod -aG guard-clients guard \
+ && usermod -aG guard-clients victim \
+ && usermod -aG guard-clients attacker
 
 COPY guard /usr/local/bin/guard
-COPY ${CLAUDE_PATH} /usr/local/bin/claude
-RUN chmod 755 /usr/local/bin/guard /usr/local/bin/claude
+RUN chmod 755 /usr/local/bin/guard
 
 # Each user gets a client config pointing at the shared socket.
 RUN for u in guard victim attacker; do \
@@ -32,23 +39,24 @@ RUN for u in guard victim attacker; do \
         chown "$u:$u" "/home/$u/.config/guard/client.yaml"; \
     done
 
-# Attacker needs a claude config directory; we do not share anything from
-# the host so it starts fresh each run.
-RUN install -d -m 0700 -o attacker -g attacker /home/attacker/.claude \
+# Attacker gets a Codex home with only the OpenRouter provider definition;
+# the per-run key arrives through the staged attacker environment.
+RUN install -d -m 0700 -o attacker -g attacker /home/attacker/.codex \
  && install -d -m 0755 -o attacker -g attacker /home/attacker/work
-
-# Minimal claude settings: no MCP servers, no inherited history.
-RUN printf '{}\n' > /home/attacker/.claude/settings.json \
- && chown attacker:attacker /home/attacker/.claude/settings.json
+COPY codex-config.toml /home/attacker/.codex/config.toml
+RUN chown attacker:attacker /home/attacker/.codex/config.toml
 
 # Victim owns a private workspace so the CTF prompt can write transient
 # state if needed; nothing sensitive lands here.
 RUN install -d -m 0700 -o victim -g victim /home/victim/work
 
 COPY entrypoint-adversary.sh /entrypoint-adversary.sh
+COPY attacker-exec.sh /usr/local/bin/attacker-exec
+COPY egress-proxy.py /usr/local/lib/guard/egress-proxy.py
 COPY ctf-attacker-prompt.md  /home/attacker/attacker-prompt.md
 COPY scenarios.yaml          /etc/guard/scenarios.yaml
-RUN chmod +x /entrypoint-adversary.sh \
+RUN chmod 755 /entrypoint-adversary.sh /usr/local/bin/attacker-exec \
+ && chmod 644 /usr/local/lib/guard/egress-proxy.py \
  && chown attacker:attacker /home/attacker/attacker-prompt.md
 
 WORKDIR /tmp

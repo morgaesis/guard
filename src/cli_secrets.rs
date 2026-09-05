@@ -59,7 +59,7 @@ pub(crate) async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                             key
                         );
                     }
-                    println!("Secret '{}' stored", key);
+                    cli_println!("Secret '{}' stored", key);
                     Ok(())
                 }
                 server::AdminResponse::Error { message } => {
@@ -89,10 +89,10 @@ pub(crate) async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                         }));
                     }
                     if keys.is_empty() {
-                        println!("No secrets stored");
+                        cli_println!("No secrets stored");
                     } else {
                         for key in keys {
-                            println!("  - {}", key);
+                            cli_println!("  - {}", key);
                         }
                     }
                     Ok(())
@@ -107,17 +107,17 @@ pub(crate) async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                         }));
                     }
                     if items.is_empty() {
-                        println!("No secrets stored");
+                        cli_println!("No secrets stored");
                     } else {
                         for item in items {
                             if item.legacy {
-                                println!("  - {}  origin=legacy", item.key);
+                                cli_println!("  - {}  origin=legacy", item.key);
                             } else if let Some(uid) = item.uid {
-                                println!("  - {}  uid={}", item.key, uid);
+                                cli_println!("  - {}  uid={}", item.key, uid);
                             } else if let Some(principal) = &item.principal {
-                                println!("  - {}  principal={}", item.key, principal);
+                                cli_println!("  - {}  principal={}", item.key, principal);
                             } else {
-                                println!("  - {}", item.key);
+                                cli_println!("  - {}", item.key);
                             }
                         }
                     }
@@ -135,7 +135,7 @@ pub(crate) async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                 .await?
             {
                 server::AdminResponse::Ok => {
-                    println!("Secret '{}' removed", key);
+                    cli_println!("Secret '{}' removed", key);
                     Ok(())
                 }
                 server::AdminResponse::Error { message } => {

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Exercise the packaged ExecStart lines with systemd's own environment expansion.
+# Exercise packaged ExecStart expansion and host /tmp visibility with systemd.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -7,6 +7,14 @@ unit_sources=(
   "$script_dir/guard.service"
   "$script_dir/guard-exec-as-caller.service"
 )
+
+for unit_source in "${unit_sources[@]}"; do
+  if grep -Eqi '^[[:space:]]*PrivateTmp[[:space:]]*=[[:space:]]*(true|yes|on|1)[[:space:]]*$' "$unit_source"; then
+    grep -Eni '^[[:space:]]*PrivateTmp[[:space:]]*=[[:space:]]*(true|yes|on|1)[[:space:]]*$' "$unit_source" >&2
+    echo "$unit_source must share the host /tmp namespace with brokered children" >&2
+    exit 1
+  fi
+done
 
 verification_dir="$(mktemp -d)"
 cleanup_verification() {
@@ -60,7 +68,9 @@ run_expansion_test() {
   local unit_name="$test_id.service"
   local unit_path="/run/systemd/system/$unit_name"
   local capture="/usr/local/libexec/$test_id-capture"
-  local output="/run/$test_id-output"
+  # Use the host /tmp namespace: a private service tmp namespace would let the
+  # child write successfully while hiding the file from this caller.
+  local output="/tmp/$test_id-output"
   local environment="/run/$test_id-environment"
   local generated
   generated="$(mktemp)"
@@ -80,6 +90,7 @@ run_expansion_test() {
     -e '/^StateDirectoryMode=/d' \
     -e '/^RuntimeDirectory=/d' \
     -e '/^RuntimeDirectoryMode=/d' \
+    -e '/^StandardInput=/d' \
     -e "s|^ExecStart=/usr/local/bin/guard |ExecStart=$capture |" \
     -e 's|^Restart=.*|Restart=no|' \
     -e '/^AmbientCapabilities=/d' \

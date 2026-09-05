@@ -3,16 +3,34 @@
 set -euo pipefail
 
 SOCKET=/scenario/run/guard.sock
+PROTECTED_CATALOG_DIR=/scenario/journey/protected-catalog
+PROTECTED_CATALOG="$PROTECTED_CATALOG_DIR/verbs.yaml"
+PROTECTED_CATALOG_LOCK="$PROTECTED_CATALOG_DIR/.verbs.yaml.learning-lock"
 SCENARIO="${2:-}"
 RAW="/scenario/raw/$SCENARIO.log"
-RESULT="/scenario/results/$SCENARIO.md"
+PRINCIPAL_ROOT="/scenario/principals/$(id -u)"
+PHASE_OUTPUT="$PRINCIPAL_ROOT/phase-output"
+RESULT="$PRINCIPAL_ROOT/results/$SCENARIO.md"
+FAILURE="$PRINCIPAL_ROOT/failure.txt"
+COLLECTOR_ROOT=/scenario/collector
+COLLECTOR_RESULTS="$COLLECTOR_ROOT/results"
+COLLECTOR_PHASES="$COLLECTOR_ROOT/phases"
 
 setup_fixture() {
-  mkdir -p /scenario/home /scenario/config/guard /scenario/data /scenario/journey \
-    /scenario/raw /scenario/results /scenario/fixtures/staging /scenario/bin /scenario/ansible /scenario/run
+  mkdir -p /scenario/home /scenario/config/guard /scenario/data \
+    /scenario/raw \
+    /scenario/fixtures/staging /scenario/bin /scenario/ansible /scenario/run
+  if [ ! -d /scenario/journey ]; then
+    mkdir /scenario/journey
+    chmod 1777 /scenario/journey
+  fi
+  if [ ! -d /scenario/principals ]; then
+    mkdir /scenario/principals
+    chmod 1777 /scenario/principals
+  fi
   chmod 0711 /scenario
-  chmod 0777 /scenario/raw /scenario/results /scenario/fixtures /scenario/fixtures/staging \
-    /scenario/ansible /scenario/journey
+  chmod 1777 /scenario/raw
+  chmod 0777 /scenario/fixtures /scenario/fixtures/staging /scenario/ansible
   printf 'synthetic operator note\n' > /scenario/fixtures/operator-note
   printf 'apiVersion: v1\nkind: Config\nsynthetic: true\n' > /scenario/fixtures/daemon.kubeconfig
   printf '[fixture]\nlocalhost\n' > /scenario/ansible/inventory
@@ -70,8 +88,39 @@ EOF
   chmod 0755 /scenario/bin/*
 }
 
+assert_protected_catalog_as_daemon() {
+  local replacement marker
+  [ "$(id -u)" -eq 1000 ]
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_DIR")" = '0:555' ]
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG")" = '0:644' ]
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_LOCK")" = '1000:600' ]
+
+  replacement=/tmp/protected-catalog-replacement
+  marker=/tmp/protected-catalog-lock-marker
+  printf 'replacement must not install\n' > "$replacement"
+  rm -f "$marker"
+  if printf blocked > "$PROTECTED_CATALOG" \
+    || rm -f "$PROTECTED_CATALOG" \
+    || mv "$replacement" "$PROTECTED_CATALOG" \
+    || mkdir "$PROTECTED_CATALOG_DIR/unauthorized" \
+    || rmdir "$PROTECTED_CATALOG_DIR" \
+    || mv "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG_DIR-replaced"; then
+    rm -f "$replacement" "$marker"
+    echo 'protected catalog preflight accepted an unauthorized mutation' >&2
+    return 1
+  fi
+  [ -f "$PROTECTED_CATALOG" ]
+  exec 9>"$PROTECTED_CATALOG_LOCK"
+  flock -n 9
+  printf lock-opened > "$marker"
+  [ "$(cat "$marker")" = lock-opened ]
+  exec 9>&-
+  rm -f "$replacement" "$marker"
+}
+
 daemon() {
   setup_fixture
+  assert_protected_catalog_as_daemon
   export HOME=/scenario/home
   export XDG_CONFIG_HOME=/scenario/config
   export XDG_DATA_HOME=/scenario/data
@@ -92,17 +141,19 @@ daemon() {
     "${evaluator_args[@]}" \
     --gate consequence \
     --socket "$SOCKET" \
-    --verbs /etc/guard/verbs.yaml \
+    --verbs "$PROTECTED_CATALOG" \
     --state-db /scenario/data/state.db \
     --audit-log /scenario/data/audit.jsonl \
     --history-retention 3600 \
     --child-env KUBECONFIG \
     --users 1001,1002 \
-    >>/scenario/raw/daemon.log 2>&1
+    --admin-token-stdin \
+    </scenario/run/admin.token >>/scenario/raw/daemon.log 2>&1
 }
 
 record_result() {
   local outcome="$1" classification="$2" evidence="$3"
+  prepare_principal_output
   {
     echo "# $SCENARIO"
     echo
@@ -131,7 +182,7 @@ run_test_filter() {
     printf '%s\n' "$listing" | grep -Eq '[0-9]+ tests, [0-9]+ benchmarks$' || continue
     output="$("$binary" "$filter" --nocapture 2>&1)" || {
       printf '%s\n' "$output" >> "$RAW"
-      printf 'test filter failed: %s\n' "$filter" > /scenario/results/failure.txt
+      printf 'test filter failed: %s\n' "$filter" > "$FAILURE"
       return 1
     }
     printf '%s\n' "$output" >> "$RAW"
@@ -140,7 +191,7 @@ run_test_filter() {
     fi
   done
   if [ "$matched" -ne 1 ]; then
-    printf 'test filter matched no tests: %s\n' "$filter" > /scenario/results/failure.txt
+    printf 'test filter matched no tests: %s\n' "$filter" > "$FAILURE"
   fi
   [ "$matched" -eq 1 ]
 }
@@ -175,17 +226,17 @@ run_contracts() {
       if ! live_output="$(guard verb run failing-revert --confirm-within 1 --socket "$SOCKET" 2>&1)"; then
         printf '%s\n' "$live_output" >> "$RAW"
         printf 'live failing-revert verb did not enter the provisional state: %s\n' \
-          "$(printf '%s\n' "$live_output" | safe_error_line)" > /scenario/results/failure.txt
+          "$(printf '%s\n' "$live_output" | safe_error_line)" > "$FAILURE"
         return 1
       fi
       printf '%s\n' "$live_output" >> "$RAW"
       sleep 5
       guard provisionals --json --socket "$SOCKET" >>"$RAW" 2>&1 || {
-        printf 'caller could not inspect its own live provisional\n' > /scenario/results/failure.txt
+        printf 'caller could not inspect its own live provisional\n' > "$FAILURE"
         return 1
       }
       grep -q 'revert_failed' "$RAW" || {
-        printf 'live failing revert did not surface revert_failed\n' > /scenario/results/failure.txt
+        printf 'live failing revert did not surface revert_failed\n' > "$FAILURE"
         return 1
       }
       ;;
@@ -197,7 +248,7 @@ run_contracts() {
       if ! live_output="$(guard verb run ssh-diagnose --socket "$SOCKET" 2>&1)"; then
         printf '%s\n' "$live_output" >> "$RAW"
         printf 'current versioned client failed against the isolated daemon: %s\n' \
-          "$(printf '%s\n' "$live_output" | safe_error_line)" > /scenario/results/failure.txt
+          "$(printf '%s\n' "$live_output" | safe_error_line)" > "$FAILURE"
         return 1
       fi
       printf '%s\n' "$live_output" >> "$RAW"
@@ -218,6 +269,8 @@ capture_phase() {
   set -e
   printf '%s\n' "$output" > "/scenario/journey/$name.out"
   printf '%s\n' "$status" > "/scenario/journey/$name.status"
+  printf '%s\n' "$output" > "$PHASE_OUTPUT/$name.out"
+  printf '%s\n' "$status" > "$PHASE_OUTPUT/$name.status"
   printf 'phase=%s uid=%s exit=%s\n%s\n' "$name" "$(id -u)" "$status" "$output" >> "$RAW"
   return "$status"
 }
@@ -233,6 +286,9 @@ capture_stdout_phase() {
   set -e
   printf '%s\n' "$output" > "/scenario/journey/$name.out"
   printf '%s\n' "$status" > "/scenario/journey/$name.status"
+  printf '%s\n' "$output" > "$PHASE_OUTPUT/$name.out"
+  printf '%s\n' "$status" > "$PHASE_OUTPUT/$name.status"
+  cp "$stderr_file" "$PHASE_OUTPUT/$name.stderr"
   printf 'phase=%s uid=%s exit=%s stdout\n%s\nstderr\n%s\n' \
     "$name" "$(id -u)" "$status" "$output" "$(cat "$stderr_file")" >> "$RAW"
   return "$status"
@@ -248,6 +304,7 @@ capture_mcp_denial() {
   status=$?
   set -e
   printf '%s\n' "$output" > /scenario/journey/maintenance-mcp.out
+  printf '%s\n' "$output" > "$PHASE_OUTPUT/maintenance-mcp.out"
   printf 'phase=maintenance-mcp uid=%s exit=%s\n%s\n' "$(id -u)" "$status" "$output" >> "$RAW"
   [ "$status" -eq 0 ]
 }
@@ -265,16 +322,18 @@ response_target() {
 }
 
 require_request_guidance() {
+  # Requester-facing guidance is audience-gated: the literal approve command
+  # is operator-only, so its presence here would be an authority leak.
   local file="$1" handle="$2"
-  grep -Fq "guard access approve $handle" "$file"
-  grep -Fq "guard access approve $handle --once" "$file"
-  grep -Fq "guard access approve $handle --uses 3" "$file"
+  grep -Fq "ask your admin to approve request $handle" "$file"
+  grep -Fq "guard access show $handle" "$file"
+  ! grep -Fq "guard access approve $handle" "$file"
 }
 
 require_hold_guidance() {
   local file="$1" handle="$2"
-  grep -Fq "guard access approve $handle --once" "$file"
-  ! grep -Fq "guard access approve $handle --uses" "$file"
+  grep -Fq "ask your admin to approve request $handle" "$file"
+  ! grep -Fq "guard access approve $handle" "$file"
 }
 
 save_request() {
@@ -383,13 +442,14 @@ private_daemon_start() {
       --no-llm \
       --gate consequence \
       --socket "$PRIVATE_SOCKET" \
-      --verbs /etc/guard/verbs.yaml \
+      --verbs "$PROTECTED_CATALOG" \
       --state-db "$PRIVATE_ROOT/data/state.db" \
       --audit-log "$PRIVATE_ROOT/data/audit.jsonl" \
       --history-retention 3600 \
       --child-env KUBECONFIG \
       --users 1001,1002 \
-      > "$PRIVATE_ROOT/log/$log_name.log" 2>&1 < /dev/null &
+      --admin-token-stdin \
+      > "$PRIVATE_ROOT/log/$log_name.log" 2>&1 < /scenario/run/admin.token &
   pid=$!
   printf '%s\n' "$pid" > "$PRIVATE_ROOT/run/daemon.pid"
   for _ in $(seq 1 100); do
@@ -433,7 +493,7 @@ phase_su13() {
   case "$phase" in
     request)
       [ "$(id -u)" -eq 1001 ]
-      sha256sum /etc/guard/verbs.yaml | awk '{print $1}' > /scenario/journey/catalog.before
+      sha256sum "$PROTECTED_CATALOG" | awk '{print $1}' > /scenario/journey/catalog.before
       save_request synthesized 'Run the isolated novel diagnostic'
       grep -q 'novelctl' /scenario/journey/synthesized-request.out
       ;;
@@ -462,8 +522,16 @@ phase_su13() {
       capture_phase synthesized-execution-approve \
         guard access approve "$handle" --once --json
       grep -q '"success": true' /scenario/journey/synthesized-execution-approve.out
-      grep -q 'approved and executed' /scenario/journey/synthesized-execution-approve.out
-      grep -q 'exit Some(0)' /scenario/journey/synthesized-execution-approve.out
+      grep -q '"state": "armed"' /scenario/journey/synthesized-execution-approve.out
+      ! grep -q 'novel-diagnostic:healthy' /scenario/journey/synthesized-execution-approve.out
+      ;;
+    resume-execution)
+      [ "$(id -u)" -eq 1001 ]
+      handle="$(read_handle synthesized-execution)"
+      capture_phase synthesized-execution-resume guard resume "$handle" --json
+      grep -q '"type": "resume_result"' /scenario/journey/synthesized-execution-resume.out
+      grep -q '"exit_code": 0' /scenario/journey/synthesized-execution-resume.out
+      grep -q 'novel-diagnostic:healthy' /scenario/journey/synthesized-execution-resume.out
       ;;
     isolate)
       [ "$(id -u)" -eq 1002 ]
@@ -489,10 +557,11 @@ phase_su13() {
       expect_failure synthesized-revoked-hold-approve \
         guard access approve "$handle" --once --json
       grep -q '"success": false' /scenario/journey/synthesized-revoked-hold-approve.out
-      grep -Eq 'expired|revoked' /scenario/journey/synthesized-revoked-hold-approve.out
-      capture_phase synthesized-revoked-hold-deny \
-        guard access deny "$handle" --reason 'originating access revoked' --json
-      grep -q '"state": "denied"' /scenario/journey/synthesized-revoked-hold-deny.out
+      grep -q '"state": "denied"' /scenario/journey/synthesized-revoked-hold-approve.out
+      capture_phase synthesized-revoked-hold-show guard access show "$handle" --json
+      grep -q '"state": "denied"' /scenario/journey/synthesized-revoked-hold-show.out
+      grep -q 'originating access session was revoked' \
+        /scenario/journey/synthesized-revoked-hold-show.out
       ;;
     after-revoke)
       [ "$(id -u)" -eq 1001 ]
@@ -501,19 +570,19 @@ phase_su13() {
       ;;
     verify)
       [ "$(id -u)" -eq 1000 ]
-      sha256sum /etc/guard/verbs.yaml | awk '{print $1}' > /scenario/journey/catalog.after
+      sha256sum "$PROTECTED_CATALOG" | awk '{print $1}' > /scenario/journey/catalog.after
       cmp /scenario/journey/catalog.before /scenario/journey/catalog.after
       run_test_filter synthesized_verbs_default_to_session_scope
       run_test_filter legacy_session_revision_fixture_is_stable
       record_result passed 'intended policy' \
-        'live prose synthesis stayed inert until access and immutable execution approval, remained principal-scoped across restart, left the operator catalog unchanged, and failed closed after revoke'
+        'live prose synthesis stayed inert until access, operator arming, and requester resume; it remained principal-scoped across restart, left the operator catalog unchanged, and failed closed after revoke'
       ;;
     *) return 2 ;;
   esac
 }
 
 phase_su14() {
-  local phase="$1" handle retry other session bearer
+  local phase="$1" handle retry other session bearer replay_handle
   case "$phase" in
     request)
       [ "$(id -u)" -eq 1001 ]
@@ -557,7 +626,10 @@ PY
       bearer="$(sed -n '1p' /scenario/journey/exposed-owner.bearer)"
       export GUARD_SESSION="$bearer"
       expect_failure replay-bearer guard run --json helm list --namespace access-fixture
-      grep -q 'session principal mismatch' /scenario/journey/replay-bearer.out
+      grep -q '"allowed": false' /scenario/journey/replay-bearer.out
+      replay_handle="$(response_handle /scenario/journey/replay-bearer.out)"
+      [ -n "$replay_handle" ]
+      [ "$replay_handle" != "$handle" ]
       ! grep -q 'fixture-release' /scenario/journey/replay-bearer.out
       unset GUARD_SESSION
       save_request other 'Inspect the fake SSH service'
@@ -590,7 +662,7 @@ PY
 
 phase_su15() {
   local phase="$1" maintenance delete denied_handle retry_handle hold denied_hold
-  local approved_snapshot_count approved_execution_count denied_execution_count
+  local approved_snapshot_count approved_claim_count approved_completion_count denied_execution_count
   case "$phase" in
     deny)
       [ "$(id -u)" -eq 1001 ]
@@ -601,10 +673,9 @@ phase_su15() {
       require_request_guidance /scenario/journey/maintenance-denied.out "$denied_handle"
       capture_mcp_denial
       grep -Fq '"allowed":false' /scenario/journey/maintenance-mcp.out
-      grep -Fq "\`guard access approve $denied_handle\`" /scenario/journey/maintenance-mcp.out
-      grep -Fq "\`guard access approve $denied_handle --once\`" /scenario/journey/maintenance-mcp.out
-      grep -Fq "\`guard access approve $denied_handle --uses 3\`" /scenario/journey/maintenance-mcp.out
-      grep -Fq "\`guard access show $denied_handle\`" /scenario/journey/maintenance-mcp.out
+      grep -Fq "ask your admin to approve request $denied_handle" /scenario/journey/maintenance-mcp.out
+      ! grep -Fq "guard access approve $denied_handle" /scenario/journey/maintenance-mcp.out
+      grep -Fq "guard access show $denied_handle" /scenario/journey/maintenance-mcp.out
       expect_failure maintenance-retry guard run --json hostctl apply /scenario/fixtures/access-maintenance-applied
       retry_handle="$(response_handle /scenario/journey/maintenance-retry.out)"
       [ "$retry_handle" = "$denied_handle" ]
@@ -636,26 +707,46 @@ phase_su15() {
       require_hold_guidance /scenario/journey/denied-held.out "$denied_hold"
       [ -d /scenario/fixtures/staging ]
       ;;
-    verify)
+    approve-held)
       [ "$(id -u)" -eq 1000 ]
       hold="$(read_handle hold)"
       capture_phase approve-held guard access approve "$hold" --once --json
       grep -q '"success": true' /scenario/journey/approve-held.out
-      grep -q '"state": "approved"' /scenario/journey/approve-held.out
+      grep -q '"state": "armed"' /scenario/journey/approve-held.out
+      [ -d /scenario/fixtures/staging ]
+      ;;
+    resume-held)
+      [ "$(id -u)" -eq 1001 ]
+      hold="$(read_handle hold)"
+      capture_phase resume-held guard resume "$hold" --json
+      grep -q '"type": "resume_result"' /scenario/journey/resume-held.out
+      grep -q '"exit_code": 0' /scenario/journey/resume-held.out
       [ ! -d /scenario/fixtures/staging ]
+      ;;
+    verify)
+      [ "$(id -u)" -eq 1000 ]
+      hold="$(read_handle hold)"
       approved_snapshot_count="$(awk -v handle="$hold" \
         'index($0, "\"kind\":\"APPROVED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "\"cmd\":\"rm -rf /scenario/fixtures/staging\"") { count++ } END { print count + 0 }' \
         /scenario/data/audit.jsonl)"
       [ "$approved_snapshot_count" -eq 1 ]
-      approved_execution_count="$(awk -v handle="$hold" \
-        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") { count++ } END { print count + 0 }' \
+      approved_claim_count="$(awk -v handle="$hold" \
+        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "[\"phase\",\"requester_claimed\"]") { count++ } END { print count + 0 }' \
         /scenario/data/audit.jsonl)"
-      [ "$approved_execution_count" -eq 1 ]
+      [ "$approved_claim_count" -eq 1 ]
+      approved_completion_count="$(awk -v handle="$hold" \
+        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "[\"phase\",\"completed\"]") { count++ } END { print count + 0 }' \
+        /scenario/data/audit.jsonl)"
+      [ "$approved_completion_count" -eq 1 ]
       expect_failure replay-held guard access approve "$hold" --once --json
-      approved_execution_count="$(awk -v handle="$hold" \
-        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") { count++ } END { print count + 0 }' \
+      approved_claim_count="$(awk -v handle="$hold" \
+        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "[\"phase\",\"requester_claimed\"]") { count++ } END { print count + 0 }' \
         /scenario/data/audit.jsonl)"
-      [ "$approved_execution_count" -eq 1 ]
+      [ "$approved_claim_count" -eq 1 ]
+      approved_completion_count="$(awk -v handle="$hold" \
+        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "[\"phase\",\"completed\"]") { count++ } END { print count + 0 }' \
+        /scenario/data/audit.jsonl)"
+      [ "$approved_completion_count" -eq 1 ]
       denied_hold="$(read_handle denied-hold)"
       capture_phase deny-held guard access deny "$denied_hold" --reason 'fixture remains protected' --json
       grep -q '"state": "denied"' /scenario/journey/deny-held.out
@@ -667,7 +758,7 @@ phase_su15() {
       run_test_filter structured_guidance_preserves_access_commands_and_coverage_detail
       run_test_filter held_tool_text_returns_exact_access_commands
       record_result passed 'intended policy' \
-        'one immutable held snapshot was approved with --once and executed exactly once; a separate hold was denied without execution; denied, provisional, and structured results retained durable identifiers and exact operator commands'
+        'one immutable held snapshot was armed with --once and resumed exactly once by its requester; a separate hold was denied without execution; denied, provisional, and structured results retained durable identifiers and exact operator commands'
       ;;
     *) return 2 ;;
   esac
@@ -709,7 +800,7 @@ phase_su16() {
       [ "$(response_handle /scenario/journey/cross-cloud.out)" = "$(read_handle cloud)" ]
       expect_failure cross-file guard run --json cat /scenario/fixtures/operator-note
       [ "$(response_handle /scenario/journey/cross-file.out)" = "$(read_handle file)" ]
-      (cd /scenario/ansible && expect_failure cross-ansible guard run --json ansible-playbook site.yml --check --diff --limit access-fixture)
+      (cd /scenario/ansible && expect_failure cross-ansible guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
       [ "$(response_handle /scenario/journey/cross-ansible.out)" = "$(read_handle ansible)" ]
       expect_failure cross-api guard run --json fixture-api access-status
       [ "$(response_handle /scenario/journey/cross-api.out)" = "$(read_handle api)" ]
@@ -775,7 +866,7 @@ phase_su16() {
       grep -q 'use limit is exhausted' /scenario/journey/command-third.out
       capture_phase cloud-use guard run --json cloudstack list virtualmachines zoneid=access-fixture-zone
       capture_phase file-use guard run --json cat /scenario/fixtures/operator-note
-      (cd /scenario/ansible && capture_phase ansible-use guard run --json ansible-playbook site.yml --check --diff --limit access-fixture)
+      (cd /scenario/ansible && capture_phase ansible-use guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
       printf '%s' synthetic-fixture-token | guard secrets add fixture/api-token >> "$RAW" 2>&1
       capture_phase api-use guard run --json fixture-api access-status
       grep -q 'fixture-api:healthy' /scenario/journey/api-use.out
@@ -1246,7 +1337,7 @@ phase_su22() {
         timeout 5 "$PRIVATE_ROOT/current" server start --no-llm \
           --gate consequence \
           --socket "$PRIVATE_ROOT/not-a-directory/guard.sock" \
-          --verbs /etc/guard/verbs.yaml \
+          --verbs "$PROTECTED_CATALOG" \
           --state-db "$PRIVATE_ROOT/data/state.db" \
           --audit-log "$PRIVATE_ROOT/data/audit.jsonl" \
           --users 1001,1002 \
@@ -1315,8 +1406,9 @@ phase_su22() {
 
 run_phase() {
   export GUARD_SOCKET="$SOCKET"
-  RAW="/scenario/raw/$SCENARIO-$(id -u).log"
-  trap 'printf "phase=%s line=%s\n" "${3:-unknown}" "$LINENO" > /scenario/results/failure.txt' ERR
+  prepare_principal_output
+  RAW="$PHASE_OUTPUT/$SCENARIO.log"
+  trap 'printf "phase=%s line=%s\n" "${3:-unknown}" "$LINENO" > "$FAILURE"' ERR
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
   case "$SCENARIO" in
     SU-13) phase_su13 "$3" ;;
@@ -1398,9 +1490,109 @@ run() {
     return 0
   fi
   record_result failed "Guard defect, fixture defect, or underlying-tool failure pending reduction" \
-    "$(sed -n '1p' /scenario/results/failure.txt 2>/dev/null || printf 'the deterministic reproducer failed')"
+    "$(sed -n '1p' "$FAILURE" 2>/dev/null || printf 'the deterministic reproducer failed')"
   echo "$SCENARIO: failed" >&2
   return 1
+}
+
+prepare_principal_output() {
+  [ -d "$PRINCIPAL_ROOT" ] && [ -O "$PRINCIPAL_ROOT" ]
+  [ -d "$PHASE_OUTPUT" ] && [ -d "$(dirname "$RESULT")" ]
+  umask 022
+}
+
+prepare_principals() {
+  local uid root
+  [ "$(id -u)" -eq 0 ]
+  setup_fixture
+  for uid in 1000 1001 1002; do
+    root="/scenario/principals/$uid"
+    mkdir -p "$root/phase-output" "$root/results"
+    chmod 0710 "$root"
+    chmod 0750 "$root/phase-output" "$root/results"
+    chown -R "$uid:0" "$root"
+  done
+  mkdir -p "$COLLECTOR_RESULTS" "$COLLECTOR_PHASES"
+  # The operator persona (uid 1000) is the only principal that can read the
+  # admin token; the daemon receives it through stdin, and uids 1001/1002
+  # hold neither the file nor the value.
+  printf 'synthetic-operator-token\n' > /scenario/run/admin.token
+  chmod 0400 /scenario/run/admin.token
+  chown 1000:0 /scenario/run/admin.token
+  chown -R 0:0 "$COLLECTOR_ROOT"
+  chmod 0700 "$COLLECTOR_ROOT" "$COLLECTOR_RESULTS" "$COLLECTOR_PHASES"
+  chown -R 1000:1000 /scenario/home /scenario/config /scenario/data /scenario/raw \
+    /scenario/fixtures /scenario/bin /scenario/ansible /scenario/run
+  chown 1000:1000 /scenario
+
+  # Keep the operator catalog immutable while giving DestinationLock a
+  # daemon-owned writable sidecar on the mounted scenario volume.
+  mkdir -p "$PROTECTED_CATALOG_DIR"
+  cp /etc/guard/verbs.yaml "$PROTECTED_CATALOG"
+  chown 0:0 "$PROTECTED_CATALOG_DIR" "$PROTECTED_CATALOG"
+  chmod 0644 "$PROTECTED_CATALOG"
+  install -m 0600 /dev/null "$PROTECTED_CATALOG_LOCK"
+  chown 1000:1000 "$PROTECTED_CATALOG_LOCK"
+  chmod 0555 "$PROTECTED_CATALOG_DIR"
+
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_DIR")" = '0:555' ]
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG")" = '0:644' ]
+  [ "$(stat -c '%u:%a' "$PROTECTED_CATALOG_LOCK")" = '1000:600' ]
+  [ "$(stat -c '%u:%a' /scenario/journey)" = '0:1777' ]
+  [ "$(sha256sum "$PROTECTED_CATALOG" | awk '{print $1}')" = \
+    "$(sha256sum /etc/guard/verbs.yaml | awk '{print $1}')" ]
+}
+
+collect_phase() {
+  local scenario="$2" uid="$3" phase="$4" status="$5" source destination
+  [ "$(id -u)" -eq 0 ]
+  source="/scenario/principals/$uid/phase-output"
+  destination="$COLLECTOR_PHASES/$scenario/$uid/$phase"
+  [ -d "$source" ]
+  mkdir -p "$COLLECTOR_PHASES/$scenario/$uid"
+  mkdir "$destination"
+  find "$source" -maxdepth 1 -type f -exec cp {} "$destination"/ \;
+  find "$destination" -maxdepth 1 -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum \
+    > "$destination.sha256"
+  printf 'scenario=%s uid=%s phase=%s runner_exit=%s\n' \
+    "$scenario" "$uid" "$phase" "$status" >> "$destination.sha256"
+}
+
+collect_result() {
+  local scenario="$2" expected="$3" candidate temporary phase_manifest phase_digest
+  local -a candidates=()
+  local uid
+  [ "$(id -u)" -eq 0 ]
+  for uid in 1000 1001 1002; do
+    candidate="/scenario/principals/$uid/results/$scenario.md"
+    if [ -f "$candidate" ]; then
+      candidates+=("$candidate")
+    fi
+  done
+  temporary="$(mktemp "$COLLECTOR_RESULTS/.${scenario}.XXXXXX")"
+  if [ "$expected" = passed ] && [ "${#candidates[@]}" -eq 1 ] \
+    && grep -Fqx -- "# $scenario" "${candidates[0]}" \
+    && grep -Fqx -- '- Result: passed' "${candidates[0]}"; then
+    head -c 131072 "${candidates[0]}" > "$temporary"
+  else
+    {
+      echo "# $scenario"
+      echo
+      echo "- Result: failed"
+      echo "- Classification: fixture defect"
+      echo "- Evidence: the root collector did not receive one matching successful candidate result"
+      echo "- Isolation: rootless container, private daemon/socket/database/fixtures/principal/network namespace, network disabled"
+      echo "- Raw transcript: retained only in the ephemeral scenario volume and removed during teardown"
+    } > "$temporary"
+  fi
+  phase_manifest="$COLLECTOR_ROOT/$scenario.phase-output.sha256"
+  find "$COLLECTOR_PHASES/$scenario" -type f -name '*.sha256' -print0 2>/dev/null \
+    | LC_ALL=C sort -z | xargs -0 -r sha256sum > "$phase_manifest"
+  phase_digest="$(sha256sum "$phase_manifest" | cut -d ' ' -f 1)"
+  printf '%s\n' "- Principal phase output digest: \`$phase_digest\`" >> "$temporary"
+  printf '%s\n' '- Final result: finalized by the root collector' >> "$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$COLLECTOR_RESULTS/$scenario.md"
 }
 
 case "${1:-}" in
@@ -1409,8 +1601,20 @@ case "${1:-}" in
   phase) run_phase "$@" ;;
   failure)
     record_result failed 'Guard defect, fixture defect, or underlying-tool failure pending reduction' \
-      "$(sed -n '1p' /scenario/results/failure.txt 2>/dev/null || printf 'a live role-separated journey phase failed')"
+      "$(sed -n '1p' "$FAILURE" 2>/dev/null || printf 'a live role-separated journey phase failed')"
     ;;
   postcheck) postcheck ;;
+  prepare-principals)
+    [ "$(id -u)" -eq 0 ] || { echo 'prepare-principals requires container root' >&2; exit 2; }
+    prepare_principals
+    ;;
+  collect-phase)
+    [ "$(id -u)" -eq 0 ] || { echo 'collect-phase requires container root' >&2; exit 2; }
+    collect_phase "$@"
+    ;;
+  collect-result)
+    [ "$(id -u)" -eq 0 ] || { echo 'collect-result requires container root' >&2; exit 2; }
+    collect_result "$@"
+    ;;
   *) echo "usage: synthetic-user.sh daemon|run|phase SCENARIO [PHASE]" >&2; exit 2 ;;
 esac

@@ -26,14 +26,20 @@ const VERB_LIST_TOOL_NAME: &str = "guard_verbs";
 const ACCESS_REQUEST_TOOL_NAME: &str = "guard_access_request";
 const APPROVAL_LIST_TOOL_NAME: &str = "guard_access_list";
 const EVALUATE_BATCH_TOOL_NAME: &str = "guard_evaluate_batch";
-const SESSION_STATUS_TOOL_NAME: &str = "guard_access_show";
+const ACCESS_SHOW_TOOL_NAME: &str = "guard_access_show";
+const ACCESS_STATUS_TOOL_NAME: &str = "guard_access_status";
+const APPROVAL_SHOW_TOOL_NAME: &str = "guard_approval_show";
+const APPROVAL_RESUME_TOOL_NAME: &str = "guard_approval_resume";
 const BUILT_IN_TOOL_NAMES: &[&str] = &[
     DEFAULT_TOOL_NAME,
     VERB_LIST_TOOL_NAME,
     ACCESS_REQUEST_TOOL_NAME,
     APPROVAL_LIST_TOOL_NAME,
     EVALUATE_BATCH_TOOL_NAME,
-    SESSION_STATUS_TOOL_NAME,
+    ACCESS_SHOW_TOOL_NAME,
+    ACCESS_STATUS_TOOL_NAME,
+    APPROVAL_SHOW_TOOL_NAME,
+    APPROVAL_RESUME_TOOL_NAME,
 ];
 const TOOL_SCHEMA_VERSION: u64 = 1;
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26", "2024-11-05"];
@@ -45,6 +51,8 @@ const MAX_HTTP_BODY: usize = 1024 * 1024;
 const MAX_HTTP_SESSIONS: usize = 1024;
 const MAX_MCP_REQUEST_IDS: usize = 16 * 1024;
 const HTTP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Clone, Debug)]
 pub struct McpConfig {
@@ -59,6 +67,8 @@ pub struct McpConfig {
     /// Bearer token required on every HTTP request. Mandatory whenever
     /// `http_addr` is set; there is no unauthenticated network transport.
     pub http_token: Option<String>,
+    /// Deadline for one buffered daemon execute or admin round trip.
+    pub client_timeout_secs: u64,
 }
 
 impl McpConfig {
@@ -67,8 +77,15 @@ impl McpConfig {
             bail!("no guard server configured for MCP (set a socket or TCP port)");
         }
 
+        if self.socket_path.is_some() && self.tcp_port.is_some() {
+            bail!("configure exactly one MCP daemon endpoint (socket or TCP port)");
+        }
+
         if self.tool_name.trim().is_empty() {
             bail!("MCP tool name cannot be empty");
+        }
+        if self.client_timeout_secs == 0 {
+            bail!("GUARD_CLIENT_TIMEOUT_SECS must be greater than zero");
         }
 
         if self.tool_name != DEFAULT_TOOL_NAME
@@ -115,6 +132,7 @@ impl Default for McpConfig {
             tool_name: DEFAULT_TOOL_NAME.to_string(),
             http_addr: None,
             http_token: None,
+            client_timeout_secs: DEFAULT_CLIENT_TIMEOUT_SECS,
         }
     }
 }
@@ -123,8 +141,8 @@ impl Default for McpConfig {
 // arguments) live in the library crate (`guard::wire::mcp`) so their parsing
 // surface can be fuzzed.
 use guard::wire::mcp::{
-    parse_jsonrpc_envelope, AccessShowArgs, EvaluateBatchArgs, GuardToolArgs, JsonRpcEnvelopeError,
-    ToolCallParams, WaitApproval,
+    parse_jsonrpc_envelope, AccessShowArgs, ApprovalArgs, EvaluateBatchArgs, GuardToolArgs,
+    JsonRpcEnvelopeError, ToolCallParams, WaitApproval,
 };
 
 #[derive(Debug, Clone)]
@@ -138,6 +156,10 @@ struct GuardToolResponse {
     status: Option<String>,
     /// Handle for a held/provisional command.
     handle: Option<String>,
+    confirm_deadline_unix: Option<u64>,
+    confirm_window_secs: Option<u64>,
+    auto_revert_durable: Option<bool>,
+    containment_failure: Option<server::ContainmentFailure>,
     approval_options: Vec<String>,
     access_requests: Vec<server::AccessRequestGuidance>,
     /// Honest statement of what the gate checked and did not check.
@@ -172,6 +194,10 @@ impl From<server::ExecuteResponse> for GuardToolResponse {
                 .to_string()
             }),
             handle: response.handle,
+            confirm_deadline_unix: response.confirm_deadline_unix,
+            confirm_window_secs: response.confirm_window_secs,
+            auto_revert_durable: response.auto_revert_durable,
+            containment_failure: response.containment_failure,
             approval_options: response.approval_options,
             access_requests: response.access_requests,
             verb_matches: response.verb_matches,
@@ -193,6 +219,10 @@ trait GuardExecutor: Send + Sync {
 #[async_trait]
 trait GuardAdmin: Send + Sync {
     async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse>;
+
+    async fn probe_endpoint(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -201,6 +231,7 @@ struct ClientExecutor {
     tcp_port: Option<u16>,
     auth_token: Option<String>,
     session_token: Option<String>,
+    client_timeout: Duration,
 }
 
 impl ClientExecutor {
@@ -220,10 +251,15 @@ impl ClientExecutor {
 #[async_trait]
 impl GuardAdmin for ClientExecutor {
     async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse> {
-        self.admin_client()
-            .send_admin(request)
+        let client = self.admin_client();
+        tokio::time::timeout(self.client_timeout, client.send_admin(request))
             .await
+            .map_err(|_| client_timeout_error("admin request", self.client_timeout, false))?
             .context("failed to query guard daemon")
+    }
+
+    async fn probe_endpoint(&self) -> Result<()> {
+        daemon_client::probe_endpoint(self.socket_path.as_deref(), self.tcp_port).await
     }
 }
 
@@ -295,13 +331,37 @@ impl GuardExecutor for ClientExecutor {
             });
         }
 
-        let response = client
-            .execute_with_injections(&args.binary, &args.args, env, secrets, args.secret_files)
-            .await
-            .context("failed to execute command through guard server")?;
+        let response = tokio::time::timeout(
+            self.client_timeout,
+            client.execute_with_injections(
+                &args.binary,
+                &args.args,
+                env,
+                secrets,
+                args.secret_files,
+            ),
+        )
+        .await
+        .map_err(|_| client_timeout_error("execute request", self.client_timeout, true))?
+        .context("failed to execute command through guard server")?;
 
         Ok(response.into())
     }
+}
+
+fn client_timeout_error(
+    operation: &str,
+    timeout: Duration,
+    execution_may_continue: bool,
+) -> anyhow::Error {
+    let continuation = if execution_may_continue {
+        "; buffered daemon execution may continue after the MCP client stops waiting"
+    } else {
+        ""
+    };
+    anyhow::anyhow!(
+        "guard daemon {operation} exceeded the client deadline of {timeout:?} (GUARD_CLIENT_TIMEOUT_SECS){continuation}"
+    )
 }
 
 fn guard_tool_secret_map(
@@ -338,16 +398,23 @@ struct JsonRpcError {
 pub async fn serve(config: McpConfig) -> Result<()> {
     config.validate()?;
 
-    let expose_admin_tools = config.socket_path.is_some() && config.tcp_port.is_none();
     let executor = Arc::new(ClientExecutor {
         socket_path: config.socket_path.clone(),
         tcp_port: config.tcp_port,
         auth_token: config.auth_token.clone(),
         session_token: config.session_token.clone(),
+        client_timeout: Duration::from_secs(config.client_timeout_secs),
     });
+    let surface = probe_mcp_surface(executor.as_ref(), &config).await;
     let server = McpServer::new(executor.clone(), executor, config.tool_name)
         .with_caller_token(config.session_token)
-        .with_admin_tools(expose_admin_tools);
+        .with_endpoint_available(surface.endpoint_available)
+        .with_admin_tools(surface.admin_tools)
+        .with_execute_admin_tools(surface.execute_admin_tools)
+        .with_approval_consequence_tools(surface.approval_consequence_tools)
+        .with_http_transport(config.http_addr.is_some())
+        .with_tcp_backend(config.tcp_port.is_some())
+        .with_diagnostics(surface.diagnostics);
 
     match config.http_addr {
         Some(addr) => {
@@ -358,6 +425,218 @@ pub async fn serve(config: McpConfig) -> Result<()> {
             serve_http(server, addr, token).await
         }
         None => serve_stdio(server).await,
+    }
+}
+
+const APPROVAL_CONSEQUENCES_CAPABILITY: &str = "approval-consequences-v1";
+
+#[derive(Clone)]
+struct McpSurface {
+    endpoint_available: bool,
+    admin_tools: bool,
+    execute_admin_tools: bool,
+    approval_consequence_tools: bool,
+    diagnostics: McpDiagnostics,
+}
+
+#[derive(Clone)]
+struct McpDiagnostics {
+    capability_membership: &'static str,
+    capability_state: &'static str,
+    detected_version: Option<String>,
+    detected_capabilities: Vec<String>,
+    endpoint_state: &'static str,
+    endpoint_reason: &'static str,
+    admin_state: &'static str,
+    admin_reason: &'static str,
+}
+
+impl McpDiagnostics {
+    fn record(&self) {
+        tracing::debug!(
+            capability_membership = self.capability_membership,
+            capability_state = self.capability_state,
+            detected_version = self.detected_version.as_deref().unwrap_or("null"),
+            detected_capabilities = ?self.detected_capabilities,
+            endpoint_state = self.endpoint_state,
+            endpoint_reason = self.endpoint_reason,
+            admin_state = self.admin_state,
+            admin_reason = self.admin_reason,
+            "cached MCP daemon probe"
+        );
+    }
+}
+
+async fn probe_mcp_surface<A: GuardAdmin>(executor: &A, config: &McpConfig) -> McpSurface {
+    let endpoint_malformed = config
+        .socket_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+        || config.tcp_port == Some(0);
+    if endpoint_malformed {
+        let diagnostics = McpDiagnostics {
+            capability_membership: "unknown",
+            capability_state: "not_observed",
+            detected_version: None,
+            detected_capabilities: Vec::new(),
+            endpoint_state: "malformed",
+            endpoint_reason: "sole_endpoint_malformed",
+            admin_state: "endpoint_unavailable",
+            admin_reason: "endpoint_unavailable",
+        };
+        diagnostics.record();
+        return McpSurface {
+            endpoint_available: false,
+            admin_tools: false,
+            execute_admin_tools: false,
+            approval_consequence_tools: false,
+            diagnostics,
+        };
+    }
+
+    if !matches!(
+        tokio::time::timeout(MCP_PROBE_TIMEOUT, executor.probe_endpoint()).await,
+        Ok(Ok(()))
+    ) {
+        let diagnostics = McpDiagnostics {
+            capability_membership: "unknown",
+            capability_state: "not_observed",
+            detected_version: None,
+            detected_capabilities: Vec::new(),
+            endpoint_state: "unavailable",
+            endpoint_reason: "sole_endpoint_unavailable",
+            admin_state: "endpoint_unavailable",
+            admin_reason: "endpoint_unavailable",
+        };
+        diagnostics.record();
+        return McpSurface {
+            endpoint_available: false,
+            admin_tools: false,
+            execute_admin_tools: false,
+            approval_consequence_tools: false,
+            diagnostics,
+        };
+    }
+
+    let ping = tokio::time::timeout(
+        MCP_PROBE_TIMEOUT,
+        executor.send_admin(server::AdminRequest::Ping),
+    )
+    .await;
+    let (capability, mut diagnostics) = match ping {
+        Ok(Ok(server::AdminResponse::Ping {
+            version,
+            capabilities,
+            ..
+        })) => {
+            let capability = capabilities
+                .iter()
+                .any(|value| value == APPROVAL_CONSEQUENCES_CAPABILITY);
+            (
+                capability,
+                McpDiagnostics {
+                    capability_membership: if capability { "member" } else { "absent" },
+                    capability_state: if capability {
+                        "capable"
+                    } else {
+                        "capability_absent"
+                    },
+                    detected_version: Some(version),
+                    detected_capabilities: capabilities,
+                    endpoint_state: "reachable",
+                    endpoint_reason: "endpoint_reachable",
+                    admin_state: "unsupported_tcp",
+                    admin_reason: "tcp_mcp_admin_unsupported",
+                },
+            )
+        }
+        Ok(Ok(_)) => (
+            false,
+            McpDiagnostics {
+                capability_membership: "unknown",
+                capability_state: "ping_malformed",
+                detected_version: Some("unknown".to_string()),
+                detected_capabilities: Vec::new(),
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "unsupported_tcp",
+                admin_reason: "tcp_mcp_admin_unsupported",
+            },
+        ),
+        Ok(Err(_)) => (
+            false,
+            McpDiagnostics {
+                capability_membership: "unknown",
+                capability_state: "ping_unavailable",
+                detected_version: None,
+                detected_capabilities: Vec::new(),
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "unsupported_tcp",
+                admin_reason: "tcp_mcp_admin_unsupported",
+            },
+        ),
+        Err(_) => (
+            false,
+            McpDiagnostics {
+                capability_membership: "unknown",
+                capability_state: "ping_unavailable",
+                detected_version: None,
+                detected_capabilities: Vec::new(),
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "unsupported_tcp",
+                admin_reason: "tcp_mcp_admin_unsupported",
+            },
+        ),
+    };
+
+    if config.tcp_port.is_some() {
+        diagnostics.record();
+        return McpSurface {
+            endpoint_available: true,
+            admin_tools: false,
+            execute_admin_tools: false,
+            approval_consequence_tools: false,
+            diagnostics,
+        };
+    }
+
+    let admin_probe = tokio::time::timeout(
+        MCP_PROBE_TIMEOUT,
+        executor.send_admin(server::AdminRequest::AccessList),
+    )
+    .await;
+    let admin_tools = matches!(
+        admin_probe,
+        Ok(Ok(server::AdminResponse::AccessItems { .. }))
+    );
+
+    diagnostics.admin_state = if admin_tools {
+        "reachable"
+    } else {
+        "endpoint_unavailable"
+    };
+    diagnostics.admin_reason = if admin_tools {
+        "unix_admin_handshake"
+    } else {
+        "unix_admin_probe_failed"
+    };
+    diagnostics.record();
+
+    McpSurface {
+        // A failed Unix self-scoped probe produces an empty surface even when
+        // the preceding Ping reached the socket. Keep the endpoint and admin
+        // failure indistinguishable to callers, as required by the MCP
+        // contract.
+        endpoint_available: admin_tools,
+        admin_tools,
+        // Resuming a hold executes an operator-approved snapshot. The daemon
+        // authenticates this MCP process's peer credentials, not the HTTP
+        // caller's bearer, so this remains stdio-only.
+        execute_admin_tools: admin_tools && config.http_addr.is_none() && capability,
+        approval_consequence_tools: admin_tools && capability,
+        diagnostics,
     }
 }
 
@@ -825,6 +1104,12 @@ struct McpServer<E: GuardExecutor, A: GuardAdmin> {
     admin: Arc<A>,
     tool_name: String,
     admin_tools: bool,
+    execute_admin_tools: bool,
+    approval_consequence_tools: bool,
+    endpoint_available: bool,
+    http_transport: bool,
+    tcp_backend: bool,
+    diagnostics: McpDiagnostics,
     initialize_seen: bool,
     seen_request_ids: HashSet<String>,
     caller_token: Option<String>,
@@ -837,6 +1122,21 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
             admin,
             tool_name,
             admin_tools: true,
+            execute_admin_tools: true,
+            approval_consequence_tools: true,
+            endpoint_available: true,
+            http_transport: false,
+            tcp_backend: false,
+            diagnostics: McpDiagnostics {
+                capability_membership: "member",
+                capability_state: "capable",
+                detected_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                detected_capabilities: vec![APPROVAL_CONSEQUENCES_CAPABILITY.to_string()],
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "reachable",
+                admin_reason: "unix_admin_handshake",
+            },
             initialize_seen: false,
             seen_request_ids: HashSet::new(),
             caller_token: None,
@@ -853,12 +1153,48 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         self
     }
 
+    fn with_execute_admin_tools(mut self, execute_admin_tools: bool) -> Self {
+        self.execute_admin_tools = execute_admin_tools;
+        self
+    }
+
+    fn with_approval_consequence_tools(mut self, enabled: bool) -> Self {
+        self.approval_consequence_tools = enabled;
+        self
+    }
+
+    fn with_endpoint_available(mut self, available: bool) -> Self {
+        self.endpoint_available = available;
+        self
+    }
+
+    fn with_http_transport(mut self, http_transport: bool) -> Self {
+        self.http_transport = http_transport;
+        self
+    }
+
+    fn with_tcp_backend(mut self, tcp_backend: bool) -> Self {
+        self.tcp_backend = tcp_backend;
+        self
+    }
+
+    fn with_diagnostics(mut self, diagnostics: McpDiagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
     fn fresh_connection(&self) -> Self {
         Self {
             executor: self.executor.clone(),
             admin: self.admin.clone(),
             tool_name: self.tool_name.clone(),
             admin_tools: self.admin_tools,
+            execute_admin_tools: self.execute_admin_tools,
+            approval_consequence_tools: self.approval_consequence_tools,
+            endpoint_available: self.endpoint_available,
+            http_transport: self.http_transport,
+            tcp_backend: self.tcp_backend,
+            diagnostics: self.diagnostics.clone(),
             initialize_seen: false,
             seen_request_ids: HashSet::new(),
             caller_token: self.caller_token.clone(),
@@ -952,7 +1288,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                         ));
                     }
                 };
-                if tool_call.name == self.tool_name {
+                if self.endpoint_available && tool_call.name == self.tool_name {
                     let result = self.call_tool(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
                 } else if self.admin_tools && tool_call.name == VERB_LIST_TOOL_NAME {
@@ -967,16 +1303,31 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 } else if self.admin_tools && tool_call.name == EVALUATE_BATCH_TOOL_NAME {
                     let result = self.call_evaluate_batch(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
-                } else if self.admin_tools && tool_call.name == SESSION_STATUS_TOOL_NAME {
+                } else if self.admin_tools && tool_call.name == ACCESS_SHOW_TOOL_NAME {
+                    let result = self.call_access_show(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
+                } else if self.admin_tools
+                    && !self.http_transport
+                    && tool_call.name == ACCESS_STATUS_TOOL_NAME
+                {
                     let result = self.call_session_status(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
+                } else if self.admin_tools
+                    && self.approval_consequence_tools
+                    && !self.http_transport
+                    && tool_call.name == APPROVAL_SHOW_TOOL_NAME
+                {
+                    let result = self.call_approval_show(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
+                } else if self.execute_admin_tools
+                    && self.admin_tools
+                    && self.approval_consequence_tools
+                    && tool_call.name == APPROVAL_RESUME_TOOL_NAME
+                {
+                    let result = self.call_approval_resume(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
                 } else {
-                    jsonrpc_error_response(
-                        id,
-                        -32601,
-                        format!("unknown tool '{}'", tool_call.name),
-                        None,
-                    )
+                    self.unavailable_tool_response(id, &tool_call.name)
                 }
             }
             _ => jsonrpc_error_response(id, -32601, format!("method not found: {method}"), None),
@@ -989,6 +1340,84 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         if method == "notifications/initialized" && !self.initialize_seen {
             tracing::warn!("received initialized notification before initialize request");
         }
+    }
+
+    fn unavailable_tool_response(&self, id: Value, tool_name: &str) -> Value {
+        let (code, diagnostic, fallback) = if !self.endpoint_available {
+            let diagnostic = if self.diagnostics.endpoint_state == "reachable"
+                && self.diagnostics.admin_state == "endpoint_unavailable"
+                && self.diagnostics.admin_reason == "unix_admin_probe_failed"
+            {
+                "unix_admin_probe_failed"
+            } else {
+                "endpoint_unavailable"
+            };
+            (
+                "endpoint_unavailable",
+                diagnostic,
+                json!({
+                    "mode": "cli_only",
+                    "limitations": ["no MCP tools"]
+                }),
+            )
+        } else if self.tcp_backend && !self.admin_tools && tool_name != self.tool_name {
+            (
+                "feature_unavailable",
+                self.diagnostics.admin_reason,
+                json!({
+                    "mode": "cli_only",
+                    "command": "guard approval show <handle>",
+                    "limitations": ["no MCP status tool", "no MCP transcript", "no MCP wait", "no MCP resume"]
+                }),
+            )
+        } else if self.http_transport
+            && matches!(
+                tool_name,
+                ACCESS_STATUS_TOOL_NAME | APPROVAL_SHOW_TOOL_NAME | APPROVAL_RESUME_TOOL_NAME
+            )
+        {
+            (
+                "feature_unavailable",
+                "tool_not_available_for_transport",
+                json!({
+                    "mode": "cli_only",
+                    "limitations": ["no MCP status tool", "no MCP transcript", "no MCP resume"]
+                }),
+            )
+        } else if matches!(
+            tool_name,
+            APPROVAL_SHOW_TOOL_NAME | APPROVAL_RESUME_TOOL_NAME
+        ) && !self.approval_consequence_tools
+        {
+            (
+                "feature_unavailable",
+                self.diagnostics.capability_state,
+                json!({
+                    "mode": "cli_only",
+                    "command": "guard approval show <handle>",
+                    "limitations": ["no MCP wait", "no MCP resume"]
+                }),
+            )
+        } else {
+            (
+                "feature_unavailable",
+                "tool_not_available_for_transport",
+                json!({
+                    "mode": "cli_only",
+                    "limitations": ["tool is not listed on this MCP surface"]
+                }),
+            )
+        };
+        jsonrpc_error_response(
+            id,
+            -32601,
+            "requested MCP tool is unavailable".to_string(),
+            Some(json!({
+                "code": code,
+                "diagnostic": diagnostic,
+                "fallback": fallback,
+            })),
+        )
     }
 
     fn initialize_result(&self, params: &Value) -> Value {
@@ -1019,12 +1448,25 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
     }
 
     fn list_tools_result(&self) -> Value {
+        if !self.endpoint_available {
+            return json!({ "tools": [] });
+        }
+        let containment_failure_schema = json!({
+            "type": ["object", "null"],
+            "description": "Typed failure detail when containment could not truthfully report an armed timer.",
+            "properties": {
+                "kind": { "type": "string", "enum": ["forward_nonzero_exit", "forward_no_exit_code", "persistence_failure"] },
+                "command_may_have_run": { "type": "boolean" },
+                "forward_exit_code": { "type": ["integer", "null"] }
+            },
+            "required": ["kind", "command_may_have_run"]
+        });
         let mut result = json!({
             "tools": [
                 {
                     "name": self.tool_name,
                     "title": "Run Command Through Guard",
-                    "description": "Execute a command through the guard daemon. Provide binary (with optional args) for a raw command, or verb for a catalog verb invocation; one of the two is required. The command is evaluated against security policy before execution. Plain environment overrides and named secret references are optional; secret values are resolved by the daemon and never exposed to the client.",
+                    "description": "Execute a command through the guard daemon. Provide binary (with optional args) for a raw command, or verb for a catalog verb invocation; one of the two is required. The command is evaluated against security policy before execution. Plain environment overrides and named secret references are optional; secret values are resolved by the daemon and never exposed to the client. Branch on `status`, not on `allowed`: `held` and `provisional` are both `allowed: true` because the request was authorized, and `held` means it has not executed. A held command waits for an operator; retrieve its outcome with guard_approval_show.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1111,12 +1553,12 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             "exit_code": { "type": ["integer", "null"] },
                             "stdout": { "type": ["string", "null"] },
                             "stderr": { "type": ["string", "null"] },
-                            "status": { "type": ["string", "null"], "description": "Consequence-gate outcome: executed, provisional, held, reverted, or dry_run. Null means the legacy gate-off path returned a normal allow/deny result." },
-                            "handle": { "type": ["string", "null"], "description": "Null for an ordinary executed or dry-run result. A denied or held result may carry a durable access-request reference; a provisional result carries its containment handle." },
+                            "status": { "type": ["string", "null"], "description": "Consequence-gate outcome: executed, provisional, held, reverted, or dry_run. Null also covers a typed containment failure." },
+                            "handle": { "type": ["string", "null"], "description": "A denied or held durable request, provisional containment, or resolvable containment-recovery handle when applicable." },
                             "approval_options": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Exact operator commands for a denied or held request. A held command exposes the one-shot approval command; a denied request may expose ordinary, one-time, and bounded-use approval commands."
+                                "description": "Audience-correct approval guidance for a denied or held request. Operators receive exact commands; requesters are directed to their admin."
                             },
                             "access_requests": {
                                 "type": "array",
@@ -1131,7 +1573,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                                     },
                                     "required": ["reference", "approval_options"]
                                 },
-                                "description": "Every durable access request created by the decision, with exact operator commands for each independently scoped request."
+                                "description": "Every durable access request created by the decision, with audience-correct approval guidance for each independently scoped request."
                             },
                             "coverage": { "type": ["object", "null"], "description": "What the gate checked and deliberately did NOT check (checked / not_checked arrays). Surfaced for held/provisional/dry-run outcomes." },
                             "verb_matches": {
@@ -1266,7 +1708,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                     }
                 },
                 {
-                    "name": SESSION_STATUS_TOOL_NAME,
+                    "name": ACCESS_SHOW_TOOL_NAME,
                     "title": "Show Access State",
                     "description": "Show one caller-visible access request, hold, or session by its stable reference.",
                     "inputSchema": {
@@ -1285,14 +1727,91 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                         "idempotentHint": true,
                         "openWorldHint": false
                     }
+                },
+                {
+                    "name": ACCESS_STATUS_TOOL_NAME,
+                    "title": "Show Access Session Status",
+                    "description": "Show requester-scoped activity, decisions, holds, and provisionals for one access-managed session.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "reference": { "type": "string" } },
+                        "required": ["reference"]
+                    },
+                    "outputSchema": admin_output_schema(
+                        "access_status",
+                        "report",
+                        json!({ "type": "object" })
+                    ),
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
                 }
             ]
         });
+        let output = &mut result["tools"][0]["outputSchema"];
+        let properties = output["properties"]
+            .as_object_mut()
+            .expect("execution output properties");
+        properties.insert(
+            "confirm_deadline_unix".to_string(),
+            json!({
+                "type": ["integer", "null"],
+                "description": "Unix deadline for a durably armed provisional containment window."
+            }),
+        );
+        properties.insert(
+            "confirm_window_secs".to_string(),
+            json!({
+                "type": ["integer", "null"],
+                "description": "Configured duration of a durably armed provisional containment window."
+            }),
+        );
+        properties.insert(
+            "auto_revert_durable".to_string(),
+            json!({
+                "type": ["boolean", "null"],
+                "description": "Whether the daemon durably recorded the armed auto-revert outcome."
+            }),
+        );
+        properties.insert(
+            "containment_failure".to_string(),
+            containment_failure_schema,
+        );
+        output["required"]
+            .as_array_mut()
+            .expect("execution output required fields")
+            .extend([
+                json!("confirm_deadline_unix"),
+                json!("confirm_window_secs"),
+                json!("auto_revert_durable"),
+                json!("containment_failure"),
+            ]);
+        let tools = result["tools"]
+            .as_array_mut()
+            .expect("tools result is an array");
+        tools.push(approval_show_tool());
+        tools.push(approval_resume_tool());
         if !self.admin_tools {
-            result["tools"]
-                .as_array_mut()
-                .expect("tools result is an array")
-                .truncate(1);
+            tools.truncate(1);
+        } else {
+            if !self.approval_consequence_tools {
+                tools.retain(|tool| {
+                    tool["name"] != APPROVAL_SHOW_TOOL_NAME
+                        && tool["name"] != APPROVAL_RESUME_TOOL_NAME
+                });
+            }
+            if !self.execute_admin_tools || self.http_transport {
+                tools.retain(|tool| tool["name"] != APPROVAL_RESUME_TOOL_NAME);
+            }
+            if self.http_transport {
+                tools.retain(|tool| {
+                    tool["name"] != ACCESS_STATUS_TOOL_NAME
+                        && tool["name"] != APPROVAL_SHOW_TOOL_NAME
+                });
+            }
         }
         result
     }
@@ -1329,9 +1848,10 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             format!("\n    params: {}", verb.params.join(", "))
                         };
                         format!(
-                            "{} [{}]{} - {}{}",
+                            "{} [{}]{}{} - {}{}",
                             verb.name,
                             verb.consequence,
+                            if verb.hold { " hold" } else { "" },
                             if verb.has_revert { " revertable" } else { "" },
                             verb.description,
                             params
@@ -1421,7 +1941,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         }
     }
 
-    async fn call_session_status(&self, arguments: Value) -> Value {
+    async fn call_access_show(&self, arguments: Value) -> Value {
         let args: AccessShowArgs = match serde_json::from_value(arguments) {
             Ok(args) => args,
             Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
@@ -1443,6 +1963,134 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
             Err(error) => tool_error_result(format!("{error:#}")),
         }
     }
+
+    /// Proxy `ApprovalShow`, or `ApprovalWait` when the caller asked to block.
+    /// This is the path by which an agent retrieves the outcome of a command it
+    /// did not hold a connection open for. The daemon scopes it to the hold's
+    /// owner (or the operator) and returns the same not-found for anyone else,
+    /// so this tool grants no read authority the caller did not already have.
+    async fn call_approval_show(&self, arguments: Value) -> Value {
+        let args: ApprovalArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        let request = match args.wait {
+            Some(timeout_secs) => server::AdminRequest::ApprovalWait {
+                handle: args.reference,
+                timeout_secs,
+            },
+            None => server::AdminRequest::ApprovalShow {
+                handle: args.reference,
+            },
+        };
+        match self.admin.send_admin(request).await {
+            Ok(server::AdminResponse::ApprovalShow { item }) => admin_tool_result(
+                "approval_show",
+                render_approval_text(&item),
+                json!({ "item": item }),
+            ),
+            Ok(server::AdminResponse::ApprovalWait { wait }) => {
+                let text = format!(
+                    "{}\nwait outcome: {}",
+                    render_approval_text(&wait.item),
+                    wait.outcome
+                );
+                admin_tool_result(
+                    "approval_show",
+                    text,
+                    json!({ "item": wait.item, "outcome": wait.outcome }),
+                )
+            }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    /// Proxy `AdminRequest::Resume`. This is an execute verb, exposed only over
+    /// stdio; see `expose_execute_admin_tools`.
+    async fn call_approval_resume(&self, arguments: Value) -> Value {
+        let args: AccessShowArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        match self
+            .admin
+            .send_admin(server::AdminRequest::Resume {
+                handle: args.reference,
+            })
+            .await
+        {
+            Ok(server::AdminResponse::GateAction {
+                message,
+                exit_code,
+                stdout,
+                stderr,
+            }) => {
+                let text = format!(
+                    "{message}\n{}{}",
+                    stdout.as_deref().unwrap_or_default(),
+                    stderr.as_deref().unwrap_or_default()
+                );
+                admin_tool_result(
+                    "approval_resume",
+                    text,
+                    json!({
+                        "result": {
+                            "message": message,
+                            "exit_code": exit_code,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                        }
+                    }),
+                )
+            }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    async fn call_session_status(&self, arguments: Value) -> Value {
+        let args: AccessShowArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        match self
+            .admin
+            .send_admin(server::AdminRequest::AccessStatus {
+                reference: args.reference,
+            })
+            .await
+        {
+            Ok(server::AdminResponse::SessionStatus {
+                report,
+                approvals,
+                provisionals,
+                requests,
+            }) => admin_tool_result(
+                "access_status",
+                format!(
+                    "session activity: total={} allowed={} denied={}; requests={} approvals={} provisionals={}",
+                    report.stats.total,
+                    report.stats.allowed,
+                    report.stats.denied,
+                    requests.len(),
+                    approvals.len(),
+                    provisionals.len(),
+                ),
+                json!({
+                    "report": report,
+                    "approvals": approvals,
+                    "provisionals": provisionals,
+                    "requests": requests,
+                }),
+            ),
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
 }
 
 fn render_verbs_text(items: &[server::VerbSummary]) -> String {
@@ -1452,9 +2100,10 @@ fn render_verbs_text(items: &[server::VerbSummary]) -> String {
     let mut lines = Vec::with_capacity(items.len());
     for v in items {
         let mut line = format!(
-            "{} [{}]{}{} - {}",
+            "{} [{}]{}{}{} - {}",
             v.name,
             v.consequence,
+            if v.hold { " hold" } else { "" },
             if v.trusted { " trusted" } else { "" },
             if v.has_revert { " revertable" } else { "" },
             v.description
@@ -1467,6 +2116,91 @@ fn render_verbs_text(items: &[server::VerbSummary]) -> String {
     lines.join("\n")
 }
 
+/// The read tool by which an agent retrieves its own held command's outcome.
+fn approval_show_tool() -> Value {
+    json!({
+        "name": APPROVAL_SHOW_TOOL_NAME,
+        "title": "Show a Held Command",
+        "description": "Show one held command owned by the caller, including its persisted transcript and exit code once it has run. With `wait`, block until an operator arms it or it reaches a terminal state, up to that many seconds. Read-only: it never approves and never executes. `status` is `pending` while it awaits a decision, `armed` once an operator approved it and it is waiting to be resumed, and a terminal value once it is finished.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": { "type": "string" },
+                "wait": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional: seconds to block for the hold to be armed or decided. Omit to read the current state and return immediately."
+                }
+            },
+            "required": ["reference"]
+        },
+        "outputSchema": admin_output_schema("approval_show", "item", json!({ "type": "object" })),
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    })
+}
+
+/// The execute verb for an armed hold. Listed only over stdio.
+fn approval_resume_tool() -> Value {
+    json!({
+        "name": APPROVAL_RESUME_TOOL_NAME,
+        "title": "Resume an Armed Held Command",
+        "description": "Run one held command that an operator armed, as its original requester. The daemon accepts a single durable execution claim, so a hold runs at most once. Use guard_approval_show first to confirm the hold is armed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "reference": { "type": "string" } },
+            "required": ["reference"]
+        },
+        "outputSchema": admin_output_schema("approval_resume", "result", json!({ "type": "object" })),
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": false,
+            "openWorldHint": true
+        }
+    })
+}
+
+/// One held command as text an agent can act on. `status` is the field to
+/// branch on; the transcript is present once the hold has run.
+fn render_approval_text(item: &server::ApprovalSummary) -> String {
+    let mut line = format!(
+        "{} status={} command={} deadline={}",
+        item.handle, item.status, item.command, item.deadline_unix
+    );
+    if let Some(reason) = item.decided_reason.as_deref() {
+        line.push_str(&format!("\nreason: {reason}"));
+    }
+    match item.status.as_str() {
+        "pending" => line.push_str("\nno operator decision yet; nothing has executed"),
+        "armed" => line.push_str(&format!(
+            "\napproved and armed; run it with guard_approval_resume {}",
+            item.handle
+        )),
+        _ => {}
+    }
+    if let Some(exit_code) = item.exit_code {
+        line.push_str(&format!("\nexit_code: {exit_code}"));
+    }
+    if let Some(stdout) = item.stdout.as_deref() {
+        line.push_str(&format!("\nstdout:\n{stdout}"));
+        if item.stdout_truncated {
+            line.push_str("\n[guard stdout transcript truncated]");
+        }
+    }
+    if let Some(stderr) = item.stderr.as_deref() {
+        line.push_str(&format!("\nstderr:\n{stderr}"));
+        if item.stderr_truncated {
+            line.push_str("\n[guard stderr transcript truncated]");
+        }
+    }
+    line
+}
+
 fn render_access_text(items: &[server::AccessItem]) -> String {
     if items.is_empty() {
         return "(no access requests or sessions)".to_string();
@@ -1474,9 +2208,25 @@ fn render_access_text(items: &[server::AccessItem]) -> String {
     items
         .iter()
         .map(|item| {
+            let uses = match item.use_policy.as_str() {
+                "bounded" => format!(
+                    " uses={}",
+                    item.remaining_uses
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "0".to_string())
+                ),
+                other => format!(" uses={other}"),
+            };
+            let consequence = if item.consequence.is_empty() {
+                if item.reference.starts_with("gr-") { "grant" } else { "arm" }
+            } else {
+                item.consequence.as_str()
+            };
             let mut line = format!(
-                "{} requester={} target={} scope={} expiry={} uses={} state={} next={}",
+                "{} kind={} consequence={} requester={} target={} scope={} expiry={}{} state={} next={}",
                 item.reference,
+                item.kind,
+                consequence,
                 item.requester,
                 item.target,
                 if item.effective_scope.is_empty() {
@@ -1487,21 +2237,16 @@ fn render_access_text(items: &[server::AccessItem]) -> String {
                 item.expires_unix
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string()),
-                match item.use_policy.as_str() {
-                    "bounded" => item
-                        .remaining_uses
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "0".to_string()),
-                    other => other.to_string(),
-                },
+                uses,
                 item.state,
                 item.next_action
             );
-            for (label, command) in ["approve", "once", "bounded"]
-                .into_iter()
-                .zip(item.approval_options.iter())
-            {
-                line.push_str(&format!("\n{label}: {command}"));
+            for option in &item.approval_options {
+                if option.starts_with("guard access approve ") {
+                    line.push_str(&format!("\napproval: {option}"));
+                } else {
+                    line.push_str(&format!("\n{option}"));
+                }
             }
             line
         })
@@ -1628,6 +2373,8 @@ fn jsonrpc_error_response(id: Value, code: i64, message: String, data: Option<Va
 }
 
 fn tool_result(result: GuardToolResponse) -> Value {
+    let is_error = result.containment_failure.is_some()
+        || (result.auto_revert_durable == Some(false) && result.containment_failure.is_none());
     let structured = json!({
         "schema_version": TOOL_SCHEMA_VERSION,
         "type": "execution_result",
@@ -1638,6 +2385,10 @@ fn tool_result(result: GuardToolResponse) -> Value {
         "stderr": result.stderr,
         "status": result.status,
         "handle": result.handle,
+        "confirm_deadline_unix": result.confirm_deadline_unix,
+        "confirm_window_secs": result.confirm_window_secs,
+        "auto_revert_durable": result.auto_revert_durable,
+        "containment_failure": result.containment_failure,
         "approval_options": result.approval_options,
         "access_requests": result.access_requests,
         "coverage": result.coverage,
@@ -1654,7 +2405,7 @@ fn tool_result(result: GuardToolResponse) -> Value {
             }
         ],
         "structuredContent": structured,
-        "isError": false
+        "isError": is_error
     })
 }
 
@@ -1669,6 +2420,10 @@ fn tool_error_result(message: String) -> Value {
         "stderr": Value::Null,
         "status": Value::Null,
         "handle": Value::Null,
+        "confirm_deadline_unix": Value::Null,
+        "confirm_window_secs": Value::Null,
+        "auto_revert_durable": Value::Null,
+        "containment_failure": Value::Null,
         "approval_options": [],
         "access_requests": [],
         "coverage": Value::Null,
@@ -1746,6 +2501,43 @@ fn render_tool_text(result: &Value) -> String {
         .unwrap_or_default();
     let decision = decision_text(result);
 
+    let typed_containment_failure = result
+        .get("containment_failure")
+        .is_some_and(|failure| !failure.is_null());
+    let legacy_containment_failure = !typed_containment_failure
+        && result.get("auto_revert_durable").and_then(Value::as_bool) == Some(false);
+    if typed_containment_failure || legacy_containment_failure {
+        let action = if handle.is_empty() {
+            "Operator action required: inspect `guard provisionals`; no recovery handle is available."
+                .to_string()
+        } else {
+            let confirm = guard::gating::provisional::operator_confirm_command(handle);
+            let revert = guard::gating::provisional::operator_revert_command(handle);
+            format!(
+                "Operator action required for handle {handle}: inspect `guard provisionals`, then run `{confirm}` or `{revert}`."
+            )
+        };
+        let mut out = String::new();
+        if !stdout.is_empty() {
+            out.push_str(stdout);
+            if !stdout.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        if !stderr.is_empty() {
+            out.push_str("stderr:\n");
+            out.push_str(stderr);
+            if !stderr.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out.push_str(&format!(
+            "CONTAINMENT FAILED: {reason}\nNo auto-revert timer is armed.\n{action}{}",
+            coverage_text(result)
+        ));
+        return out;
+    }
+
     // Consequence-gate outcomes are not denials: surface the handle, the next
     // step, and the honest coverage so the model knows what was NOT verified.
     match status {
@@ -1756,15 +2548,24 @@ fn render_tool_text(result: &Value) -> String {
             ) + &decision + &guidance;
         }
         Some("provisional") => {
+            let confirm = guard::gating::provisional::operator_confirm_command(handle);
             let mut out = String::new();
             if !stdout.is_empty() {
                 out.push_str(stdout);
                 out.push('\n');
             }
             out.push_str(&format!(
-                "PROVISIONAL (handle {handle}): applied behind an auto-revert envelope; it reverts unless the operator runs `guard confirm {handle}`.{}",
+                "PROVISIONAL (handle {handle}): applied behind an auto-revert envelope; it reverts unless the operator runs `{confirm}`.{}",
                 coverage_text(result)
             ));
+            if let (Some(deadline), Some(window)) = (
+                result.get("confirm_deadline_unix").and_then(Value::as_u64),
+                result.get("confirm_window_secs").and_then(Value::as_u64),
+            ) {
+                out.push_str(&format!(
+                    "\nConfirmation window: {window}s; deadline unix {deadline}."
+                ));
+            }
             return out;
         }
         Some("dry_run") => {
@@ -1836,12 +2637,17 @@ fn render_access_next_steps(result: &Value, handle: &str, approval_options: &[&s
         let mut output = String::from("\nAccess requests:");
         for (reference, commands) in access_requests {
             output.push_str(&format!("\n- `{reference}`"));
-            for command in commands {
-                output.push_str(&format!("\n  `{command}`"));
+            for command in &commands {
+                output.push_str(&render_approval_option(command, "  "));
             }
-            output.push_str(&format!(
-                "\n  Inspect with `guard access show {reference}`."
-            ));
+            if !commands
+                .iter()
+                .any(|command| command.contains("guard access show "))
+            {
+                output.push_str(&format!(
+                    "\n  Inspect with `guard access show {reference}`."
+                ));
+            }
         }
         return output;
     }
@@ -1852,19 +2658,36 @@ fn render_access_next_steps(result: &Value, handle: &str, approval_options: &[&s
 fn render_single_access_next_steps(handle: &str, approval_options: &[&str]) -> String {
     let mut output = String::new();
     if !approval_options.is_empty() {
-        output.push_str(if approval_options.len() == 1 {
+        let has_operator_commands = approval_options
+            .iter()
+            .any(|option| option.starts_with("guard access approve "));
+        output.push_str(if has_operator_commands && approval_options.len() == 1 {
             "\nOperator command:"
-        } else {
+        } else if has_operator_commands {
             "\nOperator commands:"
+        } else {
+            "\nNext step:"
         });
-        for command in approval_options {
-            output.push_str(&format!("\n`{command}`"));
+        for option in approval_options {
+            output.push_str(&render_approval_option(option, ""));
         }
     }
-    if !handle.is_empty() {
+    if !handle.is_empty()
+        && !approval_options
+            .iter()
+            .any(|option| option.contains("guard access show "))
+    {
         output.push_str(&format!("\nInspect with `guard access show {handle}`."));
     }
     output
+}
+
+fn render_approval_option(option: &str, indent: &str) -> String {
+    if option.starts_with("guard access approve ") {
+        format!("\n{indent}`{option}`")
+    } else {
+        format!("\n{indent}{option}")
+    }
 }
 
 fn decision_text(result: &Value) -> String {
@@ -1901,6 +2724,7 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use guard::wire::mcp::McpSshHostKeyMode;
+    use std::collections::VecDeque;
     use tokio::io::{AsyncRead, AsyncReadExt};
     use tokio::net::TcpStream;
 
@@ -1939,6 +2763,418 @@ mod tests {
         Arc::new(FakeAdmin {
             response: server::AdminResponse::Ok,
         })
+    }
+
+    enum ScriptedReply {
+        Response(Box<server::AdminResponse>),
+        Failure,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedAdmin {
+        replies: Arc<std::sync::Mutex<VecDeque<ScriptedReply>>>,
+        requests: Arc<std::sync::Mutex<Vec<server::AdminRequest>>>,
+        endpoint_probes: Arc<std::sync::Mutex<usize>>,
+        endpoint_reachable: bool,
+    }
+
+    impl ScriptedAdmin {
+        fn new(replies: Vec<ScriptedReply>) -> Self {
+            Self {
+                replies: Arc::new(std::sync::Mutex::new(replies.into())),
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+                endpoint_probes: Arc::new(std::sync::Mutex::new(0)),
+                endpoint_reachable: true,
+            }
+        }
+
+        fn unreachable() -> Self {
+            Self {
+                endpoint_reachable: false,
+                ..Self::new(Vec::new())
+            }
+        }
+    }
+
+    #[async_trait]
+    impl GuardAdmin for ScriptedAdmin {
+        async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse> {
+            self.requests.lock().unwrap().push(request);
+            match self.replies.lock().unwrap().pop_front() {
+                Some(ScriptedReply::Response(response)) => Ok(*response),
+                Some(ScriptedReply::Failure) => Err(anyhow!("probe failed")),
+                None => panic!("unexpected probe request"),
+            }
+        }
+
+        async fn probe_endpoint(&self) -> Result<()> {
+            *self.endpoint_probes.lock().unwrap() += 1;
+            if self.endpoint_reachable {
+                Ok(())
+            } else {
+                Err(anyhow!("endpoint unavailable"))
+            }
+        }
+    }
+
+    fn ping(capable: bool) -> server::AdminResponse {
+        server::AdminResponse::Ping {
+            version: "0.7.1".to_string(),
+            uptime_secs: 1,
+            mode: "enforce".to_string(),
+            dry_run: false,
+            capabilities: capable
+                .then(|| APPROVAL_CONSEQUENCES_CAPABILITY.to_string())
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn probe_config(tcp: bool, http: bool) -> McpConfig {
+        McpConfig {
+            socket_path: (!tcp).then(|| PathBuf::from("/run/guard/guard.sock")),
+            tcp_port: tcp.then_some(9555),
+            http_addr: http.then(|| "127.0.0.1:9556".parse().unwrap()),
+            http_token: http.then(|| "fixture-token".to_string()),
+            ..McpConfig::default()
+        }
+    }
+
+    fn server_for_surface(
+        surface: McpSurface,
+        http: bool,
+        tcp: bool,
+    ) -> McpServer<FakeExecutor, FakeAdmin> {
+        let executor = Arc::new(FakeExecutor {
+            response: Err("unused".to_string()),
+        });
+        McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string())
+            .with_endpoint_available(surface.endpoint_available)
+            .with_admin_tools(surface.admin_tools)
+            .with_execute_admin_tools(surface.execute_admin_tools)
+            .with_approval_consequence_tools(surface.approval_consequence_tools)
+            .with_http_transport(http)
+            .with_tcp_backend(tcp)
+            .with_diagnostics(surface.diagnostics)
+    }
+
+    fn listed_names(surface: McpSurface, http: bool, tcp: bool) -> Vec<String> {
+        let server = server_for_surface(surface, http, tcp);
+        server.list_tools_result()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PingCase {
+        Capable,
+        Absent,
+        Unavailable,
+        Malformed,
+    }
+
+    impl PingCase {
+        fn reply(self) -> ScriptedReply {
+            match self {
+                Self::Capable => ScriptedReply::Response(Box::new(ping(true))),
+                Self::Absent => ScriptedReply::Response(Box::new(ping(false))),
+                Self::Unavailable => ScriptedReply::Failure,
+                Self::Malformed => ScriptedReply::Response(Box::new(server::AdminResponse::Ok)),
+            }
+        }
+
+        fn capability_state(self) -> &'static str {
+            match self {
+                Self::Capable => "capable",
+                Self::Absent => "capability_absent",
+                Self::Unavailable => "ping_unavailable",
+                Self::Malformed => "ping_malformed",
+            }
+        }
+    }
+
+    fn baseline_names(http: bool) -> Vec<String> {
+        let mut names = vec![
+            DEFAULT_TOOL_NAME,
+            VERB_LIST_TOOL_NAME,
+            ACCESS_REQUEST_TOOL_NAME,
+            APPROVAL_LIST_TOOL_NAME,
+            EVALUATE_BATCH_TOOL_NAME,
+            ACCESS_SHOW_TOOL_NAME,
+        ];
+        if !http {
+            names.push(ACCESS_STATUS_TOOL_NAME);
+        }
+        names.into_iter().map(str::to_string).collect()
+    }
+
+    fn assert_unavailable(
+        surface: McpSurface,
+        http: bool,
+        tcp: bool,
+        tool_name: &str,
+        code: &str,
+        diagnostic: &str,
+    ) {
+        let server = server_for_surface(surface, http, tcp);
+        let response = server.unavailable_tool_response(json!(1), tool_name);
+        assert_eq!(response["error"]["data"]["code"], code);
+        assert_eq!(response["error"]["data"]["diagnostic"], diagnostic);
+    }
+
+    fn approval_summary(status: &str) -> server::ApprovalSummary {
+        server::ApprovalSummary {
+            handle: "approval-example".to_string(),
+            status: status.to_string(),
+            command: "approved-command".to_string(),
+            reason: "operator review".to_string(),
+            risk: None,
+            reversibility: None,
+            fingerprint: "fingerprint".to_string(),
+            created_unix: 1,
+            deadline_unix: 2,
+            principal: Some("1001".to_string()),
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            decided_reason: None,
+            notes: Vec::new(),
+            decision_trace: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_approval_show_wait_renders_armed_terminal_and_timeout_outcomes() {
+        for (status, outcome) in [
+            ("armed", "armed"),
+            ("approved", "approved"),
+            ("pending", "timed_out"),
+        ] {
+            let admin = Arc::new(FakeAdmin {
+                response: server::AdminResponse::ApprovalWait {
+                    wait: serde_json::from_value(json!({
+                        "item": approval_summary(status),
+                        "outcome": outcome,
+                    }))
+                    .unwrap(),
+                },
+            });
+            let server = McpServer::new(
+                Arc::new(FakeExecutor {
+                    response: Err("unused".to_string()),
+                }),
+                admin,
+                DEFAULT_TOOL_NAME.to_string(),
+            );
+            let result = server
+                .call_approval_show(json!({"reference": "approval-example", "wait": 30}))
+                .await;
+            assert_eq!(result["structuredContent"]["item"]["status"], status);
+            assert_eq!(result["structuredContent"]["outcome"], outcome);
+            assert!(result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("wait outcome: {outcome}"))));
+        }
+    }
+
+    #[tokio::test]
+    async fn unix_probe_matrix_keeps_reachable_baseline_independent_of_ping() {
+        for ping_case in [
+            PingCase::Capable,
+            PingCase::Absent,
+            PingCase::Unavailable,
+            PingCase::Malformed,
+        ] {
+            for http in [false, true] {
+                let admin = ScriptedAdmin::new(vec![
+                    ping_case.reply(),
+                    ScriptedReply::Response(Box::new(server::AdminResponse::AccessItems {
+                        items: Vec::new(),
+                    })),
+                ]);
+                let surface = probe_mcp_surface(&admin, &probe_config(false, http)).await;
+                assert_eq!(surface.diagnostics.endpoint_state, "reachable");
+                assert_eq!(
+                    surface.diagnostics.capability_state,
+                    ping_case.capability_state()
+                );
+                assert_eq!(surface.diagnostics.admin_state, "reachable");
+                let mut expected = baseline_names(http);
+                if matches!(ping_case, PingCase::Capable) && !http {
+                    expected.extend([
+                        APPROVAL_SHOW_TOOL_NAME.to_string(),
+                        APPROVAL_RESUME_TOOL_NAME.to_string(),
+                    ]);
+                }
+                assert_eq!(listed_names(surface.clone(), http, false), expected);
+                for tool in [APPROVAL_SHOW_TOOL_NAME, APPROVAL_RESUME_TOOL_NAME] {
+                    if http {
+                        assert_unavailable(
+                            surface.clone(),
+                            http,
+                            false,
+                            tool,
+                            "feature_unavailable",
+                            "tool_not_available_for_transport",
+                        );
+                    } else if !matches!(ping_case, PingCase::Capable) {
+                        assert_unavailable(
+                            surface.clone(),
+                            http,
+                            false,
+                            tool,
+                            "feature_unavailable",
+                            ping_case.capability_state(),
+                        );
+                    }
+                }
+                if http {
+                    assert_unavailable(
+                        surface,
+                        http,
+                        false,
+                        ACCESS_STATUS_TOOL_NAME,
+                        "feature_unavailable",
+                        "tool_not_available_for_transport",
+                    );
+                }
+                let requests = admin.requests.lock().unwrap();
+                assert!(matches!(
+                    requests.as_slice(),
+                    [server::AdminRequest::Ping, server::AdminRequest::AccessList]
+                ));
+                assert_eq!(*admin.endpoint_probes.lock().unwrap(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_matrix_lists_only_guard_run_and_rejects_admin_tools() {
+        for ping_case in [
+            PingCase::Capable,
+            PingCase::Absent,
+            PingCase::Unavailable,
+            PingCase::Malformed,
+        ] {
+            for http in [false, true] {
+                let admin = ScriptedAdmin::new(vec![ping_case.reply()]);
+                let surface = probe_mcp_surface(&admin, &probe_config(true, http)).await;
+                assert_eq!(surface.diagnostics.endpoint_state, "reachable");
+                assert_eq!(
+                    surface.diagnostics.capability_state,
+                    ping_case.capability_state()
+                );
+                assert_eq!(
+                    listed_names(surface.clone(), http, true),
+                    [DEFAULT_TOOL_NAME]
+                );
+                for tool in [
+                    VERB_LIST_TOOL_NAME,
+                    ACCESS_REQUEST_TOOL_NAME,
+                    APPROVAL_LIST_TOOL_NAME,
+                    EVALUATE_BATCH_TOOL_NAME,
+                    ACCESS_SHOW_TOOL_NAME,
+                    ACCESS_STATUS_TOOL_NAME,
+                    APPROVAL_SHOW_TOOL_NAME,
+                    APPROVAL_RESUME_TOOL_NAME,
+                ] {
+                    assert_unavailable(
+                        surface.clone(),
+                        http,
+                        true,
+                        tool,
+                        "feature_unavailable",
+                        "tcp_mcp_admin_unsupported",
+                    );
+                }
+                assert!(matches!(
+                    admin.requests.lock().unwrap().as_slice(),
+                    [server::AdminRequest::Ping]
+                ));
+                assert_eq!(*admin.endpoint_probes.lock().unwrap(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_unix_admin_probe_has_an_empty_surface_for_every_ping_state() {
+        for ping_case in [
+            PingCase::Capable,
+            PingCase::Absent,
+            PingCase::Unavailable,
+            PingCase::Malformed,
+        ] {
+            for http in [false, true] {
+                let admin = ScriptedAdmin::new(vec![ping_case.reply(), ScriptedReply::Failure]);
+                let surface = probe_mcp_surface(&admin, &probe_config(false, http)).await;
+                assert_eq!(surface.diagnostics.endpoint_state, "reachable");
+                assert_eq!(surface.diagnostics.admin_reason, "unix_admin_probe_failed");
+                assert!(listed_names(surface.clone(), http, false).is_empty());
+                for tool in BUILT_IN_TOOL_NAMES {
+                    assert_unavailable(
+                        surface.clone(),
+                        http,
+                        false,
+                        tool,
+                        "endpoint_unavailable",
+                        "unix_admin_probe_failed",
+                    );
+                }
+                assert!(matches!(
+                    admin.requests.lock().unwrap().as_slice(),
+                    [server::AdminRequest::Ping, server::AdminRequest::AccessList]
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_and_malformed_sole_endpoints_never_send_admin_rpcs() {
+        for tcp in [false, true] {
+            for http in [false, true] {
+                let admin = ScriptedAdmin::unreachable();
+                let surface = probe_mcp_surface(&admin, &probe_config(tcp, http)).await;
+                assert!(listed_names(surface.clone(), http, tcp).is_empty());
+                assert_unavailable(
+                    surface,
+                    http,
+                    tcp,
+                    DEFAULT_TOOL_NAME,
+                    "endpoint_unavailable",
+                    "endpoint_unavailable",
+                );
+                assert!(admin.requests.lock().unwrap().is_empty());
+                assert_eq!(*admin.endpoint_probes.lock().unwrap(), 1);
+
+                let mut config = probe_config(tcp, http);
+                if tcp {
+                    config.tcp_port = Some(0);
+                } else {
+                    config.socket_path = Some(PathBuf::new());
+                }
+                let malformed = ScriptedAdmin::new(Vec::new());
+                let surface = probe_mcp_surface(&malformed, &config).await;
+                assert_eq!(surface.diagnostics.endpoint_state, "malformed");
+                assert!(listed_names(surface.clone(), http, tcp).is_empty());
+                for tool in BUILT_IN_TOOL_NAMES {
+                    assert_unavailable(
+                        surface.clone(),
+                        http,
+                        tcp,
+                        tool,
+                        "endpoint_unavailable",
+                        "endpoint_unavailable",
+                    );
+                }
+                assert!(malformed.requests.lock().unwrap().is_empty());
+                assert_eq!(*malformed.endpoint_probes.lock().unwrap(), 0);
+            }
+        }
     }
 
     #[test]
@@ -1986,6 +3222,27 @@ mod tests {
         ] {
             assert!(text.contains(command), "missing {command}: {text}");
         }
+    }
+
+    #[test]
+    fn requester_tool_text_returns_semantic_access_handoff() {
+        let text = render_tool_text(&serde_json::json!({
+            "allowed": false,
+            "reason": "outside current access",
+            "status": null,
+            "handle": "request-example",
+            "approval_options": [
+                "ask your admin to approve request request-example (see guard access show request-example)"
+            ],
+            "exit_code": null,
+            "stdout": null,
+            "stderr": null
+        }));
+
+        assert!(text.contains(
+            "ask your admin to approve request request-example (see guard access show request-example)"
+        ));
+        assert!(!text.contains("guard access approve"));
     }
 
     #[test]
@@ -2054,6 +3311,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2169,7 +3430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_show_sends_the_requested_durable_reference() {
+    async fn access_status_sends_the_requested_session_reference() {
         let executor = Arc::new(FakeExecutor {
             response: Err("unused".to_string()),
         });
@@ -2186,7 +3447,37 @@ mod tests {
                 "id": 43,
                 "method": "tools/call",
                 "params": {
-                    "name": SESSION_STATUS_TOOL_NAME,
+                    "name": ACCESS_STATUS_TOOL_NAME,
+                    "arguments": { "reference": "requested-target" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(server::AdminRequest::AccessStatus { reference })
+                if reference == "requested-target"
+        ));
+    }
+
+    #[tokio::test]
+    async fn access_show_sends_the_requested_durable_reference() {
+        let executor = Arc::new(FakeExecutor {
+            response: Err("unused".to_string()),
+        });
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let admin = Arc::new(RecordingAdmin {
+            request: recorded.clone(),
+        });
+        let mut server = McpServer::new(executor, admin, DEFAULT_TOOL_NAME.to_string());
+        server.initialize_seen = true;
+        let _ = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 44,
+                "method": "tools/call",
+                "params": {
+                    "name": ACCESS_SHOW_TOOL_NAME,
                     "arguments": { "reference": "requested-target" }
                 }
             }))
@@ -2240,6 +3531,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2399,6 +3694,7 @@ mod tests {
             tcp_port: None,
             auth_token: None,
             session_token: None,
+            client_timeout: Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS),
         };
         let args: GuardToolArgs = serde_json::from_value(json!({})).unwrap();
         let error = executor.execute(args).await.unwrap_err();
@@ -2434,6 +3730,7 @@ mod tests {
             tcp_port: Some(port),
             auth_token: Some("exec-auth-fixture".to_string()),
             session_token: Some("session-fixture".to_string()),
+            client_timeout: Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS),
         };
         let args: GuardToolArgs = serde_json::from_value(json!({ "binary": "true" })).unwrap();
         executor.execute(args).await.unwrap();
@@ -2441,6 +3738,72 @@ mod tests {
         let request = captured.await.unwrap();
         assert_eq!(request["execute"]["auth_token"], "exec-auth-fixture");
         assert_eq!(request["execute"]["session_token"], "session-fixture");
+    }
+
+    #[tokio::test]
+    async fn executor_deadline_bounds_a_stalled_daemon_execute() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            let _ = lines.next_line().await.unwrap().expect("execute request");
+            std::future::pending::<()>().await;
+        });
+        let executor = ClientExecutor {
+            socket_path: None,
+            tcp_port: Some(port),
+            auth_token: None,
+            session_token: None,
+            client_timeout: Duration::from_millis(50),
+        };
+        let args: GuardToolArgs = serde_json::from_value(json!({ "binary": "true" })).unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), executor.execute(args))
+            .await
+            .expect("MCP execute must honor its client deadline")
+            .unwrap_err();
+        assert!(error.to_string().contains("client deadline"), "{error:#}");
+        assert!(
+            error.to_string().contains("GUARD_CLIENT_TIMEOUT_SECS"),
+            "{error:#}"
+        );
+        stalled.abort();
+        let _ = stalled.await;
+    }
+
+    #[tokio::test]
+    async fn admin_deadline_bounds_a_stalled_daemon_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            let _ = lines.next_line().await.unwrap().expect("admin request");
+            std::future::pending::<()>().await;
+        });
+        let executor = ClientExecutor {
+            socket_path: None,
+            tcp_port: Some(port),
+            auth_token: None,
+            session_token: None,
+            client_timeout: Duration::from_millis(50),
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            executor.send_admin(server::AdminRequest::VerbList),
+        )
+        .await
+        .expect("MCP admin request must honor its client deadline")
+        .unwrap_err();
+        assert!(error.to_string().contains("client deadline"), "{error:#}");
+        assert!(
+            error.to_string().contains("GUARD_CLIENT_TIMEOUT_SECS"),
+            "{error:#}"
+        );
+        stalled.abort();
+        let _ = stalled.await;
     }
 
     #[tokio::test]
@@ -2467,6 +3830,7 @@ mod tests {
             tcp_port: Some(port),
             auth_token: Some("exec-auth-fixture".to_string()),
             session_token: None,
+            client_timeout: Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS),
         };
         let response = executor
             .send_admin(server::AdminRequest::VerbList)
@@ -2532,6 +3896,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2647,6 +4015,10 @@ mod tests {
             stderr: None,
             status: None,
             handle: None,
+            confirm_deadline_unix: None,
+            confirm_window_secs: None,
+            auto_revert_durable: None,
+            containment_failure: None,
             approval_options: Vec::new(),
             access_requests: Vec::new(),
             coverage: None,
@@ -2679,6 +4051,10 @@ mod tests {
                 stderr: None,
                 status: status.map(str::to_string),
                 handle: handle.map(str::to_string),
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: if status == Some("held") {
                     vec!["guard access approve request-1 --once".to_string()]
                 } else {
@@ -2704,6 +4080,176 @@ mod tests {
         }
     }
 
+    fn execute_response_fixture() -> server::ExecuteResponse {
+        server::ExecuteResponse {
+            allowed: true,
+            reason: "recoverable change".to_string(),
+            exit_code: Some(0),
+            stdout: None,
+            stderr: None,
+            status: Some(server::GateStatus::Provisional),
+            handle: Some("pv-visible".to_string()),
+            approval_options: Vec::new(),
+            access_requests: Vec::new(),
+            coverage: Some(guard::gating::Coverage::contain()),
+            verb_matches: Vec::new(),
+            verb_guidance: None,
+            confirm_deadline_unix: Some(1_700_000_300),
+            confirm_window_secs: Some(300),
+            auto_revert_durable: Some(true),
+            containment_failure: None,
+            decision_source: "static_policy".to_string(),
+            decision_trace: None,
+        }
+    }
+
+    #[test]
+    fn mcp_provisional_result_preserves_and_renders_confirmation_window() {
+        let value = tool_result(execute_response_fixture().into());
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["confirm_deadline_unix"], 1_700_000_300_u64);
+        assert_eq!(structured["confirm_window_secs"], 300);
+        assert_eq!(structured["auto_revert_durable"], true);
+        assert!(structured["containment_failure"].is_null());
+        let text = value["content"][0]["text"].as_str().expect("tool text");
+        assert!(text.contains("pv-visible"));
+        assert!(text.contains("300s"));
+        assert!(text.contains("1700000300"));
+        assert_eq!(value["isError"], false);
+    }
+
+    #[test]
+    fn mcp_started_persistence_failure_is_typed_nonempty_and_actionable() {
+        let mut response = execute_response_fixture();
+        response.allowed = false;
+        response.reason =
+            "containment failed: command may have run; durable outcome unavailable".to_string();
+        response.status = None;
+        response.handle = Some("pv-recovery".to_string());
+        response.confirm_deadline_unix = None;
+        response.confirm_window_secs = None;
+        response.auto_revert_durable = Some(false);
+        response.containment_failure = Some(server::ContainmentFailure {
+            kind: server::ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: true,
+            forward_exit_code: Some(0),
+        });
+
+        let value = tool_result(response.into());
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["status"], Value::Null);
+        assert_eq!(
+            structured["containment_failure"]["kind"],
+            "persistence_failure"
+        );
+        assert_eq!(
+            structured["containment_failure"]["command_may_have_run"],
+            true
+        );
+        assert_eq!(structured["containment_failure"]["forward_exit_code"], 0);
+        assert!(structured["confirm_deadline_unix"].is_null());
+        assert!(structured["confirm_window_secs"].is_null());
+        assert_eq!(structured["auto_revert_durable"], false);
+        assert_eq!(value["isError"], true);
+        let text = value["content"][0]["text"].as_str().expect("tool text");
+        assert!(!text.is_empty());
+        assert!(text.contains("CONTAINMENT FAILED"));
+        assert!(text.contains("pv-recovery"));
+        assert!(
+            text.contains(&guard::gating::provisional::operator_confirm_command(
+                "pv-recovery"
+            ))
+        );
+        assert!(
+            text.contains(&guard::gating::provisional::operator_revert_command(
+                "pv-recovery"
+            ))
+        );
+        assert!(text.contains("durable outcome unavailable"));
+    }
+
+    fn prior_v1_durability_failure_fixture() -> server::ExecuteResponse {
+        let mut response = execute_response_fixture();
+        response.allowed = true;
+        response.reason =
+            "durable auto-revert state could not be recorded; operator decision required"
+                .to_string();
+        response.status = Some(server::GateStatus::Provisional);
+        response.handle = Some("legacy-recovery".to_string());
+        response.confirm_deadline_unix = None;
+        response.confirm_window_secs = None;
+        response.auto_revert_durable = Some(false);
+        response.containment_failure = None;
+        response
+    }
+
+    fn assert_prior_v1_durability_failure(value: &Value, stdout: &str, stderr: &str) {
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["allowed"], true);
+        assert_eq!(structured["status"], "provisional");
+        assert_eq!(structured["auto_revert_durable"], false);
+        assert!(structured["containment_failure"].is_null());
+        assert_eq!(value["isError"], true);
+        let text = value["content"][0]["text"].as_str().expect("tool text");
+        assert!(text.contains(stdout));
+        assert!(text.contains(stderr));
+        assert!(text.contains("CONTAINMENT FAILED"));
+        assert!(text.contains("No auto-revert timer is armed"));
+        assert!(text.contains("Operator action required"));
+        assert!(text.contains("legacy-recovery"));
+        assert!(
+            text.contains(&guard::gating::provisional::operator_confirm_command(
+                "legacy-recovery"
+            ))
+        );
+        assert!(
+            text.contains(&guard::gating::provisional::operator_revert_command(
+                "legacy-recovery"
+            ))
+        );
+        assert!(!text.contains("applied behind an auto-revert envelope"));
+    }
+
+    #[test]
+    fn mcp_prior_v1_nonstreaming_durability_failure_is_actionable_error() {
+        let mut response = prior_v1_durability_failure_fixture();
+        response.stdout = Some("forward output".to_string());
+        response.stderr = Some("forward warning".to_string());
+        let wire = serde_json::to_string(&response).expect("serialize prior v1 response");
+        let parsed: server::ExecuteResponse =
+            serde_json::from_str(&wire).expect("parse prior v1 response");
+
+        let value = tool_result(parsed.into());
+        assert_prior_v1_durability_failure(&value, "forward output", "forward warning");
+    }
+
+    #[tokio::test]
+    async fn mcp_prior_v1_streaming_durability_failure_is_actionable_error() {
+        let mut response = prior_v1_durability_failure_fixture();
+        response.stdout = None;
+        response.stderr = None;
+        let messages = [
+            serde_json::to_string(&server::ExecuteStreamMessage::Stdout {
+                data: "streamed output".to_string(),
+            })
+            .expect("serialize stdout"),
+            serde_json::to_string(&server::ExecuteStreamMessage::Stderr {
+                data: "streamed warning".to_string(),
+            })
+            .expect("serialize stderr"),
+            serde_json::to_string(&server::ExecuteStreamMessage::Result { response })
+                .expect("serialize result"),
+        ]
+        .join("\n")
+            + "\n";
+        let parsed = crate::daemon_client::read_streaming_response_for_test(&messages)
+            .await
+            .expect("parse streaming prior v1 response");
+
+        let value = tool_result(parsed.into());
+        assert_prior_v1_durability_failure(&value, "streamed output", "streamed warning");
+    }
+
     #[tokio::test]
     async fn request_missing_method_gets_invalid_request_error() {
         let executor = Arc::new(FakeExecutor {
@@ -2715,6 +4261,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2749,6 +4299,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2784,7 +4338,10 @@ mod tests {
                 ACCESS_REQUEST_TOOL_NAME,
                 APPROVAL_LIST_TOOL_NAME,
                 EVALUATE_BATCH_TOOL_NAME,
-                SESSION_STATUS_TOOL_NAME,
+                ACCESS_SHOW_TOOL_NAME,
+                ACCESS_STATUS_TOOL_NAME,
+                APPROVAL_SHOW_TOOL_NAME,
+                APPROVAL_RESUME_TOOL_NAME,
             ]
         );
         let access_request = &response["result"]["tools"][2];
@@ -2841,6 +4398,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2859,6 +4420,7 @@ mod tests {
                     coverage: Vec::new(),
                     credential_plan: None,
                     consequence: "recoverable".to_string(),
+                    hold: false,
                     trusted: true,
                     has_revert: true,
                     params: std::collections::BTreeMap::new(),
@@ -2906,6 +4468,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2958,6 +4524,7 @@ mod tests {
             tool_name: DEFAULT_TOOL_NAME.to_string(),
             http_addr: Some("127.0.0.1:0".parse().unwrap()),
             http_token: None,
+            client_timeout_secs: DEFAULT_CLIENT_TIMEOUT_SECS,
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("bearer token"));
@@ -2969,6 +4536,11 @@ mod tests {
         config
             .validate()
             .expect("token present makes http config valid");
+
+        config.client_timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("GUARD_CLIENT_TIMEOUT_SECS"));
+        config.client_timeout_secs = DEFAULT_CLIENT_TIMEOUT_SECS;
 
         config.http_addr = Some("0.0.0.0:7333".parse().unwrap());
         let err = config.validate().unwrap_err();
@@ -3030,6 +4602,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,

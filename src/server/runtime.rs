@@ -348,6 +348,8 @@ pub(super) struct NotifyEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub requester_principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -446,7 +448,16 @@ fn bounded_notify_text(value: Option<String>, max_chars: usize) -> Option<String
 fn bounded_notify_event(mut event: NotifyEvent) -> NotifyEvent {
     event.handle = bounded_notify_text(event.handle, 128);
     event.session_fingerprint = bounded_notify_text(event.session_fingerprint, 96);
-    event.reason = bounded_notify_text(event.reason, 1024);
+    event.requester_principal = event
+        .requester_principal
+        .map(|principal| guard::redact::audit_escape(&principal).into_owned());
+    event.requester_principal = bounded_notify_text(event.requester_principal, 128);
+    event.reason = bounded_notify_text(
+        event
+            .reason
+            .map(|reason| guard::gating::sanitize_gate_text(&reason)),
+        1024,
+    );
     event.status = bounded_notify_text(event.status, 64);
     event
 }
@@ -518,9 +529,9 @@ impl ProcessGuard {
         self.armed = false;
     }
 
-    pub(super) fn terminate(mut self) {
+    pub(super) async fn terminate_gracefully(mut self) {
         if self.tracker.take(self.pid, self.generation) {
-            terminate_process_tree(self.pid);
+            terminate_process_tree_gracefully(self.pid).await;
         }
         self.armed = false;
     }
@@ -544,6 +555,15 @@ fn terminate_process_tree(pid: u32) {
     }
 }
 
+#[cfg(unix)]
+async fn terminate_process_tree_gracefully(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    terminate_process_tree(pid);
+}
+
 #[cfg(windows)]
 fn terminate_process_tree(pid: u32) {
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
@@ -556,8 +576,16 @@ fn terminate_process_tree(pid: u32) {
     }
 }
 
+#[cfg(windows)]
+async fn terminate_process_tree_gracefully(pid: u32) {
+    terminate_process_tree(pid);
+}
+
 #[cfg(not(any(unix, windows)))]
 fn terminate_process_tree(_pid: u32) {}
+
+#[cfg(not(any(unix, windows)))]
+async fn terminate_process_tree_gracefully(_pid: u32) {}
 
 #[cfg(test)]
 mod tests {
@@ -570,6 +598,7 @@ mod tests {
             at_unix: 42,
             handle: Some("handle-1".into()),
             session_fingerprint: Some("session:abcd".into()),
+            requester_principal: None,
             reason: Some("operator review".into()),
             status: Some("pending".into()),
             behavior: None,
@@ -586,6 +615,7 @@ mod tests {
             at_unix: 43,
             handle: Some("recovery-1".into()),
             session_fingerprint: Some("sha256:abcd".into()),
+            requester_principal: None,
             reason: Some("persisted rollback authority is unavailable".into()),
             status: Some("needs_operator_decision".into()),
             behavior: None,
@@ -596,17 +626,22 @@ mod tests {
             encoded.len() < 512,
             "recovery notification must stay bounded"
         );
+        let value = ["q", "7"].concat();
         let bounded = bounded_notify_event(NotifyEvent {
             event: "startup_recovery_escalated",
             at_unix: 44,
             handle: Some("h".repeat(1_000)),
             session_fingerprint: None,
-            reason: Some("r".repeat(100_000)),
+            requester_principal: None,
+            reason: Some(format!("password={value}{}", "r".repeat(100_000))),
             status: Some("needs_operator_decision".into()),
             behavior: None,
         });
         assert_eq!(bounded.handle.unwrap().len(), 128);
-        assert_eq!(bounded.reason.unwrap().len(), 1024);
+        let reason = bounded.reason.unwrap();
+        assert!(reason.chars().count() <= 1024);
+        assert!(!reason.contains(&value));
+        assert!(reason.contains("[REDACTED]"));
     }
 
     #[tokio::test]
@@ -630,6 +665,7 @@ mod tests {
             at_unix: 7,
             handle: Some("p1".into()),
             session_fingerprint: None,
+            requester_principal: None,
             reason: None,
             status: Some("reverting".into()),
             behavior: None,
@@ -673,10 +709,40 @@ mod tests {
         command.as_std_mut().process_group(0);
         let mut child = command.spawn().expect("spawn process group");
         let guard = ProcessTracker::default().track(child.id().expect("child pid"));
-        guard.terminate();
+        drop(guard);
         let _ = child.wait().await;
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
         assert!(!marker.exists(), "the grandchild escaped its owned group");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn graceful_termination_sends_sigterm_before_sigkill() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("term-observed");
+        let ready = temp.path().join("trap-ready");
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(format!(
+            "trap 'printf term > {}; exit 0' TERM; printf ready > {}; while :; do sleep 1; done",
+            marker.display(),
+            ready.display()
+        ));
+        command.as_std_mut().process_group(0);
+        let mut child = command.spawn().expect("spawn process group");
+        let guard = ProcessTracker::default().track(child.id().expect("child pid"));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell installed its SIGTERM trap");
+
+        guard.terminate_gracefully().await;
+        let _ = child.wait().await.expect("reap terminated process");
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "term");
     }
 
     #[test]

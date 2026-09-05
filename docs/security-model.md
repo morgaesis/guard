@@ -54,10 +54,19 @@ grant escalation path. Tools outside the evaluator's knowledge are
 unevaluable, not implicitly trusted; operators describe house tools through
 prompt supplements (`--system-prompt-append`) or typed verbs.
 
+For cwd-dependent opaque carriers (`ansible-playbook`, `terraform`, `helm`,
+`make`, and the rest of the fixed classifier list) the carrier boundary is
+also a deterministic floor under consequence gating, not prompt compliance
+alone: a safe-mode evaluator allow of such a binary is clamped to an operator
+hold unless an operator-authored typed verb covers the command. An evaluator
+deny is never softened, and readonly and paranoid modes are unchanged.
+
 Session overlays intentionally expand baseline evaluator or readonly coverage
 inside activated verb regions. This gives a short-lived agent bounded mutation
 authority without changing the global posture. The exact session revision and
-coverage snapshot bind any hold or provisional.
+coverage snapshot bind any hold or provisional. Outside an activated region,
+an access-managed session is inert and the command follows baseline policy,
+regardless of whether the client or daemon attached the internal session token.
 
 ## Execution and credential isolation
 
@@ -72,6 +81,19 @@ the child lifetime. Holds store names and salted value hashes. Audit and session
 history store secret names only. Output redaction covers exact resolved values
 and credential-shaped text.
 
+Execution identity and credential delivery have different compromise bounds:
+
+| Context | Intended use | Compromise bound |
+|---|---|---|
+| Dedicated non-root service identity | Default broker identity with daemon-owned SSH configuration, agent socket, and secret access | An opaque approved child can retain the service account's authority, copy readable credentials, or create persistence available to that account. A grant TTL limits later Guard admissions but cannot undo those effects. |
+| Root service identity | Deployments that require root before an explicit identity drop | A default child inherits root execution authority. Use `--exec-as-caller` or a dedicated non-root service when root is not an intentional part of the grant. Guard is not a sandbox for a root child. |
+| Per-run environment or secret-file lease | One approved process that needs one named credential | Guard removes the file after the child lifetime and does not disclose the value through its protocol. An opaque child can still copy or use the credential while it is available, so lease expiry is exposure reduction rather than revocation of completed effects. |
+
+Guard has no general scoped SSH credential endpoint. Brokered SSH-using tools
+receive the service identity's configured SSH context. A narrower SSH transport
+requires a separately authenticated stream protocol, destination and forwarding
+constraints, revocation semantics, and an independent security review.
+
 The API proxy injects the endpoint upstream credential only after the request is
 allowed. It strips authentication headers, redacts protocol-classified secret
 responses, rejects uninspectable sensitive streams, and binds rollback to the
@@ -83,8 +105,21 @@ API bearer.
 Unix sockets authenticate caller uid through peer credentials. Windows named
 pipes authenticate caller SID. The stock Windows DACL admits authenticated local
 users, then Guard isolates their authority by SID; it does not restrict the pipe
-to one configured client SID. The daemon's own uid or SID is the operator
-principal for holds, provisionals, saved grants, verbs, and detailed status.
+to one configured client SID. On Unix, operator authority for holds,
+provisionals, saved grants, verbs, and detailed status is the admin bearer
+token: the token reaches the daemon through stdin at startup and is presented
+only by the root-owned operator wrapper, so a brokered child running as the
+daemon uid holds no operator authority. On Windows, kernel-authenticated local
+SYSTEM is the packaged operator principal. The installer runs operator commands
+in transient SYSTEM tasks, while brokered commands run as the daemon service
+SID. The service SID receives no operator exception. Packaged service mode
+requires a named pipe and rejects an admin bearer and TCP listener. A foreground
+Windows server can use an explicitly configured admin bearer instead and gives
+SYSTEM no implicit operator authority.
+
+Windows clients request identification-level named-pipe security. The daemon
+can authenticate the client SID, but a process that wins the pipe name cannot
+impersonate a privileged Guard client.
 
 On Unix, the local socket is private to the daemon unless an operator configures
 a group, in which case it is group-readable and group-writable. SQLite state and
@@ -127,11 +162,15 @@ an unverified environment. These operations require an explicit decision.
 
 ## Process lifetime
 
-On Unix, brokered children lead dedicated process groups. Streaming disconnect,
-request cancellation, daemon shutdown, or SIGTERM terminates the group. A child
-that deliberately detaches through an external service manager or new session
-can outlive the request. Windows service stop and cancellation terminate tracked
-direct children.
+On Unix, brokered children lead dedicated process groups. A streaming client
+disconnect, request cancellation, daemon shutdown, or SIGTERM terminates the
+group. A buffered non-streaming request is daemon-owned after admission and runs
+to completion if its client disconnects; its bounded result remains available
+through the durable hold or provisional record when one exists. Choose streaming
+execution when disconnect means cancel, and buffered execution when completion
+must not depend on the client connection. A child that deliberately detaches
+through an external service manager or new session can outlive the request.
+Windows service stop and cancellation terminate tracked direct children.
 
 Process ownership limits accidental or ordinary orphaning. It is not a kernel
 sandbox against a child that has authority to create an independent service.

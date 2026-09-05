@@ -12,12 +12,13 @@
 //! A recoverable write the policy allows is wrapped in an auto-revert envelope
 //! when the daemon's consequence gate is active: the proxy snapshots the prior
 //! object (or notes the created one) and hands a synthesized revert to the
-//! [`GateSink`], so the operator's `guard confirm` keeps it and the sweeper rolls
+//! [`GateSink`], so operator confirmation keeps it and the sweeper rolls
 //! it back otherwise. Interactive subresources (`exec`/`attach`/`portforward`)
 //! and Secret `watch`es are denied: their streams cannot be redacted or gated
 //! per object.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -35,38 +36,46 @@ use hyper::{header, HeaderMap, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
+};
 use tokio_rustls::TlsAcceptor;
 
 use super::gate::{
-    ApiCoverageVerdict, ApiEvaluationMode, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiMutation,
+    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardHandoff,
+    ApiForwardRequirement, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiMutation,
     ApiRequestSummary, ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink, HoldDecision,
     RevertConstructible,
 };
 use super::k8s_protocol::KubernetesProtocol;
+use super::k8s_protocol::{bind_mutation_preconditions, object_state, KubernetesObjectState};
 use super::op::{ApiOp, Verb};
 use super::policy::{ApiAction, ApiPolicy};
 use super::protocol::ProtocolConfig;
 use super::tls::ProxyTls;
 use super::upstream::Upstream;
 use crate::gating::{decide_gate, GateOutcome};
+use crate::redact::ExactSecretStreamRedactor as ExactSecretRedactor;
 
 /// Cap on a forwarded request body. Manifests are small; this bounds memory by
 /// rejecting an oversized request body.
 const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
+const MAX_UPSTREAM_BODY: usize = 16 * 1024 * 1024;
 const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const UPSTREAM_HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often the policy file is checked for changes (the operator "slow
 /// clock"). The default for [`ApiProxy::with_policy_reload_interval`].
 const POLICY_RELOAD_SECS: u64 = 5;
 
-const RESPONSE_REDACTION_MARKER: &[u8] = b"[REDACTED]";
-
 type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+type ProxyErrorResponse = Box<Response<ProxyBody>>;
 type ReqwestByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + Sync>>;
 type RedactingStreamState = (ReqwestByteStream, ExactSecretRedactor, bool);
 type JudgeBuilder = dyn Fn(Option<String>) -> Option<Arc<dyn ApiJudge>> + Send + Sync;
 const GUARD_SESSION_HEADER: &str = "x-guard-session";
+const MAX_KUBERNETES_OBSERVATIONS: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct GuardRejected;
@@ -75,6 +84,23 @@ struct GuardRejected;
 struct RouteAuthority {
     revision: u64,
     policy_fingerprint: String,
+}
+
+struct AuthorityRevisionTransition<'a> {
+    revision: &'a AtomicU64,
+}
+
+impl Drop for AuthorityRevisionTransition<'_> {
+    fn drop(&mut self) {
+        let previous = self.revision.fetch_add(1, Ordering::Release);
+        debug_assert!(!previous.is_multiple_of(2));
+    }
+}
+
+struct AuthorityUpdateGuard<'a> {
+    _revision_transition: AuthorityRevisionTransition<'a>,
+    _update_serial: OwnedMutexGuard<()>,
+    _coordination: OwnedRwLockWriteGuard<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,68 +120,15 @@ struct SessionAuth {
     token: String,
     context: ApiSessionContext,
 }
-
-struct ExactSecretRedactor {
-    secrets: Vec<Vec<u8>>,
-    carry: Vec<u8>,
-    keep: usize,
+struct BufferedRequest {
+    parts: Parts,
+    body: Bytes,
 }
 
-impl ExactSecretRedactor {
-    fn new(mut secrets: Vec<Vec<u8>>) -> Self {
-        secrets.retain(|secret| !secret.is_empty());
-        secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-        secrets.dedup();
-        let keep = secrets
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(1)
-            .saturating_sub(1);
-        Self {
-            secrets,
-            carry: Vec::new(),
-            keep,
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
-        self.carry.extend_from_slice(chunk);
-        let safe_end = self.carry.len().saturating_sub(self.keep);
-        self.emit_through(safe_end)
-    }
-
-    fn finish(&mut self) -> Vec<u8> {
-        let end = self.carry.len();
-        self.emit_through(end)
-    }
-
-    fn emit_through(&mut self, safe_end: usize) -> Vec<u8> {
-        let mut output = Vec::new();
-        let mut position = 0;
-        while position < safe_end {
-            if let Some(secret) = self
-                .secrets
-                .iter()
-                .find(|secret| self.carry[position..].starts_with(secret))
-            {
-                output.extend_from_slice(RESPONSE_REDACTION_MARKER);
-                position += secret.len();
-            } else {
-                output.push(self.carry[position]);
-                position += 1;
-            }
-        }
-        self.carry.drain(..position);
-        output
-    }
-
-    fn redact_all(secrets: Vec<Vec<u8>>, bytes: &[u8]) -> Bytes {
-        let mut redactor = Self::new(secrets);
-        let mut output = redactor.push(bytes);
-        output.extend_from_slice(&redactor.finish());
-        Bytes::from(output)
-    }
+struct RouteMetadata<'a> {
+    path: &'a str,
+    query: &'a str,
+    op: &'a ApiOp,
 }
 
 /// A configured API proxy: TLS identity, upstream connection, the attached
@@ -175,6 +148,13 @@ pub struct ApiProxy {
     /// swaps mark the generation odd for their short transition, then publish
     /// the next even value. Routes bind an even generation plus policy digest.
     authority_revision: AtomicU64,
+    /// Upstream handoffs hold a read lease through response headers. Authority
+    /// publication takes the write lease, so revocation waits for every
+    /// in-flight handoff without serializing independent reads and writes.
+    authority_initiation: Arc<RwLock<()>>,
+    /// Serializes update intents so only one revision can be marked odd while
+    /// it waits for existing upstream handoffs to finish.
+    authority_update_serial: Arc<AsyncMutex<()>>,
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
     gate: OnceLock<Arc<dyn GateSink>>,
@@ -190,6 +170,7 @@ pub struct ApiProxy {
     /// contained rather than an untracked delete. Entries are scoped to the
     /// creating connection and removed when their revert resolves.
     created: Mutex<CreatedRegistry>,
+    observations: Mutex<ObservationRegistry>,
     /// Monotonic per-connection id, assigned in the accept loop, so a created
     /// resource's provenance is scoped to the connection that created it.
     next_conn: AtomicU64,
@@ -204,17 +185,507 @@ pub struct ApiProxy {
     session_sink: OnceLock<Arc<dyn ApiSessionSink>>,
     listener_mode: ApiListenerMode,
     request_body_timeout: Duration,
+    /// Maximum time authority coordination can be retained while waiting for
+    /// the upstream to accept a request and return response headers.
+    upstream_handoff_timeout: Duration,
+    /// Maximum time spent buffering a response body after the finite header
+    /// handoff and any durable containment transition have completed.
+    upstream_body_timeout: Duration,
+    upstream_body_limit: usize,
     /// How often `policy_path` is checked for changes. Production keeps the
     /// [`POLICY_RELOAD_SECS`] default; tests inject a short interval so they
     /// can observe a reload without a multi-second wait.
     policy_reload_interval: Duration,
+    /// Wrapping generation advanced once when an authority revision becomes
+    /// transitional, before the update waits for in-flight handoffs.
+    authority_transition_generation: AtomicU64,
+    authority_transition_notify: tokio::sync::Notify,
+    policy_reload_notify: tokio::sync::Notify,
+}
+
+#[derive(Clone)]
+struct PendingApiAuthorization {
+    judge: Arc<dyn ApiJudge>,
+    summary: ApiRequestSummary,
+    requirement: ApiForwardRequirement,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedMutation {
+    prior_snapshot: Option<Vec<u8>>,
+    body_sha256: String,
+}
+
+struct StagedRevert {
+    handle: String,
+    created_key: Option<CreatedKey>,
+    created_path: Option<String>,
+    create_provenance: Option<String>,
+}
+
+const CREATE_PROVENANCE_ANNOTATION: &str = "guard.morgaesis.dev/provisional";
+
+#[derive(Debug, Clone)]
+struct ApprovedApiHold {
+    body_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedCreateProvenance(String);
+
+enum UpstreamHandoffOutcome {
+    Pending,
+    PreparationFailed,
+    TimedOut,
+    Finished(Result<reqwest::Response, reqwest::Error>),
+}
+
+enum UpstreamBodyError {
+    TimedOut,
+    ReadFailed,
+    TooLarge,
+}
+
+struct UpstreamSendHandoff<'a> {
+    proxy: &'a ApiProxy,
+    route_authority: RouteAuthority,
+    operation: Option<ApiOp>,
+    request: Option<reqwest::RequestBuilder>,
+    timeout: Duration,
+    outcome: UpstreamHandoffOutcome,
+    containment: Option<ContainmentLifecycle>,
+    actual_body_sha256: String,
+    authorized_body_sha256: Option<String>,
+}
+
+struct ContainmentLifecycle {
+    gate: Arc<dyn GateSink>,
+    handle: String,
+    created_key: Option<CreatedKey>,
+    created_path: Option<String>,
+    create_provenance: Option<String>,
+    handoff_started: bool,
+    transition_owned: bool,
+    armed: bool,
+}
+
+impl ContainmentLifecycle {
+    fn new(gate: Arc<dyn GateSink>, staged: StagedRevert) -> Self {
+        Self {
+            gate,
+            handle: staged.handle,
+            created_key: staged.created_key,
+            created_path: staged.created_path,
+            create_provenance: staged.create_provenance,
+            handoff_started: false,
+            transition_owned: false,
+            armed: true,
+        }
+    }
+
+    fn created_resource(&self) -> Option<(&CreatedKey, &str)> {
+        Some((self.created_key.as_ref()?, self.created_path.as_deref()?))
+    }
+
+    async fn prepare_dispatch(&mut self) -> bool {
+        let gate = self.gate.clone();
+        let handle = self.handle.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let marked = gate.mark_revert_dispatching(&handle).await;
+            if ready_tx.send(marked).is_err() || (marked && accepted_rx.await.is_err()) {
+                if marked {
+                    let _ = gate
+                        .mark_revert_indeterminate(
+                            &handle,
+                            "request handling ended after durable dispatch preparation",
+                            None,
+                        )
+                        .await;
+                } else {
+                    let _ = gate.cancel_staged_revert(&handle).await;
+                }
+            }
+        });
+        let marked = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+        if marked {
+            self.handoff_started = true;
+            let _ = accepted_tx.send(());
+        }
+        marked
+    }
+
+    async fn cancel_inert(mut self) -> bool {
+        if tokio::time::timeout(
+            Duration::from_secs(5),
+            self.gate.cancel_staged_revert(&self.handle),
+        )
+        .await
+        .is_ok_and(|cancelled| cancelled)
+        {
+            self.armed = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn preserve_indeterminate(
+        mut self,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> Option<String> {
+        self.transition_owned = true;
+        let gate = self.gate.clone();
+        let handle = self.handle.clone();
+        let reason = reason.to_string();
+        let resource_uid = resource_uid.map(str::to_string);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = gate
+                .mark_revert_indeterminate(&handle, &reason, resource_uid.as_deref())
+                .await;
+            let _ = result_tx.send(result);
+        });
+        let committed = tokio::time::timeout(Duration::from_secs(5), result_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+        self.armed = false;
+        committed.then(|| self.handle.clone())
+    }
+
+    async fn activate(
+        mut self,
+        resource_uid: Option<&str>,
+    ) -> Result<(String, Option<CreatedKey>), Option<String>> {
+        self.transition_owned = true;
+        let gate = self.gate.clone();
+        let handle = self.handle.clone();
+        let resource_uid = resource_uid.map(str::to_string);
+        let transition_uid = resource_uid.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let activated = gate
+                .mark_revert_forwarded(&handle, transition_uid.as_deref())
+                .await;
+            let recovered = if activated {
+                false
+            } else {
+                gate
+                    .mark_revert_indeterminate(
+                        &handle,
+                        "successful mutation response was received, but the confirmation window could not be activated",
+                        transition_uid.as_deref(),
+                    )
+                    .await
+            };
+            let _ = result_tx.send((activated, recovered));
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        self.armed = false;
+        match result {
+            Some((true, _)) => Ok((self.handle.clone(), self.created_key.take())),
+            Some((false, true)) => Err(Some(self.handle.clone())),
+            Some((false, false)) | None => Err(None),
+        }
+    }
+
+    async fn retire_rejected(mut self, reason: &str) -> Result<(), Option<String>> {
+        self.transition_owned = true;
+        let gate = self.gate.clone();
+        let handle = self.handle.clone();
+        let reason = reason.to_string();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let retired = gate.mark_revert_rejected(&handle, &reason).await;
+            let fallback = if retired {
+                None
+            } else {
+                gate.mark_revert_indeterminate(
+                    &handle,
+                    "the upstream rejected the request, but containment retirement did not converge",
+                    None,
+                )
+                .await
+                .then_some(handle)
+            };
+            let _ = result_tx.send((retired, fallback));
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        self.armed = false;
+        match result {
+            Some((true, _)) => Ok(()),
+            Some((false, fallback)) => Err(fallback),
+            None => Err(None),
+        }
+    }
+}
+
+impl Drop for ContainmentLifecycle {
+    fn drop(&mut self) {
+        if !self.armed || self.transition_owned {
+            return;
+        }
+        let gate = self.gate.clone();
+        let handle = self.handle.clone();
+        let handoff_started = self.handoff_started;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if handoff_started {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        gate.mark_revert_indeterminate(
+                            &handle,
+                            "request handling ended after upstream mutation dispatch began",
+                            None,
+                        ),
+                    )
+                    .await;
+                } else {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        gate.cancel_staged_revert(&handle),
+                    )
+                    .await;
+                }
+            });
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiForwardHandoff for UpstreamSendHandoff<'_> {
+    async fn forward(&mut self) -> Result<(), String> {
+        if self
+            .authorized_body_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &self.actual_body_sha256)
+        {
+            return Err("final request bytes changed after authorization".to_string());
+        }
+        if self
+            .proxy
+            .recheck_final_authority(&self.route_authority, self.operation.as_ref())
+            .await
+            .is_some()
+        {
+            return Err("policy authority changed before upstream handoff".to_string());
+        }
+        let request = self
+            .request
+            .take()
+            .ok_or_else(|| "upstream handoff was already consumed".to_string())?;
+        if let Some(containment) = self.containment.as_mut() {
+            if !containment.prepare_dispatch().await {
+                self.outcome = UpstreamHandoffOutcome::PreparationFailed;
+                return Err("durable mutation dispatch preparation failed".to_string());
+            }
+        }
+        if self
+            .proxy
+            .recheck_final_authority(&self.route_authority, self.operation.as_ref())
+            .await
+            .is_some()
+        {
+            return Err("policy authority changed during durable dispatch preparation".to_string());
+        }
+        let send = request.send();
+        tokio::pin!(send);
+        let _reservation = self
+            .proxy
+            .reserve_authority_initiation(&self.route_authority)
+            .await
+            .ok_or_else(|| "policy authority changed before upstream initiation".to_string())?;
+        // Keep the lease until the request future reaches response headers. A
+        // first poll can only queue a write; releasing here would let policy
+        // publication commit before the transport actually sends it.
+        let first_poll = {
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            send.as_mut().poll(&mut context)
+        };
+        let result = match first_poll {
+            std::task::Poll::Ready(result) => Ok(result),
+            std::task::Poll::Pending => tokio::time::timeout(self.timeout, &mut send).await,
+        };
+        match result {
+            Ok(result) => {
+                self.outcome = UpstreamHandoffOutcome::Finished(result);
+                Ok(())
+            }
+            Err(_) => {
+                self.outcome = UpstreamHandoffOutcome::TimedOut;
+                Err("upstream request handoff timed out".to_string())
+            }
+        }
+    }
+}
+
+struct SessionBoundHandoff<'a> {
+    sink: Option<&'a Arc<dyn ApiSessionSink>>,
+    auth: Option<&'a SessionAuth>,
+    context: Option<&'a ApiSessionContext>,
+    upstream: &'a mut dyn ApiForwardHandoff,
+}
+
+struct CleanupBoundHandoff<'a> {
+    proxy: &'a ApiProxy,
+    created: Option<&'a CreatedMatch>,
+    path: &'a str,
+    upstream: &'a mut dyn ApiForwardHandoff,
+}
+
+#[async_trait::async_trait]
+impl ApiForwardHandoff for CleanupBoundHandoff<'_> {
+    async fn forward(&mut self) -> Result<(), String> {
+        let Some(created) = self.created else {
+            return self.upstream.forward().await;
+        };
+        let gate = self
+            .proxy
+            .gate
+            .get()
+            .ok_or_else(|| "created-resource cleanup gate is unavailable".to_string())?;
+        let mut registry_handoff = CreatedRegistryHandoff {
+            proxy: self.proxy,
+            created,
+            path: self.path,
+            upstream: self.upstream,
+        };
+        gate.authorize_cleanup(
+            &created.handle,
+            &created.resource_uid,
+            &created.create_provenance,
+            &mut registry_handoff,
+        )
+        .await
+    }
+}
+
+struct CreatedRegistryHandoff<'a> {
+    proxy: &'a ApiProxy,
+    created: &'a CreatedMatch,
+    path: &'a str,
+    upstream: &'a mut dyn ApiForwardHandoff,
+}
+
+#[async_trait::async_trait]
+impl ApiForwardHandoff for CreatedRegistryHandoff<'_> {
+    async fn forward(&mut self) -> Result<(), String> {
+        let created = self.created;
+        let current = self
+            .proxy
+            .created
+            .lock()
+            .unwrap()
+            .find_record(&created.key)
+            .filter(|record| {
+                record.handle == created.handle
+                    && record.resource_uid == created.resource_uid
+                    && record.create_provenance == created.create_provenance
+            })
+            .ok_or_else(|| "created-resource cleanup authority was revoked".to_string())?;
+        self.proxy
+            .validate_current_created_object(
+                &created.key,
+                self.path,
+                &current.resource_uid,
+                &current.create_provenance,
+            )
+            .await?;
+        let still_current = self
+            .proxy
+            .created
+            .lock()
+            .unwrap()
+            .find_record(&created.key)
+            .is_some_and(|record| {
+                record.handle == created.handle
+                    && record.resource_uid == created.resource_uid
+                    && record.create_provenance == created.create_provenance
+            });
+        if !still_current {
+            return Err("created-resource cleanup authority was revoked".to_string());
+        }
+        self.upstream.forward().await
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiForwardHandoff for SessionBoundHandoff<'_> {
+    async fn forward(&mut self) -> Result<(), String> {
+        match (self.sink, self.auth, self.context) {
+            (Some(sink), Some(auth), Some(context)) => {
+                sink.authorize_forward(&auth.token, context, self.upstream)
+                    .await
+            }
+            (_, None, None) => self.upstream.forward().await,
+            _ => Err("session authority context is incomplete".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ApiListenerMode {
-    #[default]
     Policy,
+    #[default]
     Readonly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObservationKey {
+    endpoint: String,
+    session_fingerprint: String,
+    session_revision: String,
+    group: String,
+    version: String,
+    resource: String,
+    subresource: Option<String>,
+    namespace: Option<String>,
+    name: String,
+    uid: String,
+}
+
+#[derive(Debug, Clone)]
+struct ObservedVersion {
+    resource_version: String,
+    contention_fingerprint: String,
+}
+
+#[derive(Debug, Default)]
+struct ObservationRegistry {
+    items: HashMap<ObservationKey, ObservedVersion>,
+    order: VecDeque<ObservationKey>,
+}
+
+impl ObservationRegistry {
+    fn remember(&mut self, key: ObservationKey, observed: ObservedVersion) {
+        self.order.retain(|existing| existing != &key);
+        self.items.insert(key.clone(), observed);
+        self.order.push_back(key);
+        while self.items.len() > MAX_KUBERNETES_OBSERVATIONS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.items.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, key: &ObservationKey) -> Option<ObservedVersion> {
+        self.items.get(key).cloned()
+    }
 }
 
 /// A request shape for rarity accounting: the typed operation minus its object
@@ -238,19 +709,20 @@ struct ShapeKey {
 /// Counts request shapes seen over the proxy's lifetime and reports whether a
 /// shape is still under the escalation threshold. `threshold` is the number of
 /// occurrences that must accrue before a shape stops being escalated; 0
-/// disables escalation entirely (the common case). The map is unbounded by
-/// design: the shape space is the operator's own API surface (verb x resource
-/// x namespace) and excludes object names, so it is naturally small.
+/// disables escalation entirely (the common case). The finite FIFO bounds
+/// memory even when an attacker supplies an unbounded stream of distinct
+/// selectors or namespaces.
+const MAX_RARITY_SHAPES: usize = 4096;
 struct RarityTracker {
     threshold: u64,
-    seen: Mutex<HashMap<ShapeKey, u64>>,
+    state: Mutex<(HashMap<ShapeKey, u64>, VecDeque<ShapeKey>)>,
 }
 
 impl RarityTracker {
     fn new(threshold: u64) -> Self {
         Self {
             threshold,
-            seen: Mutex::new(HashMap::new()),
+            state: Mutex::new((HashMap::new(), VecDeque::new())),
         }
     }
 
@@ -266,7 +738,16 @@ impl RarityTracker {
         if !self.enabled() {
             return false;
         }
-        let mut seen = self.seen.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let (seen, order) = &mut *state;
+        if !seen.contains_key(&key) {
+            if seen.len() >= MAX_RARITY_SHAPES {
+                if let Some(oldest) = order.pop_front() {
+                    seen.remove(&oldest);
+                }
+            }
+            order.push_back(key.clone());
+        }
         let count = seen.entry(key).or_insert(0);
         let rare = *count < self.threshold;
         *count = count.saturating_add(1);
@@ -301,30 +782,61 @@ struct CreatedKey {
 struct CreatedMatch {
     key: CreatedKey,
     handle: String,
+    resource_uid: String,
+    create_provenance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreatedRecord {
+    handle: String,
+    resource_uid: String,
+    create_provenance: String,
 }
 
 /// Tracks resources the proxy forwarded a create for (and armed an auto-revert
 /// on), each mapped to its auto-revert handle. Pure: no clock, no I/O.
 #[derive(Debug, Default)]
 struct CreatedRegistry {
-    items: HashMap<CreatedKey, String>,
+    items: HashMap<CreatedKey, CreatedRecord>,
 }
 
 impl CreatedRegistry {
     /// Record a created resource against its auto-revert handle.
-    fn remember(&mut self, key: CreatedKey, handle: String) {
-        self.items.insert(key, handle);
+    fn remember(
+        &mut self,
+        key: CreatedKey,
+        handle: String,
+        resource_uid: String,
+        create_provenance: String,
+    ) {
+        self.items.insert(
+            key,
+            CreatedRecord {
+                handle,
+                resource_uid,
+                create_provenance,
+            },
+        );
     }
 
     /// Consume and return the auto-revert handle for a created resource, if the
     /// delete's key (connection included) matches a recorded create. Consuming
     /// ensures a resource is only ever contained-deleted once.
+    #[cfg(test)]
     fn find(&self, key: &CreatedKey) -> Option<String> {
+        self.items.get(key).map(|record| record.handle.clone())
+    }
+
+    fn find_record(&self, key: &CreatedKey) -> Option<CreatedRecord> {
         self.items.get(key).cloned()
     }
 
     fn take_if_handle(&mut self, key: &CreatedKey, handle: &str) -> bool {
-        if self.items.get(key).is_some_and(|stored| stored == handle) {
+        if self
+            .items
+            .get(key)
+            .is_some_and(|record| record.handle == handle)
+        {
             self.items.remove(key);
             true
         } else {
@@ -338,7 +850,7 @@ impl CreatedRegistry {
     /// still match a stale entry and skip the standard policy checks. Dropping
     /// the record on resolution keeps the shortcut scoped to a live revert.
     fn forget_by_handle(&mut self, handle: &str) {
-        self.items.retain(|_, h| h != handle);
+        self.items.retain(|_, record| record.handle != handle);
     }
 
     #[cfg(test)]
@@ -348,6 +860,59 @@ impl CreatedRegistry {
 }
 
 impl ApiProxy {
+    fn redact_upstream_bytes(
+        &self,
+        secrets: Vec<Vec<u8>>,
+        bytes: &[u8],
+    ) -> Result<Bytes, UpstreamBodyError> {
+        ExactSecretRedactor::redact_all(secrets, bytes, self.upstream_body_limit)
+            .map(Bytes::from)
+            .map_err(|_| UpstreamBodyError::TooLarge)
+    }
+
+    async fn read_upstream_body(
+        &self,
+        mut response: reqwest::Response,
+    ) -> Result<Bytes, UpstreamBodyError> {
+        let limit = self.upstream_body_limit;
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(UpstreamBodyError::TooLarge);
+        }
+        let read = async move {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| UpstreamBodyError::ReadFailed)?
+            {
+                if bytes.len().saturating_add(chunk.len()) > limit {
+                    return Err(UpstreamBodyError::TooLarge);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Bytes::from(bytes))
+        };
+        match tokio::time::timeout(self.upstream_body_timeout, read).await {
+            Ok(result) => result,
+            Err(_) => Err(UpstreamBodyError::TimedOut),
+        }
+    }
+
+    async fn take_upstream_body(
+        &self,
+        response: &mut Option<reqwest::Response>,
+        buffered: &mut Option<Bytes>,
+    ) -> Result<Bytes, UpstreamBodyError> {
+        if let Some(bytes) = buffered.take() {
+            return Ok(bytes);
+        }
+        let response = response.take().ok_or(UpstreamBodyError::ReadFailed)?;
+        self.read_upstream_body(response).await
+    }
+
     /// Assemble a Kubernetes proxy. `policy_path` (when set) is hot-reloaded
     /// while serving; when unset, `policy` is used as-is (typically a
     /// default-deny).
@@ -389,18 +954,27 @@ impl ApiProxy {
             policy: Arc::new(RwLock::new(policy)),
             policy_path,
             authority_revision: AtomicU64::new(0),
+            authority_initiation: Arc::new(RwLock::new(())),
+            authority_update_serial: Arc::new(AsyncMutex::new(())),
             gate: OnceLock::new(),
             judge: StdRwLock::new(None),
             judge_builder: OnceLock::new(),
             created: Mutex::new(CreatedRegistry::default()),
+            observations: Mutex::new(ObservationRegistry::default()),
             next_conn: AtomicU64::new(1),
             rarity: RarityTracker::new(0),
             endpoint: "default".to_string(),
             credential_ref: "upstream".to_string(),
             session_sink: OnceLock::new(),
-            listener_mode: ApiListenerMode::Policy,
+            listener_mode: ApiListenerMode::default(),
             request_body_timeout: REQUEST_BODY_READ_TIMEOUT,
+            upstream_handoff_timeout: UPSTREAM_HANDOFF_TIMEOUT,
+            upstream_body_timeout: UPSTREAM_BODY_TIMEOUT,
+            upstream_body_limit: MAX_UPSTREAM_BODY,
             policy_reload_interval: Duration::from_secs(POLICY_RELOAD_SECS),
+            authority_transition_generation: AtomicU64::new(0),
+            authority_transition_notify: tokio::sync::Notify::new(),
+            policy_reload_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -426,6 +1000,29 @@ impl ApiProxy {
         self
     }
 
+    /// Bound the finite upstream request handoff. Authority leases are released
+    /// when this deadline expires and never span response-body streaming.
+    #[doc(hidden)]
+    pub fn with_upstream_handoff_timeout(mut self, timeout: Duration) -> Self {
+        self.upstream_handoff_timeout = timeout;
+        self
+    }
+
+    /// Bound response buffering independently from the authority-protected
+    /// response-header handoff.
+    #[doc(hidden)]
+    pub fn with_upstream_body_timeout(mut self, timeout: Duration) -> Self {
+        self.upstream_body_timeout = timeout;
+        self
+    }
+
+    /// Override the response buffer ceiling for deterministic boundary tests.
+    #[doc(hidden)]
+    pub fn with_upstream_body_limit(mut self, limit: usize) -> Self {
+        self.upstream_body_limit = limit;
+        self
+    }
+
     /// Override how often `policy_path` is checked for changes. The default is
     /// [`POLICY_RELOAD_SECS`]; tests inject a short interval so a reload can be
     /// observed promptly.
@@ -439,6 +1036,54 @@ impl ApiProxy {
     /// hot-reload of `policy_path` has taken effect.
     pub async fn policy_fingerprint(&self) -> String {
         self.policy.read().await.authority_fingerprint()
+    }
+
+    /// Return the wrapping generation of authority transitions that have begun.
+    ///
+    /// The generation advances exactly once after the proxy publishes an odd
+    /// authority revision, before the update waits for in-flight upstream
+    /// handoffs. It observes transition entry, not completed policy
+    /// publication.
+    pub fn authority_transition_generation(&self) -> u64 {
+        self.authority_transition_generation.load(Ordering::Acquire)
+    }
+
+    /// Wait for an authority transition after `observed_generation` and return
+    /// the new wrapping generation.
+    pub async fn wait_for_authority_transition_after(&self, observed_generation: u64) -> u64 {
+        loop {
+            let notified = self.authority_transition_notify.notified();
+            let generation = self.authority_transition_generation();
+            if generation != observed_generation {
+                return generation;
+            }
+            notified.await;
+        }
+    }
+
+    /// Wait until `expected` is the active policy authority fingerprint.
+    /// Notification registration precedes each observation, so publication
+    /// cannot be missed between the fingerprint read and the wait.
+    pub async fn wait_for_policy_fingerprint(&self, expected: &str) {
+        self.wait_for_policy_fingerprint_with_before_check(expected, || {})
+            .await;
+    }
+
+    async fn wait_for_policy_fingerprint_with_before_check<F>(
+        &self,
+        expected: &str,
+        mut before_check: F,
+    ) where
+        F: FnMut(),
+    {
+        loop {
+            let notified = self.policy_reload_notify.notified();
+            before_check();
+            if self.policy_fingerprint().await == expected {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn attach_session_sink(&self, sink: Arc<dyn ApiSessionSink>) {
@@ -469,12 +1114,17 @@ impl ApiProxy {
         let _ = self.gate.set(sink);
     }
 
-    /// Attach an API judge. Later calls replace the active judge, which lets a
-    /// policy intent reload swap in a fresh evaluator and fresh cache.
-    pub fn attach_judge(&self, judge: Arc<dyn ApiJudge>) {
-        self.begin_authority_update();
-        *self.judge.write().unwrap() = Some(judge);
-        self.finish_authority_update();
+    /// Attach or replace the API judge with full authority coordination.
+    ///
+    /// The revision is marked transitional and the write lease is held until
+    /// the replacement is published, so in-flight upstream handoffs cannot
+    /// race an evaluator change.
+    pub async fn attach_judge(&self, judge: Arc<dyn ApiJudge>) {
+        let _update = self.begin_authority_update().await;
+        *self
+            .judge
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(judge);
     }
 
     /// Attach a builder used by the policy reloader to rebuild the judge when
@@ -487,40 +1137,63 @@ impl ApiProxy {
     pub fn has_judge(&self) -> bool {
         self.judge
             .read()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .is_some_and(|judge| judge.evaluator_enabled())
     }
 
-    fn begin_authority_update(&self) {
-        loop {
-            let revision = self.authority_revision.load(Ordering::Acquire);
-            if !revision.is_multiple_of(2) {
-                std::thread::yield_now();
-                continue;
-            }
-            if self
-                .authority_revision
-                .compare_exchange(
-                    revision,
-                    revision.saturating_add(1),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return;
-            }
+    async fn begin_authority_update(&self) -> AuthorityUpdateGuard<'_> {
+        self.begin_authority_update_with_callback(|| {}).await
+    }
+
+    async fn begin_authority_update_with_callback<F>(
+        &self,
+        after_revision_published: F,
+    ) -> AuthorityUpdateGuard<'_>
+    where
+        F: FnOnce(),
+    {
+        let update_serial = self.authority_update_serial.clone().lock_owned().await;
+        let revision = self.authority_revision.load(Ordering::Acquire);
+        debug_assert!(revision.is_multiple_of(2));
+        let next = revision.wrapping_add(1);
+        self.authority_revision
+            .compare_exchange(revision, next, Ordering::AcqRel, Ordering::Acquire)
+            .expect("authority update serial keeps revision stable");
+        // Own the odd revision before awaiting the write lease. Cancellation
+        // while waiting for an in-flight handoff must publish an even revision.
+        let revision_transition = AuthorityRevisionTransition {
+            revision: &self.authority_revision,
+        };
+        self.authority_transition_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.authority_transition_notify.notify_waiters();
+        after_revision_published();
+        let coordination = self.authority_initiation.clone().write_owned().await;
+        AuthorityUpdateGuard {
+            _revision_transition: revision_transition,
+            _update_serial: update_serial,
+            _coordination: coordination,
         }
     }
 
-    fn finish_authority_update(&self) {
-        let previous = self.authority_revision.fetch_add(1, Ordering::Release);
-        debug_assert!(!previous.is_multiple_of(2));
+    async fn reserve_authority_initiation(
+        &self,
+        expected: &RouteAuthority,
+    ) -> Option<OwnedRwLockReadGuard<()>> {
+        if self.authority_revision.load(Ordering::Acquire) != expected.revision
+            || !expected.revision.is_multiple_of(2)
+        {
+            return None;
+        }
+        let coordination = self.authority_initiation.clone().try_read_owned().ok()?;
+        (self.authority_revision.load(Ordering::Acquire) == expected.revision)
+            .then_some(coordination)
     }
 
-    async fn capture_route_authority(&self) -> (ApiPolicy, RouteAuthority) {
-        loop {
+    async fn capture_route_authority(&self) -> Result<(ApiPolicy, RouteAuthority)> {
+        const MAX_CAPTURE_ATTEMPTS: usize = 64;
+        for _ in 0..MAX_CAPTURE_ATTEMPTS {
             let before = self.authority_revision.load(Ordering::Acquire);
             if !before.is_multiple_of(2) {
                 tokio::task::yield_now().await;
@@ -530,19 +1203,38 @@ impl ApiProxy {
             let after = self.authority_revision.load(Ordering::Acquire);
             if before == after && after.is_multiple_of(2) {
                 let policy_fingerprint = policy.authority_fingerprint();
-                return (
+                return Ok((
                     policy,
                     RouteAuthority {
                         revision: after,
                         policy_fingerprint,
                     },
-                );
+                ));
             }
         }
+        anyhow::bail!("API route authority remained unstable")
     }
 
     pub fn protocol_name(&self) -> &str {
         self.protocol.name()
+    }
+
+    /// Return the policy or protocol-floor reason that makes `op`
+    /// unconditionally unusable through this proxy. Hold and evaluate actions
+    /// remain usable because they can still reach an authorization decision.
+    pub async fn categorical_policy_refusal(&self, op: &ApiOp) -> Result<Option<String>, String> {
+        let (policy, _) = self
+            .capture_route_authority()
+            .await
+            .map_err(|error| format!("API route authority is unavailable: {error}"))?;
+        if let Some(reason) = self.protocol.deny_outright(op) {
+            return Ok(Some(reason));
+        }
+        // This judges a hypothetical operation with no request body, so rules
+        // gated on body metadata predicates cannot match and the check stays
+        // conservative: it can over-refuse, never under-refuse.
+        let decision = policy.decide(op, b"");
+        Ok(matches!(decision.action, ApiAction::Deny).then_some(decision.reason))
     }
 
     pub fn upstream(&self) -> &Upstream {
@@ -657,45 +1349,68 @@ impl ApiProxy {
     async fn route(&self, mut req: Request<Incoming>, conn_id: u64) -> Response<ProxyBody> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
+        let has_identity_override = req.headers().keys().any(is_identity_header);
         let session_token = match take_guard_session(req.headers_mut()) {
             Ok(token) => token,
             Err(reason) => {
                 return self.status_resp(StatusCode::FORBIDDEN, reason, "Forbidden");
             }
         };
-        let session_context =
-            if let Some(token) = session_token.as_deref() {
-                let Some(sink) = self.session_sink.get() else {
+        let session_context = if let Some(token) = session_token.as_deref() {
+            let Some(sink) = self.session_sink.get() else {
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: session attribution is unavailable",
+                    "Forbidden",
+                );
+            };
+            match sink.resolve(token).await {
+                Some(context) => Some(context),
+                None => {
                     return self.status_resp(
                         StatusCode::FORBIDDEN,
-                        "guard api-proxy: session attribution is unavailable",
+                        "guard api-proxy: unknown or expired session",
                         "Forbidden",
-                    );
-                };
-                match sink.resolve(token).await {
-                    Some(context) => {
-                        if context.secret_entitlements.as_ref().is_some_and(|names| {
-                            !names.iter().any(|name| name == &self.credential_ref)
-                        }) {
-                            return self.status_resp(
-                            StatusCode::FORBIDDEN,
-                            "guard api-proxy: session is not entitled to this upstream credential",
-                            "Forbidden",
-                        );
-                        }
-                        Some(context)
-                    }
-                    None => {
-                        return self.status_resp(
-                            StatusCode::FORBIDDEN,
-                            "guard api-proxy: unknown or expired session",
-                            "Forbidden",
-                        )
-                    }
+                    )
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
+        if has_identity_override {
+            let response = self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: identity impersonation is not supported; the request was not forwarded",
+                "Forbidden",
+            );
+            if let (Some(token), Some(sink)) = (session_token.as_deref(), self.session_sink.get()) {
+                sink.record(
+                    token,
+                    ApiSessionEvent {
+                        endpoint: self.endpoint.clone(),
+                        operation: format!("{} {}", method, path),
+                        allowed: false,
+                        status: response.status().as_u16(),
+                        held: false,
+                        credential_ref: self.credential_ref.clone(),
+                    },
+                )
+                .await;
+            }
+            return response;
+        }
+        if session_context.as_ref().is_some_and(|context| {
+            context
+                .secret_entitlements
+                .as_ref()
+                .is_some_and(|names| !names.iter().any(|name| name == &self.credential_ref))
+        }) {
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: session is not entitled to this upstream credential",
+                "Forbidden",
+            );
+        }
         if let (Some(token), Some(context)) = (session_token.clone(), session_context.clone()) {
             req.extensions_mut().insert(SessionAuth { token, context });
         }
@@ -725,7 +1440,16 @@ impl ApiProxy {
         conn_id: u64,
         session_context: Option<ApiSessionContext>,
     ) -> Response<ProxyBody> {
-        let (route_policy, route_authority) = self.capture_route_authority().await;
+        let (route_policy, route_authority) = match self.capture_route_authority().await {
+            Ok(authority) => authority,
+            Err(_) => {
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: API route authority is unavailable",
+                    "Forbidden",
+                )
+            }
+        };
         req.extensions_mut().insert(route_authority);
         let method = req.method().clone();
         let path = req.uri().path().to_string();
@@ -768,9 +1492,25 @@ impl ApiProxy {
             return self.status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden");
         }
 
+        if self.is_kubernetes_mutation(&op) && session_context.is_none() {
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: Kubernetes mutations require an attributable Guard session or an operator-approved typed verb",
+                "Forbidden",
+            );
+        }
+
+        // Policy can constrain object metadata carried in a write body. Buffer
+        // only after protocol hard-denies and attribution checks have run, then
+        // preserve these exact bytes through classification and forwarding.
+        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
+            Ok(buffered) => buffered,
+            Err(error) => return self.request_body_error_response(error),
+        };
+
         let label = format!("{} {}", op.verb.as_str(), path);
 
-        let decision = route_policy.decide(&op);
+        let decision = route_policy.decide(&op, &body);
 
         // Protocol floors and explicit operator policy denies are absolute.
         // Session mode can only choose a stricter deterministic path or route a
@@ -793,7 +1533,17 @@ impl ApiProxy {
             .unwrap_or_default();
         if !op.is_read() && session_mode == ApiEvaluationMode::ReadOnly {
             return self
-                .route_coverage_only(req, &path, &op, false, conn_id, session_context.as_ref())
+                .route_coverage_only(
+                    BufferedRequest { parts, body },
+                    RouteMetadata {
+                        path: &path,
+                        query: &query,
+                        op: &op,
+                    },
+                    false,
+                    conn_id,
+                    session_context.as_ref(),
+                )
                 .await;
         }
         if !matches!(decision.action, ApiAction::Hold) {
@@ -803,15 +1553,28 @@ impl ApiProxy {
                     .is_some_and(|context| context.can_evaluate_api_override)
                 {
                     return self
-                        .route_evaluate(req, &path, &op, false, conn_id, session_context.as_ref())
+                        .route_evaluate(
+                            BufferedRequest { parts, body },
+                            RouteMetadata {
+                                path: &path,
+                                query: &query,
+                                op: &op,
+                            },
+                            false,
+                            conn_id,
+                            session_context.as_ref(),
+                        )
                         .await;
                 }
                 if session_context.is_some() {
                     return self
                         .route_coverage_only(
-                            req,
-                            &path,
-                            &op,
+                            BufferedRequest { parts, body },
+                            RouteMetadata {
+                                path: &path,
+                                query: &query,
+                                op: &op,
+                            },
                             false,
                             conn_id,
                             session_context.as_ref(),
@@ -828,7 +1591,17 @@ impl ApiProxy {
                 && matches!(decision.action, ApiAction::Evaluate)
             {
                 return self
-                    .route_coverage_only(req, &path, &op, false, conn_id, session_context.as_ref())
+                    .route_coverage_only(
+                        BufferedRequest { parts, body },
+                        RouteMetadata {
+                            path: &path,
+                            query: &query,
+                            op: &op,
+                        },
+                        false,
+                        conn_id,
+                        session_context.as_ref(),
+                    )
                     .await;
             }
         }
@@ -853,30 +1626,72 @@ impl ApiProxy {
                     .as_ref()
                     .map(|context| context.fingerprint.as_str()),
             ) {
-                let _ = crate::audit::emit_global(
-                    &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
-                        .handle(&created.handle)
-                        .reason(
-                            "contained: guard-created this session, auto-revert remains armed                              until delete succeeds",
+                let same_resource = self
+                    .validate_current_created_object(
+                        &created.key,
+                        &path,
+                        &created.resource_uid,
+                        &created.create_provenance,
+                    )
+                    .await
+                    .is_ok();
+                if same_resource {
+                    let _ = crate::audit::emit_global(
+                        &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
+                            .handle(&created.handle)
+                            .reason(
+                                "contained: guard-created this session, auto-revert remains armed until delete succeeds",
+                            )
+                            .field("decision", "allow")
+                            .field("label", &label),
+                    );
+                    return self
+                        .forward_contained_cleanup(
+                            BufferedRequest { parts, body },
+                            RouteMetadata {
+                                path: &path,
+                                query: &query,
+                                op: &op,
+                            },
+                            conn_id,
+                            created,
                         )
-                        .field("decision", "allow")
-                        .field("label", &label),
-                );
-                return self
-                    .forward_contained_cleanup(req, &path, &query, op, conn_id, created)
-                    .await;
+                        .await;
+                }
+                self.created
+                    .lock()
+                    .unwrap()
+                    .take_if_handle(&created.key, &created.handle);
             }
         }
 
         match decision.action {
             ApiAction::Deny => unreachable!("explicit deny returned above"),
             ApiAction::Hold => {
-                self.route_hold(req, &path, &query, &op, &decision.reason, conn_id)
-                    .await
+                self.route_hold_buffered(
+                    BufferedRequest { parts, body },
+                    &path,
+                    &query,
+                    &op,
+                    &decision.reason,
+                    conn_id,
+                    None,
+                )
+                .await
             }
             ApiAction::Evaluate => {
-                self.route_evaluate(req, &path, &op, false, conn_id, session_context.as_ref())
-                    .await
+                self.route_evaluate(
+                    BufferedRequest { parts, body },
+                    RouteMetadata {
+                        path: &path,
+                        query: &query,
+                        op: &op,
+                    },
+                    false,
+                    conn_id,
+                    session_context.as_ref(),
+                )
+                .await
             }
             ApiAction::Allow => {
                 // Rarity escalation: a broad allow rule fails toward scrutiny on
@@ -895,9 +1710,12 @@ impl ApiProxy {
                             );
                             return self
                                 .route_evaluate(
-                                    req,
-                                    &path,
-                                    &op,
+                                    BufferedRequest { parts, body },
+                                    RouteMetadata {
+                                        path: &path,
+                                        query: &query,
+                                        op: &op,
+                                    },
                                     true,
                                     conn_id,
                                     session_context.as_ref(),
@@ -914,30 +1732,50 @@ impl ApiProxy {
                                 label
                             );
                             return self
-                                .route_hold(req, &path, &query, &op, &reason, conn_id)
+                                .route_hold_buffered(
+                                    BufferedRequest { parts, body },
+                                    &path,
+                                    &query,
+                                    &op,
+                                    &reason,
+                                    conn_id,
+                                    None,
+                                )
                                 .await;
                         }
                     }
                 }
                 let redact = self.protocol.redactable_read(&op);
                 tracing::info!(target: "guard::apiproxy", "ALLOW {}{}", label, if redact { " (redacting)" } else { "" });
-                self.forward(req, &path, &query, redact, Some(op), conn_id)
-                    .await
+                self.forward_buffered(
+                    BufferedRequest { parts, body },
+                    &path,
+                    &query,
+                    redact,
+                    Some(op.clone()),
+                    conn_id,
+                    None,
+                    None,
+                )
+                .await
             }
         }
     }
 
-    async fn route_evaluate(
+    async fn route_evaluate<'a>(
         &self,
-        req: Request<Incoming>,
-        path: &str,
-        op: &ApiOp,
+        buffered: BufferedRequest,
+        route: RouteMetadata<'a>,
         rarity: bool,
         conn_id: u64,
         session_context: Option<&ApiSessionContext>,
     ) -> Response<ProxyBody> {
+        let mut parts = buffered.parts;
+        let body = buffered.body;
+        let path = route.path;
+        let query = route.query;
+        let op = route.op;
         let label = format!("{} {}", op.verb.as_str(), path);
-        let query = req.uri().query().unwrap_or("").to_string();
         if session_context
             .is_some_and(|context| context.evaluation_mode == ApiEvaluationMode::PolicyOnly)
         {
@@ -955,35 +1793,67 @@ impl ApiProxy {
             .filter(|judge| judge.evaluator_enabled())
         else {
             return self
-                .route_hold(
-                    req,
+                .route_hold_buffered(
+                    BufferedRequest { parts, body },
                     path,
-                    &query,
+                    query,
                     op,
                     "api-policy evaluate requested but no evaluator is attached",
                     conn_id,
+                    None,
                 )
                 .await;
         };
 
-        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
-            Ok(buffered) => buffered,
-            Err(error) => return self.request_body_error_response(error),
+        let coverage_body_shape = redacted_body_shape(&body);
+        let mut body = match prepare_create_provenance(
+            &mut parts,
+            body,
+            op,
+            self.gate.get().is_some() && self.protocol.tracks_write(op),
+        ) {
+            Ok(body) => body,
+            Err(reason) => return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid"),
         };
         let route_authority = match self.route_authority_from_parts(&parts) {
             Some(authority) => authority,
             None => return self.missing_route_authority_response(),
         };
-        let body_shape = redacted_body_shape(&body);
-        let prepared = match self.prepare_revert(op, path, &route_authority).await {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
+        let prepared_mutation = if self.is_kubernetes_mutation(op) {
+            match self
+                .arbitrate_kubernetes_mutation(&parts, &body, path, op, &route_authority, None)
+                .await
+            {
+                Ok((guarded_body, snapshot)) => {
+                    body = guarded_body;
+                    Some(PreparedMutation {
+                        prior_snapshot: snapshot,
+                        body_sha256: body_sha256(&body),
+                    })
+                }
+                Err(response) => return *response,
+            }
+        } else {
+            None
         };
+        let prepared = if self.is_kubernetes_mutation(op) {
+            self.revert_constructibility_from_prepared(op, prepared_mutation.as_ref())
+        } else {
+            match self.prepare_revert(op, path, &route_authority).await {
+                Ok(prepared) => prepared,
+                Err(response) => return *response,
+            }
+        };
+        if let Some(prepared) = prepared_mutation.as_ref() {
+            parts.extensions.insert(prepared.clone());
+        }
+        let final_body_shape = redacted_body_shape(&body);
+        let authorized_body_sha256 = body_sha256(&body);
         let summary = ApiRequestSummary {
             protocol: self.protocol.name().to_string(),
             verb: op.verb.as_str().to_string(),
             path: path.to_string(),
-            redacted_query: crate::evaluate::redact_for_llm(&query),
+            redacted_query: crate::evaluate::redact_for_llm(query),
             group: op.group.clone(),
             version: op.version.clone(),
             resource: op.resource.clone(),
@@ -992,7 +1862,9 @@ impl ApiProxy {
             name: op.name.clone(),
             dry_run: op.dry_run,
             authority_selectors: op.authority_selectors.clone(),
-            redacted_body_shape: body_shape,
+            coverage_body_shape,
+            redacted_body_shape: final_body_shape,
+            authorized_body_sha256,
             revert_constructible: prepared,
             rarity,
             endpoint: self.endpoint.clone(),
@@ -1053,6 +1925,7 @@ impl ApiProxy {
                 reason,
                 risk,
                 reversibility,
+                authorization,
             } => {
                 let _ = crate::audit::emit_global(
                     &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
@@ -1062,6 +1935,30 @@ impl ApiProxy {
                         .field("reversibility", format!("{reversibility:?}"))
                         .field("label", &label),
                 );
+                let pending_authorization = match authorization {
+                    ApiAuthorizationKind::Evaluated => PendingApiAuthorization {
+                        judge: judge.clone(),
+                        summary: summary.clone(),
+                        requirement: ApiForwardRequirement::Evaluated,
+                    },
+                    ApiAuthorizationKind::Coverage => {
+                        let (Some(risk), Some(reversibility)) = (risk, reversibility) else {
+                            return self.status_resp(
+                                StatusCode::FORBIDDEN,
+                                "guard api-proxy coverage authorization is incomplete",
+                                "Forbidden",
+                            );
+                        };
+                        PendingApiAuthorization {
+                            judge: judge.clone(),
+                            summary: summary.clone(),
+                            requirement: ApiForwardRequirement::Coverage {
+                                risk,
+                                reversibility,
+                            },
+                        }
+                    }
+                };
                 let outcome = decide_gate(reversibility, risk, prepared.is_constructible(), false);
                 match outcome {
                     // Reversible/low-risk: no envelope needed, forward as-is.
@@ -1074,14 +1971,14 @@ impl ApiProxy {
                             if redact { " (redacting)" } else { "" }
                         );
                         self.forward_buffered(
-                            parts,
-                            body,
+                            BufferedRequest { parts, body },
                             path,
-                            &query,
+                            query,
                             redact,
                             Some(op.clone()),
                             conn_id,
-                            None,
+                            prepared_mutation,
+                            Some(pending_authorization),
                         )
                         .await
                     }
@@ -1100,7 +1997,7 @@ impl ApiProxy {
                         // forwarding path repeats these checks immediately
                         // before the mutation.
                         if let Err(response) = self.revalidate_session(&parts).await {
-                            return response;
+                            return *response;
                         }
                         if let Some(response) = self
                             .recheck_final_authority(&route_authority, Some(op))
@@ -1119,42 +2016,44 @@ impl ApiProxy {
                         };
                         if !can_arm {
                             return self
-                                .route_hold_buffered(
-                                    parts,
-                                    body,
+                                .route_hold_buffered(BufferedRequest { parts, body },
                                     path,
-                                    &query,
+                                    query,
                                     op,
                                     "evaluator allowed a contained write but no auto-revert can be armed right now",
                                     conn_id,
+                                    Some(pending_authorization),
                                 )
                                 .await;
                         }
-                        let snapshot = if self.protocol.wants_prior_snapshot(op) {
+                        let forward_prepared = if prepared_mutation.is_some() {
+                            prepared_mutation
+                        } else if self.protocol.wants_prior_snapshot(op) {
                             match self
                                 .fetch_validated_snapshot(op, path, &route_authority)
                                 .await
                             {
-                                Ok(Some(s)) => Some(Some(s)),
+                                Ok(Some(snapshot)) => Some(PreparedMutation {
+                                    prior_snapshot: Some(snapshot),
+                                    body_sha256: body_sha256(&body),
+                                }),
                                 Ok(None) => {
                                     return self
-                                        .route_hold_buffered(
-                                            parts,
-                                            body,
+                                        .route_hold_buffered(BufferedRequest { parts, body },
                                             path,
-                                            &query,
+                                            query,
                                             op,
                                             "evaluator allowed a contained write but its revert could not be re-established at forward time",
                                             conn_id,
+                                            Some(pending_authorization),
                                         )
                                         .await;
                                 }
-                                Err(response) => return response,
+                                Err(response) => return *response,
                             }
                         } else {
-                            // A create's revert is built from the write response
-                            // (delete-the-created-object); it cannot be validated
-                            // before the write, so it is armed best-effort after.
+                            // A named create's delete revert is built from the
+                            // exact buffered request immediately before send.
                             None
                         };
                         let redact = self.protocol.redactable_read(op);
@@ -1165,26 +2064,26 @@ impl ApiProxy {
                             if redact { " (redacting)" } else { "" }
                         );
                         self.forward_buffered(
-                            parts,
-                            body,
+                            BufferedRequest { parts, body },
                             path,
-                            &query,
+                            query,
                             redact,
                             Some(op.clone()),
                             conn_id,
-                            snapshot,
+                            forward_prepared,
+                            Some(pending_authorization),
                         )
                         .await
                     }
                     GateOutcome::Contain | GateOutcome::Hold => {
                         self.route_hold_buffered(
-                            parts,
-                            body,
+                            BufferedRequest { parts, body },
                             path,
-                            &query,
+                            query,
                             op,
                             &format!("api evaluator allowed but consequence gate held: {reason}"),
                             conn_id,
+                            Some(pending_authorization),
                         )
                         .await
                     }
@@ -1196,32 +2095,70 @@ impl ApiProxy {
     /// Resolve exact typed API coverage without invoking the evaluator. This is
     /// the only write path available to read-only sessions and the fallback for
     /// `evaluate` policy cells under policy-only sessions.
-    async fn route_coverage_only(
+    async fn route_coverage_only<'a>(
         &self,
-        req: Request<Incoming>,
-        path: &str,
-        op: &ApiOp,
+        buffered: BufferedRequest,
+        route: RouteMetadata<'a>,
         rarity: bool,
         conn_id: u64,
         session_context: Option<&ApiSessionContext>,
     ) -> Response<ProxyBody> {
-        let query = req.uri().query().unwrap_or("").to_string();
-        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
-            Ok(buffered) => buffered,
-            Err(error) => return self.request_body_error_response(error),
+        let mut parts = buffered.parts;
+        let body = buffered.body;
+        let path = route.path;
+        let query = route.query;
+        let op = route.op;
+        let coverage_body_shape = redacted_body_shape(&body);
+        let mut body = match prepare_create_provenance(
+            &mut parts,
+            body,
+            op,
+            self.gate.get().is_some() && self.protocol.tracks_write(op),
+        ) {
+            Ok(body) => body,
+            Err(reason) => return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid"),
         };
-        let Some(judge) = self.judge.read().unwrap().clone() else {
+        let Some(judge) = self
+            .judge
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
             return self.status_resp(
                 StatusCode::FORBIDDEN,
                 "guard api-proxy: no exact typed API coverage resolver is attached",
                 "Forbidden",
             );
         };
+        let route_authority = match self.route_authority_from_parts(&parts) {
+            Some(authority) => authority,
+            None => return self.missing_route_authority_response(),
+        };
+        let prepared_mutation = if self.is_kubernetes_mutation(op) {
+            match self
+                .arbitrate_kubernetes_mutation(&parts, &body, path, op, &route_authority, None)
+                .await
+            {
+                Ok((guarded_body, snapshot)) => {
+                    body = guarded_body;
+                    Some(PreparedMutation {
+                        prior_snapshot: snapshot,
+                        body_sha256: body_sha256(&body),
+                    })
+                }
+                Err(response) => return *response,
+            }
+        } else {
+            None
+        };
+        if let Some(prepared) = prepared_mutation.as_ref() {
+            parts.extensions.insert(prepared.clone());
+        }
         let summary = ApiRequestSummary {
             protocol: self.protocol.name().to_string(),
             verb: op.verb.as_str().to_string(),
             path: path.to_string(),
-            redacted_query: crate::evaluate::redact_for_llm(&query),
+            redacted_query: crate::evaluate::redact_for_llm(query),
             group: op.group.clone(),
             version: op.version.clone(),
             resource: op.resource.clone(),
@@ -1230,7 +2167,9 @@ impl ApiProxy {
             name: op.name.clone(),
             dry_run: op.dry_run,
             authority_selectors: op.authority_selectors.clone(),
+            coverage_body_shape,
             redacted_body_shape: redacted_body_shape(&body),
+            authorized_body_sha256: body_sha256(&body),
             revert_constructible: RevertConstructible::None,
             rarity,
             endpoint: self.endpoint.clone(),
@@ -1250,29 +2189,37 @@ impl ApiProxy {
                 reversibility,
             } => {
                 let outcome = decide_gate(Some(reversibility), Some(risk), false, false);
+                let pending_authorization = PendingApiAuthorization {
+                    judge: judge.clone(),
+                    summary,
+                    requirement: ApiForwardRequirement::Coverage {
+                        risk,
+                        reversibility,
+                    },
+                };
                 if outcome != GateOutcome::ExecuteNow {
                     return self
                         .route_hold_buffered(
-                            parts,
-                            body,
+                            BufferedRequest { parts, body },
                             path,
-                            &query,
+                            query,
                             op,
                             "exact typed API coverage requires consequence approval",
                             conn_id,
+                            Some(pending_authorization),
                         )
                         .await;
                 }
                 let redact = self.protocol.redactable_read(op);
                 self.forward_buffered(
-                    parts,
-                    body,
+                    BufferedRequest { parts, body },
                     path,
-                    &query,
+                    query,
                     redact,
                     Some(op.clone()),
                     conn_id,
-                    None,
+                    prepared_mutation,
+                    Some(pending_authorization),
                 )
                 .await
             }
@@ -1303,56 +2250,28 @@ impl ApiProxy {
         }
     }
 
-    /// Park a request for operator approval and forward it on approval. Shared
-    /// by an `ApiAction::Hold` policy decision and by rarity escalation of an
-    /// otherwise-allowed request. Fails closed to a 403 when no hold queue is
-    /// attached (the daemon is running without `--gate consequence`), on a
-    /// deny/expiry, or on a capacity refusal.
-    async fn route_hold(
-        &self,
-        req: Request<Incoming>,
-        path: &str,
-        query: &str,
-        op: &ApiOp,
-        reason: &str,
-        conn_id: u64,
-    ) -> Response<ProxyBody> {
-        let label = format!("{} {}", op.verb.as_str(), path);
-        if self.gate.get().is_none() {
-            tracing::info!(
-                target: "guard::apiproxy",
-                "HOLD {} denied: no approval queue (--gate consequence is not active)",
-                label
-            );
-            return self.status_resp(
-                StatusCode::FORBIDDEN,
-                &format!(
-                    "guard api-proxy ({}): {label} requires operator approval, but the daemon \
-                     is running without --gate consequence (no approval queue); denied",
-                    self.protocol.name()
-                ),
-                "Forbidden",
-            );
-        }
-        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
-            Ok(buffered) => buffered,
-            Err(error) => return self.request_body_error_response(error),
-        };
-        self.route_hold_buffered(parts, body, path, query, op, reason, conn_id)
-            .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn route_hold_buffered(
         &self,
-        parts: Parts,
-        body: Bytes,
+        buffered: BufferedRequest,
         path: &str,
         query: &str,
         op: &ApiOp,
         reason: &str,
         conn_id: u64,
+        mut authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
+        let mut parts = buffered.parts;
+        let body = buffered.body;
+        let mut body = match prepare_create_provenance(
+            &mut parts,
+            body,
+            op,
+            self.gate.get().is_some() && self.protocol.tracks_write(op),
+        ) {
+            Ok(body) => body,
+            Err(reason) => return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid"),
+        };
         let label = format!("{} {}", op.verb.as_str(), path);
         let Some(gate) = self.gate.get() else {
             tracing::info!(
@@ -1370,6 +2289,35 @@ impl ApiProxy {
                 "Forbidden",
             );
         };
+        let route_authority = match self.route_authority_from_parts(&parts) {
+            Some(authority) => authority,
+            None => return self.missing_route_authority_response(),
+        };
+        let mut prepared_mutation = parts.extensions.get::<PreparedMutation>().cloned();
+        let mut preparation_error = None;
+        if prepared_mutation.is_none() && self.is_kubernetes_mutation(op) {
+            match self
+                .arbitrate_kubernetes_mutation(&parts, &body, path, op, &route_authority, None)
+                .await
+            {
+                Ok((guarded_body, snapshot)) => {
+                    body = guarded_body;
+                    prepared_mutation = Some(PreparedMutation {
+                        prior_snapshot: snapshot,
+                        body_sha256: body_sha256(&body),
+                    });
+                }
+                // A request that is denied by the hold never reaches the
+                // upstream, so an unavailable concurrency snapshot must not
+                // bypass the operator's denial. If the operator approves, the
+                // preparation failure is returned and no bytes are sent.
+                Err(response) => preparation_error = Some(*response),
+            }
+        }
+        if let Some(pending) = authorization.as_mut() {
+            pending.summary.redacted_body_shape = redacted_body_shape(&body);
+            pending.summary.authorized_body_sha256 = body_sha256(&body);
+        }
         tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
         let snapshot = api_hold_snapshot(label.clone(), query, op, &body);
         let session_context = parts
@@ -1379,37 +2327,58 @@ impl ApiProxy {
         let (mut response, outcome) =
             match gate.hold_request(&snapshot, reason, session_context).await {
                 HoldDecision::Approved { handle } => {
-                    let redact = self.protocol.redactable_read(op);
-                    tracing::info!(
-                        target: "guard::apiproxy",
-                        "ALLOW {} (operator approved hold {}){}",
-                        label,
-                        handle,
-                        if redact { " (redacting)" } else { "" }
-                    );
-                    let response = self
-                        .forward_buffered(
-                            parts,
-                            body,
-                            path,
-                            query,
-                            redact,
-                            Some(op.clone()),
-                            conn_id,
-                            None,
-                        )
-                        .await;
-                    (response, GuardHoldOutcome::Approved)
+                    if let Some(response) = preparation_error.take() {
+                        (response, GuardHoldOutcome::Denied)
+                    } else {
+                        let redact = self.protocol.redactable_read(op);
+                        tracing::info!(
+                            target: "guard::apiproxy",
+                            "ALLOW {} (operator approved hold {}){}",
+                            label,
+                            handle,
+                            if redact { " (redacting)" } else { "" }
+                        );
+                        let mut parts = parts;
+                        parts.extensions.insert(ApprovedApiHold {
+                            body_sha256: snapshot.body_sha256.clone(),
+                        });
+                        let response = self
+                            .forward_buffered(
+                                BufferedRequest { parts, body },
+                                path,
+                                query,
+                                redact,
+                                Some(op.clone()),
+                                conn_id,
+                                prepared_mutation,
+                                authorization,
+                            )
+                            .await;
+                        (response, GuardHoldOutcome::Approved)
+                    }
                 }
-                HoldDecision::Denied { reason } => {
+                HoldDecision::Denied { reason, handle } => {
                     tracing::info!(target: "guard::apiproxy", "DENY {} (held: {})", label, reason);
-                    let response = self.status_resp(
-                        StatusCode::FORBIDDEN,
-                        &format!(
+                    let message = handle.as_ref().map_or_else(
+                        || {
+                            format!(
                             "guard api-proxy ({}): {label} held for operator approval: {reason}",
                             self.protocol.name()
-                        ),
+                        )
+                        },
+                        |handle| {
+                            format!(
+                                "guard api-proxy ({}): {label} held for operator approval \
+                                 {handle}: {reason}; inspect with guard approval show {handle}",
+                                self.protocol.name()
+                            )
+                        },
+                    );
+                    let response = self.approval_status_resp(
+                        StatusCode::FORBIDDEN,
+                        &message,
                         "Forbidden",
+                        handle.as_deref(),
                     );
                     (response, GuardHoldOutcome::Denied)
                 }
@@ -1431,33 +2400,41 @@ impl ApiProxy {
             Ok(buffered) => buffered,
             Err(error) => return self.request_body_error_response(error),
         };
-        self.forward_buffered(parts, body, path, query, redact, op, conn_id, None)
-            .await
+        self.forward_buffered(
+            BufferedRequest { parts, body },
+            path,
+            query,
+            redact,
+            op,
+            conn_id,
+            None,
+            None,
+        )
+        .await
     }
 
-    async fn forward_contained_cleanup(
+    async fn forward_contained_cleanup<'a>(
         &self,
-        req: Request<Incoming>,
-        path: &str,
-        query: &str,
-        op: ApiOp,
+        buffered: BufferedRequest,
+        route: RouteMetadata<'a>,
         conn_id: u64,
         created: CreatedMatch,
     ) -> Response<ProxyBody> {
-        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
-            Ok(buffered) => buffered,
-            Err(error) => return self.request_body_error_response(error),
-        };
+        let parts = buffered.parts;
+        let body = buffered.body;
+        let path = route.path;
+        let query = route.query;
+        let op = route.op;
         self.forward_buffered_with_cleanup(
-            parts,
-            body,
+            BufferedRequest { parts, body },
             path,
             query,
             false,
-            Some(op),
+            Some(op.clone()),
             conn_id,
             None,
             Some(created),
+            None,
         )
         .await
     }
@@ -1465,25 +2442,28 @@ impl ApiProxy {
     #[allow(clippy::too_many_arguments)]
     async fn forward_buffered(
         &self,
-        parts: Parts,
-        body: Bytes,
+        buffered: BufferedRequest,
         path: &str,
         query: &str,
         redact: bool,
         op: Option<ApiOp>,
         conn_id: u64,
-        prepared_snapshot: Option<Option<Vec<u8>>>,
+        prepared_mutation: Option<PreparedMutation>,
+        authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
         self.forward_buffered_with_cleanup(
-            parts,
-            body,
+            BufferedRequest {
+                parts: buffered.parts,
+                body: buffered.body,
+            },
             path,
             query,
             redact,
             op,
             conn_id,
-            prepared_snapshot,
+            prepared_mutation,
             None,
+            authorization,
         )
         .await
     }
@@ -1491,20 +2471,81 @@ impl ApiProxy {
     #[allow(clippy::too_many_arguments)]
     async fn forward_buffered_with_cleanup(
         &self,
-        parts: Parts,
-        body: Bytes,
+        buffered: BufferedRequest,
         path: &str,
         query: &str,
         redact: bool,
         op: Option<ApiOp>,
         conn_id: u64,
-        mut prepared_snapshot: Option<Option<Vec<u8>>>,
+        prepared_mutation: Option<PreparedMutation>,
         created_cleanup: Option<CreatedMatch>,
+        authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
+        let mut parts = buffered.parts;
+        let mut body = buffered.body;
+        if let Some(operation) = op.as_ref() {
+            body = match prepare_create_provenance(
+                &mut parts,
+                body,
+                operation,
+                created_cleanup.is_none()
+                    && self.gate.get().is_some()
+                    && self.protocol.tracks_write(operation),
+            ) {
+                Ok(body) => body,
+                Err(reason) => {
+                    return self.status_resp(StatusCode::BAD_REQUEST, &reason, "Invalid")
+                }
+            };
+        }
         let route_authority = match self.route_authority_from_parts(&parts) {
             Some(authority) => authority,
             None => return self.missing_route_authority_response(),
         };
+        let mut prepared_mutation =
+            prepared_mutation.or_else(|| parts.extensions.get::<PreparedMutation>().cloned());
+        if let Some(prepared) = prepared_mutation.as_ref() {
+            if prepared.body_sha256 != body_sha256(&body) {
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: prepared request bytes changed before forwarding",
+                    "Forbidden",
+                );
+            }
+        } else if let Some(operation) = op
+            .as_ref()
+            .filter(|operation| self.is_kubernetes_mutation(operation))
+        {
+            match self
+                .arbitrate_kubernetes_mutation(
+                    &parts,
+                    &body,
+                    path,
+                    operation,
+                    &route_authority,
+                    None,
+                )
+                .await
+            {
+                Ok((guarded_body, snapshot)) => {
+                    body = guarded_body;
+                    prepared_mutation = Some(PreparedMutation {
+                        prior_snapshot: snapshot,
+                        body_sha256: body_sha256(&body),
+                    });
+                }
+                Err(response) => return *response,
+            }
+        }
+        if let Some(approved) = parts.extensions.get::<ApprovedApiHold>() {
+            if approved.body_sha256 != body_sha256(&body) {
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: final request bytes changed after approval; submit a fresh approval",
+                    "Forbidden",
+                );
+            }
+        }
         // Snapshot reads can block on the upstream. Acquire any snapshot before
         // the common final authority checks so a session edit, expiry, or policy
         // reload during that read is observed immediately before mutation.
@@ -1512,27 +2553,57 @@ impl ApiProxy {
             && op
                 .as_ref()
                 .is_some_and(|op| self.gate.get().is_some() && self.protocol.tracks_write(op));
-        if prepared_snapshot.is_none()
+        if prepared_mutation.is_none()
             && track_write
             && self
                 .protocol
                 .wants_prior_snapshot(op.as_ref().expect("tracked write has operation"))
         {
-            prepared_snapshot = match self.fetch_prior_object(path, &route_authority).await {
-                Ok(snapshot) => Some(snapshot),
-                Err(response) => return response,
+            prepared_mutation = match self.fetch_prior_object(path, &route_authority).await {
+                Ok(snapshot) => Some(PreparedMutation {
+                    prior_snapshot: snapshot,
+                    body_sha256: body_sha256(&body),
+                }),
+                Err(response) => return *response,
             };
         }
         let session_context = match self.revalidate_session(&parts).await {
             Ok(context) => context,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
-        if let Some(response) = self
-            .recheck_final_authority(&route_authority, op.as_ref())
-            .await
-        {
-            return response;
-        }
+        let staged_revert = if track_write {
+            let operation = op.as_ref().expect("tracked write has operation");
+            let handle = self
+                .arm_write_revert(
+                    operation,
+                    prepared_mutation
+                        .as_ref()
+                        .and_then(|prepared| prepared.prior_snapshot.clone()),
+                    &body,
+                    conn_id,
+                    session_context.clone(),
+                    parts
+                        .extensions
+                        .get::<PreparedCreateProvenance>()
+                        .map(|marker| marker.0.clone()),
+                )
+                .await;
+            if handle.is_none() && parts.extensions.get::<ApprovedApiHold>().is_none() {
+                return Box::pin(self.route_hold_buffered(
+                    BufferedRequest { parts, body },
+                    path,
+                    query,
+                    operation,
+                    "the mutation could not be durably contained before forwarding",
+                    conn_id,
+                    authorization,
+                ))
+                .await;
+            }
+            handle
+        } else {
+            None
+        };
         match self
             .forward_inner(
                 parts,
@@ -1541,11 +2612,11 @@ impl ApiProxy {
                 query,
                 redact,
                 op,
-                conn_id,
-                prepared_snapshot,
                 session_context,
                 created_cleanup,
                 route_authority,
+                authorization,
+                staged_revert,
             )
             .await
         {
@@ -1573,20 +2644,28 @@ impl ApiProxy {
         query: &str,
         redact: bool,
         op: Option<ApiOp>,
-        conn_id: u64,
-        prepared_snapshot: Option<Option<Vec<u8>>>,
         session_context: Option<ApiSessionContext>,
         created_cleanup: Option<CreatedMatch>,
         route_authority: RouteAuthority,
+        authorization: Option<PendingApiAuthorization>,
+        staged_revert: Option<StagedRevert>,
     ) -> Result<Response<ProxyBody>> {
-        // A recoverable write is wrapped in an auto-revert envelope after the
-        // upstream succeeds. Snapshot acquisition occurs in the caller before
-        // its final authority checks.
+        // A recoverable write is staged durably before its finite upstream
+        // handoff. Snapshot acquisition occurs in the caller before its final
+        // authority checks.
         let track_write = created_cleanup.is_none()
             && op
                 .as_ref()
                 .is_some_and(|o| self.gate.get().is_some() && self.protocol.tracks_write(o));
-        let snapshot = prepared_snapshot.flatten();
+        let mut containment = staged_revert.and_then(|staged| {
+            self.gate
+                .get()
+                .cloned()
+                .map(|gate| ContainmentLifecycle::new(gate, staged))
+        });
+        let kubernetes_mutation = op
+            .as_ref()
+            .is_some_and(|operation| self.is_kubernetes_mutation(operation));
 
         let url = if query.is_empty() {
             format!("{}{}", self.upstream.base(), path)
@@ -1594,6 +2673,16 @@ impl ApiProxy {
             format!("{}{}?{}", self.upstream.base(), path, query)
         };
 
+        let actual_body_sha256 = body_sha256(&body);
+        let authorized_body_sha256 = authorization
+            .as_ref()
+            .map(|pending| pending.summary.authorized_body_sha256.clone())
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<ApprovedApiHold>()
+                    .map(|approved| approved.body_sha256.clone())
+            });
         let mut rb = self.upstream.client().request(parts.method.clone(), &url);
         for (name, value) in parts.headers.iter() {
             if is_hop_by_hop(name)
@@ -1633,18 +2722,270 @@ impl ApiProxy {
             .recheck_final_authority(&route_authority, op.as_ref())
             .await
         {
+            if let Some(staged) = containment.take() {
+                if !staged.cancel_inert().await {
+                    return Ok(self.staged_cleanup_failure_response());
+                }
+            }
             return Ok(response);
         }
-        let upstream_resp = rb.send().await.context("forward to apiserver")?;
+        if let (Some(operation), Some(context)) = (
+            op.as_ref()
+                .filter(|operation| self.is_kubernetes_mutation(operation)),
+            session_context.as_ref(),
+        ) {
+            let _ = crate::audit::emit_global(
+                &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
+                    .session_fingerprint(&context.fingerprint)
+                    .reason("session-attributed Kubernetes mutation passed write arbitration")
+                    .field("decision", "forward")
+                    .field("endpoint", &self.endpoint)
+                    .field("session_revision", &context.revision)
+                    .field("verb", operation.verb.as_str())
+                    .field("resource", &operation.resource)
+                    .field(
+                        "namespace",
+                        operation.namespace.as_deref().unwrap_or("(cluster)"),
+                    )
+                    .field("name", operation.name.as_deref().unwrap_or("(collection)")),
+            );
+        }
+        // Revocable durable authority is acquired in one order: evaluator or
+        // coverage authority, then session authority. The bundle lives only
+        // through the bounded response-header handoff.
+        let mut upstream_handoff = UpstreamSendHandoff {
+            proxy: self,
+            route_authority: route_authority.clone(),
+            operation: op.clone(),
+            request: Some(rb),
+            timeout: self.upstream_handoff_timeout,
+            outcome: UpstreamHandoffOutcome::Pending,
+            containment,
+            actual_body_sha256,
+            authorized_body_sha256,
+        };
+        let auth = parts.extensions.get::<SessionAuth>();
+        let mut cleanup_handoff = CleanupBoundHandoff {
+            proxy: self,
+            created: created_cleanup.as_ref(),
+            path,
+            upstream: &mut upstream_handoff,
+        };
+        let mut session_handoff = SessionBoundHandoff {
+            sink: self.session_sink.get(),
+            auth,
+            context: session_context.as_ref(),
+            upstream: &mut cleanup_handoff,
+        };
+        let authorization_result = if let Some(pending) = authorization {
+            pending
+                .judge
+                .authorize_forward(&pending.summary, pending.requirement, &mut session_handoff)
+                .await
+        } else {
+            session_handoff.forward().await
+        };
+        let containment = upstream_handoff.containment.take();
+        let upstream_outcome = std::mem::replace(
+            &mut upstream_handoff.outcome,
+            UpstreamHandoffOutcome::Pending,
+        );
+        let (upstream_resp, mut containment) = match upstream_outcome {
+            UpstreamHandoffOutcome::Pending => {
+                if let Some(containment) = containment {
+                    if !containment.cancel_inert().await {
+                        return Ok(self.staged_cleanup_failure_response());
+                    }
+                }
+                let reason = authorization_result.err().unwrap_or_else(|| {
+                    "authority provider did not perform the protected handoff".to_string()
+                });
+                return Ok(self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    &format!("guard api-proxy authority changed before forwarding: {reason}"),
+                    "Forbidden",
+                ));
+            }
+            UpstreamHandoffOutcome::PreparationFailed => {
+                if let Some(containment) = containment {
+                    if !containment.cancel_inert().await {
+                        return Ok(self.staged_cleanup_failure_response());
+                    }
+                }
+                return Ok(self.status_resp(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "guard api-proxy: durable mutation dispatch preparation failed; no mutation was sent",
+                    "ContainmentError",
+                ));
+            }
+            UpstreamHandoffOutcome::TimedOut => {
+                let handle = if let Some(containment) = containment {
+                    containment
+                        .preserve_indeterminate(
+                            "upstream mutation dispatch timed out before response headers",
+                            None,
+                        )
+                        .await
+                } else {
+                    None
+                };
+                return Ok(self.provisional_status_resp(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "guard api-proxy: upstream request handoff timed out",
+                    "Timeout",
+                    handle.as_deref(),
+                ));
+            }
+            UpstreamHandoffOutcome::Finished(response) => {
+                let response = match response {
+                    Ok(response) => response,
+                    Err(_) => {
+                        let handle = if let Some(containment) = containment {
+                            containment
+                                .preserve_indeterminate(
+                                    "upstream mutation dispatch ended with a transport error before response headers",
+                                    None,
+                                )
+                                .await
+                        } else {
+                            None
+                        };
+                        return Ok(self.provisional_status_resp(
+                            StatusCode::BAD_GATEWAY,
+                            "guard api-proxy: upstream request handoff failed",
+                            "InternalError",
+                            handle.as_deref(),
+                        ));
+                    }
+                };
+                (response, containment)
+            }
+        };
         let status = upstream_resp.status();
         let upstream_headers = upstream_resp.headers().clone();
         let response_secrets = self.upstream.response_secret_values();
+        let mut upstream_resp = Some(upstream_resp);
+        let mut buffered_upstream_body = None;
+
+        let mut provisional_handle = None;
+        let mut containment_active = false;
+        if let Some(staged) = containment.take() {
+            if op.as_ref().is_some_and(|operation| {
+                self.protocol
+                    .definitively_rejects_mutation(operation, status.as_u16())
+            }) {
+                if let Err(handle) = staged
+                    .retire_rejected(&format!(
+                        "upstream definitively rejected mutation with HTTP {status}"
+                    ))
+                    .await
+                {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: mutation rejection was received but containment retirement did not converge",
+                        "ContainmentError",
+                        handle.as_deref(),
+                    ));
+                }
+            } else if status.is_success() {
+                let resource_uid = if let Some((key, _)) = staged.created_resource() {
+                    let body = match self
+                        .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
+                        .await
+                    {
+                        Ok(body) => body,
+                        Err(error) => {
+                            let detail = match error {
+                                UpstreamBodyError::TimedOut => {
+                                    "create response body timed out before authoritative identity was captured"
+                                }
+                                UpstreamBodyError::TooLarge => {
+                                    "create response body exceeded the identity buffer limit"
+                                }
+                                UpstreamBodyError::ReadFailed => {
+                                    "create response body failed before authoritative identity was captured"
+                                }
+                            };
+                            let handle = staged.preserve_indeterminate(detail, None).await;
+                            return Ok(self.provisional_status_resp(
+                                StatusCode::BAD_GATEWAY,
+                                "guard api-proxy: mutation succeeded but authoritative create identity is unavailable",
+                                "ContainmentIndeterminate",
+                                handle.as_deref(),
+                            ));
+                        }
+                    };
+                    let provenance = staged
+                        .create_provenance
+                        .as_deref()
+                        .expect("created containment has canonical request provenance");
+                    match authoritative_created_uid(&body, key, provenance) {
+                        Ok(uid) => {
+                            buffered_upstream_body = Some(body);
+                            Some(uid)
+                        }
+                        Err(reason) => {
+                            let handle = staged.preserve_indeterminate(&reason, None).await;
+                            return Ok(self.provisional_status_resp(
+                                StatusCode::BAD_GATEWAY,
+                                "guard api-proxy: mutation succeeded but authoritative create identity is invalid",
+                                "ContainmentIndeterminate",
+                                handle.as_deref(),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                let create_provenance = staged.create_provenance.clone();
+                match staged.activate(resource_uid.as_deref()).await {
+                    Ok((handle, created_key)) => {
+                        if let Some(key) = created_key {
+                            let uid = resource_uid
+                                .as_ref()
+                                .expect("created containment has a verified UID")
+                                .clone();
+                            if self
+                                .publication_authority_is_current(&route_authority, op.as_ref())
+                                .await
+                            {
+                                self.created.lock().unwrap().remember(
+                                    key,
+                                    handle.clone(),
+                                    uid,
+                                    create_provenance
+                                        .expect("created containment has canonical provenance"),
+                                );
+                            }
+                        }
+                        provisional_handle = Some(handle);
+                        containment_active = true;
+                    }
+                    Err(handle) => {
+                        return Ok(self.provisional_status_resp(
+                            StatusCode::BAD_GATEWAY,
+                            "guard api-proxy: mutation succeeded but durable containment requires operator action",
+                            "ContainmentError",
+                            handle.as_deref(),
+                        ));
+                    }
+                }
+            } else {
+                provisional_handle = staged
+                    .preserve_indeterminate(
+                        &format!("upstream returned HTTP {status} after mutation dispatch"),
+                        None,
+                    )
+                    .await;
+            }
+        }
 
         if has_unsupported_content_encoding(&upstream_headers) {
-            return Ok(self.status_resp(
+            return Ok(self.provisional_status_resp(
                 StatusCode::BAD_GATEWAY,
                 "guard api-proxy: refusing an encoded upstream response that cannot be credential-redacted",
                 "InternalError",
+                provisional_handle.as_deref(),
             ));
         }
 
@@ -1691,23 +3032,61 @@ impl ApiProxy {
         // response succeeds. A 2xx header followed by a body disconnect keeps
         // the revert armed because the outcome is no longer trustworthy.
         if let Some(created) = created_cleanup {
-            let bytes = upstream_resp
-                .bytes()
+            let bytes = match self
+                .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
                 .await
-                .context("read contained cleanup response")?;
-            if status.is_success() {
-                let consumed = self
-                    .created
-                    .lock()
-                    .unwrap()
-                    .take_if_handle(&created.key, &created.handle);
-                if consumed {
-                    if let Some(gate) = self.gate.get() {
-                        gate.resolve(&created.handle).await;
-                    }
+            {
+                Ok(bytes) => bytes,
+                Err(UpstreamBodyError::TimedOut) => {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "guard api-proxy: contained cleanup response body timed out",
+                        "Timeout",
+                        Some(&created.handle),
+                    ));
                 }
+                Err(UpstreamBodyError::ReadFailed) => {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: contained cleanup response body failed",
+                        "InternalError",
+                        Some(&created.handle),
+                    ));
+                }
+                Err(UpstreamBodyError::TooLarge) => {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: contained cleanup response body exceeded the byte limit",
+                        "ResponseTooLarge",
+                        Some(&created.handle),
+                    ));
+                }
+            };
+            if status.is_success() {
+                let resolved = if let Some(gate) = self.gate.get() {
+                    tokio::time::timeout(Duration::from_secs(5), gate.resolve(&created.handle))
+                        .await
+                        .is_ok_and(std::convert::identity)
+                } else {
+                    false
+                };
+                if !resolved {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: cleanup succeeded upstream but durable containment resolution failed",
+                        "ContainmentIndeterminate",
+                        Some(&created.handle),
+                    ));
+                }
+                self.forget_created_by_handle(&created.handle);
             }
-            let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
+            let bytes = self
+                .redact_upstream_bytes(response_secrets, &bytes)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "contained cleanup response exceeded the byte limit after redaction"
+                    )
+                })?;
             return Ok(builder
                 .body(full_body(bytes))
                 .expect("build contained cleanup response"));
@@ -1719,11 +3098,19 @@ impl ApiProxy {
         // on a successful body whose content-type we cannot parse and redact.
         if redact {
             if !status.is_success() {
-                let bytes = upstream_resp
-                    .bytes()
+                let bytes = self
+                    .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
                     .await
-                    .context("read Secret error response")?;
-                let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
+                    .map_err(|_| {
+                        anyhow::anyhow!("read Secret error response failed or timed out")
+                    })?;
+                let bytes = self
+                    .redact_upstream_bytes(response_secrets, &bytes)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Secret error response exceeded the byte limit after redaction"
+                        )
+                    })?;
                 return Ok(builder
                     .body(full_body(bytes))
                     .expect("build Secret error response"));
@@ -1735,10 +3122,10 @@ impl ApiProxy {
                     "InternalError",
                 ));
             }
-            let bytes = upstream_resp
-                .bytes()
+            let bytes = self
+                .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
                 .await
-                .context("read Secret response for redaction")?;
+                .map_err(|_| anyhow::anyhow!("read Secret response failed or timed out"))?;
             let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 // Fail closed: never pass an unparsed Secret body through.
@@ -1756,44 +3143,172 @@ impl ApiProxy {
             let n = self.protocol.redact_response(&mut value);
             tracing::info!(target: "guard::apiproxy", "redacted {n} Secret object(s) on {path}");
             let out = serde_json::to_vec(&value).context("re-serialize redacted Secret")?;
-            let out = ExactSecretRedactor::redact_all(response_secrets, &out);
+            let out = self
+                .redact_upstream_bytes(response_secrets, &out)
+                .map_err(|_| {
+                    anyhow::anyhow!("Secret response exceeded the byte limit after redaction")
+                })?;
             return Ok(builder
                 .body(full_body(out))
                 .expect("build redacted response"));
         }
 
-        // A tracked write: buffer the (small) object response, arm an auto-revert
-        // on success, and return the body. Writes are not streamed.
-        if track_write {
-            let bytes = upstream_resp.bytes().await.context("read write response")?;
+        // Kubernetes mutation responses are buffered so the returned object can
+        // become this same session's next observed version. The body has a
+        // separate bound because containment is already armed at this point.
+        if track_write || kubernetes_mutation {
+            let bytes = match self
+                .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(UpstreamBodyError::ReadFailed) => {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: upstream mutation response body failed",
+                        "InternalError",
+                        provisional_handle.as_deref(),
+                    ));
+                }
+                Err(UpstreamBodyError::TimedOut) => {
+                    let mut response = self.status_resp(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "guard api-proxy: upstream response body timed out after mutation handoff",
+                        "Timeout",
+                    );
+                    if let Some(handle) = provisional_handle.as_deref() {
+                        if let Ok(value) = hyper::header::HeaderValue::from_str(handle) {
+                            response.headers_mut().insert("x-guard-provisional", value);
+                        }
+                    }
+                    return Ok(response);
+                }
+                Err(UpstreamBodyError::TooLarge) => {
+                    return Ok(self.provisional_status_resp(
+                        StatusCode::BAD_GATEWAY,
+                        "guard api-proxy: upstream mutation response body exceeded the byte limit",
+                        "ResponseTooLarge",
+                        provisional_handle.as_deref(),
+                    ));
+                }
+            };
             if status.is_success() {
                 if let Some(o) = op.as_ref() {
-                    self.arm_write_revert(o, snapshot, &bytes, conn_id, session_context)
-                        .await;
+                    if let Some(context) = session_context.as_ref() {
+                        if self
+                            .publication_authority_is_current(&route_authority, Some(o))
+                            .await
+                        {
+                            self.remember_kubernetes_observation(o, &bytes, context);
+                        }
+                    }
                 }
             }
-            let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
+            if let Some(handle) = provisional_handle {
+                let deadline = if containment_active {
+                    match self.gate.get() {
+                        Some(gate) => gate.provisional_deadline(&handle).await,
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(deadline_unix) = deadline {
+                    let (provisional, warning) = provisional_response_metadata(
+                        &handle,
+                        deadline_unix,
+                        crate::env::now_unix(),
+                    );
+                    builder = builder
+                        .header("x-guard-provisional", provisional)
+                        .header(hyper::header::WARNING, warning);
+                } else {
+                    let warning = if containment_active {
+                        let confirm = crate::gating::provisional::operator_confirm_command(&handle);
+                        format!("299 guard \"change is provisional; confirm with {confirm}\"")
+                    } else {
+                        format!(
+                            "299 guard \"mutation outcome is uncertain; inspect provisional {handle}\""
+                        )
+                    };
+                    builder = builder
+                        .header("x-guard-provisional", &handle)
+                        .header(hyper::header::WARNING, warning);
+                }
+            }
+            let bytes = self
+                .redact_upstream_bytes(response_secrets, &bytes)
+                .map_err(|_| {
+                    anyhow::anyhow!("mutation response exceeded the byte limit after redaction")
+                })?;
             return Ok(builder
                 .body(full_body(bytes))
                 .expect("build write response"));
         }
 
+        // A successful named-object GET is the only read that establishes a
+        // write observation. Lists and watches cannot bind one object UID and
+        // version, and anonymous reads never establish mutation authority.
+        if status.is_success()
+            && op.as_ref().is_some_and(|operation| {
+                self.protocol.name() == "kubernetes"
+                    && operation.verb == Verb::Get
+                    && operation.name.is_some()
+            })
+            && session_context.is_some()
+        {
+            let bytes = self
+                .take_upstream_body(&mut upstream_resp, &mut buffered_upstream_body)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("read Kubernetes object response failed or timed out")
+                })?;
+            if let (Some(operation), Some(context)) = (op.as_ref(), session_context.as_ref()) {
+                if self
+                    .publication_authority_is_current(&route_authority, Some(operation))
+                    .await
+                {
+                    self.remember_kubernetes_observation(operation, &bytes, context);
+                }
+            }
+            let bytes = self
+                .redact_upstream_bytes(response_secrets, &bytes)
+                .map_err(|_| {
+                    anyhow::anyhow!("object response exceeded the byte limit after redaction")
+                })?;
+            return Ok(builder
+                .body(full_body(bytes))
+                .expect("build observed object response"));
+        }
+
         // Stream ordinary response bodies through exact credential redaction
         // while preserving chunked delivery for lists, gets, and watches.
+        let upstream_resp = upstream_resp
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("upstream response body was already consumed"))?;
         let source: ReqwestByteStream = Box::pin(upstream_resp.bytes_stream());
-        let redactor = ExactSecretRedactor::new(response_secrets);
+        let redactor = ExactSecretRedactor::new(response_secrets, self.upstream_body_limit)
+            .map_err(|_| anyhow!("upstream redaction context exceeds its resource limit"))?;
         let stream = futures::stream::try_unfold(
             (source, redactor, false),
             |(mut source, mut redactor, finished)| async move {
                 if finished {
-                    return Ok::<Option<(Frame<Bytes>, RedactingStreamState)>, reqwest::Error>(
-                        None,
-                    );
+                    return Ok::<
+                        Option<(Frame<Bytes>, RedactingStreamState)>,
+                        Box<dyn std::error::Error + Send + Sync>,
+                    >(None);
                 }
                 loop {
-                    match source.as_mut().try_next().await? {
+                    match source.as_mut().try_next().await.map_err(|error| {
+                        Box::new(error) as Box<dyn std::error::Error + Send + Sync>
+                    })? {
                         Some(chunk) => {
-                            let output = redactor.push(&chunk);
+                            let output = redactor.push(&chunk).map_err(|_| {
+                                Box::new(std::io::Error::other(
+                                    "upstream response exceeded the byte limit after redaction",
+                                ))
+                                    as Box<dyn std::error::Error + Send + Sync>
+                            })?;
                             if output.is_empty() {
                                 continue;
                             }
@@ -1803,7 +3318,12 @@ impl ApiProxy {
                             )));
                         }
                         None => {
-                            let output = redactor.finish();
+                            let output = redactor.finish().map_err(|_| {
+                                Box::new(std::io::Error::other(
+                                    "upstream response exceeded the byte limit after redaction",
+                                ))
+                                    as Box<dyn std::error::Error + Send + Sync>
+                            })?;
                             if output.is_empty() {
                                 return Ok(None);
                             }
@@ -1815,8 +3335,7 @@ impl ApiProxy {
                     }
                 }
             },
-        )
-        .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
+        );
         let body = StreamBody::new(stream).boxed();
         Ok(builder.body(body).expect("build streamed response"))
     }
@@ -1824,26 +3343,164 @@ impl ApiProxy {
     async fn revalidate_session(
         &self,
         parts: &Parts,
-    ) -> Result<Option<ApiSessionContext>, Response<ProxyBody>> {
+    ) -> Result<Option<ApiSessionContext>, ProxyErrorResponse> {
         let Some(auth) = parts.extensions.get::<SessionAuth>() else {
             return Ok(None);
         };
         let Some(sink) = self.session_sink.get() else {
-            return Err(self.status_resp(
+            return Err(Box::new(self.status_resp(
                 StatusCode::FORBIDDEN,
                 "guard api-proxy: session attribution is unavailable",
                 "Forbidden",
-            ));
+            )));
         };
         let current = sink.resolve(&auth.token).await;
         if current.as_ref() != Some(&auth.context) {
-            return Err(self.status_resp(
+            return Err(Box::new(self.status_resp(
                 StatusCode::FORBIDDEN,
                 "guard api-proxy: session expired, was revoked, or is suspended",
                 "Forbidden",
-            ));
+            )));
         }
         Ok(current)
+    }
+
+    async fn publication_authority_is_current(
+        &self,
+        route_authority: &RouteAuthority,
+        operation: Option<&ApiOp>,
+    ) -> bool {
+        // Session authority is linearized while `SessionBoundHandoff` retains
+        // its exact lease through response headers. A later session revocation
+        // does not erase the upstream operation that already happened. Policy
+        // generation is rechecked here because observations are local policy
+        // inputs and must not publish into a different route generation.
+        self.recheck_final_authority(route_authority, operation)
+            .await
+            .is_none()
+    }
+
+    fn is_kubernetes_mutation(&self, op: &ApiOp) -> bool {
+        self.protocol.name() == "kubernetes" && !op.is_read()
+    }
+
+    fn observation_key(
+        &self,
+        op: &ApiOp,
+        state: &KubernetesObjectState,
+        context: &ApiSessionContext,
+    ) -> ObservationKey {
+        ObservationKey {
+            endpoint: self.endpoint.clone(),
+            session_fingerprint: context.fingerprint.clone(),
+            session_revision: context.revision.clone(),
+            group: op.group.clone(),
+            version: op.version.clone(),
+            resource: op.resource.clone(),
+            subresource: op.subresource.clone(),
+            namespace: state.namespace.clone(),
+            name: state.name.clone(),
+            uid: state.uid.clone(),
+        }
+    }
+
+    fn remember_kubernetes_observation(
+        &self,
+        op: &ApiOp,
+        bytes: &[u8],
+        context: &ApiSessionContext,
+    ) {
+        let Some(state) = object_state(op, bytes) else {
+            return;
+        };
+        let key = self.observation_key(op, &state, context);
+        self.observations.lock().unwrap().remember(
+            key,
+            ObservedVersion {
+                resource_version: state.resource_version,
+                contention_fingerprint: state.contention_fingerprint,
+            },
+        );
+    }
+
+    async fn arbitrate_kubernetes_mutation(
+        &self,
+        parts: &Parts,
+        body: &[u8],
+        path: &str,
+        op: &ApiOp,
+        route_authority: &RouteAuthority,
+        prepared_snapshot: Option<&[u8]>,
+    ) -> Result<(Bytes, Option<Vec<u8>>), ProxyErrorResponse> {
+        let Some(auth) = parts.extensions.get::<SessionAuth>() else {
+            return Err(Box::new(self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: Kubernetes mutations require an attributable Guard session or an operator-approved typed verb",
+                "Forbidden",
+            )));
+        };
+        if op.verb == Verb::Create && op.name.is_none() {
+            return Ok((Bytes::copy_from_slice(body), None));
+        }
+        if !matches!(op.verb, Verb::Update | Verb::Patch | Verb::Delete) || op.name.is_none() {
+            return Err(Box::new(self.kubernetes_conflict(
+                "Kubernetes mutation cannot be bound to one observed object",
+            )));
+        }
+        let snapshot = match prepared_snapshot {
+            Some(snapshot) => snapshot.to_vec(),
+            None => {
+                let Some(snapshot) = self.fetch_prior_object(path, route_authority).await? else {
+                    return Err(Box::new(self.kubernetes_conflict(
+                        "current Kubernetes object could not be read for write arbitration",
+                    )));
+                };
+                snapshot
+            }
+        };
+        let Some(state) = object_state(op, &snapshot) else {
+            return Err(Box::new(self.kubernetes_conflict(
+                "current Kubernetes object has no usable UID and resourceVersion",
+            )));
+        };
+        let key = self.observation_key(op, &state, &auth.context);
+        let Some(observed) = self.observations.lock().unwrap().get(&key) else {
+            return Err(Box::new(self.kubernetes_conflict(
+                "this session has not observed the current Kubernetes object UID",
+            )));
+        };
+        if observed.resource_version != state.resource_version
+            && observed.contention_fingerprint != state.contention_fingerprint
+        {
+            return Err(Box::new(self.kubernetes_conflict(
+                "Kubernetes object changed since this session observed it",
+            )));
+        }
+        let guarded = bind_mutation_preconditions(
+            op,
+            &parts.headers,
+            body,
+            &state,
+            &observed.resource_version,
+        )
+        .map_err(|reason| Box::new(self.kubernetes_conflict(&reason)))?;
+        self.observations.lock().unwrap().remember(
+            key,
+            ObservedVersion {
+                resource_version: state.resource_version,
+                contention_fingerprint: state.contention_fingerprint,
+            },
+        );
+        Ok((Bytes::from(guarded), Some(snapshot)))
+    }
+
+    fn kubernetes_conflict(&self, reason: &str) -> Response<ProxyBody> {
+        tracing::warn!(target: "guard::apiproxy", reason, "Kubernetes mutation arbitration failed");
+        self.status_resp(
+            StatusCode::CONFLICT,
+            &format!("guard api-proxy: {reason}"),
+            "Conflict",
+        )
     }
 
     fn request_body_error_response(&self, error: RequestBodyError) -> Response<ProxyBody> {
@@ -1884,7 +3541,13 @@ impl ApiProxy {
         if let Some(reason) = op.and_then(|operation| self.protocol.deny_outright(operation)) {
             return Some(self.status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden"));
         }
-        let (_, current) = self.capture_route_authority().await;
+        let Ok((_, current)) = self.capture_route_authority().await else {
+            return Some(self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: API route authority is unavailable",
+                "Forbidden",
+            ));
+        };
         if &current != expected {
             return Some(self.status_resp(
                 StatusCode::FORBIDDEN,
@@ -1903,9 +3566,9 @@ impl ApiProxy {
         &self,
         path: &str,
         route_authority: &RouteAuthority,
-    ) -> Result<Option<Vec<u8>>, Response<ProxyBody>> {
+    ) -> Result<Option<Vec<u8>>, ProxyErrorResponse> {
         if let Some(response) = self.recheck_final_authority(route_authority, None).await {
-            return Err(response);
+            return Err(Box::new(response));
         }
         let url = format!("{}{}", self.upstream.base(), path);
         let mut rb = self
@@ -1918,13 +3581,98 @@ impl ApiProxy {
         } else if let Some((user, pass)) = self.upstream.basic_auth() {
             rb = rb.basic_auth(user, Some(pass));
         }
-        let Ok(resp) = rb.send().await else {
+        let Ok(Ok(resp)) = tokio::time::timeout(self.upstream_handoff_timeout, rb.send()).await
+        else {
             return Ok(None);
         };
         if !resp.status().is_success() {
             return Ok(None);
         }
-        Ok(resp.bytes().await.ok().map(|b| b.to_vec()))
+        Ok(self
+            .read_upstream_body(resp)
+            .await
+            .ok()
+            .map(|bytes| bytes.to_vec()))
+    }
+
+    /// Revalidate that a cleanup still targets the exact object created by the
+    /// admitted request. The retained UID and provenance must both match.
+    async fn validate_current_created_object(
+        &self,
+        key: &CreatedKey,
+        object_path: &str,
+        expected_uid: &str,
+        expected_provenance: &str,
+    ) -> Result<(), String> {
+        let url = format!("{}{}", self.upstream.base(), object_path);
+        let mut request = self
+            .upstream
+            .client()
+            .get(url)
+            .header(header::ACCEPT, "application/json")
+            .header(header::ACCEPT_ENCODING, "identity");
+        if let Some(token) = self.upstream.bearer() {
+            request = request.bearer_auth(token);
+        } else if let Some((user, pass)) = self.upstream.basic_auth() {
+            request = request.basic_auth(user, Some(pass));
+        }
+        let response = tokio::time::timeout(self.upstream_handoff_timeout, request.send())
+            .await
+            .map_err(|_| "created resource identity lookup timed out".to_string())?
+            .map_err(|_| "created resource identity lookup failed".to_string())?;
+        if !response.status().is_success() {
+            return Err("created resource identity is unavailable".to_string());
+        }
+        let bytes = self
+            .read_upstream_body(response)
+            .await
+            .map_err(|error| match error {
+                UpstreamBodyError::TimedOut => {
+                    "created resource identity response timed out".to_string()
+                }
+                UpstreamBodyError::TooLarge => {
+                    "created resource identity response exceeded the byte limit".to_string()
+                }
+                UpstreamBodyError::ReadFailed => {
+                    "created resource identity response failed".to_string()
+                }
+            })?;
+        let object: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "created resource identity response is invalid".to_string())?;
+        let metadata = object
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "created resource identity metadata is missing".to_string())?;
+        if metadata.get("name").and_then(serde_json::Value::as_str) != Some(key.name.as_str())
+            || metadata
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                != key.namespace.as_deref()
+        {
+            return Err(
+                "created resource identity does not match the admitted operation".to_string(),
+            );
+        }
+        if metadata
+            .get("annotations")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|annotations| annotations.get(CREATE_PROVENANCE_ANNOTATION))
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_provenance)
+        {
+            return Err(
+                "created resource does not carry the admitted operation provenance".to_string(),
+            );
+        }
+        let uid = metadata
+            .get("uid")
+            .and_then(serde_json::Value::as_str)
+            .filter(|uid| !uid.is_empty() && uid.len() <= 256 && !uid.chars().any(char::is_control))
+            .ok_or_else(|| "created resource UID is missing or invalid".to_string())?;
+        if uid != expected_uid {
+            return Err("created resource UID no longer matches the admitted object".to_string());
+        }
+        Ok(())
     }
 
     /// Fetch the prior object and confirm the protocol can plan a revert from
@@ -1936,7 +3684,7 @@ impl ApiProxy {
         op: &ApiOp,
         path: &str,
         route_authority: &RouteAuthority,
-    ) -> Result<Option<Vec<u8>>, Response<ProxyBody>> {
+    ) -> Result<Option<Vec<u8>>, ProxyErrorResponse> {
         let Some(snapshot) = self.fetch_prior_object(path, route_authority).await? else {
             return Ok(None);
         };
@@ -1955,7 +3703,7 @@ impl ApiProxy {
         op: &ApiOp,
         path: &str,
         route_authority: &RouteAuthority,
-    ) -> Result<RevertConstructible, Response<ProxyBody>> {
+    ) -> Result<RevertConstructible, ProxyErrorResponse> {
         let track_write = self.gate.get().is_some() && self.protocol.tracks_write(op);
         if !track_write {
             return Ok(RevertConstructible::None);
@@ -1967,7 +3715,7 @@ impl ApiProxy {
             // The marker is an input the evaluator trusts, so it must not claim a
             // revert the protocol cannot actually build from this snapshot (e.g.
             // an encrypted value the sanitizer drops). Validate by planning the
-            // snapshot-based revert; the response body is unused for these verbs.
+            // snapshot-based revert; the request body is unused for these verbs.
             if self.protocol.plan_revert(op, Some(&snapshot), &[]).is_err() {
                 return Ok(RevertConstructible::None);
             }
@@ -1979,28 +3727,49 @@ impl ApiProxy {
         Ok(RevertConstructible::DeleteCreated)
     }
 
-    /// Arm an auto-revert envelope for a tracked write the proxy just
-    /// forwarded, using the protocol's revert plan.
+    fn revert_constructibility_from_prepared(
+        &self,
+        op: &ApiOp,
+        prepared: Option<&PreparedMutation>,
+    ) -> RevertConstructible {
+        if self.gate.get().is_none() || !self.protocol.tracks_write(op) {
+            return RevertConstructible::None;
+        }
+        if !self.protocol.wants_prior_snapshot(op) {
+            return RevertConstructible::DeleteCreated;
+        }
+        let Some(snapshot) = prepared.and_then(|prepared| prepared.prior_snapshot.as_deref())
+        else {
+            return RevertConstructible::None;
+        };
+        if self.protocol.plan_revert(op, Some(snapshot), &[]).is_err() {
+            return RevertConstructible::None;
+        }
+        match op.verb {
+            Verb::Delete => RevertConstructible::RecreateFromSnapshot,
+            _ => RevertConstructible::RestorePriorState,
+        }
+    }
+
+    /// Durably stage an auto-revert envelope before a tracked write is sent.
     async fn arm_write_revert(
         &self,
         op: &ApiOp,
         snapshot: Option<Vec<u8>>,
-        response_body: &[u8],
+        request_body: &[u8],
         conn_id: u64,
         session_context: Option<ApiSessionContext>,
-    ) {
-        let Some(gate) = self.gate.get() else {
-            return;
-        };
+        create_provenance: Option<String>,
+    ) -> Option<StagedRevert> {
+        let gate = self.gate.get()?;
         let plan = match self
             .protocol
-            .plan_revert(op, snapshot.as_deref(), response_body)
+            .plan_revert(op, snapshot.as_deref(), request_body)
         {
             Ok(plan) => plan,
-            // The write is already live; a failed plan only means no auto-revert.
             Err(reason) => {
                 tracing::warn!(target: "guard::apiproxy", "{reason}");
-                return;
+                return None;
             }
         };
         let created_key = plan.created.map(|c| CreatedKey {
@@ -2013,11 +3782,19 @@ impl ApiProxy {
             namespace: c.namespace,
             name: c.name,
         });
+        let created_path = created_key.as_ref().map(|_| plan.revert.path.clone());
+        if created_key.is_some() && create_provenance.is_none() {
+            tracing::warn!(target: "guard::apiproxy", "create containment is missing canonical request provenance");
+            return None;
+        }
         let label = plan.label;
-        match gate
-            .arm_revert(ApiMutation {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            gate.arm_revert(ApiMutation {
                 label: label.clone(),
                 revert: plan.revert,
+                revert_requires_uid_precondition: created_key.is_some(),
+                create_provenance: create_provenance.clone(),
                 session_fingerprint: session_context
                     .as_ref()
                     .map(|context| context.fingerprint.clone()),
@@ -2028,21 +3805,26 @@ impl ApiProxy {
                     .and_then(|context| context.secret_entitlements),
                 upstream_target: self.upstream.base().to_string(),
                 upstream_identity: self.upstream_identity_fingerprint(),
-            })
-            .await
+            }),
+        )
+        .await
         {
-            Some(handle) => {
-                // Record provenance for a created object so a later delete of it
-                // is recognized as guard's own contained cleanup.
-                if let Some(key) = created_key {
-                    self.created.lock().unwrap().remember(key, handle.clone());
-                }
-                tracing::info!(target: "guard::apiproxy", "armed auto-revert {handle} for {label}")
+            Ok(Some(handle)) => {
+                tracing::debug!(target: "guard::apiproxy", "prepared inert API mutation containment");
+                Some(StagedRevert {
+                    handle,
+                    created_key,
+                    created_path,
+                    create_provenance,
+                })
             }
-            None => tracing::warn!(
-                target: "guard::apiproxy",
-                "could not arm auto-revert for {label} (capacity)"
-            ),
+            Ok(None) | Err(_) => {
+                tracing::warn!(
+                    target: "guard::apiproxy",
+                    "could not arm auto-revert for {label} (capacity)"
+                );
+                None
+            }
         }
     }
 
@@ -2065,8 +3847,13 @@ impl ApiProxy {
             namespace: op.namespace.clone(),
             name,
         };
-        let handle = self.created.lock().unwrap().find(&key)?;
-        Some(CreatedMatch { key, handle })
+        let record = self.created.lock().unwrap().find_record(&key)?;
+        Some(CreatedMatch {
+            key,
+            handle: record.handle,
+            resource_uid: record.resource_uid,
+            create_provenance: record.create_provenance,
+        })
     }
 
     pub fn upstream_identity_fingerprint(&self) -> String {
@@ -2162,14 +3949,151 @@ impl ApiProxy {
         response
     }
 
+    fn provisional_status_resp(
+        &self,
+        code: StatusCode,
+        message: &str,
+        reason: &str,
+        handle: Option<&str>,
+    ) -> Response<ProxyBody> {
+        let mut response = self.status_resp(code, message, reason);
+        if let Some(handle) = handle {
+            if let Ok(value) = HeaderValue::from_str(handle) {
+                response.headers_mut().insert("x-guard-provisional", value);
+            }
+        }
+        response
+    }
+
+    fn approval_status_resp(
+        &self,
+        code: StatusCode,
+        message: &str,
+        reason: &str,
+        handle: Option<&str>,
+    ) -> Response<ProxyBody> {
+        let mut response = self.status_resp(code, message, reason);
+        if let Some(handle) = handle {
+            if let Ok(value) = HeaderValue::from_str(handle) {
+                response.headers_mut().insert("x-guard-approval", value);
+            }
+        }
+        response
+    }
+
+    fn staged_cleanup_failure_response(&self) -> Response<ProxyBody> {
+        self.status_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "guard api-proxy: mutation was not sent, but durable staged-containment cleanup remains pending",
+            "ContainmentCleanupPending",
+        )
+    }
+
     fn rebuild_judge_for_intent_during_update(&self, intent: Option<String>) {
         let Some(builder) = self.judge_builder.get() else {
             return;
         };
         let judge = builder(intent);
-        *self.judge.write().unwrap() = judge;
+        *self
+            .judge
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = judge;
         tracing::info!(target: "guard::apiproxy", "rebuilt api evaluator for policy intent change");
     }
+}
+
+fn provisional_response_metadata(
+    handle: &str,
+    deadline_unix: u64,
+    now_unix: u64,
+) -> (String, String) {
+    let seconds_remaining = deadline_unix.saturating_sub(now_unix);
+    let confirm = crate::gating::provisional::operator_confirm_command(handle);
+    (
+        format!(
+            "{handle}; deadline_unix={deadline_unix}; seconds_remaining={seconds_remaining}"
+        ),
+        format!(
+            "299 guard \"change is provisional; confirm with {confirm}; auto-revert deadline_unix={deadline_unix}; seconds_remaining={seconds_remaining}\""
+        ),
+    )
+}
+
+fn bind_create_provenance(body: &[u8], provisional: &str) -> Result<Bytes, String> {
+    let mut object: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| "Kubernetes create body is not valid JSON".to_string())?;
+    let metadata = object
+        .get_mut("metadata")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "Kubernetes create body has no metadata object".to_string())?;
+    let annotations = metadata
+        .entry("annotations")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "Kubernetes create metadata annotations must be an object".to_string())?;
+    annotations.insert(
+        CREATE_PROVENANCE_ANNOTATION.to_string(),
+        serde_json::Value::String(provisional.to_string()),
+    );
+    serde_json::to_vec(&object)
+        .map(Bytes::from)
+        .map_err(|_| "Kubernetes create provenance could not be serialized".to_string())
+}
+
+fn authoritative_created_uid(
+    body: &[u8],
+    key: &CreatedKey,
+    expected_provenance: &str,
+) -> Result<String, String> {
+    let object: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| "create response is not a valid object".to_string())?;
+    let metadata = object
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "create response metadata is missing".to_string())?;
+    if metadata.get("name").and_then(serde_json::Value::as_str) != Some(key.name.as_str())
+        || metadata
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            != key.namespace.as_deref()
+    {
+        return Err("create response identity does not match the admitted request".to_string());
+    }
+    if metadata
+        .get("annotations")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|annotations| annotations.get(CREATE_PROVENANCE_ANNOTATION))
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_provenance)
+    {
+        return Err("create response provenance does not match the admitted request".to_string());
+    }
+    metadata
+        .get("uid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|uid| !uid.is_empty() && uid.len() <= 256 && !uid.chars().any(char::is_control))
+        .map(str::to_string)
+        .ok_or_else(|| "create response UID is missing or invalid".to_string())
+}
+
+fn prepare_create_provenance(
+    parts: &mut Parts,
+    body: Bytes,
+    op: &ApiOp,
+    enabled: bool,
+) -> Result<Bytes, String> {
+    if !enabled || op.verb != Verb::Create || op.dry_run {
+        return Ok(body);
+    }
+    if parts.extensions.get::<PreparedCreateProvenance>().is_some() {
+        return Ok(body);
+    }
+    let provenance = format!("{:032x}", rand::random::<u128>());
+    let body = bind_create_provenance(&body, &provenance)?;
+    parts
+        .extensions
+        .insert(PreparedCreateProvenance(provenance));
+    Ok(body)
 }
 
 fn take_guard_session(headers: &mut HeaderMap) -> Result<Option<String>, &'static str> {
@@ -2237,15 +4161,21 @@ async fn collect_request_body(
 }
 
 fn api_hold_snapshot(label: String, query: &str, op: &ApiOp, body: &[u8]) -> ApiHoldSnapshot {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(body);
     ApiHoldSnapshot {
         label,
-        body_sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        body_sha256: body_sha256(body),
         redacted_body_shape: redacted_body_shape(body),
         redacted_query: crate::evaluate::redact_for_llm(query),
         authority_selectors: op.authority_selectors.clone(),
     }
+}
+
+fn body_sha256(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn full_body(bytes: Bytes) -> ProxyBody {
@@ -2285,20 +4215,10 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
     )
 }
 
-/// Headers that carry or override the upstream request identity. A brokered
-/// client may authenticate to Guard with a session bearer, while the daemon's
-/// separate upstream credential talks to the apiserver. These headers reassign
-/// the request's authenticated identity, and where the daemon's credential
-/// holds the Kubernetes `impersonate` RBAC permission (the identity-override grant, common for
-/// admin/CI service accounts) the apiserver would evaluate a forwarded header
-/// identity instead of the operator's. Since ApiPolicy matches only
-/// verb/resource/namespace and never identity, stripping these headers keeps
-/// each forwarded request bound to the daemon's own upstream credential, so
-/// authorization and ApiPolicy apply to the operator's identity rather than
-/// any header-supplied user/group/serviceaccount. `X-Remote-*` are the
-/// equivalent front-proxy identity headers for aggregated API servers; strip
-/// them for the same reason, though they only take effect where the apiserver
-/// already trusts this proxy's client certificate.
+/// Headers that carry or override the upstream request identity. Guard rejects
+/// requests containing them before policy evaluation or forwarding because
+/// its API policy has no identity dimension. The forwarding layer keeps this
+/// defense in depth and never copies one to the upstream request.
 fn is_identity_header(name: &header::HeaderName) -> bool {
     let s = name.as_str();
     s.starts_with("impersonate-") || s.starts_with("x-remote-")
@@ -2515,30 +4435,59 @@ fn sanitize_shape_key(key: &str) -> String {
     out
 }
 
-/// Reload the policy file when its mtime changes (the operator slow clock). A
-/// parse error keeps the last good policy in force and is logged.
+/// Reload the policy file when its content changes. A parse error keeps the
+/// last good policy in force and is logged.
 async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
-    let mut last = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    use sha2::{Digest, Sha256};
+
+    let digest = |bytes: &[u8]| Sha256::digest(bytes).to_vec();
+    // The task can start after an operator has already replaced the file. The
+    // first read is therefore compared with the loaded policy, rather than
+    // treated as an unquestioned baseline that could miss that replacement.
+    let mut last = None;
     loop {
         tokio::time::sleep(proxy.policy_reload_interval).await;
-        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        if modified == last {
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::error!(
+                    target: "guard::apiproxy",
+                    "cannot read api-policy {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let observed = digest(&bytes);
+        if last.as_ref() == Some(&observed) {
             continue;
         }
-        last = modified;
-        match ApiPolicy::load_file(&path) {
+        let parsed = std::str::from_utf8(&bytes)
+            .map_err(|error| error.to_string())
+            .and_then(|yaml| ApiPolicy::from_yaml(yaml).map_err(|error| error.to_string()));
+        match parsed {
             Ok(p) => {
-                let old_intent = proxy.policy.read().await.intent.clone();
+                if last.is_none()
+                    && p.authority_fingerprint()
+                        == proxy.policy.read().await.authority_fingerprint()
+                {
+                    last = Some(observed);
+                    continue;
+                }
+                let _update = proxy.begin_authority_update().await;
+                let mut policy = proxy.policy.write().await;
+                let old_intent = policy.intent.clone();
                 let new_intent = p.intent.clone();
-                proxy.begin_authority_update();
                 if old_intent != new_intent {
                     proxy.rebuild_judge_for_intent_during_update(new_intent);
                 }
-                *proxy.policy.write().await = p;
-                proxy.finish_authority_update();
+                *policy = p;
+                last = Some(observed);
+                proxy.policy_reload_notify.notify_waiters();
                 tracing::info!(target: "guard::apiproxy", "reloaded api-policy from {}", path.display());
             }
             Err(e) => {
+                last = Some(observed);
                 tracing::error!(
                     target: "guard::apiproxy",
                     "api-policy reload failed ({}); keeping previous policy: {e}",
@@ -2552,6 +4501,24 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestJudge;
+
+    #[async_trait::async_trait]
+    impl ApiJudge for TestJudge {
+        async fn authorize_forward(
+            &self,
+            _summary: &ApiRequestSummary,
+            _requirement: ApiForwardRequirement,
+            _handoff: &mut dyn ApiForwardHandoff,
+        ) -> Result<(), String> {
+            Err("test judge does not authorize forwarding".to_string())
+        }
+
+        async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+            ApiJudgeVerdict::Error("test judge".to_string())
+        }
+    }
 
     #[test]
     fn body_shape_redacts_values_and_sanitizes_untrusted_keys() {
@@ -2580,13 +4547,221 @@ mod tests {
 
     #[test]
     fn exact_response_redaction_spans_chunk_boundaries() {
-        let mut redactor = ExactSecretRedactor::new(vec![b"operator-secret-token".to_vec()]);
-        let mut output = redactor.push(b"prefix operator-secr");
-        output.extend_from_slice(&redactor.push(b"et-token suffix"));
-        output.extend_from_slice(&redactor.finish());
+        let mut redactor =
+            ExactSecretRedactor::new(vec![b"operator-secret-token".to_vec()], 1024).unwrap();
+        let mut output = redactor.push(b"prefix operator-secr").unwrap();
+        output.extend_from_slice(&redactor.push(b"et-token suffix").unwrap());
+        output.extend_from_slice(&redactor.finish().unwrap());
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output, "prefix [REDACTED] suffix");
         assert!(!output.contains("operator-secret-token"));
+    }
+
+    #[test]
+    fn exact_response_redaction_enforces_raw_and_expanded_byte_limits() {
+        let proxy = test_proxy().with_upstream_body_limit(8);
+        let value = *b"x!";
+        assert!(proxy
+            .redact_upstream_bytes(vec![value.to_vec()], &value.repeat(4))
+            .is_err());
+        assert!(proxy.redact_upstream_bytes(Vec::new(), &[b'x'; 9]).is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_fingerprint_wait_registers_before_observation() {
+        let proxy = test_proxy();
+        let replacement = ApiPolicy::from_yaml("default: allow\n").unwrap();
+        let expected = replacement.authority_fingerprint();
+        let mut replacement = Some(replacement);
+        let mut checks = 0;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            proxy.wait_for_policy_fingerprint_with_before_check(&expected, || {
+                checks += 1;
+                match checks {
+                    1 => proxy.policy_reload_notify.notify_waiters(),
+                    2 => {
+                        *proxy
+                            .policy
+                            .try_write()
+                            .expect("policy is available for deterministic publication") =
+                            replacement.take().expect("replacement publishes once");
+                    }
+                    _ => panic!("fingerprint waiter performed an unexpected extra check"),
+                }
+            }),
+        )
+        .await
+        .expect("a notification between registration and observation must not be lost");
+        assert_eq!(checks, 2);
+    }
+
+    #[tokio::test]
+    async fn response_derived_authority_rejects_a_stale_route_generation() {
+        let proxy = test_proxy();
+        let (_, expected) = proxy.capture_route_authority().await.unwrap();
+        drop(proxy.begin_authority_update().await);
+        assert!(
+            !proxy
+                .publication_authority_is_current(&expected, None)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_update_panic_finalizes_revision_and_reads_remain_bounded() {
+        let proxy = Arc::new(test_proxy());
+        let panic_result = tokio::spawn({
+            let proxy = proxy.clone();
+            async move {
+                let _update = proxy.begin_authority_update().await;
+                panic!("injected authority publication panic");
+            }
+        })
+        .await;
+        assert!(panic_result.is_err());
+        assert!(proxy
+            .authority_revision
+            .load(Ordering::Acquire)
+            .is_multiple_of(2));
+        assert!(proxy.capture_route_authority().await.is_ok());
+
+        proxy
+            .authority_revision
+            .store(u64::MAX - 1, Ordering::Release);
+        drop(proxy.begin_authority_update().await);
+        assert_eq!(proxy.authority_revision.load(Ordering::Acquire), 0);
+
+        proxy.authority_revision.store(1, Ordering::Release);
+        assert!(proxy.capture_route_authority().await.is_err());
+        proxy.authority_revision.store(2, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn authority_update_waits_for_upstream_initiation_lease() {
+        let proxy = Arc::new(test_proxy());
+        let (_, expected) = proxy.capture_route_authority().await.unwrap();
+        let lease = proxy
+            .reserve_authority_initiation(&expected)
+            .await
+            .expect("current authority must reserve");
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let update = tokio::spawn({
+            let proxy = proxy.clone();
+            let callback_proxy = proxy.clone();
+            async move {
+                let _update = proxy
+                    .begin_authority_update_with_callback(move || {
+                        let _ = published_tx
+                            .send(callback_proxy.authority_revision.load(Ordering::Acquire));
+                    })
+                    .await;
+                proxy.authority_revision.load(Ordering::Acquire)
+            }
+        });
+        let published_revision = tokio::time::timeout(Duration::from_secs(1), published_rx)
+            .await
+            .expect("authority update publishes before waiting for the lease")
+            .expect("authority publication callback remains live");
+        assert!(!published_revision.is_multiple_of(2));
+        assert!(!update.is_finished());
+        drop(lease);
+        assert_eq!(update.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn authority_update_callback_runs_after_odd_revision_publication() {
+        let proxy = Arc::new(test_proxy());
+        let observed_revision = Arc::new(AtomicU64::new(0));
+        let transition_generation = proxy.authority_transition_generation();
+        let callback_proxy = proxy.clone();
+        let callback_observed_revision = observed_revision.clone();
+        let update = proxy
+            .begin_authority_update_with_callback(move || {
+                callback_observed_revision.store(
+                    callback_proxy.authority_revision.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+            })
+            .await;
+
+        assert_eq!(observed_revision.load(Ordering::Acquire), 1);
+        assert_eq!(
+            proxy.authority_transition_generation(),
+            transition_generation.wrapping_add(1)
+        );
+        drop(update);
+        assert_eq!(
+            proxy.authority_transition_generation(),
+            transition_generation.wrapping_add(1)
+        );
+        assert!(proxy
+            .authority_revision
+            .load(Ordering::Acquire)
+            .is_multiple_of(2));
+    }
+
+    #[tokio::test]
+    async fn cancelled_authority_update_restores_even_revision_before_write_lease() {
+        let proxy = Arc::new(test_proxy());
+        let (_, expected) = proxy.capture_route_authority().await.unwrap();
+        let lease = proxy
+            .reserve_authority_initiation(&expected)
+            .await
+            .expect("current authority must reserve");
+
+        let update = tokio::spawn({
+            let proxy = proxy.clone();
+            async move {
+                let _update = proxy.begin_authority_update().await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !proxy
+                    .authority_revision
+                    .load(Ordering::Acquire)
+                    .is_multiple_of(2)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authority update must publish its odd revision");
+        update.abort();
+        assert!(update.await.unwrap_err().is_cancelled());
+        assert!(proxy
+            .authority_revision
+            .load(Ordering::Acquire)
+            .is_multiple_of(2));
+
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(1), proxy.capture_route_authority())
+            .await
+            .expect("capture remains bounded after cancellation")
+            .expect("authority capture remains available after cancellation");
+        let update_guard =
+            tokio::time::timeout(Duration::from_secs(1), proxy.begin_authority_update())
+                .await
+                .expect("subsequent update remains bounded");
+        drop(update_guard);
+        assert!(proxy
+            .authority_revision
+            .load(Ordering::Acquire)
+            .is_multiple_of(2));
+
+        proxy
+            .authority_revision
+            .store(u64::MAX - 1, Ordering::Release);
+        let update_guard =
+            tokio::time::timeout(Duration::from_secs(1), proxy.begin_authority_update())
+                .await
+                .expect("maximum even revision update remains bounded");
+        drop(update_guard);
+        assert_eq!(proxy.authority_revision.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2687,7 +4862,12 @@ mod tests {
         // Caller A (connection 1) creates a resource; the proxy records its
         // auto-revert handle keyed to that connection.
         let mut reg = CreatedRegistry::default();
-        reg.remember(created_key(1, "foo"), "handle-A".to_string());
+        reg.remember(
+            created_key(1, "foo"),
+            "handle-A".to_string(),
+            "resource-uid".to_string(),
+            "provenance".to_string(),
+        );
 
         // Caller B on a different connection deletes the same
         // group/resource/namespace/name: no provenance match, so the delete
@@ -2714,6 +4894,8 @@ mod tests {
         reg.remember(
             session_created_key(1, "foo", "session-a"),
             "handle-a".to_string(),
+            "resource-uid".to_string(),
+            "provenance".to_string(),
         );
 
         assert_eq!(reg.find(&created_key(1, "foo")), None);
@@ -2727,7 +4909,12 @@ mod tests {
     #[test]
     fn provenance_is_dropped_when_its_revert_resolves() {
         let mut reg = CreatedRegistry::default();
-        reg.remember(created_key(1, "foo"), "handle-A".to_string());
+        reg.remember(
+            created_key(1, "foo"),
+            "handle-A".to_string(),
+            "resource-uid".to_string(),
+            "provenance".to_string(),
+        );
 
         // The create's auto-revert resolves (operator confirm, or auto/manual
         // revert): the daemon drops the provenance by handle.
@@ -2738,6 +4925,21 @@ mod tests {
         // outside guard) no longer matches the stale entry and goes through
         // normal policy.
         assert_eq!(reg.find(&created_key(1, "foo")), None);
+    }
+
+    #[test]
+    fn create_provenance_is_bound_into_the_forwarded_object() {
+        let body = bind_create_provenance(
+            br#"{"metadata":{"name":"example","annotations":{"fixture":"kept"}},"spec":{}}"#,
+            "provisional-handle",
+        )
+        .unwrap();
+        let object: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            object["metadata"]["annotations"][CREATE_PROVENANCE_ANNOTATION],
+            "provisional-handle"
+        );
+        assert_eq!(object["metadata"]["annotations"]["fixture"], "kept");
     }
 
     fn test_proxy() -> ApiProxy {
@@ -2756,6 +4958,46 @@ mod tests {
             ApiPolicy::deny_all(),
             None,
         )
+    }
+
+    #[test]
+    fn provisional_response_metadata_includes_handle_deadline_and_remaining_seconds() {
+        let (provisional, warning) =
+            provisional_response_metadata("handle-123", 1_700_000_123, 1_700_000_100);
+
+        assert_eq!(
+            provisional,
+            "handle-123; deadline_unix=1700000123; seconds_remaining=23"
+        );
+        assert_eq!(
+            warning,
+            format!(
+                "299 guard \"change is provisional; confirm with {}; auto-revert deadline_unix=1700000123; seconds_remaining=23\"",
+                crate::gating::provisional::operator_confirm_command("handle-123")
+            )
+        );
+    }
+
+    #[test]
+    fn provisional_response_metadata_never_reports_negative_remaining_seconds() {
+        let (provisional, warning) = provisional_response_metadata("handle-123", 100, 101);
+
+        assert!(provisional.ends_with("seconds_remaining=0"));
+        assert!(warning.contains("deadline_unix=100; seconds_remaining=0"));
+    }
+
+    #[tokio::test]
+    async fn judge_attachment_uses_authority_coordination() {
+        let proxy = test_proxy();
+        let before = proxy.authority_revision.load(Ordering::Acquire);
+
+        proxy.attach_judge(Arc::new(TestJudge)).await;
+
+        assert!(proxy.has_judge());
+        assert_eq!(
+            proxy.authority_revision.load(Ordering::Acquire),
+            before.wrapping_add(2)
+        );
     }
 
     fn delete_op(name: &str) -> ApiOp {
@@ -2815,6 +5057,24 @@ mod tests {
     }
 
     #[test]
+    fn rarity_tracker_evicts_distinct_attacker_shapes_at_a_finite_bound() {
+        let t = RarityTracker::new(1);
+        for index in 0..(MAX_RARITY_SHAPES + 100) {
+            let key = ShapeKey {
+                protocol: "kubernetes".to_string(),
+                verb: "get",
+                group: String::new(),
+                resource: format!("resource-{index}"),
+                subresource: None,
+                namespace: Some(format!("namespace-{index}")),
+                authority_selectors: Default::default(),
+            };
+            assert!(t.observe_is_rare(key));
+        }
+        assert!(t.state.lock().unwrap().0.len() <= MAX_RARITY_SHAPES);
+    }
+
+    #[test]
     fn shape_key_ignores_object_name() {
         let proxy = test_proxy();
         // Two deletes of differently-named objects share a shape.
@@ -2853,11 +5113,12 @@ mod tests {
     #[test]
     fn created_provenance_matches_without_consuming() {
         let proxy = test_proxy();
-        proxy
-            .created
-            .lock()
-            .unwrap()
-            .remember(created_key(1, "foo"), "h1".to_string());
+        proxy.created.lock().unwrap().remember(
+            created_key(1, "foo"),
+            "h1".to_string(),
+            "resource-uid".to_string(),
+            "provenance".to_string(),
+        );
 
         let op = delete_op("foo");
         // A delete on a different connection does not match.
@@ -3023,11 +5284,12 @@ mod tests {
     #[test]
     fn forget_created_by_handle_clears_public_provenance() {
         let proxy = test_proxy();
-        proxy
-            .created
-            .lock()
-            .unwrap()
-            .remember(created_key(1, "foo"), "h1".to_string());
+        proxy.created.lock().unwrap().remember(
+            created_key(1, "foo"),
+            "h1".to_string(),
+            "resource-uid".to_string(),
+            "provenance".to_string(),
+        );
 
         proxy.forget_created_by_handle("h1");
 

@@ -24,7 +24,13 @@ StateDirectoryMode=0700
 UMask=0077
 # GUARD_ALLOWED_UIDS contains only UID[,UID...]. Keeping --users outside the
 # expansion makes systemd pass the option and its value as separate arguments.
-ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --socket-group guard-clients --state-db /var/lib/guard/state.db --users ${GUARD_ALLOWED_UIDS}
+# The admin token reaches the daemon only through stdin: systemd opens the
+# root-held token file and hands over the descriptor, so the value never
+# enters the daemon's environment, argv, or a file its brokered children can
+# read (children run as the daemon uid but must not inherit its operator
+# authority). Provision the file once as root:root 0400; see DEPLOYMENT.md.
+StandardInput=file:/etc/guard/admin.token
+ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --socket-group guard-clients --state-db /var/lib/guard/state.db --users ${GUARD_ALLOWED_UIDS} --admin-token-stdin
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -66,7 +72,6 @@ NoNewPrivileges=true
 # relies on. AmbientCapabilities= grants the two capabilities without lowering
 # that ceiling.
 AmbientCapabilities=CAP_FOWNER CAP_DAC_READ_SEARCH
-PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/run/guard /var/lib/guard

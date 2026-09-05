@@ -5,6 +5,7 @@ name: Release Validation
   workflow_call:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -59,6 +60,17 @@ jobs:
           }
           test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag_commit}" --jq '.commit.verification.verified')" = true || {
             echo "release commit signature is not verified"
+            exit 1
+          }
+          ci_run_id=$(gh run list --workflow CI --commit "$tag_commit" --event push --limit 10 \
+            --json databaseId,headSha \
+            --jq "map(select(.headSha == \"${tag_commit}\")) | first | .databaseId // empty")
+          test -n "$ci_run_id" || {
+            echo "mainline CI run was not found for the release commit"
+            exit 1
+          }
+          timeout 1800s gh run watch "$ci_run_id" --compact --exit-status || {
+            echo "mainline CI did not pass for the release commit"
             exit 1
           }
           check_runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag_commit}/check-runs?per_page=100")
@@ -163,13 +175,15 @@ jobs:
           archive="${bundle}.tar.gz"
           root="dist/${bundle}"
           mkdir -p "$root/deployment/systemd" "$root/deployment/hardening" \
-            "$root/deployment/windows" "$root/examples" "$root/docs"
+            "$root/deployment/windows" "$root/examples" "$root/docs" "$root/ctf"
           cp "target/${BUILD_TARGET}/release/${ARTIFACT_NAME}" "$root/${ARTIFACT_NAME}"
           binary_hash=$(sha256sum "$root/${ARTIFACT_NAME}" | cut -d ' ' -f 1)
           printf '%s  %s\n' "$binary_hash" "$ARTIFACT_NAME" > "$root/BINARY-SHA256"
-          cp README.md INSTALL.md DEPLOYMENT.md ARCHITECTURE.md ROADMAP.md LICENSE .env.example "$root/"
+          cp README.md INSTALL.md DEPLOYMENT.md DEVELOPMENT.md SECURITY.md \
+            ARCHITECTURE.md ROADMAP.md LICENSE .env.example "$root/"
           cp docs/*.md "$root/docs/"
-          cp examples/*.yaml examples/README.md examples/fallback-models.env "$root/examples/"
+          cp ctf/DESIGN.md "$root/ctf/"
+          cp examples/*.yaml examples/*.md examples/fallback-models.env "$root/examples/"
           cp deployment/systemd/guard.service \
             deployment/systemd/guard-exec-as-caller.service \
             deployment/systemd/guard.env.example \
@@ -212,6 +226,8 @@ jobs:
           root="$smoke/$bundle"
           test -f "$root/INSTALL.md"
           test -f "$root/DEPLOYMENT.md"
+          test -f "$root/DEVELOPMENT.md"
+          test -f "$root/SECURITY.md"
           test -f "$root/ARCHITECTURE.md"
           test -f "$root/ROADMAP.md"
           test -f "$root/LICENSE"
@@ -219,11 +235,13 @@ jobs:
           test -f "$root/docs/release-verification.md"
           test -f "$root/docs/configuration.md"
           test -f "$root/docs/api-proxy.md"
+          test -f "$root/ctf/DESIGN.md"
           test -f "$root/examples/verbs.yaml"
           test -f "$root/examples/verbs-readonly.yaml"
           test -f "$root/examples/verbs-kubectl.yaml"
           test -f "$root/examples/api-policy.yaml"
           test -f "$root/examples/fallback-models.env"
+          test -f "$root/examples/system-prompt-append-tools.md"
           test -f "$root/deployment/windows/install-guard.ps1"
           actual_manifest="dist/${bundle}.manifest.actual"
           find "$root" -type f -printf '%P\n' | LC_ALL=C sort > "$actual_manifest"
@@ -370,6 +388,15 @@ jobs:
             if ($operatorDocument.type -ne 'access_error' -or $operatorDocument.error -notmatch 'unknown or unauthorized access reference') {
               throw 'Unknown access reference returned the wrong structured error.'
             }
+
+            $decisionOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -File $installer -Action access-approve -Reference 'gr-00000000000000000000000000000000' -Json 2>&1)
+            $decisionStatus = $LASTEXITCODE
+            if ($decisionStatus -ne 1) { throw "Unknown access approval returned native status $decisionStatus instead of 1." }
+            try { $decisionDocument = ($decisionOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop }
+            catch { throw 'Unknown access approval did not return structured JSON.' }
+            if ($decisionDocument.type -ne 'access_decisions' -or $decisionDocument.response.result -ne 'access_decisions' -or $decisionDocument.response.items[0].message -ne 'unknown access request') {
+              throw 'Token-required access approval did not reach the operator handler.'
+            }
             if (@(Get-ScheduledTask -TaskName 'guard-op-*' -ErrorAction SilentlyContinue).Count -ne $taskCount) {
               throw 'Operator failure left a scheduled task behind.'
             }
@@ -405,8 +432,11 @@ jobs:
             }
             New-Item -ItemType Directory -Path $apiRoot -Force | Out-Null
             $apiBody = Join-Path $apiRoot 'api-revert-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.body'
-            [IO.File]::WriteAllBytes($apiBody, [byte[]](1, 2, 3, 4, 5))
             Protect-PrivateServiceTree -Path $apiRoot -GuardSid $guardSid
+            # API-revert bodies are authority only while referenced by durable
+            # provisional state, so startup prunes an owned orphan. Keep this
+            # end-to-end rollback baseline empty; the Pester contract covers a
+            # nonempty snapshot round trip through the backup helpers.
             $baselineApiReverts = Get-ApiRevertHashes -GuardSid $guardSid
             Start-Service -Name $ServiceName
 

@@ -1,5 +1,21 @@
 # Development
 
+## Contributing
+
+Bug reports and enhancement requests use the repository's GitHub issue
+tracker. Security reports follow [SECURITY.md](SECURITY.md) and do not belong in
+public issues.
+
+Contributions use GitHub pull requests against `main`. Keep each pull request
+focused on one coherent change, add behavioral tests for changed behavior, and
+update the existing documentation when a public contract changes. Run the
+pre-commit gate below over the complete diff before requesting review. A
+maintainer review and passing required checks are required before merge.
+
+Contributions are accepted under the repository's MIT license. By submitting a
+contribution, the contributor confirms they have the right to provide it under
+that license.
+
 ## Building
 
 ```bash
@@ -145,15 +161,18 @@ tracked entry points cover the harness:
 
 ```bash
 export GUARD_LLM_API_KEY=sk-or-...
+export CLAUDE_CREDS=/path/to/dedicated-test-credentials.json
 
 # Two-container harness (guard daemon + shimmed tools vs. target host).
-./ctf/run.sh                                   # build and start containers
-podman exec -it guard-local run-claude-attack  # drive the agent CTF
-./ctf/teardown.sh                              # clean up containers and state
+bash ./ctf/run.sh    # build and start the per-run labeled containers
+podman exec -it --user "$(id -u)" <local-container> \
+  env -i HOME=/home/agent PATH=/home/agent/.guard/shims:/usr/local/bin:/usr/bin:/bin \
+  run-claude-attack  # drive the agent CTF
+bash ./ctf/teardown.sh <run-manifest>  # remove the exact run's resources
 
-# Single hardened container running an adversarial Claude campaign against
-# the daemon; results land in ctf/runs/<timestamp>/.
-./ctf/run-adversary.sh
+# One isolated container per credentialed adversary scenario; bounded,
+# redacted results land in ctf/runs/<timestamp>-<scenario>/.
+bash ./ctf/run-adversary.sh
 
 # Consequence-gating harness (Docker or Podman).
 ./ctf/gating/run.sh          # adversarial gating attack
@@ -161,8 +180,9 @@ podman exec -it guard-local run-claude-attack  # drive the agent CTF
 ```
 
 `run.sh` and `run-adversary.sh` need `GUARD_LLM_API_KEY` or
-`OPENROUTER_API_KEY` for the daemon's evaluator, plus a `claude` CLI and its
-OAuth credentials for the attacking agent.
+`OPENROUTER_API_KEY` for the daemon's evaluator, plus a `claude` CLI.
+`CLAUDE_CREDS` is required and must name a dedicated, short-lived test
+identity credential, never a personal OAuth session.
 
 ## Test integrity
 

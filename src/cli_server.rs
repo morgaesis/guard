@@ -10,7 +10,9 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use guard::env::guard_env;
-use guard::learned_rules::{AutoShimMode, LearnedRuleStore, LearningConfig};
+use guard::learned_rules::{
+    create_hardened_file_if_absent, AutoShimMode, LearnedRuleStore, LearningConfig,
+};
 use guard::policy::PolicyMode;
 use std::io::Write;
 use std::path::PathBuf;
@@ -58,8 +60,8 @@ struct ApiEndpointSpec {
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ApiEndpointMode {
-    #[default]
     Policy,
+    #[default]
     Readonly,
 }
 
@@ -93,6 +95,52 @@ pub(crate) fn resolve_history_retention(
         anyhow::bail!("history retention must be greater than zero");
     }
     Ok(value)
+}
+
+/// Read the admin token from stdin: the first line, bounded, never echoed.
+/// Production deployments hand the daemon a root-opened file descriptor
+/// (systemd StandardInput=file:) so the token never enters the daemon's
+/// environment, argv, or a file its brokered children can read.
+fn read_admin_token_stdin() -> Result<String> {
+    use std::io::Read;
+    let mut buffer = String::new();
+    std::io::Read::take(&mut std::io::stdin(), 4096)
+        .read_to_string(&mut buffer)
+        .context("failed to read the admin token from stdin")?;
+    let token = buffer.lines().next().unwrap_or("").trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("--admin-token-stdin: the admin token on stdin must not be empty");
+    }
+    Ok(token)
+}
+
+#[cfg(windows)]
+fn validate_windows_service_operator_config(
+    service: bool,
+    has_socket: bool,
+    has_tcp_listener: bool,
+    admin_token_stdin: bool,
+    has_admin_token: bool,
+) -> Result<()> {
+    if !service {
+        return Ok(());
+    }
+    if admin_token_stdin {
+        anyhow::bail!(
+            "the packaged Windows service rejects --admin-token-stdin; its operator wrapper uses the kernel-authenticated SYSTEM named-pipe identity"
+        );
+    }
+    if has_admin_token {
+        anyhow::bail!(
+            "the packaged Windows service rejects GUARD_ADMIN_TOKEN; brokered children share the service identity and must not inherit an operator bearer"
+        );
+    }
+    if !has_socket || has_tcp_listener {
+        anyhow::bail!(
+            "the packaged Windows service requires exactly one named-pipe listener via --socket and does not accept a TCP listener"
+        );
+    }
+    Ok(())
 }
 
 fn guard_env_u64(suffix: &str) -> Result<Option<u64>> {
@@ -154,8 +202,30 @@ fn default_api_promotion_state_path() -> Option<PathBuf> {
 /// call site): auto-promotion should work out of the box on a fresh host,
 /// the same way `--learn-deny` and `--learn-rules` do not require the
 /// operator to hand-create a state file first.
-fn default_verbs_path() -> Option<PathBuf> {
+pub(crate) fn default_verbs_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("verbs.yaml"))
+}
+
+fn should_create_default_verbs_path(
+    allow_promotion_enabled: bool,
+    gate_enabled: bool,
+    immutable_service_catalog: bool,
+) -> bool {
+    allow_promotion_enabled && gate_enabled && !immutable_service_catalog
+}
+
+fn allow_promotion_for_catalog(requested: bool, immutable_service_catalog: bool) -> bool {
+    requested && !immutable_service_catalog
+}
+
+fn require_explicit_service_verbs_path(
+    path: Option<PathBuf>,
+    immutable_service_catalog: bool,
+) -> Result<Option<PathBuf>> {
+    if immutable_service_catalog && path.is_none() {
+        anyhow::bail!("the packaged Windows service requires an explicit verb catalog");
+    }
+    Ok(path)
 }
 
 /// Parse a `--metrics-addr` value: a full `ADDR:PORT` socket address, or a bare
@@ -190,6 +260,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             tcp_port,
             auth_token,
             admin_token,
+            admin_token_stdin,
             socket_group,
             users,
             policy,
@@ -200,6 +271,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             llm_timeout,
             llm_retries,
             llm_models,
+            llm_reasoning_effort,
             llm,
             no_llm,
             no_redact,
@@ -226,6 +298,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             metrics_addr,
             history_retention,
             exec_as_caller,
+            exec_timeout_secs,
             system_prompt,
             system_prompt_append,
             gate,
@@ -272,9 +345,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             command_evaluator_burst,
             command_evaluator_error_threshold,
             command_evaluator_circuit_cooldown,
-            // Consumed in `main` (Windows SCM dispatch); irrelevant to the
-            // server run itself, which is identical in service and foreground.
-            service: _,
+            service,
         } => {
             tracing::info!("Starting guard server...");
 
@@ -374,13 +445,38 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     "TCP server requires GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
                 );
             }
-            let admin_token = admin_token
+            let configured_admin_token = admin_token
                 .filter(|token| !token.is_empty())
                 .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()));
-            if tcp_port.is_some() && admin_token.is_none() {
+            #[cfg(windows)]
+            validate_windows_service_operator_config(
+                service,
+                socket_path.is_some(),
+                tcp_port.is_some(),
+                admin_token_stdin,
+                configured_admin_token.is_some(),
+            )?;
+            let immutable_service_catalog = cfg!(windows) && service;
+            let admin_token = if admin_token_stdin {
+                Some(read_admin_token_stdin()?)
+            } else {
+                configured_admin_token
+            };
+            if admin_token.is_none() {
+                #[cfg(not(windows))]
                 tracing::warn!(
-                    "TCP admin RPCs other than ping are disabled; set GUARD_ADMIN_TOKEN to use operator access and status commands over TCP"
+                    "admin RPCs other than ping are refused on every listener; configure --admin-token-stdin with a root-held token file (or GUARD_ADMIN_TOKEN for development)"
                 );
+                #[cfg(windows)]
+                if service {
+                    tracing::info!(
+                        "packaged operator RPCs require a kernel-authenticated local SYSTEM named-pipe caller"
+                    );
+                } else {
+                    tracing::warn!(
+                        "admin RPCs other than ping are refused; configure GUARD_ADMIN_TOKEN for a foreground development server"
+                    );
+                }
             }
 
             let shim_dir =
@@ -475,6 +571,10 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     tracing::info!("Approved commands will execute as the connecting unix uid");
                 }
             }
+            let exec_timeout_secs = exec_timeout_secs
+                .map(Some)
+                .unwrap_or(guard_env_u64("EXEC_TIMEOUT_SECS")?)
+                .unwrap_or(0);
 
             let llm_enabled = resolve_bool_flag(llm, no_llm, true);
             if !llm_enabled {
@@ -509,6 +609,9 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             if let Some(api_url) = resolved_api_url {
                 eval_config = eval_config.llm_api_url(api_url);
             }
+            if let Some(proxy_url) = guard_env("LLM_PROXY_URL").filter(|value| !value.is_empty()) {
+                eval_config = eval_config.llm_proxy_url(proxy_url);
+            }
 
             // Model resolution precedence (single primary model):
             //   1. --llm-model CLI flag
@@ -524,6 +627,23 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .or_else(|| guard_env("LLM_MODEL").filter(|v| !v.is_empty()));
             if let Some(model) = resolved_single_model {
                 eval_config = eval_config.llm_model(model);
+            }
+
+            // Reasoning effort: flag > env var > default (minimal). The flag
+            // is enum-validated by clap; the env var is validated here so a
+            // typo fails startup instead of silently reaching the provider.
+            let resolved_reasoning_effort = llm_reasoning_effort
+                .filter(|value| !value.is_empty())
+                .or_else(|| guard_env("LLM_REASONING_EFFORT").filter(|value| !value.is_empty()));
+            if let Some(effort) = resolved_reasoning_effort {
+                anyhow::ensure!(
+                    guard::evaluate::REASONING_EFFORT_VALUES.contains(&effort.as_str()),
+                    "invalid GUARD_LLM_REASONING_EFFORT '{}': expected one of {}",
+                    effort,
+                    guard::evaluate::REASONING_EFFORT_VALUES.join(", ")
+                );
+                tracing::info!("LLM reasoning effort: {}", effort);
+                eval_config = eval_config.llm_reasoning_effort(effort);
             }
 
             // Retries: flag > env var > default.
@@ -678,13 +798,20 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 eval_config = eval_config.deny_shapes(Arc::new(RwLock::new(store)));
             }
 
-            let allow_promotion_enabled = if no_learn_allow {
+            let requested_allow_promotion = if no_learn_allow {
                 false
             } else {
                 learn_allow
                     .or_else(|| guard_env("LEARN_ALLOW").map(|v| parse_env_bool(&v)))
                     .unwrap_or(true)
             };
+            let allow_promotion_enabled =
+                allow_promotion_for_catalog(requested_allow_promotion, immutable_service_catalog);
+            if requested_allow_promotion && immutable_service_catalog {
+                tracing::info!(
+                    "Auto-verb promotion disabled because the packaged service catalog is immutable"
+                );
+            }
             if allow_promotion_enabled {
                 let learn_allow_state_path = learn_allow_state
                     .or_else(|| {
@@ -943,7 +1070,16 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 );
             }
 
-            tracing::info!("Admin RPCs restricted to daemon UID");
+            #[cfg(not(windows))]
+            tracing::info!("Admin RPCs require the admin bearer token on every listener");
+            #[cfg(windows)]
+            if service {
+                tracing::info!(
+                    "Admin RPCs require a kernel-authenticated local SYSTEM named-pipe caller"
+                );
+            } else {
+                tracing::info!("Admin RPCs require the admin bearer token");
+            }
 
             let tool_registry = tool_config::ToolRegistry::load_default().unwrap_or_else(|e| {
                 tracing::warn!("Could not load tool config: {}", e);
@@ -956,6 +1092,12 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             if let Some(ref token) = auth_token {
                 redact_secrets.push(token.clone());
             }
+            if let Some(ref token) = admin_token {
+                redact_secrets.push(token.clone());
+            }
+            let _trusted_exact_secret_scope =
+                guard::redact::register_trusted_exact_secrets(&redact_secrets)
+                    .context("register daemon exact-redaction literals")?;
 
             let history_retention_secs =
                 resolve_history_retention(history_retention, guard_env("HISTORY_RETENTION_SECS"))?;
@@ -979,6 +1121,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             let socket_announcement = socket_path
                 .as_ref()
                 .map(|path| format!("guard server listening on socket {}", path.display()));
+            let state_dir = state_db_path.as_ref().and_then(|path| {
+                path.parent().map(|parent| {
+                    parent
+                        .canonicalize()
+                        .unwrap_or_else(|_| parent.to_path_buf())
+                })
+            });
 
             tracing::info!("Creating server instance...");
             let config = server::ServerConfig {
@@ -987,6 +1136,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 redact,
                 auth_token,
                 admin_token,
+                allow_windows_system_operator: cfg!(windows) && service,
                 socket_group,
                 allowed_uids,
                 shim_dir,
@@ -994,7 +1144,9 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 redact_secrets,
                 preflight,
                 exec_as_caller,
+                exec_timeout_secs,
                 state_db_path,
+                state_dir,
                 audit_log_path,
                 ..server::ServerConfig::default()
             };
@@ -1115,40 +1267,26 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             // inert without consequence gating (see `AllowPromotionStore::
             // record_approval`), so there is no reason to create a live,
             // trust-bearing catalog file a daemon running without --gate
-            // could never populate.
+            // could never populate. The packaged Windows service receives an
+            // explicit administrator-owned catalog from its installer. It
+            // does not create a profile-local catalog because service
+            // configuration is immutable process input.
+            let explicit_verbs_path = require_explicit_service_verbs_path(
+                explicit_verbs_path,
+                immutable_service_catalog,
+            )?;
             let verbs_path = match explicit_verbs_path {
                 Some(path) => Some(path),
-                None if allow_promotion_enabled && gate_mode.is_on() => {
+                None if should_create_default_verbs_path(
+                    allow_promotion_enabled,
+                    gate_mode.is_on(),
+                    immutable_service_catalog,
+                ) =>
+                {
                     let path = default_verbs_path()
                         .ok_or_else(|| anyhow::anyhow!("could not determine default verbs path"))?;
                     if !path.exists() {
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent).with_context(|| {
-                                format!("failed to create {}", parent.display())
-                            })?;
-                        }
-                        std::fs::write(&path, "verbs: []\n")
-                            .with_context(|| format!("failed to create {}", path.display()))?;
-                        // This file grants real, permanent LLM-bypassing
-                        // trust once auto-promotion populates it -- harden
-                        // its permissions explicitly rather than relying on
-                        // process umask, since this path is created
-                        // automatically rather than only when an operator
-                        // deliberately opted in via --verbs.
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            if let Err(e) = std::fs::set_permissions(
-                                &path,
-                                std::fs::Permissions::from_mode(0o600),
-                            ) {
-                                tracing::warn!(
-                                    "failed to set restrictive permissions on {}: {}",
-                                    path.display(),
-                                    e
-                                );
-                            }
-                        }
+                        create_hardened_file_if_absent(&path, "verbs: []\n")?;
                         tracing::info!(
                             "Created empty verb catalog at {} for auto-verb-promotion",
                             path.display()
@@ -1159,7 +1297,15 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 None => None,
             };
             if let Some(path) = verbs_path {
-                let catalog = guard::gating::verb::VerbCatalog::load(&path)
+                #[cfg(windows)]
+                let catalog = if immutable_service_catalog {
+                    guard::gating::verb::VerbCatalog::load_immutable(&path)
+                } else {
+                    guard::gating::verb::VerbCatalog::load(&path)
+                };
+                #[cfg(not(windows))]
+                let catalog = guard::gating::verb::VerbCatalog::load(&path);
+                let catalog = catalog
                     .with_context(|| format!("failed to load verb catalog {}", path.display()))?;
                 tracing::info!(
                     "Loaded verb catalog from {} ({} verb(s), version {})",
@@ -1167,6 +1313,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     catalog.names().len(),
                     catalog.version()
                 );
+                srv.set_verb_catalog_path(path.clone());
                 srv.set_verbs(catalog);
             }
 
@@ -1477,11 +1624,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 let proxy = Arc::new(proxy);
                 let mut api_judge_attached = false;
                 if let Some(coverage) = api_promotion_store.clone() {
-                    proxy.attach_judge(server::DaemonApiJudge::build_coverage_only(
-                        &api_judge_llm,
-                        policy_intent.as_deref(),
-                        coverage,
-                    ));
+                    proxy
+                        .attach_judge(server::DaemonApiJudge::build_coverage_only(
+                            &api_judge_llm,
+                            policy_intent.as_deref(),
+                            coverage,
+                        ))
+                        .await;
                 }
                 if api_judge_llm.enabled
                     && api_judge_llm
@@ -1512,7 +1661,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         );
                     proxy.attach_judge_builder(builder.clone());
                     if let Some(judge) = builder(policy_intent) {
-                        proxy.attach_judge(judge);
+                        proxy.attach_judge(judge).await;
                         api_judge_attached = true;
                         tracing::info!(
                             "API proxy evaluator attached for {}",
@@ -1584,7 +1733,8 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     api_judge_cache_ttl,
                     api_promotion_store.clone(),
                     api_judge_spend.clone(),
-                )?;
+                )
+                .await?;
                 tracing::info!(
                     "API endpoint '{}' enabled for {} on {}",
                     name,
@@ -1600,10 +1750,10 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             // listens. Printed after all startup validation so a refused start
             // never claims a listener.
             if let Some(line) = socket_announcement {
-                println!("{line}");
+                cli_println!("{line}");
             }
             if let Some(port) = tcp_port {
-                println!("guard server listening on tcp 127.0.0.1:{}", port);
+                cli_println!("guard server listening on tcp 127.0.0.1:{}", port);
             }
 
             srv.run().await
@@ -1647,8 +1797,8 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         streamed_output = true;
                         match stream {
                             server::OutputStream::Stdout => {
-                                print!("{}", data);
-                                let _ = std::io::stdout().flush();
+                                cli_print!("{}", data);
+                                let _ = crate::cli_output::stdout().flush();
                             }
                             server::OutputStream::Stderr => {
                                 eprint!("{}", data);
@@ -1662,7 +1812,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             if resp.allowed {
                 if !streamed_output {
                     if let Some(stdout) = &resp.stdout {
-                        print!("{}", stdout);
+                        cli_print!("{}", stdout);
                     }
                     if let Some(stderr) = &resp.stderr {
                         eprint!("{}", stderr);
@@ -1747,7 +1897,7 @@ fn is_supported_api_loopback(ip: std::net::IpAddr) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_named_api_proxy(
+async fn build_named_api_proxy(
     spec: ApiEndpointSpec,
     llm: &guard::evaluate::LlmConfig,
     cache_enabled: bool,
@@ -1876,11 +2026,13 @@ fn build_named_api_proxy(
     let proxy = Arc::new(proxy);
     let mut judge_attached = false;
     if let Some(store) = coverage.clone() {
-        proxy.attach_judge(server::DaemonApiJudge::build_coverage_only(
-            llm,
-            policy_intent.as_deref(),
-            store,
-        ));
+        proxy
+            .attach_judge(server::DaemonApiJudge::build_coverage_only(
+                llm,
+                policy_intent.as_deref(),
+                store,
+            ))
+            .await;
     }
     if llm.enabled && llm.api_key.as_ref().is_some_and(|key| !key.is_empty()) {
         let llm = llm.clone();
@@ -1903,7 +2055,7 @@ fn build_named_api_proxy(
         });
         proxy.attach_judge_builder(builder.clone());
         if let Some(judge) = builder(policy_intent) {
-            proxy.attach_judge(judge);
+            proxy.attach_judge(judge).await;
             judge_attached = true;
         }
     }
@@ -1973,6 +2125,41 @@ fn session_aliases_upstream(proxy: &guard::proxy::ApiProxy, token: &str) -> bool
 }
 
 #[cfg(test)]
+mod verb_catalog_path_tests {
+    use std::path::PathBuf;
+
+    use super::{
+        allow_promotion_for_catalog, require_explicit_service_verbs_path,
+        should_create_default_verbs_path,
+    };
+
+    #[test]
+    fn immutable_service_requires_an_explicit_catalog() {
+        assert!(!should_create_default_verbs_path(true, true, true));
+        assert!(should_create_default_verbs_path(true, true, false));
+        assert!(!should_create_default_verbs_path(false, true, false));
+        assert!(!should_create_default_verbs_path(true, false, false));
+        assert!(!allow_promotion_for_catalog(true, true));
+        assert!(allow_promotion_for_catalog(true, false));
+        assert!(!allow_promotion_for_catalog(false, false));
+
+        let configured = PathBuf::from("configured-verbs.yaml");
+        assert_eq!(
+            require_explicit_service_verbs_path(Some(configured.clone()), true).unwrap(),
+            Some(configured)
+        );
+        assert!(require_explicit_service_verbs_path(None, true)
+            .unwrap_err()
+            .to_string()
+            .contains("requires an explicit verb catalog"));
+        assert_eq!(
+            require_explicit_service_verbs_path(None, false).unwrap(),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
 mod api_endpoint_tests {
     use super::*;
 
@@ -2007,8 +2194,8 @@ mod api_endpoint_tests {
         }
     }
 
-    #[test]
-    fn builds_multiple_named_listeners_for_the_same_protocol() {
+    #[tokio::test]
+    async fn builds_multiple_named_listeners_for_the_same_protocol() {
         let temp = tempfile::tempdir().unwrap();
         let kubeconfig = temp.path().join("upstream.yaml");
         std::fs::write(
@@ -2020,6 +2207,8 @@ mod api_endpoint_tests {
             enabled: false,
             api_key: None,
             api_url: None,
+            proxy_url: None,
+            reasoning_effort: None,
             model: None,
             models: Vec::new(),
             timeout_secs: 1,
@@ -2036,6 +2225,7 @@ mod api_endpoint_tests {
                 server::ApiJudgeSpendConfig::default(),
             )),
         )
+        .await
         .unwrap();
         let second = build_named_api_proxy(
             endpoint("second", kubeconfig),
@@ -2048,6 +2238,7 @@ mod api_endpoint_tests {
                 server::ApiJudgeSpendConfig::default(),
             )),
         )
+        .await
         .unwrap();
         assert_eq!(first.0, "first");
         assert_eq!(second.0, "second");
@@ -2077,5 +2268,26 @@ mod api_endpoint_tests {
         symlink(&output, &link).unwrap();
         assert!(write_brokered_kubeconfig_output(&link, "replacement", true).is_err());
         assert_eq!(std::fs::read_to_string(output).unwrap(), "new");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_service_operator_tests {
+    use super::validate_windows_service_operator_config;
+
+    #[test]
+    fn packaged_service_requires_one_named_pipe_and_no_bearer() {
+        assert!(validate_windows_service_operator_config(true, true, false, false, false).is_ok());
+        assert!(
+            validate_windows_service_operator_config(true, false, false, false, false).is_err()
+        );
+        assert!(validate_windows_service_operator_config(true, true, true, false, false).is_err());
+        assert!(validate_windows_service_operator_config(true, true, false, true, false).is_err());
+        assert!(validate_windows_service_operator_config(true, true, false, false, true).is_err());
+    }
+
+    #[test]
+    fn foreground_windows_server_retains_explicit_bearer_configuration() {
+        assert!(validate_windows_service_operator_config(false, false, true, true, true).is_ok());
     }
 }

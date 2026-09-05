@@ -17,12 +17,15 @@ not in command-line arguments.
 |---|---|---|
 | `GUARD_LLM_API_KEY` | none | Evaluator API key. `OPENROUTER_API_KEY` is also accepted. |
 | `GUARD_LLM_API_URL` | OpenRouter chat completions | OpenAI-compatible evaluator endpoint. |
-| `GUARD_LLM_MODEL` | `openai/gpt-5.4-mini` | Primary model. |
+| `GUARD_LLM_PROXY_URL` | unset | HTTP CONNECT proxy used only for evaluator requests. |
+| `GUARD_LLM_MODEL` | `openai/gpt-5.4-mini` | Primary model. `openai/gpt-5.6-luna` with `GUARD_LLM_REASONING_EFFORT=high` holds the same corpus at a quarter of the token price but denies a borderline maintenance command more often. |
 | `GUARD_LLM_MODELS` | unset | Comma-separated fallback chain that supersedes the single model. |
 | `GUARD_LLM_RETRIES` | `2` | Transient retries per model, from 0 to 2; larger values are capped at 2. |
 | `GUARD_LLM_TIMEOUT` | `30` | Per-call timeout in seconds. |
+| `GUARD_LLM_REASONING_EFFORT` | `minimal` | Hidden-reasoning effort requested from the provider (`minimal`, `low`, `medium`, `high`, `max`). Raise it for reasoning-capable models whose decision quality improves with more thinking; reasoning tokens bill and spend from the completion budget. |
 | `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid`. |
 | `GUARD_DRY_RUN` | `false` | Evaluate approved work without spawning it. |
+| `GUARD_EXEC_TIMEOUT_SECS` | `0` | Wall-clock limit for brokered commands. Zero is unlimited. `--exec-timeout-secs` takes precedence. |
 | `GUARD_PROMPT_APPEND` | unset | Additive evaluator prompt path. |
 | `GUARD_PREFLIGHT` | `false` | Deterministic executable and credential-disclosure checks. |
 | `GUARD_ALLOW_BIN` | unset | Comma-separated hard binary floor. |
@@ -31,7 +34,7 @@ not in command-line arguments.
 | `GUARD_ACCESS_TTL_SECS` | `3600` | Lifetime in seconds for access-managed sessions. |
 | `GUARD_NOTIFY_CMD` | unset | Operator command receiving one JSON gate-lifecycle event on stdin. |
 | `GUARD_NOTIFY_TIMEOUT_SECS` | `10` | Notify command timeout in seconds, from 1 to 60. |
-| `GUARD_VERBS` | state directory when promotion needs it | Typed verb catalog. |
+| `GUARD_VERBS` | state directory when promotion needs it | Typed verb catalog. The packaged Windows service requires an explicit administrator-owned catalog, loads it once, and disables promotion. |
 | `GUARD_GRANTS` | unset | Reusable saved-grant catalog. |
 
 `--system-prompt <path>` replaces the compiled mode prompt.
@@ -46,6 +49,43 @@ describes each such tool there: what its mutation surface is, which invocations
 are inspection, and which argument shapes are out of bounds. Typed verbs are
 the deterministic alternative for tools whose semantics should not depend on
 evaluator judgment at all.
+
+For example, an operator-provided `site-admin` binary with
+`inspect --service NAME` and `apply --service NAME` subcommands can use this
+prompt supplement:
+
+```text
+Local tool: site-admin
+- `site-admin inspect --service NAME` reads service state and does not mutate it.
+- `site-admin apply --service NAME` reconciles the named service and may change
+  configuration, processes, and remote state. Treat it as an opaque mutation.
+- Reject unknown subcommands, payload arguments, shell fragments, stdin-driven
+  input, and service names that are not visible as one argv element.
+```
+
+When only a fixed inspection set is required, a typed verb removes evaluator
+ambiguity:
+
+```yaml
+version: 1
+verbs:
+  - name: site-admin-inspect
+    description: Inspect one configured service
+    binary: site-admin
+    args: [inspect, --service, "{service}"]
+    params:
+      service:
+        enum: [api, worker]
+    consequence: reversible
+```
+
+The prompt supplement explains novel invocations. The typed verb is the
+enforcement surface for repeated commands whose executable shapes are finite.
+An optional `exec_timeout_secs` field applies a wall-clock limit to one verb and
+overrides `GUARD_EXEC_TIMEOUT_SECS`; setting the field to `0` makes that verb
+unlimited.
+A copyable supplement in this style for an in-house `servicectl` CLI is at
+[`examples/system-prompt-append-tools.md`](../examples/system-prompt-append-tools.md).
 
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
 enabled, policy allow patterns do not skip evaluation. `--no-evaluator` makes
@@ -64,6 +104,12 @@ credential plans, and rollback behavior.
 | `GUARD_AUTH_TOKEN` | none | Execution bearer required for TCP. |
 | `GUARD_ADMIN_TOKEN` | none | Separate bearer for TCP admin RPCs. |
 | `GUARD_MCP_TOKEN` | none | Bearer required by HTTP MCP. |
+| `GUARD_CLIENT_TIMEOUT_SECS` | `600` | MCP bridge deadline in seconds for each buffered execute or admin daemon round trip. |
+
+The MCP deadline stops the bridge from waiting for a response. Buffered
+execution remains daemon-owned after admission and can continue after the MCP
+deadline; `GUARD_EXEC_TIMEOUT_SECS` or a verb's `exec_timeout_secs` bounds the
+child itself.
 
 The client endpoint order is an explicit command option, environment, saved
 client configuration, then the default local endpoint. Use `guard config show`
@@ -121,9 +167,11 @@ or coverage changes invalidate affected authority.
 | `GUARD_API_VERB_COVERAGE_MIN_DENIALS` | `3` | Evidence required for API deny coverage. |
 | `GUARD_API_VERB_COVERAGE_STATE` | state directory | Generated API coverage state. |
 
-`guard run --reevaluate` skips only a generated deny-shape match. It never
-bypasses operator-authored policy. Automatically promoted allows remain subject
-to the consequence floor, regime stamps, and declared coverage boundaries.
+`guard run --reevaluate` skips only a generated deny-shape match, reported as
+`source: learned-deny` on the denial. It never bypasses operator-authored
+policy and does not clear the decision cache. Automatically promoted allows
+remain subject to the consequence floor, regime stamps, and declared coverage
+boundaries.
 
 ## Child execution and secrets
 
@@ -146,6 +194,33 @@ the evaluator subject and cache authority. Raw environment values stay out of
 prompts and audit; Guard binds them with a value digest. Secret bindings expose
 only environment and store names to policy, while resolved values remain inside
 the daemon.
+
+### Tool-owned environment
+
+The daemon loads `tools.yaml` from its Guard configuration directory. Each
+binary can receive fixed environment values and named secrets owned by the
+daemon:
+
+```yaml
+tools:
+  ansible-playbook:
+    env:
+      HOME: /var/lib/guard
+      ANSIBLE_LOCAL_TEMP: /var/lib/guard/.ansible/tmp
+      PATH: /opt/ansible-tools/bin:/usr/local/bin:/usr/bin:/bin
+```
+
+This pattern gives `connection: local` tasks a writable home and temporary
+directory while selecting an operator-managed Python environment for modules.
+Create those directories with service-account ownership before starting Guard.
+Pin `ansible_python_interpreter` in the inventory or a typed verb when a
+playbook must use a particular interpreter. Tool values override the built-in
+safe environment, and a request cannot override the same variable.
+
+Tool configuration is binary-wide. Use separate wrapper binary names when two
+verb families require incompatible environments. Per-user entries under
+`users` can override fixed values or secret references, but the authenticated
+principal's secret namespace remains the source.
 
 ## API proxy
 
@@ -202,7 +277,12 @@ Each record carries `seq` and `prev_hash` (SHA-256 of the previous serialized
 record; a fixed genesis constant for the first), so any truncation, edit, or
 reorder breaks the chain. `guard audit verify` walks the chain and reports
 intact or the first broken sequence; `guard audit tail [-n N]` reads the most
-recent records. Both are daemon-principal-only and support `--json`.
+recent records. Tail results are read projections: historical `SECRET_EXPOSED`
+records retain sequence, timestamp, kind, field keys, and stored hash metadata
+while replacing command, reason, and field values with redaction markers and
+adding `read_projection: "secret_exposure_detail_redacted"`. The projection
+does not represent the serialized bytes used by the hash chain. Both commands
+require operator authority and support `--json`.
 
 If an allow decision, an operator approval, or a confirm cannot be durably
 appended (disk full, permission failure), the action is denied: guard fails

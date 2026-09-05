@@ -15,6 +15,11 @@ use std::time::Duration;
 /// Per-attempt backoff schedule (seconds). Index = attempt number (0 = first retry).
 /// The initial attempt is not delayed.
 const BACKOFF_SECONDS: [f64; 3] = [0.5, 1.5, 4.5];
+pub(super) const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_PROVIDER_JSON_DEPTH: usize = 32;
+pub(super) const MAX_PROVIDER_CONTAINER_ITEMS: usize = 1024;
+pub(super) const MAX_PROVIDER_STRING_BYTES: usize = 64 * 1024;
+pub(super) const MAX_PROVIDER_DIAGNOSTIC_BYTES: usize = 4096;
 
 /// Classifies why a single LLM attempt failed, so the retry loop can decide
 /// whether to retry at all and whether to downgrade from function-calling to
@@ -49,6 +54,16 @@ impl std::fmt::Display for AttemptError {
 }
 
 impl AttemptError {
+    fn sanitized(self) -> Self {
+        match self {
+            Self::RateLimited { retry_after } => Self::RateLimited { retry_after },
+            Self::ServerError(value) => Self::ServerError(sanitize_provider_error(value)),
+            Self::Transport(value) => Self::Transport(sanitize_provider_error(value)),
+            Self::ParseError(value) => Self::ParseError(sanitize_provider_error(value)),
+            Self::ClientError(value) => Self::ClientError(sanitize_provider_error(value)),
+        }
+    }
+
     /// Retriable means "try again within the per-model budget". Client errors
     /// (401/403/404) are NOT retriable because retrying with the same key/model
     /// won't help.
@@ -109,24 +124,40 @@ impl Evaluator {
             }
             Ok(resp) => {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                tracing::warn!("LLM API returned {}: {}", status, body);
+                let body = bounded_response_text(resp).await.unwrap_or_default();
+                tracing::warn!(
+                    "LLM API returned {}: {}",
+                    status,
+                    provider_error_excerpt(&body, 200)
+                );
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!("LLM connectivity check failed: {}", e);
-                Err(e.into())
+                let error = sanitize_provider_error(e);
+                tracing::warn!("LLM connectivity check failed: {}", error);
+                anyhow::bail!(error)
             }
         }
     }
 
     /// Top-level LLM evaluation: walks the model-fallback chain and, per model,
-    /// runs the retry loop. The LLM NEVER sees the unredacted command; only the
-    /// caller's audit log does.
+    /// runs the retry loop. Structured command callers apply argv-aware
+    /// redaction before any provider request body is built.
     #[tracing::instrument(skip(self, command, prompt_append), fields(command_len = command.len()))]
+    #[cfg(test)]
     pub(super) async fn evaluate_llm(
         &self,
         command: &str,
+        prompt_append: Option<&str>,
+    ) -> EvalResult {
+        self.evaluate_llm_with_argv(command, None, prompt_append)
+            .await
+    }
+
+    pub(super) async fn evaluate_llm_with_argv(
+        &self,
+        command: &str,
+        structured_command: Option<(&str, &[String])>,
         prompt_append: Option<&str>,
     ) -> EvalResult {
         let api_key = match &self.llm_config.api_key {
@@ -139,10 +170,11 @@ impl Evaluator {
             }
         };
 
-        // Redact secret-shaped substrings BEFORE the command text enters any LLM
-        // payload. The audit log, on the other hand, sees the original - that
-        // happens in the caller's layer, not here.
-        let redacted_command = redact_for_llm(command);
+        // Preserve argv boundaries for binary-specific option classification
+        // before applying the free-text model-boundary redactor.
+        let structured_redacted = structured_command
+            .map(|(binary, args)| crate::redact::redact_command_line(binary, args));
+        let redacted_command = redact_for_llm(structured_redacted.as_deref().unwrap_or(command));
         if redacted_command != command {
             // debug, not info: with the broadened redaction surface this
             // fires on most commands carrying any high-entropy argument and
@@ -176,9 +208,10 @@ impl Evaluator {
                 .await
             {
                 Ok(decision) => {
+                    let reason = crate::redact::redact_output_text(&decision.reason);
                     if decision.decision.eq_ignore_ascii_case("APPROVE") {
                         return EvalResult::Allow {
-                            reason: decision.reason,
+                            reason,
                             source: EvalSource::Llm,
                             risk: Some(decision.risk),
                             // Carry the model's class through only when gating is
@@ -191,13 +224,14 @@ impl Evaluator {
                         };
                     } else {
                         return EvalResult::Deny {
-                            reason: decision.reason,
+                            reason,
                             source: EvalSource::Llm,
                             risk: Some(decision.risk),
                         };
                     }
                 }
                 Err(e) => {
+                    let e = e.sanitized();
                     tracing::warn!(
                         "model {} exhausted retry budget: {} - trying next in chain",
                         model,
@@ -284,6 +318,7 @@ impl Evaluator {
                     return Ok(decision);
                 }
                 Err(e) => {
+                    let e = e.sanitized();
                     let status_tag = e.status_tag();
                     // Log failed attempt usage (zero tokens we know of; still visible in audit).
                     log_usage(model, attempt_num, &TokenUsage::default(), status_tag);
@@ -317,10 +352,25 @@ impl Evaluator {
         use_function_calling: bool,
     ) -> Result<(LlmResponse, TokenUsage), AttemptError> {
         let gating = self.gate_mode.is_on();
+        let reasoning_effort = self.llm_config.reasoning_effort();
         let body = if use_function_calling {
-            build_function_call_body(api_url, model, system_prompt, command, gating)
+            build_function_call_body(
+                api_url,
+                model,
+                system_prompt,
+                command,
+                gating,
+                reasoning_effort,
+            )
         } else {
-            build_json_response_body(api_url, model, system_prompt, command, gating)
+            build_json_response_body(
+                api_url,
+                model,
+                system_prompt,
+                command,
+                gating,
+                reasoning_effort,
+            )
         };
 
         tracing::debug!("LLM POST {}: model={}", api_url, model);
@@ -344,10 +394,9 @@ impl Evaluator {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
 
-        let response_text = response
-            .text()
+        let response_text = bounded_response_text(response)
             .await
-            .map_err(|e| AttemptError::Transport(e.to_string()))?;
+            .map_err(AttemptError::Transport)?;
 
         if status.as_u16() == 429 {
             return Err(AttemptError::RateLimited { retry_after });
@@ -356,7 +405,7 @@ impl Evaluator {
             return Err(AttemptError::ServerError(format!(
                 "{}: {}",
                 status,
-                truncate(&response_text, 200)
+                provider_error_excerpt(&response_text, 200)
             )));
         }
         if status.is_client_error() {
@@ -368,31 +417,39 @@ impl Evaluator {
             if use_function_calling && response_text.to_ascii_lowercase().contains("tool_choice") {
                 return Err(AttemptError::ParseError(format!(
                     "tool calling unsupported by provider: {}",
-                    truncate(&response_text, 200)
+                    provider_error_excerpt(&response_text, 200)
                 )));
             }
             return Err(AttemptError::ClientError(format!(
                 "{}: {}",
                 status,
-                truncate(&response_text, 200)
+                provider_error_excerpt(&response_text, 200)
             )));
         }
         if !status.is_success() {
             return Err(AttemptError::Transport(format!(
                 "unexpected status {}: {}",
                 status,
-                truncate(&response_text, 200)
+                provider_error_excerpt(&response_text, 200)
             )));
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| AttemptError::ParseError(format!("non-JSON response: {}", e)))?;
+        let parsed = parse_provider_json(&response_text).map_err(|error| {
+            AttemptError::ParseError(truncate(&error, MAX_PROVIDER_DIAGNOSTIC_BYTES))
+        })?;
 
         let usage = extract_usage(&parsed);
 
         // Routers commonly return HTTP 200 with an embedded error object.
         if parsed.get("error").is_some() {
-            return Err(AttemptError::ClientError(provider_error_summary(&parsed)));
+            let summary = provider_error_summary(&parsed);
+            // OpenRouter reports upstream capacity exhaustion as an embedded
+            // error on a 200, not as a 429; those are transient and worth the
+            // same backoff-and-retry treatment as an explicit 429.
+            if embedded_error_is_rate_limit(&parsed, &summary) {
+                return Err(AttemptError::RateLimited { retry_after: None });
+            }
+            return Err(AttemptError::ClientError(summary));
         }
 
         if let Some(decision) = provider_refusal_response(&parsed) {
@@ -400,11 +457,24 @@ impl Evaluator {
         }
 
         let decision = parse_decision_response(&parsed, use_function_calling).map_err(|e| {
-            AttemptError::ParseError(format!("{}; {}", e, response_shape_summary(&parsed)))
+            AttemptError::ParseError(truncate(
+                &format!("{}; {}", e, response_shape_summary(&parsed)),
+                MAX_PROVIDER_DIAGNOSTIC_BYTES,
+            ))
         })?;
 
         Ok((decision, usage))
     }
+}
+
+/// True when a 200-with-embedded-error response is a rate limit in disguise:
+/// an explicit 429 error code, or rate-limit wording in the error text.
+fn embedded_error_is_rate_limit(parsed: &serde_json::Value, summary: &str) -> bool {
+    if parsed.pointer("/error/code").and_then(|code| code.as_u64()) == Some(429) {
+        return true;
+    }
+    let lowered = summary.to_ascii_lowercase();
+    lowered.contains("rate-limited") || lowered.contains("rate limit")
 }
 
 /// Token usage metrics from the provider response.
@@ -461,9 +531,129 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Sanitize provider-controlled diagnostics before they become errors, logs,
+/// audit detail, or caller-visible text.
+pub(super) fn sanitize_provider_error(value: impl std::fmt::Display) -> String {
+    crate::redact::redact_output_text(&value.to_string())
+}
+
+/// Sanitize a provider response body while it is still identifiable as
+/// untrusted, then apply the requested display bound.
+pub(super) fn provider_error_excerpt(body: &str, max: usize) -> String {
+    truncate(&sanitize_provider_error(body), max)
+}
+
+pub(super) async fn bounded_response_text(
+    mut response: reqwest::Response,
+) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+    {
+        return Err("provider response exceeded the bounded byte limit".to_string());
+    }
+    let mut bytes = Vec::with_capacity(MAX_PROVIDER_RESPONSE_BYTES.min(8192));
+    while let Some(chunk) = response.chunk().await.map_err(sanitize_provider_error)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err("provider response exceeded the bounded byte limit".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| "provider response was not valid UTF-8 within the byte limit".to_string())
+}
+
+pub(super) fn parse_provider_json(text: &str) -> Result<serde_json::Value, String> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let mut quoted = false;
+    for byte in text.bytes() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                if depth > MAX_PROVIDER_JSON_DEPTH {
+                    return Err(
+                        "provider response JSON nesting exceeded the structure limit".to_string(),
+                    );
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if quoted || depth != 0 {
+        return Err("provider response JSON was incomplete".to_string());
+    }
+    let value = serde_json::from_str(text)
+        .map_err(|error| format!("provider response JSON was invalid: {error}"))?;
+    validate_provider_json_shape(&value, 0)?;
+    Ok(value)
+}
+
+fn validate_provider_json_shape(value: &serde_json::Value, depth: usize) -> Result<(), String> {
+    if depth > MAX_PROVIDER_JSON_DEPTH {
+        return Err("provider response JSON nesting exceeded the structure limit".to_string());
+    }
+    match value {
+        serde_json::Value::Array(values) => {
+            if values.len() > MAX_PROVIDER_CONTAINER_ITEMS {
+                return Err("provider response JSON array exceeded the structure limit".to_string());
+            }
+            for value in values {
+                validate_provider_json_shape(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if values.len() > MAX_PROVIDER_CONTAINER_ITEMS {
+                return Err(
+                    "provider response JSON object exceeded the structure limit".to_string()
+                );
+            }
+            for (key, value) in values {
+                if key.len() > MAX_PROVIDER_STRING_BYTES {
+                    return Err(
+                        "provider response JSON key exceeded the structure limit".to_string()
+                    );
+                }
+                validate_provider_json_shape(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::String(value) if value.len() > MAX_PROVIDER_STRING_BYTES => {
+            return Err("provider response JSON string exceeded the structure limit".to_string());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{parse_provider_json, MAX_PROVIDER_STRING_BYTES};
     use crate::evaluate::{EvalConfig, EvalResult, Evaluator};
+
+    #[test]
+    fn provider_json_shape_limits_string_and_container_growth() {
+        let oversized = serde_json::json!({
+            "choices": [{"message": {"content": "x".repeat(MAX_PROVIDER_STRING_BYTES + 1)}}]
+        });
+        assert!(parse_provider_json(&oversized.to_string()).is_err());
+
+        let many = serde_json::json!({
+            "items": (0..=1024).collect::<Vec<_>>()
+        });
+        assert!(parse_provider_json(&many.to_string()).is_err());
+    }
 
     // --- Retry loop tests using a mock HTTP server ---
 
@@ -541,6 +731,45 @@ mod tests {
         }
     }
 
+    async fn run_mock_capture(
+        listener: tokio::net::TcpListener,
+        response_body: String,
+        captured: tokio::sync::oneshot::Sender<Vec<u8>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        while let Ok(read) = stream.read(&mut chunk).await {
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(header_end) = find_subslice(&request, b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .split("\r\n")
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length: ")
+                            .or_else(|| line.strip_prefix("content-length: "))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        let _ = captured.send(request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
@@ -566,6 +795,86 @@ mod tests {
         )
     }
 
+    fn tool_call_body_with_reason(decision: &str, reason: &str) -> String {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "decide",
+                            "arguments": serde_json::json!({
+                                "decision": decision,
+                                "reason": reason,
+                                "risk": 1
+                            }).to_string()
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn provider_rationale_is_sanitized_at_the_evaluator_boundary() {
+        let value = ["q", "7"].concat();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock = tokio::spawn(run_mock(
+            listener,
+            vec![(
+                200,
+                tool_call_body_with_reason("APPROVE", &format!("password={value}")),
+                None,
+            )],
+        ));
+        let evaluator = mock_server_evaluator(port, 0, vec![]).await;
+
+        let result = evaluator.evaluate("fixturectl status").await;
+        assert!(result.is_allow());
+        assert!(!result.reason().contains(&value));
+        assert!(result.reason().contains("[REDACTED]"));
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_argv_is_redacted_before_provider_payload_construction() {
+        for (binary, args, sensitive) in [
+            (
+                "curl",
+                vec!["-u".to_string(), ["q", "7"].concat()],
+                ["q", "7"].concat(),
+            ),
+            (
+                "mysqlsh.exe",
+                vec![format!("-p{}", ["r", "8"].concat())],
+                ["r", "8"].concat(),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let mock = tokio::spawn(run_mock_capture(
+                listener,
+                tool_call_body("APPROVE"),
+                sender,
+            ));
+            let evaluator = mock_server_evaluator(port, 0, vec![]).await;
+            let result = evaluator
+                .evaluate_scoped_argv(binary, &args, None, false, false, Some("fixture"))
+                .await;
+            assert!(result.is_allow());
+            let payload = receiver.await.unwrap();
+            assert!(!payload
+                .windows(sensitive.len())
+                .any(|part| part == sensitive.as_bytes()));
+            assert!(String::from_utf8_lossy(&payload).contains("[REDACTED]"));
+            mock.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn test_retry_on_429_then_success() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -584,6 +893,28 @@ mod tests {
         let result = evaluator.evaluate_llm("id", None).await;
         assert!(result.is_allow(), "got: {}", result);
         let _ = mock.await;
+    }
+
+    #[tokio::test]
+    async fn evaluator_uses_its_explicit_http_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let mock = tokio::spawn(run_mock(
+            listener,
+            vec![(200, tool_call_body("APPROVE"), None)],
+        ));
+        let evaluator = Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url("http://guard-evaluator.invalid/chat".to_string())
+                .llm_proxy_url(proxy_url)
+                .llm_retries(0),
+        )
+        .expect("evaluator with HTTP proxy");
+
+        let result = evaluator.evaluate_llm("id", None).await;
+        assert!(result.is_allow(), "got: {result}");
+        mock.await.unwrap();
     }
 
     #[tokio::test]
@@ -725,6 +1056,25 @@ mod tests {
                 .to_string();
         let good_body = r#"{"choices":[{"message":{"content":"{\"decision\":\"APPROVE\",\"reason\":\"ok\",\"risk\":1}"}}]}"#.to_string();
         let responses = vec![(404, unsupported, None), (200, good_body, None)];
+        let mock = tokio::spawn(run_mock(listener, responses));
+
+        let evaluator = mock_server_evaluator(port, 2, vec![]).await;
+        let result = evaluator.evaluate_llm("pwd", None).await;
+        assert!(result.is_allow(), "got: {}", result);
+        let _ = mock.await;
+    }
+
+    #[tokio::test]
+    async fn test_embedded_rate_limit_error_is_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // OpenRouter reports upstream saturation as HTTP 200 with an embedded
+        // error; the retry loop must treat it like an explicit 429 and try
+        // again instead of failing the evaluation on the first response.
+        let limited = r#"{"error":{"message":"model is temporarily rate-limited upstream. Please retry shortly.","code":429}}"#
+            .to_string();
+        let good_body = r#"{"choices":[{"message":{"content":"{\"decision\":\"APPROVE\",\"reason\":\"ok\",\"risk\":1}"}}]}"#.to_string();
+        let responses = vec![(200, limited, None), (200, good_body, None)];
         let mock = tokio::spawn(run_mock(listener, responses));
 
         let evaluator = mock_server_evaluator(port, 2, vec![]).await;

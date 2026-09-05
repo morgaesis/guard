@@ -1,10 +1,14 @@
 //! Auxiliary LLM synthesis: verbs from operator prose and learned deny shapes.
 
-use super::client::truncate;
+use super::client::{
+    bounded_response_text, parse_provider_json, provider_error_excerpt, sanitize_provider_error,
+    truncate,
+};
 use super::redact::redact_for_llm;
 use super::Evaluator;
 use crate::gating::deny_shape::DenyLearningOutcome;
 use crate::gating::verb::Verb;
+use crate::learned_rules::run_async_durable_store_operation;
 use anyhow::{bail, Result};
 use std::time::Duration;
 
@@ -25,19 +29,30 @@ Rules:
 - Use {param} placeholders in args; each renders as exactly ONE argv element.
   Never put shell operators, pipes, redirects, spaces-as-separators, or a second
   command in one arg. Never use sh -c / cmd /c / -c style interpreters.
+- File arguments in known file-taking positions must be absolute paths in both
+  the forward command and revert. Do not rely on the daemon's working directory.
 - An exec target must address a stable controller reference such as
   deploy/<name>, never a bare pod name.
 - A multi-token subcommand must be separate argv elements or separate
   enumerated params, never one whitespace-bearing parameter.
+- For an exact JSONPath, field selector, or other bounded value that needs a
+  literal space inside one argv element, set value_type to single_argv and set
+  max_length. Keep the anchored pattern narrow and exclude shell controls.
 - Parameter patterns must enumerate the allowed values (e.g. ^(status|df)$)
   rather than admit free text.
 - allow_dash MUST be false unless a value is legitimately a leading-dash token.
 - consequence: "reversible" for read-only/list/get/idempotent; "recoverable"
   ONLY for a mutation with a clean structured inverse, and then ALSO provide a
   `revert`; "irreversible" for destruction or anything lacking a clean inverse.
+- hold: true for a sensitive or broad read that requires operator review despite
+  being reversible, such as bulk account enumeration; otherwise false.
 - trusted: true only for clearly safe read-only operations; otherwise false so
   the LLM still evaluates the rendered command.
 - Do not invent flags that print or redirect credentials or configuration.
+- description: one or two plain sentences telling an operator what approving
+  this verb admits: the binary and operation, which arguments are pinned, and
+  how broad each parameter is. Describe the command template itself, never the
+  requester's motive, and do not restate the verb name.
 - evidence: one or two sentences justifying the binary, params, patterns, and
   class as least-privilege."#;
 
@@ -67,8 +82,14 @@ impl Evaluator {
         let Some(store) = &self.deny_shapes else {
             return Ok(None);
         };
-        let mut guard = store.write().await;
-        guard.record_denial(binary, args, command, reason)
+        let binary = binary.to_string();
+        let args = args.to_vec();
+        let command = command.to_string();
+        let reason = reason.to_string();
+        run_async_durable_store_operation(store, "deny-shape observation", move |candidate| {
+            candidate.record_denial(&binary, &args, &command, &reason)
+        })
+        .await
     }
 
     /// Attempt to synthesize and promote a deny shape from an outcome flagged
@@ -91,15 +112,21 @@ impl Evaluator {
         else {
             return Ok(false);
         };
-        let mut guard = store.write().await;
-        guard.promote_shape(
-            &outcome.service,
-            &outcome.binary,
-            &args_pattern,
-            &outcome.evidence_args,
-            &evidence_note,
-            outcome.denials,
-        )?;
+        let service = outcome.service.clone();
+        let binary = outcome.binary.clone();
+        let evidence_args = outcome.evidence_args.clone();
+        let denials = outcome.denials;
+        run_async_durable_store_operation(store, "deny-shape promotion", move |candidate| {
+            candidate.promote_shape(
+                &service,
+                &binary,
+                &args_pattern,
+                &evidence_args,
+                &evidence_note,
+                denials,
+            )
+        })
+        .await?;
         Ok(true)
     }
 
@@ -145,7 +172,7 @@ impl Evaluator {
             match self.synthesize_verb_once(&api_key, &api_url, &body).await {
                 Ok(verb) => return Ok(verb),
                 Err(e) => {
-                    last_err = e.to_string();
+                    last_err = sanitize_provider_error(e);
                     tracing::warn!(
                         "verb synthesis attempt {}/{} failed: {}",
                         attempt,
@@ -179,21 +206,28 @@ impl Evaluator {
             .await
             .map_err(|e| anyhow::anyhow!("transport error: {e}"))?;
         let status = response.status();
-        let text = response
-            .text()
+        let text = bounded_response_text(response)
             .await
             .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
         if !status.is_success() {
-            bail!("LLM call failed ({}): {}", status, truncate(&text, 200));
+            bail!(
+                "LLM call failed ({}): {}",
+                status,
+                provider_error_excerpt(&text, 200)
+            );
         }
-        let parsed: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
+        let parsed = parse_provider_json(&text)
+            .map_err(|e| anyhow::anyhow!("non-JSON response: {}", truncate(&e, 4096)))?;
         let args_str = parsed
             .pointer("/choices/0/message/tool_calls/0/function/arguments")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("model did not return a create_verb tool call"))?;
-        let args: serde_json::Value = serde_json::from_str(args_str)
-            .map_err(|e| anyhow::anyhow!("tool-call arguments were not valid JSON: {e}"))?;
+        let args = parse_provider_json(args_str).map_err(|e| {
+            anyhow::anyhow!(
+                "tool-call arguments were not valid JSON: {}",
+                truncate(&e, 4096)
+            )
+        })?;
         let verb: Verb = serde_json::from_value(args)
             .map_err(|e| anyhow::anyhow!("model output did not match the verb schema: {e}"))?;
         Ok(verb)
@@ -230,7 +264,7 @@ impl Evaluator {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    last_err = e.to_string();
+                    last_err = sanitize_provider_error(e);
                     tracing::warn!(
                         "deny-shape synthesis attempt {}/{} failed: {}",
                         attempt,
@@ -263,21 +297,28 @@ impl Evaluator {
             .await
             .map_err(|e| anyhow::anyhow!("transport error: {e}"))?;
         let status = response.status();
-        let text = response
-            .text()
+        let text = bounded_response_text(response)
             .await
             .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
         if !status.is_success() {
-            bail!("LLM call failed ({}): {}", status, truncate(&text, 200));
+            bail!(
+                "LLM call failed ({}): {}",
+                status,
+                provider_error_excerpt(&text, 200)
+            );
         }
-        let parsed: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
+        let parsed = parse_provider_json(&text)
+            .map_err(|e| anyhow::anyhow!("non-JSON response: {}", truncate(&e, 4096)))?;
         let args_str = parsed
             .pointer("/choices/0/message/tool_calls/0/function/arguments")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("model did not return a create_deny_shape tool call"))?;
-        let args: serde_json::Value = serde_json::from_str(args_str)
-            .map_err(|e| anyhow::anyhow!("tool-call arguments were not valid JSON: {e}"))?;
+        let args = parse_provider_json(args_str).map_err(|e| {
+            anyhow::anyhow!(
+                "tool-call arguments were not valid JSON: {}",
+                truncate(&e, 4096)
+            )
+        })?;
         let confident = args
             .get("confident")
             .and_then(|v| v.as_bool())
@@ -340,7 +381,7 @@ fn build_create_verb_body(
                     "type": "object",
                     "properties": {
                         "name": {"type": "string", "description": "short kebab-case verb name"},
-                        "description": {"type": "string"},
+                        "description": {"type": "string", "description": "one or two plain sentences an operator reads before approving: which binary and operation this admits, what the template pins, and how broad each parameter is"},
                         "binary": {"type": "string", "description": "the exact executable name, no path"},
                         "args": {
                             "type": "array",
@@ -355,12 +396,15 @@ fn build_create_verb_body(
                                 "properties": {
                                     "pattern": {"type": "string", "description": "FULLY ANCHORED regex ^...$, as narrow as possible; pin to specific named values when the request names them"},
                                     "required": {"type": "boolean"},
-                                    "allow_dash": {"type": "boolean"}
+                                    "allow_dash": {"type": "boolean"},
+                                    "value_type": {"type": "string", "enum": ["token", "single_argv"], "description": "single_argv permits bounded spaces inside one argv element"},
+                                    "max_length": {"type": "integer", "minimum": 1, "maximum": 4096, "description": "required with value_type=single_argv"}
                                 },
                                 "required": ["pattern"]
                             }
                         },
                         "consequence": {"type": "string", "enum": ["reversible", "recoverable", "irreversible"]},
+                        "hold": {"type": "boolean", "description": "true when this operation requires operator approval despite being reversible"},
                         "revert": {
                             "type": "object",
                             "properties": {
@@ -372,7 +416,7 @@ fn build_create_verb_body(
                         "trusted": {"type": "boolean", "description": "true only for clearly safe read-only operations"},
                         "evidence": {"type": "string", "description": "one or two sentences justifying this least-privilege shape"}
                     },
-                    "required": ["name", "binary", "consequence", "evidence"]
+                    "required": ["name", "description", "binary", "consequence", "evidence"]
                 }
             }
         }],
@@ -387,12 +431,12 @@ fn build_create_verb_body(
 /// model is instructed to prefer declining (`confident: false`) over
 /// guessing.
 const SYSTEM_PROMPT_CREATE_DENY_SHAPE: &str = "You infer the minimal common shape from several \
-argument strings that were all denied for the same binary. Each example below is quoted exactly \
-as the regex must match it: no binary name, no leading or trailing space, no added punctuation. \
+canonical JSON argv arrays that were all denied for the same binary. Each example below is quoted \
+exactly as the regex must match it, including JSON brackets, commas, quotes, and escapes. \
 Produce a single fully-anchored regular expression (must start with ^ and end with $) that matches \
 each quoted example verbatim and materially similar variants -- and nothing broader. Do not prepend \
 `^\\s` or any other whitespace to the pattern; the match starts at the first character of the \
-argument string itself. Only set confident=true if the examples clearly share one narrow shape. If \
+JSON array itself. Only set confident=true if the examples clearly share one narrow shape. If \
 they look unrelated, or generalizing would require matching a wide range of unrelated arguments, \
 set confident=false and leave args_pattern empty. This pattern will become an automatic deny fast \
 path with no human review, so err toward declining rather than guessing.";
@@ -409,7 +453,7 @@ fn build_create_deny_shape_body(
         .collect::<Vec<_>>()
         .join("\n");
     let user = format!(
-        "Binary: {binary}\nMost recent denial reason: {last_reason}\n\nDenied argument strings \
+        "Binary: {binary}\nMost recent denial reason: {last_reason}\n\nDenied canonical argv arrays \
          (quoted exactly; match them without the surrounding quotes):\n{examples}"
     );
     let user = redact_for_llm(&user);
@@ -427,7 +471,7 @@ fn build_create_deny_shape_body(
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "args_pattern": {"type": "string", "description": "FULLY ANCHORED regex ^...$ over the space-joined argument string"},
+                        "args_pattern": {"type": "string", "description": "FULLY ANCHORED regex ^...$ over the canonical JSON argv array"},
                         "confident": {"type": "boolean", "description": "true only if the examples clearly share one narrow shape"},
                         "evidence": {"type": "string", "description": "one sentence justifying this shape"}
                     },
@@ -442,6 +486,45 @@ fn build_create_deny_shape_body(
 #[cfg(test)]
 mod tests {
     use crate::evaluate::{EvalConfig, Evaluator};
+
+    async fn provider_failure(body: String) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn synthesis_provider_failures_are_sanitized_for_each_variant() {
+        let value = ["q", "7"].concat();
+        let evaluator = Evaluator::new(EvalConfig::default()).unwrap();
+        let (url, task) = provider_failure(format!("password={value}")).await;
+        let error = evaluator
+            .synthesize_verb_once("fixture", &url, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        task.await.unwrap();
+        assert!(!error.to_string().contains(&value));
+
+        let (url, task) = provider_failure(format!("password={value}")).await;
+        let error = evaluator
+            .synthesize_deny_shape_once("fixture", &url, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        task.await.unwrap();
+        assert!(!error.to_string().contains(&value));
+    }
 
     #[tokio::test]
     async fn deny_shape_observation_without_llm_key_does_not_error() {

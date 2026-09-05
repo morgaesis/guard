@@ -22,8 +22,8 @@
 #   irreversible -> held for operator approval before it runs
 #
 # `trusted: true` skips the LLM evaluator (deterministic allow); the declared
-# class still drives the gate. Only the operator (daemon principal) edits this
-# file; it is hot-reloaded. Agents cannot add or alter verbs.
+# class still drives the gate. Only an operator-owned deployment path edits
+# this file; it is hot-reloaded. Agents cannot add or alter verbs.
 
 verbs:
   # ---- Reversible: read-only inspection, runs immediately ----
@@ -134,6 +134,6 @@ verbs:
     args: ["--context", "{context}", "apply", "-f", "{path}"]
     params:
       context: { pattern: "^(dev|staging|sandbox)$", required: true }
-      path: { pattern: "^[A-Za-z0-9._/\\\\:-]{1,255}$", required: true }
+      path: { pattern: '^(?:/[A-Za-z0-9._/-]{1,254}|[A-Za-z]:\\[A-Za-z0-9._\\-]{1,252})$', required: true }
     consequence: irreversible
     trusted: true

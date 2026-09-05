@@ -54,7 +54,7 @@ pub(crate) async fn handle_shim(options: ShimOptions) -> Result<()> {
         } else {
             generator.remove_all()?;
         }
-        println!("Removed shims");
+        cli_println!("Removed shims");
         return Ok(());
     }
 
@@ -71,7 +71,7 @@ pub(crate) async fn handle_shim(options: ShimOptions) -> Result<()> {
     let generator = shim::ShimGenerator::new(std::env::current_exe()?, shim_dir.clone());
     let tools_refs: Vec<&str> = tools_to_install.iter().map(|s| s.as_str()).collect();
     generator.generate(&tools_refs)?;
-    println!("Installed shims to: {}", shim_dir.display());
+    cli_println!("Installed shims to: {}", shim_dir.display());
 
     // Register tool configs if env/secret flags were provided
     if !env_vars.is_empty() || !secret_vars.is_empty() {
@@ -91,9 +91,10 @@ pub(crate) async fn handle_shim(options: ShimOptions) -> Result<()> {
                 for (k, v) in &secret_vars {
                     user_override.secrets.insert(k.clone(), v.clone());
                 }
-                println!(
+                cli_println!(
                     "Registered per-user ({}) config for: {}",
-                    user_key, tool_name
+                    user_key,
+                    tool_name
                 );
             } else {
                 // Base tool config
@@ -103,7 +104,7 @@ pub(crate) async fn handle_shim(options: ShimOptions) -> Result<()> {
                 for (k, v) in &secret_vars {
                     existing.secrets.insert(k.clone(), v.clone());
                 }
-                println!("Registered tool config for: {}", tool_name);
+                cli_println!("Registered tool config for: {}", tool_name);
             }
 
             registry.set(tool_name, existing)?;
@@ -138,12 +139,12 @@ fn print_installed_shims(shim_dir: PathBuf, json: bool) -> Result<()> {
         }));
     }
     if installed.is_empty() {
-        println!("No shims installed");
+        cli_println!("No shims installed");
     } else {
         let registry = tool_config::ToolRegistry::load_default()
             .unwrap_or_else(|_| tool_config::ToolRegistry::empty());
         for s in installed {
-            print!("  - {}", s);
+            cli_print!("  - {}", s);
             if let Some(tc) = registry.get(&s) {
                 let parts: Vec<String> = tc
                     .env
@@ -152,7 +153,7 @@ fn print_installed_shims(shim_dir: PathBuf, json: bool) -> Result<()> {
                     .chain(tc.secrets.iter().map(|(k, v)| format!("{k}=<secret:{v}>")))
                     .collect();
                 if !parts.is_empty() {
-                    print!("  [{}]", parts.join(", "));
+                    cli_print!("  [{}]", parts.join(", "));
                 }
                 for (uid, user_override) in &tc.users {
                     let user_parts: Vec<String> = user_override
@@ -167,11 +168,11 @@ fn print_installed_shims(shim_dir: PathBuf, json: bool) -> Result<()> {
                         )
                         .collect();
                     if !user_parts.is_empty() {
-                        print!("  user({uid}): [{}]", user_parts.join(", "));
+                        cli_print!("  user({uid}): [{}]", user_parts.join(", "));
                     }
                 }
             }
-            println!();
+            cli_println!();
         }
     }
     Ok(())

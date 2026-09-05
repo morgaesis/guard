@@ -1,15 +1,21 @@
 #!/bin/sh
 set -eu
 
-# Administrative RPCs on a local Guard socket accept only the active daemon
-# uid. Refuse ambiguous service state instead of guessing an identity.
+# Administrative RPCs require the admin bearer token. The operator wrapper
+# runs as root (via sudo), reads the root-held token file, and presents it.
+# Brokered children never see the token: it lives only in this root context
+# and in the daemon's memory, fed from stdin at daemon startup.
 standard_state=$(systemctl is-active guard.service 2>/dev/null || true)
 caller_state=$(systemctl is-active guard-exec-as-caller.service 2>/dev/null || true)
 if [ "$standard_state" = active ] && [ "$caller_state" != active ]; then
-  exec runuser --user guard -- /usr/local/bin/guard "$@" --socket /run/guard/guard.sock
+  :
+elif [ "$caller_state" = active ] && [ "$standard_state" != active ]; then
+  :
+else
+  echo 'guard-operator requires exactly one active packaged Guard service' >&2
+  exit 1
 fi
-if [ "$caller_state" = active ] && [ "$standard_state" != active ]; then
-  exec /usr/local/bin/guard "$@" --socket /run/guard/guard.sock
-fi
-echo 'guard-operator requires exactly one active packaged Guard service' >&2
-exit 1
+
+GUARD_ADMIN_TOKEN="$(cat /etc/guard/admin.token)"
+export GUARD_ADMIN_TOKEN
+exec /usr/local/bin/guard "$@" --socket /run/guard/guard.sock

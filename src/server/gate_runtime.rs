@@ -4,29 +4,67 @@ pub(super) use guard::env::now_unix;
 
 use guard::audit::{AuditEvent, AuditKind};
 
-use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
-use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
+use guard::gating::approval::{
+    bound_approval_transcript, Approval, ApprovalSnapshot, ApprovalStatus,
+};
+use guard::gating::provisional::{
+    ApiRevertPlan, Provisional, ProvisionalRegistry, ProvisionalStatus, REVERT_BODY_CLEANUP_PREFIX,
+};
 use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
-use guard::principal::PrincipalKey;
+use guard::principal::{scope_eq, PrincipalKey};
+use guard::redact::{
+    command_contains_sensitive_literals, redact_command_line, SENSITIVE_ARGV_REPLAY_GUIDANCE,
+};
 use std::path::PathBuf;
 use tokio::io::AsyncWrite;
 
 use super::execute::{
     admit_access_use, audit_command_line, audit_session_fingerprint,
-    exec_after_approval_with_secret_authority, exec_with_read_grant_retry_with_secret_authority,
+    exec_after_approval_with_command_authority, exec_after_approval_with_secret_authority,
+    exec_with_read_grant_retry_with_command_authority, resolve_current_tool_env,
+    CommandAuthorization, VerbAuthorityExpectation,
 };
 use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
 use super::runtime::NotifyEvent;
 use super::transport::write_stream_message;
 use super::wire::{
-    CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult, ExecuteStreamMessage, RevertSpec,
-    VerbContext,
+    approval_is_armed, CallerIdentity, ContainmentOutcome, ExecOutcome, ExecuteRequest,
+    ExecuteResult, ExecuteStreamMessage, RevertSpec, VerbContext,
 };
 use super::{
     RequestContext, ServerContext, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS,
     MAX_CONFIRM_WITHIN_SECS, MAX_PENDING_GLOBAL, MAX_PENDING_PER_CALLER, REVERT_EXEC_TIMEOUT_SECS,
     SWEEPER_GRACE_SECS, SWEEPER_TICK_SECS,
 };
+
+async fn api_session_requester_principal(
+    server: &ServerContext,
+    fingerprint: Option<&str>,
+    revision: Option<&str>,
+) -> Option<PrincipalKey> {
+    let (Some(fingerprint), Some(revision)) = (fingerprint, revision) else {
+        return None;
+    };
+    let sessions = server.state.sessions.read().await;
+    sessions.list().into_iter().find_map(|summary| {
+        let matches_authority = sessions
+            .api_authority_for(&summary.token)
+            .is_some_and(|(candidate, _)| candidate == fingerprint)
+            && sessions
+                .authority_snapshot(&summary.token)
+                .is_some_and(|(candidate, _)| candidate == revision);
+        if !matches_authority {
+            return None;
+        }
+        match summary.owner {
+            crate::session::SessionOwner::Principal(principal) => Some(principal),
+            crate::session::SessionOwner::Unowned => None,
+        }
+    })
+}
+
+const STAGED_CLEANUP_RETRY_SECS: u64 = 30;
+const DISPATCH_CLASSIFICATION_RETRY_SECS: u64 = 90;
 
 // ===========================================================================
 // Consequence gating: routing of LLM-approved commands by reversibility.
@@ -158,19 +196,209 @@ async fn gate_capacity_reason(
 }
 
 async fn try_persist_provisional(server: &ServerContext, p: &Provisional) -> Result<(), String> {
-    if let Some(store) = &server.state.session_store {
-        store
-            .save_provisional(p.clone())
-            .await
-            .map_err(|error| format!("failed to persist provisional {}: {error}", p.handle))?;
-    }
-    Ok(())
+    let Some(store) = &server.state.session_store else {
+        return Err("durable provisional state is unavailable".to_string());
+    };
+    store
+        .save_provisional(p.clone())
+        .await
+        .map_err(|error| format!("failed to persist provisional {}: {error}", p.handle))
 }
 
-pub(super) async fn persist_provisional(server: &ServerContext, p: &Provisional) {
-    if let Err(error) = try_persist_provisional(server, p).await {
-        tracing::warn!("{error}");
+/// Complete the safe transition from the live post-forward persistence-loss
+/// row to durable state before an operator decision is applied. The detailed
+/// store error is kept in local diagnostics only.
+pub(super) async fn converge_forward_persistence_failure(
+    server: &ServerContext,
+    provisional: &Provisional,
+) -> bool {
+    if !provisional.forward_persistence_failed {
+        return true;
     }
+    let Some(store) = &server.state.session_store else {
+        tracing::error!(
+            "cannot converge provisional {}: durable state store is unavailable",
+            provisional.handle
+        );
+        return false;
+    };
+    let mut durable = provisional.clone();
+    durable.forward_persistence_failed = false;
+    let transition_gate = server.provisional_transition_gate(&provisional.handle);
+    let _transition = transition_gate.lock().await;
+    if server
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&provisional.handle)
+        != Some(provisional)
+    {
+        return false;
+    }
+    match store.save_provisional(durable.clone()).await {
+        Ok(()) => {
+            let mut registry = server.state.provisional.write().await;
+            if registry.get(&provisional.handle) != Some(provisional) {
+                return false;
+            }
+            registry.insert(durable);
+            true
+        }
+        Err(error) => {
+            tracing::error!(
+                "cannot converge provisional {} after forward persistence failure: {}",
+                provisional.handle,
+                error
+            );
+            false
+        }
+    }
+}
+
+/// Commit one exact provisional transition before conditionally publishing it
+/// to the live registry. The independently owned task retains coordination
+/// through durable completion even if its caller is cancelled.
+pub(super) async fn persist_provisional_transition(
+    server: &ServerContext,
+    expected: Provisional,
+    next: Provisional,
+) -> Result<bool, String> {
+    let server = server.clone();
+    tokio::spawn(async move {
+        let transition_gate = server.provisional_transition_gate(&expected.handle);
+        let _transition = transition_gate.lock().await;
+        if server.state.provisional.read().await.get(&expected.handle) != Some(&expected) {
+            return Ok(false);
+        }
+        let Some(store) = &server.state.session_store else {
+            return Err("durable provisional state is unavailable".to_string());
+        };
+        if expected.forward_persistence_failed {
+            store
+                .save_provisional(expected.clone())
+                .await
+                .map_err(|error| format!("failed to converge provisional state: {error}"))?;
+        }
+        #[cfg(test)]
+        if let Some(api) = expected.api_revert.as_ref() {
+            pause_api_containment(&api.endpoint, "provisional_transition_before_persist").await;
+        }
+        store
+            .compare_and_swap_provisional(expected.clone(), next.clone())
+            .await
+            .map_err(|error| format!("failed to persist provisional transition: {error}"))?;
+        #[cfg(test)]
+        if let Some(api) = expected.api_revert.as_ref() {
+            pause_api_containment(&api.endpoint, "provisional_transition_committed").await;
+        }
+        let mut registry = server.state.provisional.write().await;
+        if registry.get(&expected.handle) == Some(&expected) {
+            registry.insert(next);
+            Ok(true)
+        } else {
+            // A live mutation that did not participate in this coordinator is
+            // never overwritten by a stale post-I/O result.
+            Ok(false)
+        }
+    })
+    .await
+    .map_err(|error| format!("provisional transition task failed: {error}"))?
+}
+
+/// Cancel one exact inert API row under the same coordinator used by dispatch
+/// publication. Once a dispatch transition commits, this operation cannot
+/// match either durable or live state.
+async fn cancel_exact_staged_provisional(server: &ServerContext, handle: &str) -> bool {
+    let server = server.clone();
+    let handle = handle.to_string();
+    tokio::spawn(async move {
+        let transition_gate = server.provisional_transition_gate(&handle);
+        let _transition = transition_gate.lock().await;
+        let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
+            return true;
+        };
+        if expected.status != ProvisionalStatus::Staged || expected.forward_done {
+            return false;
+        }
+        let Some(store) = &server.state.session_store else {
+            return false;
+        };
+        if let Err(error) = remove_revert_body(&expected) {
+            tracing::warn!("api-proxy staged revert body cleanup failed: {error}");
+            let mut cleanup_pending = expected.clone();
+            cleanup_pending.revert_detail = Some(
+                "pre-dispatch containment cleanup is pending a bounded durable retry".to_string(),
+            );
+            if store
+                .compare_and_swap_provisional(expected.clone(), cleanup_pending.clone())
+                .await
+                .is_ok()
+            {
+                let mut registry = server.state.provisional.write().await;
+                if registry.get(&handle) == Some(&expected) {
+                    registry.insert(cleanup_pending);
+                }
+            }
+            return false;
+        }
+        if let Err(error) = store.compare_and_delete_provisional(expected.clone()).await {
+            tracing::warn!("api-proxy staged revert cleanup failed: {error}");
+            let mut cleanup_pending = expected.clone();
+            cleanup_pending.revert_detail = Some(
+                "pre-dispatch containment cleanup is pending a bounded durable retry".to_string(),
+            );
+            if store
+                .compare_and_swap_provisional(expected.clone(), cleanup_pending.clone())
+                .await
+                .is_ok()
+            {
+                let mut registry = server.state.provisional.write().await;
+                if registry.get(&handle) == Some(&expected) {
+                    registry.insert(cleanup_pending);
+                }
+            }
+            return false;
+        }
+        let mut registry = server.state.provisional.write().await;
+        if registry.get(&handle) != Some(&expected) {
+            return false;
+        }
+        registry.remove(&handle);
+        drop(registry);
+        #[cfg(test)]
+        if let Some(api) = expected.api_revert.as_ref() {
+            pause_api_containment(&api.endpoint, "staging_cleanup_completed").await;
+        }
+        true
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Remove a failed pre-dispatch body staging transaction while its per-handle
+/// coordinator is held. Failure leaves the exact durable owner row intact so
+/// startup and the bounded cleanup path retain both quota and file ownership.
+async fn retire_failed_body_staging_locked(server: &ServerContext, expected: &Provisional) -> bool {
+    if remove_revert_body(expected).is_err() {
+        return false;
+    }
+    let Some(store) = &server.state.session_store else {
+        return false;
+    };
+    if store
+        .compare_and_delete_provisional(expected.clone())
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut registry = server.state.provisional.write().await;
+    if registry.get(&expected.handle) != Some(expected) {
+        return false;
+    }
+    registry.remove(&expected.handle);
+    true
 }
 
 /// Drop any API-proxy delete-provenance tied to a now-resolved auto-revert
@@ -221,14 +449,20 @@ async fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Resu
         use tokio::io::AsyncWriteExt;
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .await?;
         file.write_all(bytes).await?;
-        file.flush().await
+        file.sync_all().await?;
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "revert body has no parent",
+            )
+        })?;
+        tokio::fs::File::open(parent).await?.sync_all().await
     }
     #[cfg(windows)]
     {
@@ -244,14 +478,212 @@ async fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Resu
     }
 }
 
+#[cfg(test)]
+type ApiContainmentHook = (
+    std::sync::Arc<tokio::sync::Semaphore>,
+    std::sync::Arc<tokio::sync::Semaphore>,
+);
+
+#[cfg(test)]
+fn api_containment_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<(String, &'static str), ApiContainmentHook>>
+{
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<(String, &'static str), ApiContainmentHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(super) struct ApprovalLifecycleTestHook {
+    pub(super) enqueued: std::sync::Arc<tokio::sync::Semaphore>,
+    pub(super) retired: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+fn approval_lifecycle_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<usize, ApprovalLifecycleTestHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<usize, ApprovalLifecycleTestHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(super) fn observe_approval_lifecycle_for_test(
+    server: &ServerContext,
+) -> ApprovalLifecycleTestHook {
+    let hook = ApprovalLifecycleTestHook {
+        enqueued: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        retired: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+    };
+    approval_lifecycle_hooks().lock().unwrap().insert(
+        std::sync::Arc::as_ptr(&server.state.approvals) as usize,
+        ApprovalLifecycleTestHook {
+            enqueued: hook.enqueued.clone(),
+            retired: hook.retired.clone(),
+        },
+    );
+    hook
+}
+
+#[cfg(test)]
+fn signal_approval_lifecycle(server: &ServerContext, retired: bool) {
+    let hooks = approval_lifecycle_hooks().lock().unwrap();
+    let Some(hook) = hooks.get(&(std::sync::Arc::as_ptr(&server.state.approvals) as usize)) else {
+        return;
+    };
+    if retired {
+        hook.retired.add_permits(1);
+    } else {
+        hook.enqueued.add_permits(1);
+    }
+}
+
+#[cfg(test)]
+fn install_api_containment_hook(endpoint: &str, phase: &'static str) -> ApiContainmentHook {
+    let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    api_containment_hooks().lock().unwrap().insert(
+        (endpoint.to_string(), phase),
+        (reached.clone(), release.clone()),
+    );
+    (reached, release)
+}
+
+#[cfg(test)]
+async fn pause_api_containment(endpoint: &str, phase: &'static str) {
+    let hook = api_containment_hooks()
+        .lock()
+        .unwrap()
+        .remove(&(endpoint.to_string(), phase));
+    if let Some((reached, release)) = hook {
+        reached.add_permits(1);
+        release.acquire().await.unwrap().forget();
+    }
+}
+
 /// Remove a revert's persisted body file once its provisional reaches a terminal
 /// state, so secret-bearing snapshots do not accumulate on disk.
-pub(super) fn remove_revert_body(p: &Provisional) {
+pub(super) fn remove_revert_body(p: &Provisional) -> std::io::Result<()> {
     if let Some(api) = &p.api_revert {
         if let Some(body_file) = &api.body_file {
-            let _ = std::fs::remove_file(body_file);
+            match std::fs::remove_file(body_file) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        let parent = body_file.parent().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "revert body has no parent",
+                            )
+                        })?;
+                        std::fs::File::open(parent)?.sync_all()?;
+                    }
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    #[cfg(unix)]
+                    {
+                        let parent = body_file.parent().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "revert body has no parent",
+                            )
+                        })?;
+                        std::fs::File::open(parent)?.sync_all()?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
+    Ok(())
+}
+
+fn mark_revert_body_cleanup_pending(row: &mut Provisional) {
+    if row
+        .api_revert
+        .as_ref()
+        .and_then(|revert| revert.body_file.as_ref())
+        .is_none()
+    {
+        return;
+    }
+    let detail = row
+        .revert_detail
+        .take()
+        .unwrap_or_else(|| "rollback completed".to_string());
+    row.revert_detail = Some(format!("{REVERT_BODY_CLEANUP_PREFIX}{detail}"));
+}
+
+async fn converge_terminal_revert_body_cleanup(
+    server: &ServerContext,
+    expected: &Provisional,
+) -> bool {
+    let Some(current) = server
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&expected.handle)
+        .cloned()
+    else {
+        return false;
+    };
+    if !current.status.is_lifecycle_final()
+        || current.status != expected.status
+        || current
+            .api_revert
+            .as_ref()
+            .and_then(|revert| revert.body_file.as_ref())
+            != expected
+                .api_revert
+                .as_ref()
+                .and_then(|revert| revert.body_file.as_ref())
+    {
+        return false;
+    }
+    let Some(detail) = current
+        .revert_detail
+        .as_deref()
+        .and_then(|detail| detail.strip_prefix(REVERT_BODY_CLEANUP_PREFIX))
+    else {
+        return true;
+    };
+    if let Err(error) = remove_revert_body(&current) {
+        tracing::warn!(
+            "rollback body cleanup for provisional {} remains pending: {}",
+            current.handle,
+            error
+        );
+        return false;
+    }
+    let mut next = current.clone();
+    if let Some(revert) = next.api_revert.as_mut() {
+        revert.body_file = None;
+    }
+    next.revert_detail = (detail != "rollback completed").then(|| detail.to_string());
+    persist_provisional_transition(server, current, next)
+        .await
+        .unwrap_or(false)
+}
+
+pub(super) async fn persist_terminal_provisional_with_body_cleanup(
+    server: &ServerContext,
+    expected: Provisional,
+    mut next: Provisional,
+) -> Result<bool, String> {
+    if !next.status.is_lifecycle_final() {
+        return Err("rollback-body cleanup requires a terminal provisional".to_string());
+    }
+    mark_revert_body_cleanup_pending(&mut next);
+    if !persist_provisional_transition(server, expected, next.clone()).await? {
+        return Ok(false);
+    }
+    let _ = converge_terminal_revert_body_cleanup(server, &next).await;
+    Ok(true)
 }
 
 /// Retires an API-proxy hold whose parked request vanished (the brokered
@@ -289,10 +721,26 @@ impl Drop for ProxyHoldOrphanGuard {
                 if let Some(a) = server.state.approvals.read().await.get(&handle).cloned() {
                     let session_fingerprint = a.snapshot.session_fingerprint.clone();
                     let _ = persist_approval(&server, &a).await;
+                    #[cfg(test)]
+                    signal_approval_lifecycle(&server, true);
                     session_fingerprint
                 } else {
                     None
                 };
+            let requester_principal =
+                server
+                    .state
+                    .approvals
+                    .read()
+                    .await
+                    .get(&handle)
+                    .and_then(|approval| {
+                        approval
+                            .snapshot
+                            .principal
+                            .as_ref()
+                            .map(ToString::to_string)
+                    });
             server.emit_audit_ungated(
                 AuditEvent::new(AuditKind::HoldOrphaned)
                     .handle(&handle)
@@ -303,6 +751,7 @@ impl Drop for ProxyHoldOrphanGuard {
                 at_unix: now,
                 handle: Some(handle),
                 session_fingerprint,
+                requester_principal,
                 reason: Some("requester disconnected before a held API decision".to_string()),
                 status: Some("orphaned".to_string()),
                 behavior: None,
@@ -312,11 +761,12 @@ impl Drop for ProxyHoldOrphanGuard {
 }
 
 /// Bridges the API proxy's synthesized reverts into the daemon's consequence
-/// machinery. Holds a clone of the server server (which shares the provisional
+/// machinery. Holds a clone of the server context (which shares the provisional
 /// registry and state store), and a directory for stored HTTP revert bodies.
 /// The proxy acts as the daemon principal, so the operator manages
 /// proxy-armed provisionals with the same
-/// `guard confirm` / `guard provisionals` / `guard revert` commands.
+/// packaged operator confirmation, inspection, and reversion actions.
+#[derive(Clone)]
 pub(super) struct DaemonGateSink {
     pub(super) server: ServerContext,
     pub(super) endpoint: String,
@@ -356,6 +806,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // promised, so it holds rather than forward an uncontainable write.
         let principal = Some(self.server.config.daemon_principal.clone());
         self.snapshot_dir_safe
+            && self.server.state.session_store.is_some()
             && gate_capacity_reason(&self.server, principal.as_ref())
                 .await
                 .is_none()
@@ -369,25 +820,22 @@ impl guard::proxy::GateSink for DaemonGateSink {
         }
         let handle = new_handle();
         let now = now_unix();
-        let body_file = if let Some(body) = &mutation.revert.body {
+        let requester_principal = api_session_requester_principal(
+            &self.server,
+            mutation.session_fingerprint.as_deref(),
+            mutation.session_revision.as_deref(),
+        )
+        .await;
+
+        let revert_body = mutation.revert.body.clone();
+        let body_file = if revert_body.is_some() {
             if !self.snapshot_dir_safe {
                 tracing::error!(
-                    "api-proxy: refusing to arm a body-bearing revert because the revert directory is not owner-only; the change is live but will not auto-revert"
+                    "api-proxy: refusing to stage a body-bearing revert because the revert directory is not owner-only; the mutation will not be forwarded without containment"
                 );
                 return None;
             }
-            let file = self.snapshot_dir.join(format!("api-revert-{handle}.body"));
-            // The snapshot can carry secret material (e.g. a Secret captured
-            // before a delete-restore), so the file is owner-only.
-            if let Err(e) = write_owner_only(&file, body).await {
-                tracing::error!(
-                    "api-proxy: failed to write revert body {}: {}",
-                    file.display(),
-                    e
-                );
-                return None;
-            }
-            Some(file)
+            Some(self.snapshot_dir.join(format!("api-revert-{handle}.body")))
         } else {
             None
         };
@@ -398,12 +846,16 @@ impl guard::proxy::GateSink for DaemonGateSink {
             upstream_identity: mutation.upstream_identity,
             method: mutation.revert.method,
             path: mutation.revert.path,
+            requires_uid_precondition: mutation.revert_requires_uid_precondition,
+            resource_uid: None,
+            create_provenance: mutation.create_provenance,
             body_file,
         };
 
         let provisional = Provisional {
             handle: handle.clone(),
             principal,
+            requester_principal,
             binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![mutation.label.clone()],
             cwd: None,
@@ -422,34 +874,321 @@ impl guard::proxy::GateSink for DaemonGateSink {
             reason: mutation.label,
             decision_trace: Some(guard::gating::DecisionTrace::source("api_proxy")),
             created_unix: now,
-            deadline_unix: now.saturating_add(self.window_secs),
-            forward_done: true,
-            status: ProvisionalStatus::Armed,
+            deadline_unix: 0,
+            window_secs: 0,
+            auto_reverted_unix: None,
+            forward_done: false,
+            forward_exit: None,
+            forward_persistence_failed: false,
+            status: ProvisionalStatus::Staged,
             revert_exit: None,
             revert_detail: None,
             api_revert: Some(api_revert),
         };
-        if let Err(error) = try_persist_provisional(&self.server, &provisional).await {
-            tracing::error!("api-proxy auto-revert was not armed: {error}");
-            remove_revert_body(&provisional);
-            return None;
-        }
-        self.server
+        let server = self.server.clone();
+        #[cfg(test)]
+        let endpoint = self.endpoint.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let transition_gate = server.provisional_transition_gate(&provisional.handle);
+            let transition = transition_gate.lock().await;
+            let body_path = provisional
+                .api_revert
+                .as_ref()
+                .and_then(|api| api.body_file.as_ref());
+            let mut durable_owner = provisional.clone();
+            if body_path.is_some() {
+                durable_owner.revert_detail = Some(
+                    "pre-dispatch revert body preparation is pending durable cleanup".to_string(),
+                );
+            }
+            if let Err(error) = try_persist_provisional(&server, &durable_owner).await {
+                tracing::error!("api-proxy auto-revert was not staged: {error}");
+                let _ = ready_tx.send(None);
+                return;
+            }
+            server
+                .state
+                .provisional
+                .write()
+                .await
+                .insert(durable_owner.clone());
+            if let (Some(path), Some(body)) = (body_path, revert_body.as_deref()) {
+                // The snapshot can carry secret material, so creation and all
+                // later publication remain owned by this detached operation.
+                if let Err(error) = write_owner_only(path, body).await {
+                    tracing::error!(
+                        "api-proxy: failed to write revert body {}: {}",
+                        path.display(),
+                        error
+                    );
+                    let _ = retire_failed_body_staging_locked(&server, &durable_owner).await;
+                    let _ = ready_tx.send(None);
+                    return;
+                }
+                #[cfg(test)]
+                pause_api_containment(&endpoint, "body_written").await;
+                let Some(store) = &server.state.session_store else {
+                    let _ = retire_failed_body_staging_locked(&server, &durable_owner).await;
+                    let _ = ready_tx.send(None);
+                    return;
+                };
+                if let Err(error) = store
+                    .compare_and_swap_provisional(durable_owner.clone(), provisional.clone())
+                    .await
+                {
+                    tracing::error!("api-proxy revert body ownership was not finalized: {error}");
+                    let _ = retire_failed_body_staging_locked(&server, &durable_owner).await;
+                    let _ = ready_tx.send(None);
+                    return;
+                }
+                let mut registry = server.state.provisional.write().await;
+                if registry.get(&provisional.handle) != Some(&durable_owner) {
+                    drop(registry);
+                    let _ = retire_failed_body_staging_locked(&server, &provisional).await;
+                    let _ = ready_tx.send(None);
+                    return;
+                }
+                registry.insert(provisional.clone());
+            }
+            #[cfg(test)]
+            pause_api_containment(&endpoint, "published").await;
+            let delivered = ready_tx.send(Some(handle.clone())).is_ok();
+            drop(transition);
+            if !delivered || accepted_rx.await.is_err() {
+                let _ = cancel_exact_staged_provisional(&server, &handle).await;
+            }
+        });
+        let handle = ready_rx.await.ok().flatten()?;
+        let _ = accepted_tx.send(());
+        Some(handle)
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        let server = self.server.clone();
+        let handle = handle.to_string();
+        tokio::spawn(async move {
+            let expected = {
+                let registry = server.state.provisional.read().await;
+                let Some(expected) = registry.get(&handle).cloned() else {
+                    return false;
+                };
+                if expected.status == ProvisionalStatus::Dispatching && !expected.forward_done {
+                    return true;
+                }
+                if expected.status != ProvisionalStatus::Staged || expected.forward_done {
+                    return false;
+                }
+                expected
+            };
+            let mut next = expected.clone();
+            next.status = ProvisionalStatus::Dispatching;
+            match persist_provisional_transition(&server, expected, next).await {
+                Ok(published) => published,
+                Err(error) => {
+                    tracing::error!("api-proxy dispatch marker was not persisted: {error}");
+                    false
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
+        let server = self.server.clone();
+        #[cfg(test)]
+        let endpoint = self.endpoint.clone();
+        let handle = handle.to_string();
+        let resource_uid = resource_uid.map(str::to_string);
+        let window_secs = self.window_secs;
+        let task = tokio::spawn(async move {
+            let transition_gate = server.provisional_transition_gate(&handle);
+            let _transition = transition_gate.lock().await;
+            let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
+                return false;
+            };
+            if expected.forward_done && expected.forward_exit == Some(0) {
+                return expected.status == ProvisionalStatus::Armed
+                    && resource_uid.as_deref()
+                        == expected
+                            .api_revert
+                            .as_ref()
+                            .and_then(|api| api.resource_uid.as_deref());
+            }
+            if expected.forward_done
+                || expected.forward_exit.is_some()
+                || expected.status != ProvisionalStatus::Dispatching
+            {
+                return false;
+            }
+            if let Some(api) = expected.api_revert.as_ref() {
+                if api.requires_uid_precondition && resource_uid.is_none() {
+                    return false;
+                }
+            }
+            let now = now_unix();
+            let mut next = expected.clone();
+            next.status = ProvisionalStatus::Armed;
+            next.forward_done = true;
+            next.forward_exit = Some(0);
+            next.forward_persistence_failed = false;
+            next.deadline_unix = now.saturating_add(window_secs);
+            next.window_secs = window_secs;
+            next.revert_detail = None;
+            if let Some(api) = next.api_revert.as_mut() {
+                api.resource_uid = resource_uid;
+            }
+            let Some(store) = &server.state.session_store else {
+                return false;
+            };
+            if let Err(error) = store
+                .compare_and_swap_provisional(expected.clone(), next.clone())
+                .await
+            {
+                tracing::error!("api-proxy auto-revert activation failed: {error}");
+                return false;
+            }
+            #[cfg(test)]
+            pause_api_containment(&endpoint, "activation_committed").await;
+            server.state.provisional.write().await.insert(next.clone());
+            server.emit_event(NotifyEvent {
+                event: "provisional_armed",
+                at_unix: now,
+                handle: Some(handle),
+                session_fingerprint: next.session_fingerprint,
+                requester_principal: None,
+                reason: Some(next.reason),
+                status: Some("armed".to_string()),
+                behavior: None,
+            });
+            #[cfg(test)]
+            pause_api_containment(&endpoint, "activation_published").await;
+            true
+        });
+        task.await.unwrap_or(false)
+    }
+
+    async fn provisional_deadline(&self, handle: &str) -> Option<u64> {
+        let provisional = self
+            .server
             .state
             .provisional
-            .write()
+            .read()
             .await
-            .insert(provisional.clone());
-        self.server.emit_event(NotifyEvent {
-            event: "provisional_armed",
-            at_unix: now,
-            handle: Some(handle.clone()),
-            session_fingerprint: mutation.session_fingerprint,
-            reason: Some(provisional.reason.clone()),
-            status: Some("armed".to_string()),
-            behavior: None,
+            .get(handle)
+            .cloned()?;
+        (provisional.status == ProvisionalStatus::Armed
+            && provisional.forward_done
+            && provisional.deadline_unix > 0)
+            .then_some(provisional.deadline_unix)
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        let server = self.server.clone();
+        let handle = handle.to_string();
+        let reason = guard::redact::redact_output_text(reason);
+        let resource_uid = resource_uid.map(str::to_string);
+        let task = tokio::spawn(async move {
+            let transition_gate = server.provisional_transition_gate(&handle);
+            let _transition = transition_gate.lock().await;
+            let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
+                return false;
+            };
+            if expected.status == ProvisionalStatus::Armed
+                && expected.forward_done
+                && expected.forward_exit == Some(0)
+            {
+                return true;
+            }
+            if !matches!(
+                expected.status,
+                ProvisionalStatus::Dispatching | ProvisionalStatus::NeedsOperatorDecision
+            ) || (expected.forward_done
+                && expected.status != ProvisionalStatus::NeedsOperatorDecision)
+                || expected.forward_exit.is_some()
+            {
+                return false;
+            }
+            let mut next = expected.clone();
+            next.status = ProvisionalStatus::NeedsOperatorDecision;
+            next.forward_done = true;
+            next.forward_exit = None;
+            next.forward_persistence_failed = false;
+            next.deadline_unix = 0;
+            next.window_secs = 0;
+            next.revert_detail = Some(reason);
+            if let Some(api) = next.api_revert.as_mut() {
+                if resource_uid.is_some() {
+                    api.resource_uid = resource_uid;
+                }
+            }
+            let Some(store) = &server.state.session_store else {
+                return false;
+            };
+            let persisted = if expected.forward_persistence_failed {
+                store.save_provisional(next.clone()).await
+            } else {
+                store
+                    .compare_and_swap_provisional(expected.clone(), next.clone())
+                    .await
+            };
+            if let Err(error) = persisted {
+                tracing::error!("api-proxy uncertain mutation state was not updated: {error}");
+                return false;
+            }
+            server.state.provisional.write().await.insert(next.clone());
+            server.emit_event(NotifyEvent {
+                event: "provisional_needs_operator_decision",
+                at_unix: now_unix(),
+                handle: Some(handle),
+                session_fingerprint: next.session_fingerprint,
+                requester_principal: None,
+                reason: next.revert_detail,
+                status: Some("needs_operator_decision".to_string()),
+                behavior: None,
+            });
+            true
         });
-        Some(handle)
+        task.await.unwrap_or(false)
+    }
+
+    async fn mark_revert_rejected(&self, handle: &str, reason: &str) -> bool {
+        let Some(expected) = self
+            .server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(handle)
+            .cloned()
+        else {
+            return false;
+        };
+        if expected.status != ProvisionalStatus::Dispatching || expected.forward_done {
+            return false;
+        }
+        let mut next = expected.clone();
+        next.status = ProvisionalStatus::Reverted;
+        next.revert_detail = Some(guard::redact::redact_output_text(reason));
+        match persist_terminal_provisional_with_body_cleanup(&self.server, expected, next).await {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!("api-proxy rejected mutation retirement failed: {error}");
+                false
+            }
+        }
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        cancel_exact_staged_provisional(&self.server, handle).await
     }
 
     async fn hold_request(
@@ -461,7 +1200,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
         use guard::proxy::HoldDecision;
         let principal = Some(self.server.config.daemon_principal.clone());
         if let Some(why) = gate_capacity_reason(&self.server, principal.as_ref()).await {
-            return HoldDecision::Denied { reason: why };
+            return HoldDecision::Denied {
+                reason: why,
+                handle: None,
+            };
         }
         let handle = new_handle();
         let now = now_unix();
@@ -510,6 +1252,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
             verb_params: std::collections::BTreeMap::new(),
             catalog_version: None,
             verb_digest: None,
+            verb_composition_digest: None,
+            exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal,
@@ -533,7 +1277,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
             notes: Vec::new(),
         };
         if let Err(reason) = persist_approval(&self.server, &approval).await {
-            return HoldDecision::Denied { reason };
+            return HoldDecision::Denied {
+                reason,
+                handle: None,
+            };
         }
         let notify = self
             .server
@@ -542,6 +1289,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .write()
             .await
             .enqueue(approval.clone());
+        #[cfg(test)]
+        signal_approval_lifecycle(&self.server, false);
         self.server.emit_audit_ungated(
             AuditEvent::new(AuditKind::Held)
                 .handle(&handle)
@@ -560,6 +1309,11 @@ impl guard::proxy::GateSink for DaemonGateSink {
             at_unix: now,
             handle: Some(handle.clone()),
             session_fingerprint: session_context.map(|context| context.fingerprint.clone()),
+            requester_principal: approval
+                .snapshot
+                .principal
+                .as_ref()
+                .map(ToString::to_string),
             reason: Some(reason.to_string()),
             status: Some("pending".to_string()),
             behavior: None,
@@ -609,6 +1363,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                         reason: a
                             .decided_reason
                             .unwrap_or_else(|| a.status.as_str().to_string()),
+                        handle: Some(handle),
                     };
                 }
                 Some(_) => {}
@@ -616,6 +1371,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                     orphan_guard.armed = false;
                     return HoldDecision::Denied {
                         reason: "held request disappeared from the queue".to_string(),
+                        handle: Some(handle),
                     };
                 }
             }
@@ -628,6 +1384,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                 orphan_guard.armed = false;
                 return HoldDecision::Denied {
                     reason: "expired without operator approval".to_string(),
+                    handle: Some(handle),
                 };
             }
             let poll = remaining
@@ -637,20 +1394,29 @@ impl guard::proxy::GateSink for DaemonGateSink {
         }
     }
 
-    async fn resolve(&self, handle: &str) {
+    async fn resolve(&self, handle: &str) -> bool {
         // The created object is already gone by the workload's own action, so the
         // pending create-revert is moot. Confirm it to cancel
         // the timer; the sweeper then never tries to delete an absent object. A
-        // handle that is already terminal is a no-op.
-        let mut registry = self.server.state.provisional.write().await;
-        let Some(expected) = registry.get(handle).cloned() else {
-            return;
-        };
-        let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
-        staged.insert(expected.clone());
-        match staged.confirm(handle) {
-            Ok(p) => {
-                if let Some(store) = &self.server.state.session_store {
+        // missing row is already resolved, while an incompatible live state
+        // fails closed.
+        let server = self.server.clone();
+        #[cfg(test)]
+        let endpoint = self.endpoint.clone();
+        let handle = handle.to_string();
+        tokio::spawn(async move {
+            let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
+                return true;
+            };
+            let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
+            staged.insert(expected.clone());
+            match staged.confirm(&handle) {
+                Ok(p) => {
+                    #[cfg(test)]
+                    pause_api_containment(&endpoint, "resolve_before_persist").await;
+                    let Some(store) = &server.state.session_store else {
+                        return false;
+                    };
                     if let Err(error) = store
                         .compare_and_swap_provisional(expected, p.clone())
                         .await
@@ -660,30 +1426,74 @@ impl guard::proxy::GateSink for DaemonGateSink {
                             handle,
                             error
                         );
-                        return;
+                        return false;
                     }
+                    server.state.provisional.write().await.insert(p.clone());
+                    tracing::info!(
+                        "api-proxy: resolved auto-revert {} (created object deleted by workload)",
+                        handle
+                    );
+                    server.emit_event(NotifyEvent {
+                        event: "decision_made",
+                        at_unix: now_unix(),
+                        handle: Some(handle),
+                        session_fingerprint: p.session_fingerprint.clone(),
+                        requester_principal: None,
+                        reason: Some("workload removed its contained created object".to_string()),
+                        status: Some("confirmed".to_string()),
+                        behavior: None,
+                    });
+                    true
                 }
-                registry.insert(p.clone());
-                drop(registry);
-                tracing::info!(
-                    "api-proxy: resolved auto-revert {} (created object deleted by workload)",
-                    handle
-                );
-                self.server.emit_event(NotifyEvent {
-                    event: "decision_made",
-                    at_unix: now_unix(),
-                    handle: Some(handle.to_string()),
-                    session_fingerprint: p.session_fingerprint.clone(),
-                    reason: Some("workload removed its contained created object".to_string()),
-                    status: Some("confirmed".to_string()),
-                    behavior: None,
-                });
+                Err(e) => {
+                    tracing::debug!("api-proxy: resolve {} was a no-op: {}", handle, e);
+                    false
+                }
             }
-            Err(e) => {
-                drop(registry);
-                tracing::debug!("api-proxy: resolve {} was a no-op: {}", handle, e);
-            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn guard::proxy::ApiForwardHandoff,
+    ) -> Result<(), String> {
+        let transition_gate = self.server.provisional_transition_gate(handle);
+        let _transition =
+            tokio::time::timeout(std::time::Duration::from_secs(5), transition_gate.lock())
+                .await
+                .map_err(|_| "provisional cleanup authority lock timed out".to_string())?;
+        let api = {
+            let registry = self.server.state.provisional.read().await;
+            let row = registry
+                .get(handle)
+                .filter(|row| {
+                    row.status == ProvisionalStatus::Armed
+                        && row.forward_done
+                        && row.forward_exit == Some(0)
+                })
+                .ok_or_else(|| "provisional cleanup authority was revoked".to_string())?;
+            row.api_revert
+                .clone()
+                .filter(|api| {
+                    api.resource_uid.as_deref() == Some(resource_uid)
+                        && api.create_provenance.as_deref() == Some(create_provenance)
+                })
+                .ok_or_else(|| "provisional cleanup identity changed".to_string())?
+        };
+        if !api.requires_uid_precondition {
+            return Err("provisional cleanup lacks an exact UID precondition".to_string());
         }
+        // This exact row/UID/provenance comparison is the cleanup admission
+        // point. Keep the per-handle coordinator through the finite upstream
+        // handoff so confirm, revert, and resolution cannot retire this exact
+        // cleanup authority before the request is initiated. The lock is
+        // handle-scoped and is never held while streaming the response body.
+        handoff.forward().await
     }
 }
 
@@ -700,6 +1510,61 @@ async fn try_delete_provisional_row(server: &ServerContext, handle: &str) -> Res
 async fn delete_provisional_row(server: &ServerContext, handle: &str) {
     if let Err(error) = try_delete_provisional_row(server, handle).await {
         tracing::warn!("{error}");
+    }
+}
+
+/// Retire a staging row for a forward command that never ran. The terminal
+/// row is installed in memory first and persisted before deletion, so a failed
+/// delete cannot leave an actionable `Armed` record or consume capacity.
+async fn retire_non_executed_provisional(
+    server: &ServerContext,
+    provisional: &Provisional,
+    detail: String,
+) -> Result<(), String> {
+    let mut terminal = provisional.clone();
+    terminal.status = ProvisionalStatus::Reverted;
+    terminal.revert_detail = Some(detail);
+    server
+        .state
+        .provisional
+        .write()
+        .await
+        .insert(terminal.clone());
+
+    match try_persist_provisional(server, &terminal).await {
+        Ok(()) => match try_delete_provisional_row(server, &terminal.handle).await {
+            Ok(()) => {
+                server
+                    .state
+                    .provisional
+                    .write()
+                    .await
+                    .remove(&terminal.handle);
+                Ok(())
+            }
+            Err(delete_error) => {
+                tracing::warn!(
+                    "{delete_error}; retained terminal non-executed provisional {}",
+                    terminal.handle
+                );
+                Ok(())
+            }
+        },
+        Err(save_error) => match try_delete_provisional_row(server, &terminal.handle).await {
+            Ok(()) => {
+                server
+                    .state
+                    .provisional
+                    .write()
+                    .await
+                    .remove(&terminal.handle);
+                Ok(())
+            }
+            Err(delete_error) => Err(format!(
+                "failed to retire non-executed provisional {}: {save_error}; {delete_error}",
+                terminal.handle
+            )),
+        },
     }
 }
 
@@ -738,6 +1603,16 @@ async fn assess_revert(
     forward: &ExecuteRequest,
     revert: &RevertSpec,
 ) -> RevertAssessment {
+    let sensitive_check = revert
+        .confirm_check
+        .as_ref()
+        .is_some_and(|check| command_contains_sensitive_literals(&check.binary, &check.args));
+    if command_contains_sensitive_literals(&forward.binary, &forward.args)
+        || command_contains_sensitive_literals(&revert.binary, &revert.args)
+        || sensitive_check
+    {
+        return RevertAssessment::NeedsReview(SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string());
+    }
     if let Some(reason) = invalid_binary_reason(&revert.binary) {
         return RevertAssessment::NeedsReview(reason);
     }
@@ -760,23 +1635,12 @@ async fn assess_revert(
             ));
         }
     }
-    let forward_line = if forward.args.is_empty() {
-        forward.binary.clone()
-    } else {
-        format!("{} {}", forward.binary, forward.args.join(" "))
-    };
-    let revert_line = if revert.args.is_empty() {
-        revert.binary.clone()
-    } else {
-        format!("{} {}", revert.binary, revert.args.join(" "))
-    };
-    let check_line = revert.confirm_check.as_ref().map(|check| {
-        if check.args.is_empty() {
-            check.binary.clone()
-        } else {
-            format!("{} {}", check.binary, check.args.join(" "))
-        }
-    });
+    let forward_line = redact_command_line(&forward.binary, &forward.args);
+    let revert_line = redact_command_line(&revert.binary, &revert.args);
+    let check_line = revert
+        .confirm_check
+        .as_ref()
+        .map(|check| redact_command_line(&check.binary, &check.args));
     let window = forward
         .confirm_within_secs
         .unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS)
@@ -804,10 +1668,20 @@ async fn assess_revert(
             .as_deref()
             .unwrap_or("none; deadline always rolls back")
     );
+    let session_prompt = match forward.session_token.as_deref() {
+        Some(token) => server
+            .state
+            .sessions
+            .read()
+            .await
+            .evaluator_prompt_append_for(token),
+        None => None,
+    };
+    let evaluation_context = merge_revert_assessment_prompt(session_prompt.as_deref(), &context);
     match server
         .state
         .evaluator
-        .evaluate_with_context(&revert_line, Some(&context))
+        .evaluate_with_context(&revert_line, Some(&evaluation_context))
         .await
     {
         guard::evaluate::EvalResult::Allow { .. } => RevertAssessment::Sensible,
@@ -817,6 +1691,22 @@ async fn assess_revert(
         guard::evaluate::EvalResult::Error(e) => {
             RevertAssessment::NeedsReview(format!("rollback could not be evaluated: {e}"))
         }
+    }
+}
+
+pub(super) fn merge_revert_assessment_prompt(
+    session_prompt: Option<&str>,
+    context: &str,
+) -> String {
+    match session_prompt
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        Some(prompt) => format!(
+            "SESSION AUTHORITY CONTEXT. The rollback must remain within this scoped intent:\n\
+             {prompt}\n\n{context}"
+        ),
+        None => context.to_string(),
     }
 }
 
@@ -869,6 +1759,34 @@ pub(super) struct GateInputs {
     /// Selected requester-session verbs supplying this execution's authority.
     /// Baseline or unrelated work leaves this empty.
     pub(super) consume_access_verbs: Vec<String>,
+    /// Deterministic floor: route this allow to an operator hold regardless of
+    /// its reversibility class and risk score. Set by the safe-mode
+    /// opaque-carrier floor (`guard::gating::opaque_carrier_floor_reason`);
+    /// the caller's own `--require-approval` is honored separately from the
+    /// request.
+    pub(super) force_hold: bool,
+}
+
+fn held_containment_guidance(
+    reversibility: Option<Reversibility>,
+    risk: Option<i32>,
+    revert_preauthorized: bool,
+    has_revert: bool,
+    confirm_within_secs: Option<u64>,
+) -> Option<String> {
+    if decide_gate(reversibility, risk, true, false) != GateOutcome::Contain {
+        return None;
+    }
+    let window = confirm_within_secs.unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS);
+    if revert_preauthorized && has_revert {
+        Some(format!(
+            "contain: re-run with --confirm-within {window} to execute under auto-revert"
+        ))
+    } else {
+        Some(format!(
+            "contain: re-run with --revert '<cmd>' --confirm-within {window} to execute under auto-revert"
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -920,7 +1838,7 @@ async fn access_admission_denial(
     let mut handles = Vec::new();
     for intent in intents {
         if let Ok(item) =
-            super::admin::submit_access_request(server, caller, None, &intent, None).await
+            super::admin::submit_access_request(server, caller, None, &intent, None, None).await
         {
             if item.kind == "request" {
                 handles.push(item.reference);
@@ -956,13 +1874,28 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             );
         }
     }
+    let exec_timeout_secs = inputs
+        .verb
+        .as_ref()
+        .and_then(|verb| verb.exec_timeout_secs)
+        .unwrap_or(server.config.exec_timeout_secs);
+    let command_authority = Some(CommandAuthorization::routed(
+        inputs.verb.as_ref(),
+        inputs.authority.as_ref(),
+        exec_timeout_secs,
+    ));
     let secret_authority = inputs
         .authority
         .as_ref()
         .map(|snapshot| snapshot.secret_entitlements.clone());
 
-    // Gating off, or an operator-authored static-policy allow: execute directly.
-    if !server.config.gate.is_on() || inputs.bypass {
+    let force_hold = request.require_approval.unwrap_or(false)
+        || inputs.verb.as_ref().is_some_and(|verb| verb.hold)
+        || inputs.force_hold;
+
+    // Gating off, or an operator-authored static-policy allow with no matched
+    // per-verb hold requirement: execute directly.
+    if !server.config.gate.is_on() || (inputs.bypass && !force_hold) {
         if let Err(reason) =
             admit_access_use(server, &request, &inputs.consume_access_verbs, None).await
         {
@@ -974,11 +1907,12 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             )
             .await;
         }
-        return exec_with_read_grant_retry_with_secret_authority(
+        return exec_with_read_grant_retry_with_command_authority(
             context,
             request,
             inputs.reason,
             secret_authority,
+            command_authority,
         )
         .await;
     }
@@ -986,7 +1920,6 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
     // The row owner is the caller's cross-platform principal (uid string on
     // Unix, SID on Windows). A non-Unix caller is no longer dropped to None.
     let caller_principal = context.caller.principal();
-    let force_hold = request.require_approval.unwrap_or(false);
     let revert_available = request.revert.is_some();
     let outcome = decide_gate(
         inputs.reversibility,
@@ -1008,11 +1941,12 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 )
                 .await;
             }
-            exec_with_read_grant_retry_with_secret_authority(
+            exec_with_read_grant_retry_with_command_authority(
                 context,
                 request,
                 inputs.reason,
                 secret_authority,
+                command_authority,
             )
             .await
         }
@@ -1050,16 +1984,27 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 context,
                 request,
                 caller_principal,
-                inputs.reason,
-                inputs.authority,
-                inputs.consume_access_verbs,
-                decision_trace,
+                ContainmentInputs {
+                    reason: inputs.reason,
+                    authority: inputs.authority,
+                    consume_access_verbs: inputs.consume_access_verbs,
+                    decision_trace,
+                    command_authority,
+                },
             )
             .await
         }
         GateOutcome::Hold => {
+            let containment_guidance = held_containment_guidance(
+                inputs.reversibility,
+                inputs.risk,
+                inputs.revert_preauthorized,
+                request.revert.is_some(),
+                request.confirm_within_secs,
+            );
             hold_for_approval_with_trace(context, request, caller_principal, inputs, decision_trace)
                 .await
+                .with_verb_resolution(Vec::new(), containment_guidance)
         }
     }
 }
@@ -1078,23 +2023,62 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
         context,
         request,
         caller_principal,
-        reason,
-        authority,
-        Vec::new(),
-        None,
+        ContainmentInputs {
+            reason,
+            authority,
+            consume_access_verbs: Vec::new(),
+            decision_trace: None,
+            command_authority: None,
+        },
     )
     .await
 }
 
-async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
+#[cfg(all(test, unix))]
+pub(super) async fn arm_containment_with_access_use_for_test<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     caller_principal: Option<PrincipalKey>,
     reason: String,
     authority: Option<SessionAuthoritySnapshot>,
     consume_access_verbs: Vec<String>,
-    decision_trace: Option<guard::gating::DecisionTrace>,
 ) -> ExecuteResult {
+    arm_containment_with_access_use(
+        context,
+        request,
+        caller_principal,
+        ContainmentInputs {
+            reason,
+            authority,
+            consume_access_verbs,
+            decision_trace: None,
+            command_authority: None,
+        },
+    )
+    .await
+}
+
+struct ContainmentInputs {
+    reason: String,
+    authority: Option<SessionAuthoritySnapshot>,
+    consume_access_verbs: Vec<String>,
+    decision_trace: Option<guard::gating::DecisionTrace>,
+    command_authority: Option<CommandAuthorization>,
+}
+
+async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
+    request: ExecuteRequest,
+    caller_principal: Option<PrincipalKey>,
+    inputs: ContainmentInputs,
+) -> ExecuteResult {
+    let ContainmentInputs {
+        reason,
+        authority,
+        consume_access_verbs,
+        decision_trace,
+        command_authority,
+    } = inputs;
     let server = context.server;
     let caller = context.caller;
     // decide_gate only returns Contain when a revert is present.
@@ -1102,6 +2086,17 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         Some(r) => r,
         None => return ExecuteResult::held(reason, new_handle(), Coverage::hold()),
     };
+
+    let sensitive_check = revert
+        .confirm_check
+        .as_ref()
+        .is_some_and(|check| command_contains_sensitive_literals(&check.binary, &check.args));
+    if command_contains_sensitive_literals(&request.binary, &request.args)
+        || command_contains_sensitive_literals(&revert.binary, &revert.args)
+        || sensitive_check
+    {
+        return ExecuteResult::denied(SENSITIVE_ARGV_REPLAY_GUIDANCE);
+    }
 
     if let Some(why) = invalid_binary_reason(&revert.binary) {
         return ExecuteResult::exec_failed(reason, why);
@@ -1136,10 +2131,9 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     if server.config.dry_run {
         return ExecuteResult::dry_run_gated(
             format!(
-                "{} [GATE] would execute inside a containment envelope (auto-revert: {} {})",
+                "{} [GATE] would execute inside a containment envelope (auto-revert: {})",
                 reason,
-                revert.binary,
-                revert.args.join(" ")
+                redact_command_line(&revert.binary, &revert.args)
             ),
             Coverage::contain(),
         );
@@ -1178,9 +2172,6 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             "session expired, was revoked, or changed before containment could be armed",
         );
     }
-    if let Err(reason) = admit_access_use(server, &request, &consume_access_verbs, None).await {
-        return access_admission_denial(server, caller, &consume_access_verbs, reason).await;
-    }
     let (session_revision, secret_entitlements) = match request.session_token.as_deref() {
         Some(_) => match authority {
             Some(snapshot) => (snapshot.revision, snapshot.secret_entitlements),
@@ -1195,6 +2186,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     let provisional = Provisional {
         handle: handle.clone(),
         principal: caller_principal,
+        requester_principal: None,
         binary: request.binary.clone(),
         args: request.args.clone(),
         cwd: request.cwd.clone(),
@@ -1235,8 +2227,14 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         reason: reason.clone(),
         decision_trace,
         created_unix: now,
-        deadline_unix: now.saturating_add(window),
+        // No confirmation deadline exists until the forward command exits
+        // successfully. Zero is a persisted sentinel for "not started".
+        deadline_unix: 0,
+        window_secs: 0,
+        auto_reverted_unix: None,
         forward_done: false,
+        forward_exit: None,
+        forward_persistence_failed: false,
         status: ProvisionalStatus::Armed,
         revert_exit: None,
         revert_detail: None,
@@ -1245,9 +2243,26 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     // Commit BEFORE exec so a crash between exec and arm still leaves a
     // recoverable revert (startup recovery routes it to needs_operator_decision).
     if let Err(detail) = try_persist_provisional(server, &provisional).await {
+        tracing::error!(
+            "containment provisional {} was not durable before forward execution: {}",
+            handle,
+            detail
+        );
         return ExecuteResult::exec_failed(
-            reason,
-            format!("command was not run because its rollback state was not durable: {detail}"),
+            reason.clone(),
+            "command was not run because durable rollback state is unavailable".to_string(),
+        )
+        .containment_failed(
+            "command was not run because durable rollback state is unavailable",
+            None,
+            Coverage::contain(),
+            ContainmentOutcome::PersistenceFailure {
+                command_started: false,
+                forward_exit_code: None,
+            },
+            None,
+            None,
+            None,
         );
     }
     server
@@ -1257,48 +2272,194 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         .await
         .insert(provisional.clone());
 
+    // The containment row is durable before bounded access is consumed. If
+    // admission rejects the request, remove the unused row and leave the
+    // authority budget untouched.
+    if let Err(admission_reason) =
+        admit_access_use(server, &request, &consume_access_verbs, None).await
+    {
+        if let Err(cleanup_error) = retire_non_executed_provisional(
+            server,
+            &provisional,
+            "forward command was not admitted; no rollback is required".to_string(),
+        )
+        .await
+        {
+            tracing::error!(
+                "failed to retire unstarted provisional {handle} after access admission denial: {cleanup_error}"
+            );
+        }
+        return access_admission_denial(server, caller, &consume_access_verbs, admission_reason)
+            .await;
+    }
+
     let session_fingerprint = audit_session_fingerprint(request.session_token.as_deref());
-    let result = exec_after_approval_with_secret_authority(
+    let result = exec_after_approval_with_command_authority(
         context,
         request,
         reason.clone(),
         Some(provisional.secret_entitlements.clone()),
+        command_authority,
     )
     .await;
-    let exposed_secret_refs = result.exposed_secret_refs().to_vec();
+    let credential_references = result.credential_references().to_vec();
 
     match result.exec {
         ExecOutcome::Completed {
             exit_code,
-            stdout,
-            stderr,
+            ref stdout,
+            ref stderr,
         } => {
+            let stdout = stdout.clone();
+            let stderr = stderr.clone();
+            let finished_unix = now_unix();
             let updated = {
-                let mut reg = server.state.provisional.write().await;
-                reg.mark_forward_done(&handle, exit_code);
-                reg.get(&handle).cloned()
+                let mut staged = ProvisionalRegistry::new();
+                staged.insert(provisional.clone());
+                staged.mark_forward_done(&handle, exit_code, finished_unix, window)
             };
-            if let Some(u) = updated {
-                persist_provisional(server, &u).await;
+            // Zero on a forward command that did not exit cleanly: no timer was
+            // armed, so the response must not advertise a deadline.
+            let Some(updated) = updated else {
+                let response_reason =
+                    "command executed, but its durable containment row was lost; operator decision required";
+                return result
+                    .containment_failed(
+                        response_reason,
+                        None,
+                        Coverage::contain(),
+                        ContainmentOutcome::PersistenceFailure {
+                            command_started: true,
+                            forward_exit_code: exit_code,
+                        },
+                        exit_code,
+                        stdout,
+                        stderr,
+                    )
+                    .with_credential_references(credential_references);
+            };
+            if !persist_provisional_transition(server, provisional.clone(), updated.clone())
+                .await
+                .unwrap_or(false)
+            {
+                let mut recovery = provisional.clone();
+                recovery.status = ProvisionalStatus::NeedsOperatorDecision;
+                recovery.forward_done = true;
+                recovery.forward_exit = exit_code;
+                recovery.deadline_unix = 0;
+                recovery.window_secs = 0;
+                recovery.revert_detail = Some(
+                    "forward command completed but its final containment outcome requires durable recovery"
+                        .to_string(),
+                );
+                let recovery_committed =
+                    persist_provisional_transition(server, provisional.clone(), recovery)
+                        .await
+                        .unwrap_or(false);
+                tracing::error!(
+                    "post-forward provisional outcome did not reach its primary durable transition"
+                );
+                let response_reason = match exit_code {
+                    Some(0) => "command executed, but its durable auto-revert state could not be recorded; operator decision required".to_string(),
+                    Some(exit_code) => format!(
+                        "forward command exited with code {exit_code}, but its durable outcome could not be recorded; operator decision required"
+                    ),
+                    None => "forward command ended without an exit code, but its durable outcome could not be recorded; operator decision required".to_string(),
+                };
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .reason(&response_reason)
+                        .field("exit", format!("{exit_code:?}")),
+                );
+                return result
+                    .containment_failed(
+                        response_reason,
+                        recovery_committed.then_some(handle),
+                        Coverage::contain(),
+                        ContainmentOutcome::PersistenceFailure {
+                            command_started: true,
+                            forward_exit_code: exit_code,
+                        },
+                        exit_code,
+                        stdout,
+                        stderr,
+                    )
+                    .with_credential_references(credential_references);
             }
-            server.emit_audit_ungated(
-                AuditEvent::new(AuditKind::Provisional)
-                    .handle(&handle)
-                    .caller(caller)
-                    .session_fingerprint(&session_fingerprint)
-                    .field("deadline", now.saturating_add(window))
-                    .field("window", format!("{window}s"))
-                    .field("revert", audit_command_line(&revert.binary, &revert.args)),
-            );
-            server.emit_event(NotifyEvent {
-                event: "provisional_armed",
-                at_unix: now_unix(),
-                handle: Some(handle.clone()),
-                session_fingerprint: Some(session_fingerprint),
-                reason: Some(reason.clone()),
-                status: Some("armed".to_string()),
-                behavior: None,
-            });
+            if exit_code.is_none() {
+                let response_reason = format!(
+                    "{reason}; forward command ended without an exit code; auto-revert was not armed; operator decision required"
+                );
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .reason(&response_reason),
+                );
+                return result
+                    .containment_failed(
+                        response_reason,
+                        Some(handle),
+                        Coverage::contain(),
+                        ContainmentOutcome::ForwardNoExitCode,
+                        None,
+                        stdout,
+                        stderr,
+                    )
+                    .with_credential_references(credential_references);
+            }
+            if exit_code != Some(0) {
+                let exit_code = exit_code.expect("nonzero containment exit has a code");
+                let response_reason = format!(
+                    "{reason}; forward command exited with code {exit_code}; auto-revert was not armed; operator decision required"
+                );
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .reason(&response_reason)
+                        .field("exit", exit_code),
+                );
+                return result
+                    .containment_failed(
+                        response_reason,
+                        Some(handle),
+                        Coverage::contain(),
+                        ContainmentOutcome::ForwardNonzeroExit { exit_code },
+                        Some(exit_code),
+                        stdout,
+                        stderr,
+                    )
+                    .with_credential_references(credential_references);
+            }
+            let armed_deadline = updated.deadline_unix;
+            let armed_window = updated.window_secs;
+            {
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::Provisional)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .field("deadline", finished_unix.saturating_add(window))
+                        .field("window", format!("{window}s"))
+                        .field("revert", audit_command_line(&revert.binary, &revert.args)),
+                );
+                server.emit_event(NotifyEvent {
+                    event: "provisional_armed",
+                    at_unix: finished_unix,
+                    handle: Some(handle.clone()),
+                    session_fingerprint: Some(session_fingerprint),
+                    requester_principal: None,
+                    reason: Some(reason.clone()),
+                    status: Some("armed".to_string()),
+                    behavior: None,
+                });
+            }
             ExecuteResult::provisional(
                 reason,
                 handle,
@@ -1306,32 +2467,95 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 exit_code,
                 stdout,
                 stderr,
+                armed_deadline,
+                armed_window,
             )
-            .with_exposed_secret_refs(exposed_secret_refs)
+            .with_credential_references(credential_references)
         }
-        // The child was launched and then failed (e.g. the client stream dropped
-        // mid-run). It may already have applied its mutation, so keep the
-        // provisional armed: the auto-revert timer fires at the deadline and
-        // rolls the unconfirmed change back rather than leaking it. Mark the
-        // forward done so the deadline is honored, and surface the failure.
-        ExecOutcome::Failed { started: true, .. } => {
+        // The child was launched and then failed (for example, the client
+        // stream dropped). Its partial effects are unknown. Persist that
+        // interruption explicitly and require an operator to confirm or revert;
+        // a confirmation timer cannot start from an unobserved completion.
+        ExecOutcome::Failed {
+            started: true,
+            reason: ref failure_detail,
+        } => {
+            let detail = format!(
+                "forward command was interrupted after launch: {failure_detail}; operator confirmation or rollback is required"
+            );
             let updated = {
-                let mut reg = server.state.provisional.write().await;
-                reg.mark_forward_done(&handle, None);
-                reg.get(&handle).cloned()
+                let mut staged = ProvisionalRegistry::new();
+                staged.insert(provisional.clone());
+                staged.mark_forward_interrupted(&handle, detail.clone())
             };
-            if let Some(u) = updated {
-                persist_provisional(server, &u).await;
-            }
+            let (response_reason, recovery_handle, outcome) = match updated {
+                Some(updated) => match persist_provisional_transition(
+                    server,
+                    provisional.clone(),
+                    updated,
+                )
+                .await
+                {
+                    Ok(true) => (
+                        "forward command ended without an exit code; auto-revert was not armed; operator decision required",
+                        Some(handle.clone()),
+                        ContainmentOutcome::ForwardNoExitCode,
+                    ),
+                    Ok(false) | Err(_) => {
+                        let mut recovery = provisional.clone();
+                        recovery.status = ProvisionalStatus::NeedsOperatorDecision;
+                        recovery.forward_done = true;
+                        recovery.forward_exit = None;
+                        recovery.deadline_unix = 0;
+                        recovery.window_secs = 0;
+                        recovery.revert_detail = Some(detail.clone());
+                        let durable_recovery = persist_provisional_transition(
+                            server,
+                            provisional.clone(),
+                            recovery,
+                        )
+                        .await
+                        .unwrap_or(false);
+                        tracing::warn!(
+                            "interrupted forward outcome did not reach its primary durable transition"
+                        );
+                        (
+                            "forward command ended without an exit code, and its interrupted state was not recorded durably; operator decision required",
+                            durable_recovery.then(|| handle.clone()),
+                            ContainmentOutcome::PersistenceFailure {
+                                command_started: true,
+                                forward_exit_code: None,
+                            },
+                        )
+                    }
+                },
+                None => (
+                    "forward command ended without an exit code, but its containment row is unavailable; operator decision required",
+                    None,
+                    ContainmentOutcome::PersistenceFailure {
+                        command_started: true,
+                        forward_exit_code: None,
+                    },
+                ),
+            };
             server.emit_audit_ungated(
                 AuditEvent::new(AuditKind::ProvisionalInterrupted)
                     .handle(&handle)
                     .caller(caller)
                     .session_fingerprint(&session_fingerprint)
-                    .reason("forward launched then failed; auto-revert armed")
-                    .field("deadline", now.saturating_add(window)),
+                    .reason(&detail),
             );
             result
+                .containment_failed(
+                    response_reason,
+                    recovery_handle,
+                    Coverage::contain(),
+                    outcome,
+                    None,
+                    None,
+                    None,
+                )
+                .with_credential_references(credential_references)
         }
         ExecOutcome::Failed {
             started: false,
@@ -1341,47 +2565,18 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             // deleting the staging row. If deletion fails, restart recovery
             // sees a non-rollbackable terminal record rather than interpreting
             // an armed, unstarted row as an ambiguous mutation.
-            let terminal = {
-                let mut terminal = provisional.clone();
-                terminal.status = ProvisionalStatus::Reverted;
-                terminal.revert_detail = Some(format!(
-                    "forward command did not start; no rollback is required: {spawn_detail}"
-                ));
-                server
-                    .state
-                    .provisional
-                    .write()
-                    .await
-                    .insert(terminal.clone());
-                terminal
-            };
-            match try_persist_provisional(server, &terminal).await {
-                Ok(()) => match try_delete_provisional_row(server, &handle).await {
-                    Ok(()) => {
-                        server.state.provisional.write().await.remove(&handle);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "{error}; retained terminal non-executed provisional {handle}"
-                        );
-                    }
-                },
-                Err(save_error) => match try_delete_provisional_row(server, &handle).await {
-                    Ok(()) => {
-                        server.state.provisional.write().await.remove(&handle);
-                    }
-                    Err(delete_error) => {
-                        tracing::error!(
-                            "failed to retire non-executed provisional {handle}: {save_error}; {delete_error}"
-                        );
-                        return ExecuteResult::exec_failed(
-                            reason,
-                            format!(
-                                "{spawn_detail}; rollback state could not be retired safely: {save_error}; {delete_error}"
-                            ),
-                        );
-                    }
-                },
+            if let Err(retire_error) = retire_non_executed_provisional(
+                server,
+                &provisional,
+                format!("forward command did not start; no rollback is required: {spawn_detail}"),
+            )
+            .await
+            {
+                tracing::error!("{retire_error}");
+                return ExecuteResult::exec_failed(
+                    reason,
+                    format!("{spawn_detail}; rollback state could not be retired safely"),
+                );
             }
             result
         }
@@ -1420,6 +2615,9 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         consume_access_verbs,
         ..
     } = inputs;
+    if command_contains_sensitive_literals(&request.binary, &request.args) {
+        return ExecuteResult::denied(SENSITIVE_ARGV_REPLAY_GUIDANCE);
+    }
     if server.config.dry_run {
         return ExecuteResult::dry_run_gated(
             format!(
@@ -1441,25 +2639,20 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
     let handle = new_handle();
     let now = now_unix();
 
-    let tool_secret_sources = {
-        let mut registry = server.state.tool_registry.write().await;
-        let _ = registry.reload_if_stale();
-        match registry
-            .resolve_env(
-                &request.binary,
-                &server.state.secrets,
-                caller_principal.as_ref(),
-                caller.user_key().as_deref(),
+    let tool_secret_sources = match resolve_current_tool_env(
+        server,
+        &request.binary,
+        caller_principal.as_ref(),
+        caller.user_key().as_deref(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved.into_resolved().secret_sources,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                reason,
+                format!("approval hold rejected: tool secret resolution failed: {error}"),
             )
-            .await
-        {
-            Ok(resolved) => resolved.secret_sources,
-            Err(error) => {
-                return ExecuteResult::exec_failed(
-                    reason,
-                    format!("approval hold rejected: tool secret resolution failed: {error}"),
-                )
-            }
         }
     };
 
@@ -1562,9 +2755,15 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         verb_name: verb.as_ref().map(|v| v.name.clone()),
-        verb_params: verb.as_ref().map(|v| v.params.clone()).unwrap_or_default(),
+        verb_params: std::collections::BTreeMap::new(),
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
         verb_digest: verb.as_ref().and_then(|v| v.verb_digest.clone()),
+        verb_composition_digest: verb.as_ref().and_then(|v| v.composition_digest.clone()),
+        exec_timeout_secs: Some(
+            verb.as_ref()
+                .and_then(|verb| verb.exec_timeout_secs)
+                .unwrap_or(server.config.exec_timeout_secs),
+        ),
         access_verbs: consume_access_verbs,
         access_requests,
         principal: caller_principal,
@@ -1588,6 +2787,20 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         notes: Vec::new(),
     };
 
+    // Serialize the final session check with access admission and revocation.
+    // A revocation that wins this lock prevents the hold from being published;
+    // a hold that wins commits first and the revoke transaction denies it.
+    let transition = server.state.authority_transition_gate.lock().await;
+    if approval.snapshot.session_fingerprint.is_some() {
+        let sessions = server.state.sessions.read().await;
+        if super::admin::session_token_for_approval_snapshot(&sessions, &approval.snapshot)
+            .is_none()
+        {
+            return ExecuteResult::denied(
+                "session expired, was revoked, or changed before approval hold creation",
+            );
+        }
+    }
     if let Err(message) = persist_approval(server, &approval).await {
         return ExecuteResult::exec_failed(reason, message);
     }
@@ -1597,12 +2810,15 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         .write()
         .await
         .enqueue(approval.clone());
+    drop(transition);
+    #[cfg(test)]
+    signal_approval_lifecycle(server, false);
     server.emit_audit_ungated(
         AuditEvent::new(AuditKind::Held)
             .handle(&handle)
             .caller(caller)
             .session_fingerprint(audit_session_fingerprint(request.session_token.as_deref()))
-            .cmd(audit_command_line(&request.binary, &request.args))
+            .cmd(server.redact_command_line(&request.binary, &request.args))
             .field("risk", format!("{risk:?}"))
             .field("class", format!("{:?}", reversibility.map(|r| r.as_str())))
             .field("ttl", format!("{}s", server.config.approval_ttl_secs)),
@@ -1615,6 +2831,11 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
             .session_token
             .as_deref()
             .map(|token| audit_session_fingerprint(Some(token))),
+        requester_principal: approval
+            .snapshot
+            .principal
+            .as_ref()
+            .map(ToString::to_string),
         reason: Some(reason.clone()),
         status: Some("pending".to_string()),
         behavior: None,
@@ -1624,6 +2845,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         Some(wait) => {
             wait_for_decision(
                 server,
+                caller,
                 &handle,
                 notify,
                 wait,
@@ -1634,7 +2856,9 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         }
         None => ExecuteResult::held(reason, handle.clone(), Coverage::hold()).with_verb_resolution(
             Vec::new(),
-            Some(format!("approve: guard access approve {handle} --once")),
+            Some(super::admin::approval_guidance(
+                server, caller, &handle, true,
+            )),
         ),
     }
 }
@@ -1644,6 +2868,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
 /// return the real outcome. On timeout the command stays held.
 async fn wait_for_decision<W: AsyncWrite + Unpin>(
     server: &ServerContext,
+    caller: &CallerIdentity,
     handle: &str,
     notify: std::sync::Arc<tokio::sync::Notify>,
     wait_secs: u64,
@@ -1666,7 +2891,17 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
+        // Drop the registry read guard before attempting requester resume.
+        // Holding it across `resume_approval()` deadlocks when the resume path
+        // installs its `Pending -> Approving` transition under the write lock.
+        let approval = {
+            let approvals = server.state.approvals.read().await;
+            approvals.get(handle).cloned()
+        };
+        if let Some(a) = approval {
+            if approval_is_armed(&a) {
+                return resume_approval(server, caller, handle).await;
+            }
             if a.status.is_decided() {
                 return approval_to_result(&a);
             }
@@ -1685,7 +2920,9 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
             )
             .with_verb_resolution(
                 Vec::new(),
-                Some(format!("approve: guard access approve {handle} --once")),
+                Some(super::admin::approval_guidance(
+                    server, caller, handle, true,
+                )),
             );
         }
 
@@ -1702,6 +2939,194 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
             }
         }
     }
+}
+
+pub(super) fn bound_persisted_transcript(value: Option<String>) -> Option<String> {
+    bound_approval_transcript(value).0
+}
+
+async fn reconcile_resumed_approval(server: &ServerContext, handle: &str) {
+    let Some(store) = &server.state.session_store else {
+        return;
+    };
+    match store.load_approvals().await {
+        Ok(rows) => {
+            if let Some(row) = rows.into_iter().find(|row| row.handle == handle) {
+                let wake = row.status.is_decided();
+                server
+                    .state
+                    .approvals
+                    .write()
+                    .await
+                    .install_persisted(row, wake);
+            }
+        }
+        Err(error) => tracing::warn!("failed to reconcile resumed approval {handle}: {error}"),
+    }
+}
+
+async fn commit_resumed_approval(
+    server: &ServerContext,
+    expected: Approval,
+    next: Approval,
+    wake: bool,
+) -> Result<(), String> {
+    let handle = expected.handle.clone();
+    if let Some(store) = &server.state.session_store {
+        if let Err(error) = store
+            .compare_and_swap_approval(expected, next.clone())
+            .await
+        {
+            reconcile_resumed_approval(server, &handle).await;
+            return Err(format!(
+                "approval transition conflict for {handle}: {error}"
+            ));
+        }
+    }
+    server
+        .state
+        .approvals
+        .write()
+        .await
+        .install_persisted(next, wake);
+    Ok(())
+}
+
+/// Claim and execute one operator-armed hold as its original requester. The
+/// durable `Pending -> Approving` compare-and-set is the one-shot boundary.
+/// A daemon restart while the child runs recovers `Approving` to `ExecFailed`,
+/// so an ambiguous execution is never replayed.
+pub(super) async fn resume_approval(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> ExecuteResult {
+    let transition = server.state.authority_transition_gate.lock().await;
+    let Some(expected) = server.state.approvals.read().await.get(handle).cloned() else {
+        return ExecuteResult::denied("no armed held command for this requester");
+    };
+    let caller_principal = caller.principal();
+    if !caller.is_local_peer()
+        || !scope_eq(&expected.snapshot.principal, &caller_principal)
+        || !approval_is_armed(&expected)
+    {
+        return ExecuteResult::denied("no armed held command for this requester");
+    }
+
+    let now = now_unix();
+    if now >= expected.deadline_unix() {
+        let mut expired = expected.clone();
+        expired.status = ApprovalStatus::Expired;
+        expired.decided_unix = Some(now);
+        expired.decided_reason = Some("expired before requester resume".to_string());
+        if let Err(error) = commit_resumed_approval(server, expected, expired, true).await {
+            return ExecuteResult::exec_failed("held command expired", error);
+        }
+        return ExecuteResult::denied("held command expired before requester resume");
+    }
+
+    let mut claimed = expected.clone();
+    claimed.status = ApprovalStatus::Approving;
+    claimed.decided_reason = Some("requester claimed armed hold for execution".to_string());
+    if let Err(error) = commit_resumed_approval(server, expected, claimed.clone(), false).await {
+        return ExecuteResult::denied(error);
+    }
+    drop(transition);
+
+    if !server.emit_audit(
+        AuditEvent::new(AuditKind::ApprovedExecuted)
+            .handle(handle)
+            .caller(caller)
+            .session_fingerprint(
+                claimed
+                    .snapshot
+                    .session_fingerprint
+                    .as_deref()
+                    .unwrap_or("none"),
+            )
+            .cmd(claimed.snapshot.command_line())
+            .field("phase", "requester_claimed"),
+    ) {
+        let mut failed = claimed.clone();
+        failed.status = ApprovalStatus::ExecFailed;
+        failed.decided_unix = Some(now_unix());
+        failed.decided_reason = Some(super::AUDIT_UNAVAILABLE_REASON.to_string());
+        let _ = commit_resumed_approval(server, claimed, failed, true).await;
+        return ExecuteResult::exec_failed(
+            "requester resume refused",
+            super::AUDIT_UNAVAILABLE_REASON.to_string(),
+        );
+    }
+
+    let reason = format!("requester resumed operator-approved hold {handle}");
+    let result = execute_snapshot(server, &claimed.snapshot, &reason).await;
+    let completed_unix = now_unix();
+    let mut terminal = claimed.clone();
+    match &result.exec {
+        ExecOutcome::Completed {
+            exit_code,
+            stdout,
+            stderr,
+        } => {
+            terminal.status = ApprovalStatus::Approved;
+            terminal.decided_unix = Some(completed_unix);
+            terminal.decided_reason = Some("requester resumed operator-approved hold".to_string());
+            terminal.result_exit = *exit_code;
+            terminal.result_stdout = bound_persisted_transcript(stdout.clone());
+            terminal.result_stderr = bound_persisted_transcript(stderr.clone());
+        }
+        ExecOutcome::Failed { reason, .. } => {
+            terminal.status = ApprovalStatus::ExecFailed;
+            terminal.decided_unix = Some(completed_unix);
+            terminal.decided_reason = Some(reason.clone());
+            terminal.result_exit = None;
+            terminal.result_stdout = None;
+            terminal.result_stderr = None;
+        }
+        _ => {
+            terminal.status = ApprovalStatus::ExecFailed;
+            terminal.decided_unix = Some(completed_unix);
+            terminal.decided_reason =
+                Some("resumed execution returned a non-terminal outcome".to_string());
+            terminal.result_exit = None;
+            terminal.result_stdout = None;
+            terminal.result_stderr = None;
+        }
+    }
+    if let Err(error) =
+        commit_resumed_approval(server, claimed.clone(), terminal.clone(), true).await
+    {
+        return ExecuteResult::exec_failed(
+            reason,
+            format!("held command ran but its result was not durable: {error}"),
+        );
+    }
+    server.emit_audit_ungated(
+        AuditEvent::new(AuditKind::ApprovedExecuted)
+            .handle(handle)
+            .caller(caller)
+            .session_fingerprint(
+                claimed
+                    .snapshot
+                    .session_fingerprint
+                    .as_deref()
+                    .unwrap_or("none"),
+            )
+            .field("phase", "completed")
+            .field("status", terminal.status.as_str())
+            .field("exit", format!("{:?}", terminal.result_exit)),
+    );
+    server.emit_event(NotifyEvent {
+        event: "decision_made",
+        at_unix: completed_unix,
+        handle: Some(handle.to_string()),
+        session_fingerprint: claimed.snapshot.session_fingerprint.clone(),
+        requester_principal: claimed.snapshot.principal.as_ref().map(ToString::to_string),
+        reason: terminal.decided_reason.clone(),
+        status: Some(terminal.status.as_str().to_string()),
+        behavior: None,
+    });
+    result
 }
 
 /// Build the client-facing result from a decided approval record.
@@ -1773,15 +3198,32 @@ pub(super) async fn execute_snapshot(
 ) -> ExecuteResult {
     let access_requests =
         (!snapshot.access_requests.is_empty()).then_some(snapshot.access_requests.as_slice());
-    execute_snapshot_with_access_request(server, snapshot, reason, access_requests).await
+    execute_snapshot_with_access_request_inner(server, snapshot, reason, access_requests).await
 }
 
+#[cfg(all(test, unix))]
 pub(super) async fn execute_snapshot_with_access_request(
     server: &ServerContext,
     snapshot: &ApprovalSnapshot,
     reason: &str,
     preferred_access_requests: Option<&[String]>,
 ) -> ExecuteResult {
+    execute_snapshot_with_access_request_inner(server, snapshot, reason, preferred_access_requests)
+        .await
+}
+
+async fn execute_snapshot_with_access_request_inner(
+    server: &ServerContext,
+    snapshot: &ApprovalSnapshot,
+    reason: &str,
+    preferred_access_requests: Option<&[String]>,
+) -> ExecuteResult {
+    if snapshot.contains_sensitive_literals() {
+        return ExecuteResult::exec_failed(
+            reason.to_string(),
+            SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string(),
+        );
+    }
     if !binary_allowed(&server.config.allowed_binaries, &snapshot.binary) {
         return ExecuteResult::exec_failed(
             reason.to_string(),
@@ -1839,25 +3281,20 @@ pub(super) async fn execute_snapshot_with_access_request(
 
     let caller = reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown);
 
-    let current_tool_sources = {
-        let mut registry = server.state.tool_registry.write().await;
-        let _ = registry.reload_if_stale();
-        match registry
-            .resolve_env(
-                &snapshot.binary,
-                &server.state.secrets,
-                snapshot.principal.as_ref(),
-                caller.user_key().as_deref(),
+    let current_tool_sources = match resolve_current_tool_env(
+        server,
+        &snapshot.binary,
+        snapshot.principal.as_ref(),
+        caller.user_key().as_deref(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved.into_resolved().secret_sources,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                format!("approval rejected: failed to re-resolve tool secrets: {error}"),
             )
-            .await
-        {
-            Ok(resolved) => resolved.secret_sources,
-            Err(error) => {
-                return ExecuteResult::exec_failed(
-                    reason.to_string(),
-                    format!("approval rejected: failed to re-resolve tool secrets: {error}"),
-                )
-            }
         }
     };
 
@@ -2072,11 +3509,33 @@ async fn execute_snapshot_request(
         stream_output: false,
         stream_writer: &mut sink,
     };
-    exec_after_approval_with_secret_authority(
+    let verb_authority = snapshot
+        .verb_name
+        .as_ref()
+        .map(|name| VerbAuthorityExpectation {
+            name: name.clone(),
+            catalog_version: snapshot.catalog_version,
+            definition_digest: snapshot.verb_digest.clone(),
+            composition_digest: snapshot.verb_composition_digest.clone(),
+        });
+    let session_authority =
+        snapshot
+            .session_revision
+            .as_ref()
+            .map(|revision| SessionAuthoritySnapshot {
+                revision: revision.clone(),
+                secret_entitlements: snapshot.secret_entitlements.clone(),
+            });
+    exec_after_approval_with_command_authority(
         &mut context,
         request,
         reason.to_string(),
         Some(snapshot.secret_entitlements.clone()),
+        Some(CommandAuthorization::replay(
+            verb_authority,
+            session_authority,
+            snapshot.exec_timeout_secs,
+        )),
     )
     .await
 }
@@ -2100,6 +3559,85 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
         tick.tick().await;
         let now = now_unix();
 
+        // Staging is inert and hidden, but a failed request-side cleanup must
+        // not occupy admission capacity forever. Retry only exact Staged rows;
+        // a concurrent dispatch CAS makes cancellation fail closed.
+        let stale_staged = server
+            .state
+            .provisional
+            .read()
+            .await
+            .staged_cleanup_due_handles(now, STAGED_CLEANUP_RETRY_SECS);
+        for handle in stale_staged {
+            if !cancel_exact_staged_provisional(&server, &handle).await {
+                tracing::warn!("staged API containment cleanup remains pending");
+            }
+        }
+
+        let terminal_body_cleanup = server
+            .state
+            .provisional
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .filter(|row| {
+                row.status.is_lifecycle_final()
+                    && row
+                        .revert_detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.starts_with(REVERT_BODY_CLEANUP_PREFIX))
+            })
+            .collect::<Vec<_>>();
+        for row in terminal_body_cleanup {
+            if !converge_terminal_revert_body_cleanup(&server, &row).await {
+                tracing::warn!("terminal rollback-body cleanup remains pending");
+            }
+        }
+
+        let stale_dispatches = server
+            .state
+            .provisional
+            .read()
+            .await
+            .dispatch_classification_due_handles(now, DISPATCH_CLASSIFICATION_RETRY_SECS);
+        for handle in stale_dispatches {
+            let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
+                continue;
+            };
+            if expected.status != ProvisionalStatus::Dispatching || expected.forward_done {
+                continue;
+            }
+            let mut next = expected.clone();
+            next.status = ProvisionalStatus::NeedsOperatorDecision;
+            next.forward_done = true;
+            next.forward_exit = None;
+            next.deadline_unix = 0;
+            next.window_secs = 0;
+            next.revert_detail = Some(
+                "upstream mutation dispatch completed without a durable outcome classification"
+                    .to_string(),
+            );
+            if let Err(error) = persist_provisional_transition(&server, expected, next).await {
+                tracing::warn!("mutation containment classification retry failed: {error}");
+            }
+        }
+
+        let failed_classifications = server
+            .state
+            .provisional
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .filter(|row| row.forward_persistence_failed)
+            .collect::<Vec<_>>();
+        for row in failed_classifications {
+            if !converge_forward_persistence_failure(&server, &row).await {
+                tracing::warn!("mutation containment classification remains pending");
+            }
+        }
+
         // Expire unattended holds FIRST (fail-closed deny on a timer). Doing this
         // before the reverts guarantees the fail-closed promise is met every tick
         // even if a revert is slow.
@@ -2121,6 +3659,7 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
                     at_unix: now,
                     handle: Some(h.clone()),
                     session_fingerprint: a.snapshot.session_fingerprint.clone(),
+                    requester_principal: a.snapshot.principal.as_ref().map(ToString::to_string),
                     reason: Some("held action expired without approval".to_string()),
                     status: Some("expired".to_string()),
                     behavior: None,
@@ -2137,37 +3676,28 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
         // out the next tick's fail-closed expiry sweep.
         let due = { server.state.provisional.read().await.due_handles(now) };
         for handle in due {
-            let claimed = {
-                let mut registry = server.state.provisional.write().await;
-                let Some(expected) = registry.get(&handle).cloned() else {
-                    continue;
-                };
-                let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
-                staged.insert(expected.clone());
-                let Ok(next) = staged.begin_revert(&handle) else {
-                    continue;
-                };
-                if let Some(store) = &server.state.session_store {
-                    if let Err(error) = store
-                        .compare_and_swap_provisional(expected, next.clone())
-                        .await
-                    {
-                        tracing::warn!(
-                            "failed to persist due rollback claim {}: {}",
-                            handle,
-                            error
-                        );
-                        continue;
-                    }
-                }
-                registry.insert(next.clone());
-                next
+            let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
+                continue;
             };
+            let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
+            staged.insert(expected.clone());
+            let Ok(claimed) = staged.begin_revert(&handle) else {
+                continue;
+            };
+            match persist_provisional_transition(&server, expected, claimed.clone()).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!("failed to persist due rollback claim {}: {}", handle, error);
+                    continue;
+                }
+            }
             server.emit_event(NotifyEvent {
                 event: "provisional_due",
                 at_unix: now,
                 handle: Some(claimed.handle.clone()),
                 session_fingerprint: claimed.session_fingerprint.clone(),
+                requester_principal: None,
                 reason: Some(claimed.reason.clone()),
                 status: Some("reverting".to_string()),
                 behavior: None,
@@ -2233,8 +3763,16 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
 }
 
 /// Run the revert for a provisional under the original caller's identity, with no
-/// client stream. Used by the sweeper and `guard revert`.
+/// client stream. Used by the sweeper and operator-initiated reversion.
 async fn run_provisional_revert(server: &ServerContext, p: &Provisional) -> ExecuteResult {
+    if p.api_revert.is_none()
+        && command_contains_sensitive_literals(&p.revert_binary, &p.revert_args)
+    {
+        return ExecuteResult::exec_failed(
+            format!("auto-revert of provisional {}", p.handle),
+            SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string(),
+        );
+    }
     if let Some(reason) = invalid_binary_reason(&p.revert_binary) {
         return ExecuteResult::exec_failed(
             format!("auto-revert of provisional {}", p.handle),
@@ -2299,6 +3837,12 @@ pub(super) async fn run_provisional_check(
     p: &Provisional,
 ) -> ExecuteResult {
     let binary = p.confirm_check_binary.as_deref().unwrap_or_default();
+    if command_contains_sensitive_literals(binary, &p.confirm_check_args) {
+        return ExecuteResult::exec_failed(
+            format!("confirmation check for provisional {}", p.handle),
+            SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string(),
+        );
+    }
     if let Some(reason) = invalid_binary_reason(binary) {
         return ExecuteResult::exec_failed(
             format!("confirmation check for provisional {}", p.handle),
@@ -2375,8 +3919,13 @@ pub(super) async fn finish_due_provisional(
         _ => None,
     });
     if check_exit == Some(0) {
-        let mut registry = server.state.provisional.write().await;
-        let expected = registry.get(&p.handle).cloned();
+        let expected = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&p.handle)
+            .cloned();
         let confirmed = expected.as_ref().and_then(|expected| {
             let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
             staged.insert(expected.clone());
@@ -2384,22 +3933,11 @@ pub(super) async fn finish_due_provisional(
         });
         match (expected, confirmed) {
             (Some(expected), Some(row)) => {
-                if let Some(store) = &server.state.session_store {
-                    if let Err(error) = store
-                        .compare_and_swap_provisional(expected, row.clone())
-                        .await
-                    {
-                        drop(registry);
-                        tracing::warn!(
-                            "confirmation check succeeded but provisional {} could not become durable: {}",
-                            p.handle,
-                            error
-                        );
-                    } else {
-                        registry.insert(row.clone());
-                        drop(registry);
+                match persist_terminal_provisional_with_body_cleanup(server, expected, row.clone())
+                    .await
+                {
+                    Ok(true) => {
                         forget_proxy_provenance(server, &p.handle).await;
-                        remove_revert_body(p);
                         server.emit_audit_ungated(
                             AuditEvent::new(AuditKind::ProvisionalAutoConfirmed)
                                 .handle(&p.handle)
@@ -2417,6 +3955,7 @@ pub(super) async fn finish_due_provisional(
                             at_unix: now_unix(),
                             handle: Some(p.handle.clone()),
                             session_fingerprint: p.session_fingerprint.clone(),
+                            requester_principal: None,
                             reason: Some("independent confirmation check succeeded".to_string()),
                             status: Some("confirmed".to_string()),
                             behavior: None,
@@ -2426,31 +3965,18 @@ pub(super) async fn finish_due_provisional(
                             Some(0),
                         );
                     }
-                } else {
-                    registry.insert(row.clone());
-                    drop(registry);
-                    forget_proxy_provenance(server, &p.handle).await;
-                    remove_revert_body(p);
-                    server.emit_audit_ungated(
-                        AuditEvent::new(AuditKind::ProvisionalAutoConfirmed)
-                            .handle(&p.handle)
-                            .field(
-                                "check",
-                                audit_command_line(
-                                    p.confirm_check_binary.as_deref().unwrap_or_default(),
-                                    &p.confirm_check_args,
-                                ),
-                            )
-                            .field("control_path", format!("{:?}", p.control_path)),
-                    );
-                    return (
-                        format!("provisional {} confirmed by independent check", p.handle),
-                        Some(0),
-                    );
+                    Ok(false) => tracing::warn!(
+                        "confirmation check succeeded but provisional {} changed before publication",
+                        p.handle
+                    ),
+                    Err(error) => tracing::warn!(
+                        "confirmation check succeeded but provisional {} could not become durable: {}",
+                        p.handle,
+                        error
+                    ),
                 }
             }
             _ => {
-                drop(registry);
                 tracing::warn!(
                     "confirmation check succeeded but provisional {} was no longer reverting",
                     p.handle
@@ -2518,13 +4044,28 @@ async fn run_api_revert(
         )));
     }
     drop(registry);
-    let body = if let Some(path) = &api.body_file {
+    let mut body = if let Some(path) = &api.body_file {
         Some(tokio::fs::read(path).await.map_err(|e| {
             RevertError::Failed(format!("read api revert body {}: {e}", path.display()))
         })?)
     } else {
         None
     };
+    if api.requires_uid_precondition {
+        let uid = api.resource_uid.as_deref().ok_or_else(|| {
+            RevertError::Retryable(
+                "created resource identity is not verified; rollback remains disabled".to_string(),
+            )
+        })?;
+        if uid.is_empty() || uid.len() > 256 || uid.chars().any(char::is_control) {
+            return Err(RevertError::Retryable(
+                "created resource identity is invalid; rollback remains disabled".to_string(),
+            ));
+        }
+        body = Some(
+            bind_created_resource_precondition(body.take(), uid).map_err(RevertError::Failed)?,
+        );
+    }
     let method: reqwest::Method = api.method.parse().map_err(|e| {
         RevertError::Failed(format!("invalid api revert method '{}': {e}", api.method))
     })?;
@@ -2572,6 +4113,26 @@ async fn run_api_revert(
     Ok(())
 }
 
+fn bind_created_resource_precondition(body: Option<Vec<u8>>, uid: &str) -> Result<Vec<u8>, String> {
+    let mut options = match body {
+        Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|_| "created-resource rollback options are not valid JSON".to_string())?,
+        None => serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+        }),
+    };
+    let Some(object) = options.as_object_mut() else {
+        return Err("created-resource rollback options are not a JSON object".to_string());
+    };
+    object.insert(
+        "preconditions".to_string(),
+        serde_json::json!({ "uid": uid }),
+    );
+    serde_json::to_vec(&options)
+        .map_err(|_| "serialize created-resource rollback options".to_string())
+}
+
 /// Why an API revert did not complete. A retryable failure leaves the live
 /// mutation for an operator decision; a hard failure is terminal.
 enum RevertError {
@@ -2600,8 +4161,8 @@ async fn defer_revert(
             );
             return (
                 format!(
-                    "provisional {} revert was deferred but persistence failed: {}",
-                    p.handle, error
+                    "provisional {} revert was deferred but its durable state could not be recorded; retry the operator action",
+                    p.handle
                 ),
                 None,
             );
@@ -2619,6 +4180,7 @@ async fn defer_revert(
         at_unix: now_unix(),
         handle: Some(p.handle.clone()),
         session_fingerprint: p.session_fingerprint.clone(),
+        requester_principal: None,
         reason: Some(detail.clone()),
         status: Some("needs_operator_decision".to_string()),
         behavior: None,
@@ -2702,10 +4264,16 @@ pub(super) async fn finish_revert(
             ),
         }
     };
+    // `kind` names who drove this rollback ("auto"/"auto-check-failed" for the
+    // deadline sweeper, "manual" for operator reversion). Only the sweeper's own
+    // rollback stamps the row, so later operator confirmation can say the timer
+    // fired rather than only that the handle is spent.
+    let auto_reverted_unix = kind.starts_with("auto").then(now_unix);
     let updated = {
-        let mut reg = server.state.provisional.write().await;
+        let mut reg = ProvisionalRegistry::new();
+        reg.insert(p.clone());
         if status_ok {
-            reg.set_reverted(&p.handle, exit);
+            reg.set_reverted(&p.handle, exit, auto_reverted_unix);
         } else {
             reg.set_revert_failed(
                 &p.handle,
@@ -2718,27 +4286,34 @@ pub(super) async fn finish_revert(
         reg.get(&p.handle).cloned()
     };
     if let Some(u) = &updated {
-        if let Err(error) = try_persist_provisional(server, u).await {
+        let persistence =
+            persist_terminal_provisional_with_body_cleanup(server, p.clone(), u.clone()).await;
+        let persistence_failure = match persistence {
+            Ok(true) => None,
+            Ok(false) => Some(
+                "live provisional state changed before the terminal transition committed"
+                    .to_string(),
+            ),
+            Err(error) => Some(bounded_persistence_diagnostic(&error)),
+        };
+        if let Some(diagnostic) = persistence_failure {
             tracing::error!(
                 "rollback for provisional {} completed but its terminal state was not durable: {}",
                 p.handle,
-                error
+                diagnostic
             );
             return (
                 format!(
-                    "provisional {} rollback completed but terminal persistence failed: {}",
-                    p.handle, error
+                    "provisional {} rollback completed but its terminal state could not be recorded: {}",
+                    p.handle, diagnostic
                 ),
                 exit,
             );
         }
     }
     // The revert is terminal (whether it succeeded or failed); drop any
-    // api-proxy provenance tied to it so it cannot outlive its window, and
-    // remove the persisted revert body so secret-bearing snapshots do not
-    // accumulate on disk.
+    // api-proxy provenance tied to it so it cannot outlive its window.
     forget_proxy_provenance(server, &p.handle).await;
-    remove_revert_body(p);
     if status_ok {
         server.emit_audit_ungated(
             AuditEvent::new(AuditKind::Revert)
@@ -2752,6 +4327,7 @@ pub(super) async fn finish_revert(
             at_unix: now_unix(),
             handle: Some(p.handle.clone()),
             session_fingerprint: p.session_fingerprint.clone(),
+            requester_principal: None,
             reason: Some(format!("rollback completed ({kind})")),
             status: Some("reverted".to_string()),
             behavior: None,
@@ -2774,6 +4350,7 @@ pub(super) async fn finish_revert(
             at_unix: now_unix(),
             handle: Some(p.handle.clone()),
             session_fingerprint: p.session_fingerprint.clone(),
+            requester_principal: None,
             reason: detail.clone(),
             status: Some("revert_failed".to_string()),
             behavior: None,
@@ -2790,9 +4367,182 @@ pub(super) async fn finish_revert(
     }
 }
 
+const MAX_PERSISTENCE_DIAGNOSTIC_CHARS: usize = 512;
+
+fn bounded_persistence_diagnostic(error: &str) -> String {
+    let redacted = guard::redact::redact_output_text(error);
+    let mut diagnostic = redacted
+        .chars()
+        .take(MAX_PERSISTENCE_DIAGNOSTIC_CHARS)
+        .collect::<String>();
+    if redacted.chars().count() > MAX_PERSISTENCE_DIAGNOSTIC_CHARS {
+        diagnostic.push('…');
+    }
+    diagnostic
+}
+
 #[cfg(test)]
 mod transactional_tests {
     use super::*;
+    use guard::gating::provisional::ProvisionalRegistry;
+
+    fn fixture_api_mutation(with_body: bool) -> guard::proxy::ApiMutation {
+        guard::proxy::ApiMutation {
+            label: "fixture mutation".to_string(),
+            revert: guard::proxy::HttpRevert {
+                method: "DELETE".to_string(),
+                path: "/fixture".to_string(),
+                body: with_body.then(|| b"{}".to_vec()),
+            },
+            revert_requires_uid_precondition: false,
+            create_provenance: None,
+            session_fingerprint: None,
+            session_revision: None,
+            secret_entitlements: None,
+            upstream_target: "https://fixture.invalid".to_string(),
+            upstream_identity: "fixture-identity".to_string(),
+        }
+    }
+
+    #[test]
+    fn held_recoverable_commands_name_the_available_containment_route() {
+        assert_eq!(
+            held_containment_guidance(
+                Some(Reversibility::Recoverable),
+                Some(4),
+                false,
+                false,
+                Some(120),
+            ),
+            Some(
+                "contain: re-run with --revert '<cmd>' --confirm-within 120 to execute under auto-revert"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            held_containment_guidance(Some(Reversibility::Recoverable), Some(4), true, true, None,),
+            Some(
+                "contain: re-run with --confirm-within 300 to execute under auto-revert"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn held_irreversible_or_high_risk_commands_do_not_promise_containment() {
+        assert_eq!(
+            held_containment_guidance(
+                Some(Reversibility::Irreversible),
+                Some(4),
+                false,
+                false,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            held_containment_guidance(Some(Reversibility::Recoverable), Some(9), true, true, None,),
+            None
+        );
+    }
+
+    fn api_session(owner: PrincipalKey) -> crate::session::SessionGrant {
+        crate::session::SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: false,
+            auto_amend: false,
+            granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(owner),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_revert_persists_session_owner_without_changing_daemon_identity() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let owner = PrincipalKey::from_uid(4242);
+        let token = "session-attribution";
+        assert!(server
+            .state
+            .sessions
+            .write()
+            .await
+            .grant(token.to_string(), api_session(owner.clone())));
+        let (session_fingerprint, session_revision) = {
+            let sessions = server.state.sessions.read().await;
+            let (fingerprint, _) = sessions.api_authority_for(token).unwrap();
+            let (revision, _) = sessions.authority_snapshot(token).unwrap();
+            (fingerprint, revision)
+        };
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: "fixture-endpoint".to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let mut mutation = fixture_api_mutation(false);
+        mutation.session_fingerprint = Some(session_fingerprint.clone());
+        mutation.session_revision = Some(session_revision);
+
+        let handle = guard::proxy::GateSink::arm_revert(&sink, mutation)
+            .await
+            .unwrap();
+        let staged = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            staged.principal,
+            Some(server.config.daemon_principal.clone())
+        );
+        assert_eq!(staged.requester_principal, Some(owner.clone()));
+        assert_eq!(staged.session_fingerprint, Some(session_fingerprint));
+
+        assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+        assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+        let armed = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            guard::proxy::GateSink::provisional_deadline(&sink, &handle).await,
+            Some(armed.deadline_unix)
+        );
+
+        let persisted = store
+            .load_provisionals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.handle == handle)
+            .unwrap();
+        assert_eq!(persisted.principal, Some(server.config.daemon_principal));
+        assert_eq!(persisted.requester_principal, Some(owner));
+        assert_eq!(persisted.session_fingerprint, armed.session_fingerprint);
+    }
 
     #[tokio::test]
     async fn api_revert_creation_failure_does_not_arm_memory_only_authority() {
@@ -2821,6 +4571,8 @@ mod transactional_tests {
                     path: "/fixture".to_string(),
                     body: None,
                 },
+                revert_requires_uid_precondition: false,
+                create_provenance: None,
                 session_fingerprint: None,
                 session_revision: None,
                 secret_entitlements: None,
@@ -2833,5 +4585,609 @@ mod transactional_tests {
         assert!(handle.is_none());
         assert!(server.state.provisional.read().await.list().is_empty());
         assert!(store.load_provisionals().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_revert_activation_failure_keeps_durable_operator_authority() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: "fixture-endpoint".to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(
+            &sink,
+            guard::proxy::ApiMutation {
+                label: "fixture mutation".to_string(),
+                revert: guard::proxy::HttpRevert {
+                    method: "DELETE".to_string(),
+                    path: "/fixture".to_string(),
+                    body: None,
+                },
+                revert_requires_uid_precondition: false,
+                create_provenance: None,
+                session_fingerprint: None,
+                session_revision: None,
+                secret_entitlements: None,
+                upstream_target: "https://fixture.invalid".to_string(),
+                upstream_identity: "fixture-identity".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+        store.fail_next_write_for_test();
+        assert!(!guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+        let live_after_failure = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert_eq!(live_after_failure.status, ProvisionalStatus::Dispatching);
+        assert!(!live_after_failure.forward_persistence_failed);
+        assert_eq!(
+            store
+                .load_provisionals()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.handle == handle)
+                .unwrap()
+                .status,
+            ProvisionalStatus::Dispatching
+        );
+        store.fail_next_write_for_test();
+        assert!(
+            !guard::proxy::GateSink::mark_revert_indeterminate(
+                &sink,
+                &handle,
+                "upstream handoff outcome is uncertain",
+                None,
+            )
+            .await
+        );
+        let still_live = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert_eq!(still_live.status, ProvisionalStatus::Dispatching);
+        assert!(!still_live.forward_persistence_failed);
+        assert_eq!(
+            store
+                .load_provisionals()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.handle == handle)
+                .unwrap()
+                .status,
+            ProvisionalStatus::Dispatching
+        );
+        assert!(
+            guard::proxy::GateSink::mark_revert_indeterminate(
+                &sink,
+                &handle,
+                "upstream handoff outcome is uncertain",
+                None,
+            )
+            .await
+        );
+
+        let live = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        assert!(live.forward_done);
+        assert_eq!(live.forward_exit, None);
+        assert_eq!(live.status, ProvisionalStatus::NeedsOperatorDecision);
+        let durable = store
+            .load_provisionals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.handle == handle)
+            .unwrap();
+        assert_eq!(durable.status, ProvisionalStatus::NeedsOperatorDecision);
+        assert_eq!(durable.forward_exit, None);
+        let mut registry = ProvisionalRegistry::new();
+        registry.insert(durable);
+        assert!(registry.begin_revert(&handle).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cleanup_resolution_persistence_does_not_hold_the_live_registry_writer() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store);
+        let endpoint = "fixture-resolve".to_string();
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: endpoint.clone(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+        assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+        assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+
+        let (reached, release) = install_api_containment_hook(&endpoint, "resolve_before_persist");
+        let resolving = tokio::spawn({
+            let sink = sink.clone();
+            let handle = handle.clone();
+            async move { guard::proxy::GateSink::resolve(&sink, &handle).await }
+        });
+        reached.acquire().await.unwrap().forget();
+        let unrelated_writer = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.state.provisional.write(),
+        )
+        .await
+        .expect("durable cleanup resolution must not retain the live registry writer");
+        drop(unrelated_writer);
+        release.add_permits(1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), resolving)
+                .await
+                .expect("cleanup resolution completes after persistence resumes")
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn provisional_transition_releases_live_registry_and_rejects_stale_publication() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store);
+        let endpoint = "fixture-transition";
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: endpoint.to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+        assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+        assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+        let expected = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        let mut staged = ProvisionalRegistry::new();
+        staged.insert(expected.clone());
+        let next = staged.confirm(&handle).unwrap();
+        let (reached, release) =
+            install_api_containment_hook(endpoint, "provisional_transition_before_persist");
+        let transition = tokio::spawn({
+            let server = server.clone();
+            let expected = expected.clone();
+            async move { persist_provisional_transition(&server, expected, next).await }
+        });
+        reached.acquire().await.unwrap().forget();
+
+        let mut live = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.state.provisional.write(),
+        )
+        .await
+        .expect("durable transition must not retain the live registry writer");
+        let mut newer = expected.clone();
+        newer.revert_detail = Some("newer live classification".to_string());
+        live.insert(newer.clone());
+        drop(live);
+
+        release.add_permits(1);
+        assert!(!transition.await.unwrap().unwrap());
+        assert_eq!(
+            server.state.provisional.read().await.get(&handle).cloned(),
+            Some(newer)
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_cancel_cannot_cross_a_committed_dispatch_transition() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let endpoint = "fixture-dispatch-cancel";
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: endpoint.to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+        let (committed, publish) =
+            install_api_containment_hook(endpoint, "provisional_transition_committed");
+        let dispatch = tokio::spawn({
+            let sink = sink.clone();
+            let handle = handle.clone();
+            async move { guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await }
+        });
+        committed.acquire().await.unwrap().forget();
+
+        let (cancel_started, cancel_entered) = tokio::sync::oneshot::channel();
+        let cancel = tokio::spawn({
+            let sink = sink.clone();
+            let handle = handle.clone();
+            async move {
+                let _ = cancel_started.send(());
+                guard::proxy::GateSink::cancel_staged_revert(&sink, &handle).await
+            }
+        });
+        cancel_entered.await.unwrap();
+        assert!(server
+            .provisional_transition_gate(&handle)
+            .try_lock()
+            .is_err());
+
+        publish.add_permits(1);
+        assert!(dispatch.await.unwrap());
+        assert!(!cancel.await.unwrap());
+        assert_eq!(
+            server
+                .state
+                .provisional
+                .read()
+                .await
+                .get(&handle)
+                .unwrap()
+                .status,
+            ProvisionalStatus::Dispatching
+        );
+        assert_eq!(
+            store
+                .load_provisionals()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.handle == handle)
+                .unwrap()
+                .status,
+            ProvisionalStatus::Dispatching
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_transition_for_one_handle_does_not_serialize_an_unrelated_handle() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        server.state.session_store = Some(
+            crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+                .await
+                .unwrap(),
+        );
+        let endpoint = "fixture-per-handle-transition";
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: endpoint.to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let first = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+        let second = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+        let (committed, release) =
+            install_api_containment_hook(endpoint, "provisional_transition_committed");
+        let paused = tokio::spawn({
+            let sink = sink.clone();
+            async move { guard::proxy::GateSink::mark_revert_dispatching(&sink, &first).await }
+        });
+        committed.acquire().await.unwrap().forget();
+
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            guard::proxy::GateSink::mark_revert_dispatching(&sink, &second),
+        )
+        .await
+        .expect("unrelated transition must not wait for the paused handle"));
+
+        release.add_permits(1);
+        assert!(paused.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_staged_cleanup_is_visible_and_retryable() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: "fixture-cleanup-retry".to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+
+        store.fail_next_provisional_delete_for_test();
+        assert!(!guard::proxy::GateSink::cancel_staged_revert(&sink, &handle).await);
+        let visible = server.state.provisional.read().await.visible_list();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].forward_outcome(), "cleanup_pending");
+        assert_eq!(store.load_provisionals().await.unwrap(), visible);
+
+        assert!(guard::proxy::GateSink::cancel_staged_revert(&sink, &handle).await);
+        assert!(server.state.provisional.read().await.list().is_empty());
+        assert!(store.load_provisionals().await.unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_body_deletion_failure_retains_a_visible_cleanup_owner() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: "fixture-body-cleanup-retry".to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(true))
+            .await
+            .unwrap();
+        let body = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .and_then(|row| row.api_revert.as_ref())
+            .and_then(|revert| revert.body_file.clone())
+            .unwrap();
+        std::fs::remove_file(&body).unwrap();
+        std::fs::create_dir(&body).unwrap();
+
+        assert!(!guard::proxy::GateSink::cancel_staged_revert(&sink, &handle).await);
+        let durable = store.load_provisionals().await.unwrap();
+        assert_eq!(durable.len(), 1);
+        assert_eq!(durable[0].forward_outcome(), "cleanup_pending");
+
+        std::fs::remove_dir(&body).unwrap();
+        assert!(guard::proxy::GateSink::cancel_staged_revert(&sink, &handle).await);
+        assert!(store.load_provisionals().await.unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_revert_body_cleanup_failure_is_durable_and_retryable() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: "fixture-terminal-body-cleanup".to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(true))
+            .await
+            .unwrap();
+        assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+        assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+        let expected = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        let body = expected
+            .api_revert
+            .as_ref()
+            .and_then(|revert| revert.body_file.clone())
+            .unwrap();
+        std::fs::remove_file(&body).unwrap();
+        std::fs::create_dir(&body).unwrap();
+        let mut staged = ProvisionalRegistry::new();
+        staged.insert(expected.clone());
+        let confirmed = staged.confirm(&handle).unwrap();
+
+        assert!(
+            persist_terminal_provisional_with_body_cleanup(&server, expected, confirmed,)
+                .await
+                .unwrap()
+        );
+        let pending = store.load_provisionals().await.unwrap().remove(0);
+        assert_eq!(pending.status, ProvisionalStatus::Confirmed);
+        assert!(pending
+            .revert_detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with(REVERT_BODY_CLEANUP_PREFIX)));
+
+        std::fs::remove_dir(&body).unwrap();
+        assert!(converge_terminal_revert_body_cleanup(&server, &pending).await);
+        let cleaned = store.load_provisionals().await.unwrap().remove(0);
+        assert!(cleaned
+            .api_revert
+            .as_ref()
+            .is_some_and(|revert| revert.body_file.is_none()));
+        assert!(cleaned.revert_detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_api_revert_staging_finishes_cleanup_after_body_and_publication() {
+        for phase in ["body_written", "published"] {
+            let mut server = crate::server::tests::config_for_proposal_test();
+            let state = tempfile::tempdir().unwrap();
+            let store = crate::session_store::SessionStore::open(
+                state.path().join(format!("{phase}.db")),
+                3600,
+            )
+            .await
+            .unwrap();
+            server.state.session_store = Some(store.clone());
+            let endpoint = format!("fixture-{phase}");
+            let sink = DaemonGateSink {
+                server: server.clone(),
+                endpoint: endpoint.clone(),
+                protocol: "fixture-protocol".to_string(),
+                snapshot_dir: state.path().to_path_buf(),
+                snapshot_dir_safe: true,
+                window_secs: 60,
+            };
+            let (reached, release) = install_api_containment_hook(&endpoint, phase);
+            let (cleanup_completed, cleanup_release) =
+                install_api_containment_hook(&endpoint, "staging_cleanup_completed");
+            let task = tokio::spawn(async move {
+                guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(true)).await
+            });
+            reached.acquire().await.unwrap().forget();
+            task.abort();
+            release.add_permits(1);
+            cleanup_completed.acquire().await.unwrap().forget();
+            assert!(server.state.provisional.read().await.list().is_empty());
+            assert!(store.load_provisionals().await.unwrap().is_empty());
+            let body_count = std::fs::read_dir(state.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("api-revert-")
+                })
+                .count();
+            assert_eq!(body_count, 0);
+            cleanup_release.add_permits(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_api_revert_activation_finishes_durable_live_publication() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store.clone());
+        let endpoint = "fixture-activation";
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: endpoint.to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+        assert!(
+            guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await,
+            "staged mutation advances to the dispatch boundary"
+        );
+        let (reached, release) = install_api_containment_hook(endpoint, "activation_committed");
+        let (published, published_release) =
+            install_api_containment_hook(endpoint, "activation_published");
+        let sink_task = sink.clone();
+        let handle_task = handle.clone();
+        let task = tokio::spawn(async move {
+            guard::proxy::GateSink::mark_revert_forwarded(&sink_task, &handle_task, None).await
+        });
+        reached.acquire().await.unwrap().forget();
+        task.abort();
+        release.add_permits(1);
+        published.acquire().await.unwrap().forget();
+        let live = server.state.provisional.read().await.get(&handle).cloned();
+        let durable = store
+            .load_provisionals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.handle == handle);
+        assert!(live.is_some_and(|row| row.status == ProvisionalStatus::Armed));
+        assert!(durable.is_some_and(|row| row.status == ProvisionalStatus::Armed));
+        published_release.add_permits(1);
+    }
+
+    #[test]
+    fn created_resource_rollback_is_bound_to_the_original_uid() {
+        let original_uid = "original-resource-uid";
+        let replacement_uid = "replacement-resource-uid";
+        let body = bind_created_resource_precondition(
+            Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "kind": "DeleteOptions",
+                    "apiVersion": "v1",
+                    "propagationPolicy": "Background",
+                }))
+                .unwrap(),
+            ),
+            original_uid,
+        )
+        .unwrap();
+        let options: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(options["preconditions"]["uid"].as_str(), Some(original_uid));
+        assert_ne!(
+            options["preconditions"]["uid"].as_str(),
+            Some(replacement_uid)
+        );
     }
 }

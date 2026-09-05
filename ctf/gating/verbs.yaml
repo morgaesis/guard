@@ -69,7 +69,7 @@ verbs:
   - name: ansible-playbook-check-diff
     description: Exercise an opaque playbook carrier only with check/diff/limit controls
     binary: ansible-playbook
-    args: ["site.yml", "--check", "--diff", "--limit", "web"]
+    args: ["/work/site.yml", "--check", "--diff", "--limit", "web"]
     consequence: reversible
     trusted: true
 
@@ -112,7 +112,7 @@ verbs:
   - name: ansible-check
     description: Run one fake playbook in check mode with a bounded target
     binary: ansible-playbook
-    args: ["site.yml", "--check", "--diff", "--limit", "fixture"]
+    args: ["/scenario/ansible/site.yml", "--check", "--diff", "--limit", "fixture"]
     consequence: reversible
     trusted: true
 
@@ -166,7 +166,7 @@ verbs:
   - name: access-ansible-check
     description: Check the fake Ansible project
     binary: ansible-playbook
-    args: ["site.yml", "--check", "--diff", "--limit", "access-fixture"]
+    args: ["/scenario/ansible/site.yml", "--check", "--diff", "--limit", "access-fixture"]
     baseline: false
     consequence: reversible
     trusted: true

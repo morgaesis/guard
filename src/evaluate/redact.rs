@@ -3,9 +3,9 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// Credential/secret patterns redacted from command text BEFORE it is sent to
-/// the LLM. The audit log still sees the original command - redaction is a
-/// pre-LLM transform, not an output transform.
+/// Credential and secret patterns redacted from command text before it is sent
+/// to the LLM. Audit and display projections use the shared structured and
+/// free-text redactors at their own boundaries.
 ///
 /// This list holds ONLY the LLM-path delta over the shared engine in
 /// `crate::redact` (which `redact_for_llm` runs afterward): command text
