@@ -21,8 +21,21 @@ COPY config ./config
 COPY tests ./tests
 COPY examples ./examples
 
-RUN cargo test --release --locked --quiet --no-run \
-    && install -m 0755 target/release/guard /usr/local/bin/guard
+# The registry, git checkouts, and target directory live in build cache mounts
+# so a rebuild after a source change reuses every unchanged dependency instead
+# of compiling the whole tree again. The build runs in /src/target itself
+# because the test binaries bake that path in at compile time through
+# CARGO_BIN_EXE_guard. The finished target is copied into the image, and
+# /src/target then points at the copy, because `run.sh test` and the
+# synthetic-user scenarios run the compiled test binaries from /src/target at
+# container run time, where no cache mount exists.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo test --release --locked --quiet --no-run \
+    && install -m 0755 target/release/guard /usr/local/bin/guard \
+    && cp -a /src/target /src/target-image
+RUN rm -rf /src/target && ln -s /src/target-image /src/target
 
 # Three distinct identities: the daemon/operator (uid 1000) and two agents
 # (uids 1001 and 1002). Peer credentials keep their authority separate.
