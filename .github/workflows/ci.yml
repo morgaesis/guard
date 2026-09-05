@@ -30,58 +30,37 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Test release integrity logic
+      - name: Test release publication
         if: runner.os == 'Linux'
         shell: bash
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "guard") | .version')
-          verify_tag() { test "$1" = "v${version}"; }
-          verify_tag "v${version}"
-          if verify_tag "v0.0.0"; then
-            echo "mismatched release tag was accepted"
-            exit 1
-          fi
-          mkdir -p /tmp/guard-release-test/a /tmp/guard-release-test/b /tmp/guard-release-test/c
-          printf one > /tmp/guard-release-test/a/one.tar.gz
-          printf two > /tmp/guard-release-test/b/two.tar.gz
-          printf sbom > /tmp/guard-release-test/c/three.cdx.json
-          printf skip > /tmp/guard-release-test/c/notes.txt
-          find /tmp/guard-release-test -type f \( -name '*.tar.gz' -o -name '*.cdx.json' \) -print \
-            | LC_ALL=C sort | while IFS= read -r asset; do
-            checksum=$(sha256sum "$asset" | cut -d ' ' -f 1)
-            printf '%s  %s\n' "$checksum" "$(basename "$asset")"
-          done > /tmp/guard-release-test/SHA256SUMS
-          test -s /tmp/guard-release-test/SHA256SUMS
-          test "$(wc -l < /tmp/guard-release-test/SHA256SUMS)" -eq 3
-          if grep -q 'notes.txt' /tmp/guard-release-test/SHA256SUMS; then
-            echo "checksum manifest included an unexpected file type"
-            exit 1
-          fi
-          release_job=$(sed -n '/^  release:/,$p' .github/workflows/publish-release.yml)
-          checkout_line=$(awk '/uses: actions\/checkout@/ { print NR; exit }' <<< "$release_job")
-          create_line=$(awk '/name: Create Release/ { print NR; exit }' <<< "$release_job")
-          test -n "$checkout_line"
-          test -n "$create_line"
-          test "$checkout_line" -lt "$create_line"
-          checkout_block=$(awk '/uses: actions\/checkout@/ { found = 1 } found { print; if (++lines == 5) exit }' <<< "$release_job")
-          grep -q 'persist-credentials: false' <<< "$checkout_block"
-          grep -q 'fetch-depth: 0' <<< "$checkout_block"
-          release_validation=$(cat .github/workflows/release.yml)
-          grep -q '^  actions: read$' <<< "$release_validation"
-          grep -q 'timeout 1800s gh run watch' <<< "$release_validation"
-          publish_validation=$(sed -n '/^  validate:/,/^  release:/p' .github/workflows/publish-release.yml)
-          grep -q 'actions: read' <<< "$publish_validation"
-          mkdir /tmp/guard-release-test/verify
-          cp /tmp/guard-release-test/a/*.tar.gz /tmp/guard-release-test/b/*.tar.gz /tmp/guard-release-test/verify/
-          cp /tmp/guard-release-test/c/*.cdx.json /tmp/guard-release-test/verify/
-          cp /tmp/guard-release-test/SHA256SUMS /tmp/guard-release-test/verify/
-          (cd /tmp/guard-release-test/verify && sha256sum --check SHA256SUMS)
-          rm -rf /tmp/guard-release-test
+        run: scripts/test-publish-release.sh
 
-      - name: Exercise packaged systemd argument expansion
+      - name: Test release archive comparison diagnostics
         if: runner.os == 'Linux'
         shell: bash
-        run: sudo ./deployment/systemd/test-guard-service-expansion.sh
+        run: scripts/build-release-archive.sh --test-archive-comparison
+
+      - name: Test systemd integration invocation contract
+        if: runner.os == 'Linux'
+        shell: bash
+        run: ./deployment/systemd/test-guard-service-expansion.sh --self-test
+
+      - name: Verify systemd unit files
+        if: runner.os == 'Linux'
+        shell: bash
+        run: ./deployment/systemd/test-guard-service-expansion.sh --verify-only
+
+      - name: Fault-inject Unix upgrade and rollback
+        if: runner.os == 'Linux'
+        shell: bash
+        run: ./deployment/systemd/test-upgrade-guard.sh
+
+      - name: Test Windows installer contract
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0 -ErrorAction Stop
+          Invoke-Pester -Path deployment/windows/install-guard.Tests.ps1 -CI
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1.17.0
@@ -113,23 +92,41 @@ jobs:
           fi
 
       - name: Clippy lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test --locked --all-features -- --test-threads=1
 
   adversarial_gate:
-    name: Credential-free adversarial gate
+    name: Fixed-identity adversarial gate
     runs-on: ubuntu-latest
+    # The harness also bounds its build and attack phases so this remains a
+    # final containment boundary rather than the usual failure path.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Run isolated adversarial gate
         shell: bash
+        env:
+          CTF_BUILD_TIMEOUT_SECS: "1200"
+          CTF_ATTACK_TIMEOUT_SECS: "300"
+          CTF_CLEANUP_TIMEOUT_SECS: "20"
+          CTF_DIAGNOSTIC_TIMEOUT_SECS: "5"
+          CTF_DIAGNOSTIC_DIR: ${{ runner.temp }}/guard-adversarial-diagnostics
         run: |
           python3 ./ctf/egress-proxy.py --self-test
+          ./ctf/gating/run.sh static
           ./ctf/gating/run.sh attack
+      - name: Upload sanitized adversarial diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: fixed-identity-adversarial-diagnostics
+          path: ${{ runner.temp }}/guard-adversarial-diagnostics/summary.txt
+          if-no-files-found: warn
+          retention-days: 7
 
   synthetic_user:
     name: Isolated synthetic-user catalog
@@ -149,13 +146,27 @@ jobs:
         env:
           CONTAINER_ENGINE: podman
         run: ./ctf/gating/run.sh synthetic-user
+      - name: Upload synthetic-user diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: synthetic-user-diagnostics
+          path: |
+            .cache/synthetic-user/status.md
+            .cache/synthetic-user/latest-run
+            .cache/synthetic-user/runs/*/manifest.md
+            .cache/synthetic-user/runs/*/source-files.sha256
+            .cache/synthetic-user/runs/*/scenarios/*.md
+          if-no-files-found: warn
+          retention-days: 7
 
   release_validation:
     name: Required release package validation
     uses: ./.github/workflows/release.yml
     permissions:
-      actions: read
-      contents: read
+      actions: read  # Let release validation inspect mainline workflow runs.
+      checks: read  # Let release validation verify required check results.
+      contents: read  # Let release validation inspect signed refs and commits.
 
   # Branch protection requires a status check literally named "Test & Lint".
   # The matrix job above reports as "Test & Lint (ubuntu-latest)" / "Test &
@@ -182,7 +193,7 @@ jobs:
             exit 1
           fi
           if [ "$ADVERSARIAL_RESULT" != "success" ]; then
-            echo "Credential-free adversarial gate did not succeed: $ADVERSARIAL_RESULT"
+            echo "Fixed-identity adversarial gate did not succeed: $ADVERSARIAL_RESULT"
             exit 1
           fi
           if [ "$SYNTHETIC_USER_RESULT" != "success" ]; then
@@ -198,29 +209,34 @@ jobs:
             exit 1
           fi
 
+  ci_build_targets:
+    name: Resolve CI build targets
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Extend release targets with the CI-only macOS build
+        id: targets
+        shell: bash
+        run: |
+          matrix=$(bash scripts/build-release-archive.sh --matrix-json | jq -c \
+            '.include += [{
+              target: "aarch64-apple-darwin",
+              os: "macos-latest",
+              artifact_name: "guard",
+              use_cross: false
+            }]')
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+
   build_dry_run:
     name: Build (${{ matrix.target }})
-    needs: test
+    needs: [test, ci_build_targets]
     runs-on: ${{ matrix.os }}
     strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            binary: guard
-          # Dry-runs the cross-compiled release target so aarch64 breakage
-          # surfaces on pull requests instead of at tag time. Mirrors the
-          # cross usage in release.yml.
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            binary: guard
-            use_cross: true
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            binary: guard
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            binary: guard.exe
+      matrix: ${{ fromJSON(needs.ci_build_targets.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -253,7 +269,7 @@ jobs:
         id: binary-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
           key: ${{ steps.build-environment.outputs.cache_key }}
 
       - name: Rust Cache
@@ -264,6 +280,14 @@ jobs:
           cache-workspace-crates: true
           save-if: ${{ github.event_name != 'pull_request' }}
 
+      - name: Verify release builds use the lockfile
+        shell: bash
+        run: |
+          if rg --pcre2 '^\s+(?:cargo|cross) build(?![^\n]*--locked)(?:\s|$)' .github/workflows/release.yml .github/workflows/ci.yml; then
+            echo 'release build command omits --locked' >&2
+            exit 1
+          fi
+
       - name: Install Cross
         if: matrix.use_cross && steps.binary-cache.outputs.cache-hit != 'true'
         run: cargo install cross --version 0.2.5 --locked
@@ -273,14 +297,14 @@ jobs:
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
-        run: cargo build --release --target "$BUILD_TARGET"
+        run: cargo build --locked --release --target "$BUILD_TARGET"
 
       - name: Build (Cross)
         if: matrix.use_cross && steps.binary-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
-        run: cross build --release --target "$BUILD_TARGET"
+        run: cross build --locked --release --target "$BUILD_TARGET"
 
       - name: Save exact binary
         if: >-
@@ -289,13 +313,13 @@ jobs:
           github.ref == 'refs/heads/main'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
           key: ${{ steps.binary-cache.outputs.cache-primary-key }}
 
       - name: Verify binary
         shell: bash
         env:
-          BINARY: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          BINARY: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
           USE_CROSS: ${{ matrix.use_cross }}
         run: |
           if [ "$USE_CROSS" = "true" ]; then

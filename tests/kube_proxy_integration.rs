@@ -21,6 +21,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde_json::{json, Value};
 use tokio_rustls::rustls::{self, pki_types};
+use tokio_rustls::TlsAcceptor;
 
 use guard::gating::Reversibility;
 use guard::proxy::{
@@ -1140,8 +1141,7 @@ async fn start_arbitration_proxy(
     upstream_base: &str,
     mode: Option<ApiListenerMode>,
 ) -> (String, reqwest::Client) {
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(upstream_base), None).expect("upstream");
+    let upstream = upstream_for_mock(upstream_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml("default: allow\n").unwrap();
@@ -1152,16 +1152,18 @@ async fn start_arbitration_proxy(
     }
     let proxy = Arc::new(proxy);
     proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    let headers = proxy_transport_headers(&proxy);
     tokio::spawn(proxy.serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .default_headers(headers)
         .build()
         .unwrap();
     (format!("https://{listen}"), client)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn anonymous_default_listener_cannot_mutate_under_allow_policy() {
+async fn transport_authenticated_default_listener_cannot_mutate_under_allow_policy() {
     let (upstream, mock) = spawn_arbitration_mock().await;
     let (base, client) = start_arbitration_proxy(&upstream, None).await;
 
@@ -1325,8 +1327,7 @@ async fn held_kubernetes_mutations_approve_the_exact_guarded_bytes() {
     ];
     for (method, content_type, body) in cases {
         let (upstream, mock) = spawn_arbitration_mock().await;
-        let upstream =
-            Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream), None).expect("upstream");
+        let upstream = upstream_for_mock(&upstream).await;
         let tls = ProxyTls::generate().expect("tls");
         let ca_pem = tls.ca_pem().to_string();
         let policy = ApiPolicy::from_yaml(
@@ -1556,8 +1557,7 @@ async fn rarity_and_coverage_holds_bind_every_guarded_mutation_byte() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn object_change_after_hold_cannot_rewrite_approved_mutation_bytes() {
     let (upstream, mock) = spawn_arbitration_mock().await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream), None).expect("upstream");
+    let upstream = upstream_for_mock(&upstream).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(
@@ -1619,8 +1619,7 @@ async fn policy_reload_during_arbitration_prevents_mutable_forwarding() {
     let release = Arc::new(tokio::sync::Notify::new());
     let (upstream_base, mock) =
         spawn_blocking_arbitration_mock(started.clone(), release.clone()).await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&upstream_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let temp = tempfile::tempdir().unwrap();
@@ -1686,8 +1685,7 @@ async fn policy_reload_during_arbitration_prevents_mutable_forwarding() {
 async fn read_handoff_holds_authority_until_upstream_response_headers() {
     let (upstream_base, read_reached, release_read) =
         spawn_policy_barrier_upstream(hyper::Method::GET).await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&upstream_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let temp = tempfile::tempdir().unwrap();
@@ -1749,8 +1747,7 @@ async fn read_handoff_holds_authority_until_upstream_response_headers() {
 async fn evaluated_read_handoff_holds_authority_until_upstream_response_headers() {
     let (upstream_base, read_reached, release_read) =
         spawn_policy_barrier_upstream(hyper::Method::GET).await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&upstream_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let temp = tempfile::tempdir().unwrap();
@@ -1818,8 +1815,7 @@ async fn evaluated_read_handoff_holds_authority_until_upstream_response_headers(
 async fn read_does_not_queue_behind_reload_waiting_for_a_stalled_mutation() {
     let (upstream_base, mutation_reached, release_mutation) =
         spawn_policy_barrier_upstream(hyper::Method::POST).await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&upstream_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let temp = tempfile::tempdir().unwrap();
@@ -1882,8 +1878,7 @@ async fn read_does_not_queue_behind_reload_waiting_for_a_stalled_mutation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn final_denial_releases_policy_authority_before_staged_cleanup() {
     let (upstream_base, _) = spawn_counting_upstream().await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&upstream_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let temp = tempfile::tempdir().unwrap();
@@ -1940,8 +1935,7 @@ async fn final_denial_releases_policy_authority_before_staged_cleanup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ipv6_loopback_listener_serves_with_matching_tls_identity() {
     let mock_base = spawn_mock_upstream().await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let listener = tokio::net::TcpListener::bind("[::1]:0")
@@ -1956,11 +1950,22 @@ async fn ipv6_loopback_listener_serves_with_matching_tls_identity() {
         None,
     ));
     assert_eq!(proxy.proxy_url(), format!("https://{listen}"));
+    let brokered: Value = serde_yaml_ng::from_str(&proxy.brokered_kubeconfig()).unwrap();
+    let transport_bearer = brokered["users"][0]["user"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     tokio::spawn(proxy.serve_on(listener));
 
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {transport_bearer}").parse().unwrap(),
+    );
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .no_proxy()
+        .default_headers(headers)
         .build()
         .unwrap();
     let response = client
@@ -1982,6 +1987,25 @@ async fn reserve_listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
     (listener, addr)
 }
 
+fn proxy_transport_bearer(proxy: &ApiProxy) -> String {
+    let brokered: Value = serde_yaml_ng::from_str(&proxy.brokered_kubeconfig()).unwrap();
+    brokered["users"][0]["user"]["token"]
+        .as_str()
+        .expect("generated brokered kubeconfig carries a transport bearer")
+        .to_string()
+}
+
+fn proxy_transport_headers(proxy: &ApiProxy) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {}", proxy_transport_bearer(proxy))
+            .parse()
+            .unwrap(),
+    );
+    headers
+}
+
 /// Wait for the proxy's reload generation signal until `yaml` is published.
 async fn wait_for_policy_reload(proxy: &ApiProxy, yaml: &str) {
     let expected = ApiPolicy::from_yaml(yaml)
@@ -1998,10 +2022,57 @@ async fn wait_for_policy_reload(proxy: &ApiProxy, yaml: &str) {
     .expect("policy reload was not observed within the bounded deadline");
 }
 
-fn kubeconfig_for(mock_base: &str) -> String {
+fn kubeconfig_for(server: &str, ca_data: &str, bearer: Option<&str>) -> String {
+    let user = bearer.map_or_else(
+        || "{}".to_string(),
+        |value| format!("{{token: {}}}", serde_json::to_string(value).unwrap()),
+    );
     format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster:\n      server: \"{server}\"\n      certificate-authority-data: \"{ca_data}\"\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {user}\n"
     )
+}
+
+/// Put the test-only plaintext handler behind the same authenticated TLS
+/// boundary that Guard requires from a Kubernetes API server.
+async fn upstream_for_mock(mock_base: &str) -> Upstream {
+    upstream_for_mock_with_bearer(mock_base, None).await
+}
+
+async fn upstream_for_mock_with_bearer(mock_base: &str, bearer: Option<&str>) -> Upstream {
+    let target = mock_base
+        .strip_prefix("http://")
+        .expect("mock upstream uses a private plaintext listener")
+        .parse::<std::net::SocketAddr>()
+        .expect("mock upstream address");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind TLS mock upstream");
+    let listen = listener.local_addr().expect("TLS mock upstream address");
+    let tls = ProxyTls::generate().expect("mock upstream TLS");
+    let ca_data = tls.ca_data_b64();
+    let mut server_config = (*tls.server_config()).clone();
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(_) => continue,
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut client) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {
+                    return;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+    let kubeconfig = kubeconfig_for(&format!("https://{listen}"), &ca_data, bearer);
+    Upstream::from_kubeconfig_str(&kubeconfig, None).expect("TLS mock upstream")
 }
 
 async fn start_proxy_with(
@@ -2102,8 +2173,7 @@ async fn start_proxy_with_limits(
     body_timeout: Duration,
     body_limit: Option<usize>,
 ) -> (String, reqwest::Client) {
-    let kubeconfig = kubeconfig_for(&mock_base);
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
@@ -3333,12 +3403,8 @@ rules:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_gates_redacts_and_forwards() {
-    // Upstream: the mock apiserver over plain HTTP (no creds needed).
     let mock_base = spawn_mock_upstream().await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
-    );
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
 
     // Proxy: ephemeral CA, shipped example policy.
     let tls = ProxyTls::generate().expect("tls");
@@ -3351,16 +3417,43 @@ async fn proxy_gates_redacts_and_forwards() {
     );
     proxy.attach_session_sink(Arc::new(LiveSessionSink));
 
-    // The brokered config must point at the proxy and carry no credential.
+    // The brokered config points at the proxy and carries only its generated
+    // transport bearer, never the upstream credential.
     let brokered = proxy.brokered_kubeconfig();
-    guard::proxy::validate_brokered_kubeconfig(&brokered).expect("brokered config credential-free");
+    guard::proxy::validate_brokered_kubeconfig(&brokered).expect("valid brokered config");
     assert!(brokered.contains(&format!("https://{listen}")));
+    let brokered_document: Value = serde_yaml_ng::from_str(&brokered).unwrap();
+    let transport_bearer = brokered_document["users"][0]["user"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     tokio::spawn(proxy.clone().serve_on(listener));
 
     let base = format!("https://{listen}");
+    let unauthenticated_client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let unauthenticated = unauthenticated_client
+        .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated.status(),
+        403,
+        "loopback TLS without a proxy or session bearer must fail closed"
+    );
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {transport_bearer}").parse().unwrap(),
+    );
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .default_headers(headers)
         .build()
         .unwrap();
 
@@ -3473,8 +3566,7 @@ async fn proxy_gates_redacts_and_forwards() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http2_multiplexes_session_authentication_failures_independently() {
     let mock_base = spawn_mock_upstream().await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let (listener, listen) = reserve_listener().await;
@@ -3486,6 +3578,7 @@ async fn http2_multiplexes_session_authentication_failures_independently() {
         None,
     ));
     proxy.attach_session_sink(Arc::new(H2SessionSink));
+    let transport_bearer = proxy_transport_bearer(&proxy);
     tokio::spawn(proxy.serve_on(listener));
 
     let ca_der = base64::engine::general_purpose::STANDARD
@@ -3529,6 +3622,7 @@ async fn http2_multiplexes_session_authentication_failures_independently() {
             .unwrap(),
         Request::builder()
             .uri(&authority)
+            .header("authorization", format!("Bearer {transport_bearer}"))
             .body(Full::new(Bytes::new()))
             .unwrap(),
         Request::builder()
@@ -4274,10 +4368,8 @@ async fn spawn_write_mock_with_observation() -> (String, CreateProvenance) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_arms_auto_revert_for_writes() {
     let mock_base = spawn_write_mock().await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
-    );
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
+    let upstream_target = upstream.base().to_string();
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
@@ -4368,7 +4460,7 @@ async fn proxy_arms_auto_revert_for_writes() {
     let calls = sink.calls.lock().unwrap();
     assert!(calls.iter().all(|call| {
         call.session_fingerprint.as_deref() == Some("session-fingerprint")
-            && call.upstream_target == mock_base
+            && call.upstream_target == upstream_target
             && call.upstream_identity.len() == 64
     }));
     let resource_uids = sink.resource_uids.lock().unwrap();
@@ -4458,10 +4550,7 @@ async fn spawn_header_echo_upstream() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_denies_subresource_and_identity_override_headers() {
     let mock_base = spawn_header_echo_upstream().await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
-    );
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
@@ -4469,12 +4558,14 @@ async fn proxy_denies_subresource_and_identity_override_headers() {
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
     let session_sink = RecordingSessionSink::default();
     proxy.attach_session_sink(Arc::new(session_sink.clone()));
+    let headers = proxy_transport_headers(&proxy);
 
     tokio::spawn(proxy.clone().serve_on(listener));
 
     let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .default_headers(headers)
         .build()
         .unwrap();
 
@@ -4552,10 +4643,8 @@ async fn proxy_denies_subresource_and_identity_override_headers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guard_session_bearer_is_validated_and_never_forwarded() {
     let mock_base = spawn_header_echo_upstream().await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{token: upstream-only}}\n"
-    );
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream_credential = format!("fixture-{:032x}", rand::random::<u128>());
+    let upstream = upstream_for_mock_with_bearer(&mock_base, Some(&upstream_credential)).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).unwrap();
@@ -4598,7 +4687,7 @@ async fn guard_session_bearer_is_validated_and_never_forwarded() {
         "the upstream credential must be injected but redacted from the response"
     );
     assert!(!body.to_string().contains("live-session"));
-    assert!(!body.to_string().contains("upstream-only"));
+    assert!(!body.to_string().contains(&upstream_credential));
 
     let invalid = client
         .get(format!("{base}/api/v1/namespaces/dev/pods"))
@@ -4612,7 +4701,7 @@ async fn guard_session_bearer_is_validated_and_never_forwarded() {
         "unknown or expired sessions fail closed"
     );
 
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock_with_bearer(&mock_base, Some(&upstream_credential)).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).unwrap();
@@ -4642,8 +4731,7 @@ async fn guard_session_bearer_is_validated_and_never_forwarded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readonly_listener_requires_session_override_and_keeps_protocol_denies() {
     let mock_base = spawn_mock_upstream().await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml("default: allow\n").unwrap();
@@ -4655,9 +4743,11 @@ async fn readonly_listener_requires_session_override_and_keeps_protocol_denies()
     let judge = RecordingJudge::new(vec![judge_allow(Some(1), Some(Reversibility::Reversible))]);
     proxy.attach_judge(Arc::new(judge.clone())).await;
     proxy.attach_session_sink(Arc::new(LiveSessionSink));
+    let headers = proxy_transport_headers(&proxy);
     tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .default_headers(headers)
         .build()
         .unwrap();
     let base = format!("https://{listen}");
@@ -4699,8 +4789,7 @@ async fn readonly_listener_requires_session_override_and_keeps_protocol_denies()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issued_session_modes_enforce_api_boundary_without_prompt_bypass() {
     let mock_base = spawn_mock_upstream().await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(
@@ -4788,8 +4877,7 @@ async fn issued_session_modes_enforce_api_boundary_without_prompt_bypass() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_expansion_is_revalidated_immediately_before_forward() {
     let mock_base = spawn_write_mock().await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml("default: allow\n").unwrap();
@@ -4848,8 +4936,7 @@ async fn session_expansion_is_revalidated_immediately_before_forward() {
 async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
     let writes = Arc::new(AtomicUsize::new(0));
     let mock_base = spawn_counted_write_mock(writes.clone()).await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let temp = tempfile::tempdir().unwrap();
@@ -4963,8 +5050,7 @@ async fn direct_allow_revalidates_session_after_delayed_snapshot() {
     let writes = Arc::new(AtomicUsize::new(0));
     let mock_base =
         spawn_blocking_snapshot_mock(started.clone(), release.clone(), writes.clone()).await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(
@@ -5023,8 +5109,7 @@ async fn assert_direct_allow_reload_fails_closed(next_action: &str, next_intent:
     let writes = Arc::new(AtomicUsize::new(0));
     let mock_base =
         spawn_blocking_snapshot_mock(started.clone(), release.clone(), writes.clone()).await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let temp = tempfile::tempdir().unwrap();
@@ -5106,10 +5191,8 @@ async fn proxy_self_access_review_carries_upstream_credential() {
     let mock_base = spawn_header_echo_upstream().await;
     // The operator kubeconfig carries a bearer token; the proxy injects it on
     // every forwarded request, including the self-access review.
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{token: operator-secret-token}}\n"
-    );
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream_credential = format!("fixture-{:032x}", rand::random::<u128>());
+    let upstream = upstream_for_mock_with_bearer(&mock_base, Some(&upstream_credential)).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     // Allow the review create (cluster-scoped) so it reaches the upstream.
@@ -5423,8 +5506,7 @@ async fn start_provenance_proxy_with_body_timeout(
     session_sink: Option<Arc<dyn ApiSessionSink>>,
     body_timeout: Duration,
 ) -> (SingleConnectionClient, RecordingSink) {
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).unwrap();
@@ -5761,8 +5843,7 @@ async fn contained_delete_body_stall_is_bounded_and_retains_revert() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn created_provenance_never_overrides_an_explicit_policy_deny() {
     let mock_base = spawn_create_delete_mock().await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(
@@ -5848,21 +5929,20 @@ async fn spawn_non_json_secret_mock() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_fails_closed_on_non_json_secret_response() {
     let mock_base = spawn_non_json_secret_mock().await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
-    );
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let headers = proxy_transport_headers(&proxy);
 
     tokio::spawn(proxy.clone().serve_on(listener));
 
     let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .default_headers(headers)
         .build()
         .unwrap();
 
@@ -5932,10 +6012,7 @@ async fn spawn_eviction_mock() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_eviction_does_not_launder_a_later_delete() {
     let mock_base = spawn_eviction_mock().await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
-    );
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     // Allow the eviction subresource in dev, but hold plain pod deletes.
@@ -6062,21 +6139,20 @@ async fn spawn_helm_release_mock() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_rejects_helm_release_secret_instead_of_returning_false_empty_state() {
     let mock_base = spawn_helm_release_mock().await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
-    );
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let headers = proxy_transport_headers(&proxy);
 
     tokio::spawn(proxy.clone().serve_on(listener));
 
     let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .default_headers(headers)
         .build()
         .unwrap();
 
@@ -6091,7 +6167,9 @@ async fn proxy_rejects_helm_release_secret_instead_of_returning_false_empty_stat
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["status"], "Failure");
     assert_eq!(v["reason"], "Forbidden");
-    assert!(v["message"].as_str().unwrap().contains("typed Helm verb"));
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("local Helm execution is not supported"));
+    assert!(message.contains("non-Helm typed Kubernetes operation"));
     assert!(!v.to_string().contains("SDRzSUFB"));
 }
 
@@ -6223,7 +6301,6 @@ impl guard::proxy::GateSink for DenyingSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_matches_create_body_metadata_predicates() {
     let mock_base = spawn_mock_upstream().await;
-    let kubeconfig = kubeconfig_for(&mock_base);
     let policy = ApiPolicy::from_yaml(
         r#"
 default: deny
@@ -6242,7 +6319,7 @@ rules:
 "#,
     )
     .expect("policy");
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let (listener, listen) = reserve_listener().await;
@@ -6292,9 +6369,6 @@ rules:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_hold_forwards_on_approval_and_fails_closed_without_queue() {
     let mock_base = spawn_mock_upstream().await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
-    );
     let policy_yaml = r#"
 default: deny
 rules:
@@ -6310,7 +6384,7 @@ rules:
 
     // No gate sink attached: the hold cannot queue anywhere, so it denies and
     // says why.
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
@@ -6349,7 +6423,7 @@ rules:
 
     // Approval queue attached and the operator approves: the held delete is
     // released and forwarded to the upstream.
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
@@ -6390,7 +6464,7 @@ rules:
     }
 
     for reason in ["operator denied", "approval expired"] {
-        let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+        let upstream = upstream_for_mock(&mock_base).await;
         let tls = ProxyTls::generate().expect("tls");
         let ca_pem = tls.ca_pem().to_string();
         let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
@@ -6440,8 +6514,7 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
     use sha2::{Digest, Sha256};
 
     let (mock_base, observed_create) = spawn_write_mock_with_observation().await;
-    let upstream =
-        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(
@@ -6784,16 +6857,13 @@ impl guard::proxy::GateSink for CountingSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_rarity_escalation_holds_only_rare_shapes() {
     let mock_base = spawn_mock_upstream().await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
-    );
     // A broad read-allow rule: every read is permitted by policy, so only rarity
     // escalation can hold one.
     let policy = ApiPolicy::from_yaml(
         "default: deny\nrules:\n  - verbs: [get, list]\n    resources: [\"*\"]\n    namespaces: [\"*\"]\n    action: allow\n",
     )
     .expect("policy");
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let upstream = upstream_for_mock(&mock_base).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let (listener, listen) = reserve_listener().await;
@@ -6802,11 +6872,13 @@ async fn proxy_rarity_escalation_holds_only_rare_shapes() {
         Arc::new(ApiProxy::new(listen, tls, upstream, policy, None).with_rarity_escalation(2));
     let sink = CountingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
+    let headers = proxy_transport_headers(&proxy);
     tokio::spawn(proxy.clone().serve_on(listener));
 
     let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .default_headers(headers)
         .build()
         .unwrap();
 

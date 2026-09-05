@@ -9,8 +9,9 @@ use anyhow::{bail, Context, Result};
 use guard::env::now_unix;
 use guard::gating::verb::{
     canonicalize_generated_authority_envelope, generated_access_matcher_shape,
-    normalize_generated_access_verb, parse_normalized_generated_access_verb, CoverageAction,
-    CoverageObservationReplay, CoverageProvenance, ValueConstraint, Verb, VerbCoverageCell,
+    normalize_generated_access_verb, parse_normalized_generated_access_verb,
+    protected_tool_command_path, CoverageAction, CoverageObservationReplay, CoverageProvenance,
+    ValueConstraint, Verb, VerbCoverageCell,
 };
 use guard::gating::Reversibility;
 use guard::principal::PrincipalKey;
@@ -722,6 +723,7 @@ fn migrate_legacy_pattern(
         })
         .collect::<Vec<_>>();
     let evidence_metadata = command_metadata(&binary, &evidence_args);
+    let command_path = protected_tool_command_path(&binary, &evidence_args)?;
     let evidence_arg_count = evidence_args.len();
     let mut boundary_args = evidence_args.clone();
     boundary_args.push("__outside_legacy_prefix__".to_string());
@@ -738,6 +740,7 @@ fn migrate_legacy_pattern(
             "explicit-allow".to_string()
         },
         action,
+        command_path,
         required_args: Vec::new(),
         forbidden_args: Vec::new(),
         min_args: Some(evidence_args.len()),
@@ -936,14 +939,7 @@ mod tests {
     fn reference_saved_grant_catalog_is_valid() {
         let catalog = SavedGrantCatalog::from_yaml(include_str!("../examples/saved-grants.yaml"))
             .expect("reference catalog");
-        assert_eq!(
-            catalog.names(),
-            vec![
-                "ansible-host-a-apply".to_string(),
-                "cert-manager-rotation".to_string(),
-                "kube-readonly".to_string()
-            ]
-        );
+        assert_eq!(catalog.names(), vec!["kube-readonly".to_string()]);
     }
 
     #[test]
@@ -1031,6 +1027,36 @@ mod tests {
             actions(&["delete", "pod", "--force"]).is_empty(),
             "exact deny cardinality must be preserved"
         );
+    }
+
+    #[test]
+    fn migrated_legacy_deny_matches_exact_argv_with_ansible_inventory() {
+        #[cfg(unix)]
+        let inventory = "/srv/guard/blocked.ini";
+        #[cfg(windows)]
+        let inventory = "C:/srv/guard/blocked.ini";
+        let yaml = format!(
+            "profiles:\n  - name: legacy\n    deny: [\"ansible-playbook --inventory={inventory}\"]\n"
+        );
+        let catalog = SavedGrantCatalog::from_yaml(&yaml).expect("migrate profile");
+        let grant = catalog.get("legacy").expect("saved grant");
+        let migrated = &grant.generated_verbs[0];
+
+        let mut verbs = guard::gating::verb::VerbCatalog::empty();
+        verbs
+            .upsert_saved_grant_verb(migrated.clone())
+            .expect("install migrated deny");
+
+        let exact =
+            verbs.match_command_all("ansible-playbook", &[format!("--inventory={inventory}")]);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].action, CoverageAction::Deny);
+        assert!(verbs
+            .match_command_all(
+                "ansible-playbook",
+                &[format!("--inventory={inventory}"), "site.yml".to_string(),],
+            )
+            .is_empty());
     }
 
     #[test]
@@ -1253,12 +1279,13 @@ mod tests {
             let mut verb = Verb {
                 name: "access-generated-fixture".to_string(),
                 description: String::new(),
-                binary: "fixturectl".to_string(),
+                binary: "printf".to_string(),
                 args: vec!["inspect".to_string(), "{item}".to_string()],
                 baseline: false,
                 coverage: vec![VerbCoverageCell {
                     name: "item".to_string(),
                     action: CoverageAction::Evaluate,
+                    command_path: Vec::new(),
                     required_args: Vec::new(),
                     forbidden_args: Vec::new(),
                     min_args: None,

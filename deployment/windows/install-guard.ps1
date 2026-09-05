@@ -82,16 +82,20 @@ $ConfigRoot = 'C:\ProgramData\GuardConfig'
 $VerbsPath = Join-Path $ConfigRoot 'verbs.yaml'
 $DataDir = 'C:\ProgramData\Guard'
 $StateDb = Join-Path $DataDir 'state.db'
-$KubeDir = Join-Path $DataDir 'kube'
+$AuthorityKey = Join-Path $DataDir 'authority.hmac'
+$KubeDir = Join-Path $ConfigRoot 'kube'
 $KubeConfig = Join-Path $KubeDir 'config'
 $MaintenanceRoot = 'C:\ProgramData\GuardMaintenance'
 $StagingDir = Join-Path $MaintenanceRoot 'staging'
 $BackupRoot = Join-Path $MaintenanceRoot 'backups'
 $TaskOutDir = Join-Path $MaintenanceRoot 'task-output'
+$TransactionJournal = Join-Path $MaintenanceRoot 'upgrade-transaction.json'
 
 $ServiceReadinessTimeoutSeconds = 30
 $OperatorTaskTimeoutSeconds = 60
-$BackupMetadataSchema = 2
+$BackupMetadataSchema = 5
+$TransactionJournalSchema = 4
+$DeploymentMutexName = 'Global\GuardDeploymentTransaction'
 
 $SidSystem = 'S-1-5-18'
 $SidAdmins = 'S-1-5-32-544'
@@ -392,6 +396,7 @@ function Set-ExactAclTree {
         [string[]]$Exclude = @()
     )
     if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-NoReparsePoint -Path $Path
     Set-ExactFileSystemAcl -Path $Path -OwnerSid $OwnerSid -Entries $Entries
     foreach ($item in Get-PrunedTreeItems -Path $Path -Exclude $Exclude) {
         Set-ExactFileSystemAcl -Path $item.FullName -OwnerSid $OwnerSid -Entries $Entries
@@ -405,6 +410,7 @@ function Assert-ExactAclTree {
         [Parameter(Mandatory)][object[]]$Entries,
         [string[]]$Exclude = @()
     )
+    Assert-NoReparsePoint -Path $Path
     Assert-ExactFileSystemAcl -Path $Path -OwnerSid $OwnerSid -Entries $Entries
     foreach ($item in Get-PrunedTreeItems -Path $Path -Exclude $Exclude) {
         Assert-ExactFileSystemAcl -Path $item.FullName -OwnerSid $OwnerSid -Entries $Entries
@@ -412,11 +418,14 @@ function Assert-ExactAclTree {
 }
 
 function Reset-TreeForAdministrativeMaintenance {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$AdditionalRoots = @()
+    )
     if (-not (Test-Path -LiteralPath $Path)) { return }
-    if (-not ((Test-PathWithin -Path $Path -Parent $DataDir) -or
-        (Test-PathWithin -Path $Path -Parent $ConfigRoot) -or
-        (Test-PathWithin -Path $Path -Parent $MaintenanceRoot))) {
+    $allowedRoots = @($InstallRoot, $DataDir, $ConfigRoot, $MaintenanceRoot) + @($AdditionalRoots)
+    $withinAllowedRoot = @($allowedRoots | Where-Object { Test-PathWithin -Path $Path -Parent $_ }).Count -gt 0
+    if (-not $withinAllowedRoot) {
         throw "Refusing to reset ACLs outside a Guard-owned tree: '$Path'."
     }
     $pending = [Collections.Generic.Stack[string]]::new()
@@ -471,37 +480,293 @@ function Set-MaintenanceAcl {
     Set-ExactAclTree -Path $MaintenanceRoot -OwnerSid $SidAdmins -Entries $entries
 }
 
+function Get-DeploymentStatePaths {
+    param([AllowNull()]$StatePaths)
+    if ($null -ne $StatePaths) { return $StatePaths }
+    return [pscustomobject]@{
+        StateDb = $StateDb
+        AuthorityKey = $AuthorityKey
+        ApiRevertRoot = Join-Path $DataDir 'api-proxy-reverts'
+        SocketName = $SocketName
+    }
+}
+
+function Get-StateDirectory {
+    param([Parameter(Mandatory)]$StatePaths)
+    return (Split-Path -Parent ([string]$StatePaths.StateDb))
+}
+
+function Get-StatePrivateRoots {
+    param([Parameter(Mandatory)]$StatePaths)
+    $stateDirectory = Get-StateDirectory -StatePaths $StatePaths
+    return @(
+        (Join-Path $stateDirectory 'secret-files'),
+        [string]$StatePaths.ApiRevertRoot
+    )
+}
+
+function Get-StatePrivateFiles {
+    param([Parameter(Mandatory)]$StatePaths)
+    return @([string]$StatePaths.AuthorityKey)
+}
+
+function Get-StateAdministrativeRoots {
+    param([Parameter(Mandatory)]$StatePaths)
+    return @((Join-Path (Get-StateDirectory -StatePaths $StatePaths) 'kube'))
+}
+
+function Assert-DedicatedStateDirectory {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$StateDb
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    Assert-NoReparsePoint -Path $Path
+    $databaseName = Split-Path -Leaf $StateDb
+    $allowedNames = @(
+        $databaseName,
+        "$databaseName-wal",
+        "$databaseName-shm",
+        "$databaseName-journal",
+        "$databaseName.daemon.lock",
+        'guard.log',
+        'authority.hmac',
+        'api-proxy-reverts',
+        'secret-files',
+        'kube'
+    )
+    $unexpected = @(Get-ChildItem -LiteralPath $Path -Force | Where-Object { $_.Name -notin $allowedNames })
+    if ($unexpected.Count -gt 0) {
+        throw "Guard service --state-db must be beneath a dedicated state directory containing only Guard state."
+    }
+}
+
+function Get-ActiveKubeConfigPath {
+    param(
+        [Parameter(Mandatory)][hashtable]$Environment,
+        [Parameter(Mandatory)]$StatePaths
+    )
+    $legacyConfig = Join-Path (Get-StateDirectory -StatePaths $StatePaths) 'kube\config'
+    if ($Environment.ContainsKey('KUBECONFIG')) {
+        $selected = [string]$Environment['KUBECONFIG']
+        if ($selected.Equals($KubeConfig, [StringComparison]::OrdinalIgnoreCase)) {
+            return $KubeConfig
+        }
+        if ($selected.Equals($legacyConfig, [StringComparison]::OrdinalIgnoreCase)) {
+            return $legacyConfig
+        }
+        throw 'Guard service KUBECONFIG must use the managed authority root.'
+    }
+    if (Test-Path -LiteralPath $KubeConfig -PathType Leaf) { return $KubeConfig }
+    if (Test-Path -LiteralPath $legacyConfig -PathType Leaf) { return $legacyConfig }
+    return $null
+}
+
+function Normalize-KubeEnvironmentAuthority {
+    param(
+        [Parameter(Mandatory)][hashtable]$Environment,
+        [Parameter(Mandatory)]$StatePaths
+    )
+    $result = @{}
+    foreach ($entry in $Environment.GetEnumerator()) {
+        $result[[string]$entry.Key] = [string]$entry.Value
+    }
+    if (-not $result.ContainsKey('KUBECONFIG')) { return $result }
+
+    $selected = [string]$result['KUBECONFIG']
+    $legacyConfig = Join-Path (Get-StateDirectory -StatePaths $StatePaths) 'kube\config'
+    if (-not $selected.Equals($KubeConfig, [StringComparison]::OrdinalIgnoreCase) -and
+        -not $selected.Equals($legacyConfig, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Guard service KUBECONFIG must use the managed authority root.'
+    }
+    if (Test-Path -LiteralPath $selected -PathType Leaf) { return $result }
+
+    [void]$result.Remove('KUBECONFIG')
+    $childNames = @()
+    if ($result.ContainsKey('GUARD_CHILD_ENV')) {
+        $childNames += @(([string]$result['GUARD_CHILD_ENV'] -split ',') | ForEach-Object { $_.Trim() } | Where-Object {
+            $_ -and -not $_.Equals('KUBECONFIG', [StringComparison]::OrdinalIgnoreCase)
+        })
+    }
+    $childNames = @($childNames | Select-Object -Unique)
+    if ($childNames.Count -gt 0) {
+        $result['GUARD_CHILD_ENV'] = $childNames -join ','
+    }
+    else {
+        [void]$result.Remove('GUARD_CHILD_ENV')
+    }
+    return $result
+}
+
+function Copy-KubeConfigToAuthorityRoot {
+    param(
+        [AllowNull()]$StatePaths,
+        [Parameter(Mandatory)][hashtable]$Environment
+    )
+    $statePaths = Get-DeploymentStatePaths -StatePaths $StatePaths
+    $source = Get-ActiveKubeConfigPath -Environment $Environment -StatePaths $statePaths
+    if ($null -eq $source) { return }
+    if ($source.Equals($KubeConfig, [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not (Test-Path -LiteralPath $KubeConfig -PathType Leaf)) {
+            throw 'Guard service KUBECONFIG does not exist in the managed authority root.'
+        }
+        Assert-NoReparsePoint -Path $KubeConfig
+        return
+    }
+    $stateDirectory = Get-StateDirectory -StatePaths $statePaths
+    Assert-NoReparsePoint -Path $stateDirectory
+    Assert-NoReparsePoint -Path (Split-Path -Parent $source)
+    Assert-NoReparsePoint -Path $source
+    if (Test-Path -LiteralPath $ConfigRoot) { Assert-NoReparsePoint -Path $ConfigRoot }
+    if (Test-Path -LiteralPath $KubeConfig) {
+        Assert-NoReparsePoint -Path $KubeConfig
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash -ne
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $KubeConfig).Hash) {
+            throw 'Guard kube configuration exists in both state and authority roots with different content.'
+        }
+        return
+    }
+    New-Item -ItemType Directory -Force -Path $KubeDir | Out-Null
+    $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash
+    Install-FileAtomically -Source $source -Destination $KubeConfig -ExpectedHash $sourceHash
+}
+
+function Convert-LegacyKubeEnvironment {
+    param(
+        [Parameter(Mandatory)][hashtable]$Environment,
+        [Parameter(Mandatory)]$StatePaths
+    )
+    $result = @{}
+    foreach ($entry in $Environment.GetEnumerator()) {
+        $result[[string]$entry.Key] = [string]$entry.Value
+    }
+    if (-not $result.ContainsKey('KUBECONFIG')) { return $result }
+    $legacyConfig = Join-Path (Get-StateDirectory -StatePaths $StatePaths) 'kube\config'
+    if (-not ([string]$result['KUBECONFIG']).Equals($legacyConfig, [StringComparison]::OrdinalIgnoreCase)) {
+        return $result
+    }
+    if (-not (Test-Path -LiteralPath $KubeConfig -PathType Leaf)) {
+        throw 'The legacy service environment requires kube authority that has not been migrated.'
+    }
+    $result['KUBECONFIG'] = $KubeConfig
+    return $result
+}
+
+function Complete-ManagedKubeEnvironment {
+    param([Parameter(Mandatory)][hashtable]$Environment)
+    $result = @{}
+    foreach ($entry in $Environment.GetEnumerator()) {
+        $result[[string]$entry.Key] = [string]$entry.Value
+    }
+    $childNames = @()
+    if ($result.ContainsKey('GUARD_CHILD_ENV')) {
+        $childNames += @(([string]$result['GUARD_CHILD_ENV'] -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne 'KUBECONFIG' })
+    }
+    if (Test-Path -LiteralPath $KubeConfig -PathType Leaf) {
+        $result['KUBECONFIG'] = $KubeConfig
+        $childNames += 'KUBECONFIG'
+    }
+    else {
+        [void]$result.Remove('KUBECONFIG')
+    }
+    $childNames = @($childNames | Select-Object -Unique)
+    if ($childNames.Count -gt 0) {
+        $result['GUARD_CHILD_ENV'] = $childNames -join ','
+    }
+    else {
+        [void]$result.Remove('GUARD_CHILD_ENV')
+    }
+    return $result
+}
+
+function Assert-PrivateServiceTree {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$GuardSid
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $entries = @((New-AclEntry -Sid $GuardSid -Rights ([Security.AccessControl.FileSystemRights]::FullControl)))
+    Assert-ExactAclTree -Path $Path -OwnerSid $GuardSid -Entries $entries
+}
+
 function Set-DeploymentAcls {
-    param([Parameter(Mandatory)][string]$GuardSid)
-    New-Item -ItemType Directory -Force -Path $InstallRoot, $ConfigRoot, $DataDir, $KubeDir | Out-Null
+    param(
+        [Parameter(Mandatory)][string]$GuardSid,
+        [AllowNull()]$StatePaths
+    )
+    $statePaths = Get-DeploymentStatePaths -StatePaths $StatePaths
+    $stateDirectory = Get-StateDirectory -StatePaths $statePaths
+    $privateRoots = Get-StatePrivateRoots -StatePaths $statePaths
+    $privateFiles = Get-StatePrivateFiles -StatePaths $statePaths
+    $administrativeRoots = Get-StateAdministrativeRoots -StatePaths $statePaths
+    if (-not (Test-PathWithin -Path $KubeDir -Parent $ConfigRoot)) {
+        throw "Guard kube configuration must remain beneath the administrator-owned configuration directory."
+    }
+    New-Item -ItemType Directory -Force -Path $InstallRoot, $ConfigRoot, $stateDirectory, $KubeDir | Out-Null
+    Assert-DedicatedStateDirectory -Path $stateDirectory -StateDb $statePaths.StateDb
     Set-ExactAclTree -Path $InstallRoot -OwnerSid $SidAdmins -Entries (Get-ServiceReadAclEntries -GuardSid $GuardSid)
     Set-ExactAclTree -Path $ConfigRoot -OwnerSid $SidAdmins -Entries (Get-ServiceReadAclEntries -GuardSid $GuardSid)
-
-    $privateRoots = @(
-        (Join-Path $DataDir 'secret-files'),
-        (Join-Path $DataDir 'api-proxy-reverts')
-    )
-    Set-ExactAclTree -Path $DataDir -OwnerSid $SidAdmins -Entries (Get-ServiceWriteAclEntries -GuardSid $GuardSid) -Exclude $privateRoots
+    Set-ExactAclTree -Path $stateDirectory -OwnerSid $SidAdmins -Entries (Get-ServiceWriteAclEntries -GuardSid $GuardSid) -Exclude ($privateRoots + $privateFiles + $administrativeRoots)
+    foreach ($administrativeRoot in $administrativeRoots) {
+        if (Test-Path -LiteralPath $administrativeRoot -PathType Container) {
+            Set-ExactAclTree -Path $administrativeRoot -OwnerSid $SidAdmins -Entries (Get-AdministrativeAclEntries)
+        }
+    }
+    foreach ($privateRoot in $privateRoots) {
+        Protect-PrivateServiceTree -Path $privateRoot -GuardSid $GuardSid
+    }
+    foreach ($privateFile in $privateFiles) {
+        if (Test-Path -LiteralPath $privateFile -PathType Leaf) {
+            Set-ExactFileSystemAcl -Path $privateFile -OwnerSid $GuardSid -Entries @((New-AclEntry -Sid $GuardSid -Rights ([Security.AccessControl.FileSystemRights]::FullControl)))
+        }
+    }
     Set-MaintenanceAcl
 }
 
 function Assert-DeploymentAcls {
-    param([Parameter(Mandatory)][string]$GuardSid)
+    param(
+        [Parameter(Mandatory)][string]$GuardSid,
+        [AllowNull()]$StatePaths,
+        [bool]$AuthorityKeyPresent = $true
+    )
+    $statePaths = Get-DeploymentStatePaths -StatePaths $StatePaths
+    $stateDirectory = Get-StateDirectory -StatePaths $statePaths
+    $privateRoots = Get-StatePrivateRoots -StatePaths $statePaths
+    $privateFiles = Get-StatePrivateFiles -StatePaths $statePaths
+    $administrativeRoots = Get-StateAdministrativeRoots -StatePaths $statePaths
     $readEntries = Get-ServiceReadAclEntries -GuardSid $GuardSid
     $writeEntries = Get-ServiceWriteAclEntries -GuardSid $GuardSid
     $administrativeEntries = Get-AdministrativeAclEntries
+    if (-not (Test-PathWithin -Path $KubeDir -Parent $ConfigRoot)) {
+        throw "Guard kube configuration must remain beneath the administrator-owned configuration directory."
+    }
     Assert-ExactAclTree -Path $InstallRoot -OwnerSid $SidAdmins -Entries $readEntries
     Assert-ExactAclTree -Path $ConfigRoot -OwnerSid $SidAdmins -Entries $readEntries
-    $privateRoots = @(
-        (Join-Path $DataDir 'secret-files'),
-        (Join-Path $DataDir 'api-proxy-reverts')
-    )
-    Assert-ExactFileSystemAcl -Path $DataDir -OwnerSid $SidAdmins -Entries $writeEntries
-    Assert-ExactFileSystemAcl -Path $KubeDir -OwnerSid $SidAdmins -Entries $writeEntries
+    Assert-ExactAclTree -Path $stateDirectory -OwnerSid $SidAdmins -Entries $writeEntries -Exclude ($privateRoots + $privateFiles + $administrativeRoots)
+    foreach ($administrativeRoot in $administrativeRoots) {
+        if (Test-Path -LiteralPath $administrativeRoot -PathType Container) {
+            Assert-ExactAclTree -Path $administrativeRoot -OwnerSid $SidAdmins -Entries $administrativeEntries
+        }
+    }
+    foreach ($privateRoot in $privateRoots) {
+        Assert-PrivateServiceTree -Path $privateRoot -GuardSid $GuardSid
+    }
+    foreach ($privateFile in $privateFiles) {
+        $privateFilePresent = Test-Path -LiteralPath $privateFile -PathType Leaf
+        if ($privateFile.Equals([string]$statePaths.AuthorityKey, [StringComparison]::OrdinalIgnoreCase)) {
+            if ($privateFilePresent -ne $AuthorityKeyPresent) {
+                throw 'Daemon authority file presence does not match the recorded deployment state.'
+            }
+            if (-not $privateFilePresent) {
+                continue
+            }
+        }
+        elseif (-not $privateFilePresent) {
+            throw "Daemon authority file is missing: '$privateFile'."
+        }
+        Assert-ExactFileSystemAcl -Path $privateFile -OwnerSid $GuardSid -Entries @((New-AclEntry -Sid $GuardSid -Rights ([Security.AccessControl.FileSystemRights]::FullControl)))
+    }
     Assert-ExactAclTree -Path $MaintenanceRoot -OwnerSid $SidAdmins -Entries $administrativeEntries
-    # Guard creates and validates the daemon-only private subtrees itself.
-    # Administrators deliberately cannot reopen them without a maintenance
-    # ownership reset, so deployment verification prunes them above.
 }
 
 function Get-ServiceRegistryPath {
@@ -675,13 +940,6 @@ function Merge-ServiceEnvironment {
     $result = @{}
     foreach ($name in $Existing.Keys) { $result[$name] = $Existing[$name] }
     foreach ($name in $Imported.Keys) { $result[$name] = $Imported[$name] }
-    $result['KUBECONFIG'] = $KubeConfig
-    $childNames = @()
-    if ($result.ContainsKey('GUARD_CHILD_ENV')) {
-        $childNames += @(([string]$result['GUARD_CHILD_ENV'] -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    }
-    if ($childNames -notcontains 'KUBECONFIG') { $childNames += 'KUBECONFIG' }
-    $result['GUARD_CHILD_ENV'] = ($childNames | Select-Object -Unique) -join ','
     return $result
 }
 
@@ -692,7 +950,12 @@ function Set-ServiceEnvironment {
     )
     Set-ServiceRegistryAcl -GuardSid $GuardSid
     $pairs = @($Environment.Keys | Sort-Object | ForEach-Object { "$_=$($Environment[$_])" })
-    New-ItemProperty -LiteralPath (Get-ServiceRegistryPath) -Name Environment -PropertyType MultiString -Value $pairs -Force | Out-Null
+    if ($pairs.Count -eq 0) {
+        Remove-ItemProperty -LiteralPath (Get-ServiceRegistryPath) -Name Environment -Force -ErrorAction SilentlyContinue
+    }
+    else {
+        New-ItemProperty -LiteralPath (Get-ServiceRegistryPath) -Name Environment -PropertyType MultiString -Value $pairs -Force | Out-Null
+    }
     Set-ServiceRegistryAcl -GuardSid $GuardSid
 }
 
@@ -743,6 +1006,7 @@ function Assert-ReferenceCount {
 }
 
 function Get-GuardActionArguments {
+    param([Parameter(Mandatory)][string]$Socket)
     $arguments = [Collections.Generic.List[string]]::new()
     switch ($Action) {
         'access-approve' {
@@ -808,7 +1072,7 @@ function Get-GuardActionArguments {
         default { throw "Action '$Action' is not an operator RPC action." }
     }
     if ($Json -and $Action -notin @('confirm', 'revert')) { [void]$arguments.Add('--json') }
-    [void]$arguments.Add('--socket'); [void]$arguments.Add($SocketName)
+    [void]$arguments.Add('--socket'); [void]$arguments.Add((Assert-CanonicalSocketName -Socket $Socket))
     return [string[]]$arguments
 }
 
@@ -883,7 +1147,8 @@ function Read-GuardOperatorStatus {
 function Invoke-GuardAsOperator {
     param(
         [Parameter(Mandatory)][string[]]$Arguments,
-        [Parameter(Mandatory)][string]$GuardExe
+        [Parameter(Mandatory)][string]$GuardExe,
+        [switch]$JsonOutput
     )
     Assert-Admin -ForAction $Action
     if (-not (Test-Path -LiteralPath $GuardExe -PathType Leaf)) { throw "Installed Guard binary not found at '$GuardExe'." }
@@ -923,7 +1188,7 @@ function Invoke-GuardAsOperator {
             $diagnostic = if ($null -eq $output) { '' } else { ConvertTo-SanitizedDiagnosticOutput -Value $output }
             throw "Guard operator task timed out; native_status=$nativeStatus; output=$diagnostic"
         }
-        return Resolve-GuardOperatorResult -RawOutput $output -NativeStatus $nativeStatus -JsonOutput:$Json
+        return Resolve-GuardOperatorResult -RawOutput $output -NativeStatus $nativeStatus -JsonOutput:($JsonOutput -or $Json)
     }
     finally {
         $diagnostic = if ($null -eq $output) { $null } else { ConvertTo-SanitizedDiagnosticOutput -Value $output }
@@ -964,6 +1229,107 @@ function ConvertTo-SanitizedDiagnosticOutput {
         $sanitized = $sanitized.Substring(0, 16384 - $marker.Length) + $marker
     }
     return $sanitized
+}
+
+function Get-GuardServiceStartupDiagnostic {
+    $serviceLog = Join-Path $DataDir 'guard.log'
+    if (Test-Path -LiteralPath $serviceLog -PathType Leaf) {
+        try {
+            $lines = @(Get-Content -LiteralPath $serviceLog -Tail 80 -ErrorAction Stop |
+                Where-Object { $_ -match 'guard service.*error|daemon terminated with error' })
+            if ($lines.Count -gt 0) {
+                $errorLine = [string]$lines[-1]
+                if ($errorLine -match '(?i)verb catalog|catalog authority') { return 'verb-catalog' }
+                if ($errorLine -match '(?i)state database|state-db|sqlite|authority file') { return 'durable-state' }
+                if ($errorLine -match '(?i)named pipe|socket|listener|endpoint') { return 'local-endpoint' }
+                if ($errorLine -match '(?i)kubeconfig|api proxy|brokered') { return 'brokered-api' }
+                if ($errorLine -match '(?i)service dispatcher|StartServiceCtrlDispatcher') { return 'service-dispatcher' }
+                if ($errorLine -match '(?i)permission|access is denied|dacl|acl') { return 'filesystem-authority' }
+                return 'daemon-startup'
+            }
+        }
+        catch { }
+    }
+    try {
+        $service = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
+        switch ([int]$service.Win32ExitCode) {
+            2 { return 'service-binary-missing' }
+            5 { return 'service-access-denied' }
+            1053 { return 'service-handshake-timeout' }
+            1067 { return 'service-process-terminated' }
+            1069 { return 'service-account-logon' }
+            default {
+                if ([int]$service.Win32ExitCode -ne 0) { return 'service-control-manager' }
+            }
+        }
+    }
+    catch { }
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'System'
+            ProviderName = 'Service Control Manager'
+            StartTime = (Get-Date).AddMinutes(-2)
+        } -ErrorAction Stop | Where-Object {
+            $_.Message -match '(?i)\bguard\b|Guard consequence gate'
+        })
+        foreach ($event in $events) {
+            $message = [string]$event.Message
+            $eventCodeToken = ''
+            if (@($event.Properties).Count -gt 1) {
+                $eventCodeToken = [string]$event.Properties[1].Value
+            }
+            if ([int]$event.Id -eq 7000 -and $eventCodeToken -match '^%%(?<code>[0-9]{1,10})$') {
+                $eventCode = [int64]$Matches.code
+                switch ($eventCode) {
+                    2 { return 'service-binary-missing' }
+                    3 { return 'service-binary-path-missing' }
+                    5 { return 'service-access-denied' }
+                    193 { return 'service-binary-invalid' }
+                    1053 { return 'service-handshake-timeout' }
+                    1067 { return 'service-process-terminated' }
+                    1069 { return 'service-account-logon' }
+                    default { return "service-start-failed-code-$eventCode" }
+                }
+            }
+            if ($message -match '(?i)logon failure|account name is invalid|password is incorrect') {
+                return 'service-account-logon'
+            }
+            if ($message -match '(?i)system cannot find the file|file specified') {
+                return 'service-binary-missing'
+            }
+            if ($message -match '(?i)access is denied') {
+                return 'service-access-denied'
+            }
+            if ($message -match '(?i)not a valid Win32 application') {
+                return 'service-binary-invalid'
+            }
+            if ($message -match '(?i)did not respond.*timely fashion') {
+                return 'service-handshake-timeout'
+            }
+            switch ([int]$event.Id) {
+                7009 { return 'service-handshake-timeout' }
+                7011 { return 'service-handshake-timeout' }
+                7023 { return 'service-process-terminated' }
+                7024 { return 'service-process-terminated' }
+                7031 { return 'service-process-terminated' }
+                7034 { return 'service-process-terminated' }
+                7038 { return 'service-account-logon' }
+                7000 { return 'service-start-failed' }
+            }
+        }
+    }
+    catch { }
+    return ''
+}
+
+function Initialize-GuardServiceLog {
+    New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+    Assert-NoReparsePoint -Path $DataDir
+    $serviceLog = Join-Path $DataDir 'guard.log'
+    if (-not (Test-Path -LiteralPath $serviceLog)) {
+        [IO.File]::WriteAllBytes($serviceLog, [byte[]]@())
+    }
+    Assert-NoReparsePoint -Path $serviceLog
 }
 
 function Remove-GuardOperatorArtifacts {
@@ -1021,6 +1387,61 @@ function Wait-ServiceStopped {
     $service.WaitForStatus('Stopped', (New-TimeSpan -Seconds 30))
 }
 
+function Start-GuardService {
+    param([Parameter(Mandatory)][string]$Name)
+    $lastStatus = 'Unavailable'
+    $lastError = 'the service controller did not expose the service'
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if ($service) {
+            $service.Refresh()
+            $lastStatus = [string]$service.Status
+            if ($service.Status -eq 'Running') { return }
+        }
+
+        $startFailed = $false
+        if ($service -and $service.Status -eq 'Stopped') {
+            try {
+                Start-Service -Name $Name -ErrorAction Stop
+            }
+            catch {
+                $startFailed = $true
+                $lastError = $_.Exception.Message
+            }
+            $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+            if ($service) {
+                $service.Refresh()
+                $lastStatus = [string]$service.Status
+                if ($service.Status -eq 'Running') { return }
+            }
+        }
+
+        if ($service -and ($service.Status -eq 'StartPending' -or -not $startFailed)) {
+            try {
+                $service.WaitForStatus('Running', (New-TimeSpan -Seconds 10))
+                $service.Refresh()
+                $lastStatus = [string]$service.Status
+                if ($service.Status -eq 'Running') { return }
+                $lastError = "the bounded transition completed in state '$lastStatus'"
+            }
+            catch {
+                $service.Refresh()
+                $lastStatus = [string]$service.Status
+                $lastError = $_.Exception.Message
+            }
+        }
+        if ($attempt -lt 3) { Start-Sleep -Milliseconds 200 }
+    }
+    $daemonDiagnostic = Get-GuardServiceStartupDiagnostic
+    $diagnosticSuffix = if ([string]::IsNullOrWhiteSpace($daemonDiagnostic)) {
+        ''
+    }
+    else {
+        "; daemon diagnostic: $daemonDiagnostic"
+    }
+    throw "Guard service '$Name' did not reach Running after 3 bounded state-transition attempts. Last observed status: '$lastStatus'. Last transition error: $lastError$diagnosticSuffix"
+}
+
 function Assert-ServicePathName {
     param([Parameter(Mandatory)][string]$PathName)
     if ([string]::IsNullOrWhiteSpace($PathName) -or $PathName -match '[\x00-\x1f\x7f]') {
@@ -1034,6 +1455,155 @@ function Assert-ServicePathName {
     return $PathName
 }
 
+function ConvertFrom-GuardServiceCommandLine {
+    param([Parameter(Mandatory)][string]$PathName)
+    [void](Assert-ServicePathName -PathName $PathName)
+    $tokens = [Collections.Generic.List[string]]::new()
+    $index = 0
+    while ($index -lt $PathName.Length) {
+        while ($index -lt $PathName.Length -and [char]::IsWhiteSpace($PathName[$index])) { $index++ }
+        if ($index -ge $PathName.Length) { break }
+        if ($PathName[$index] -eq '"') {
+            $index++
+            $start = $index
+            while ($index -lt $PathName.Length -and $PathName[$index] -ne '"') { $index++ }
+            if ($index -ge $PathName.Length -or $index -eq $start) {
+                throw 'The Guard service command line contains an empty or unterminated quoted argument.'
+            }
+            $tokens.Add($PathName.Substring($start, $index - $start))
+            $index++
+            if ($index -lt $PathName.Length -and -not [char]::IsWhiteSpace($PathName[$index])) {
+                throw 'The Guard service command line contains unsupported quoted argument escaping.'
+            }
+        }
+        else {
+            $start = $index
+            while ($index -lt $PathName.Length -and -not [char]::IsWhiteSpace($PathName[$index])) {
+                if ($PathName[$index] -eq '"') {
+                    throw 'The Guard service command line contains unsupported embedded quotes.'
+                }
+                $index++
+            }
+            $tokens.Add($PathName.Substring($start, $index - $start))
+        }
+    }
+    if ($tokens.Count -eq 0 -or -not $tokens[0].Equals($DeployedExe, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The Guard service command line does not begin with the installed executable.'
+    }
+    return [string[]]$tokens.ToArray()
+}
+
+function Assert-CanonicalStateDatabasePath {
+    param([Parameter(Mandatory)][string]$Path)
+    if ($Path -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _().,@+=\-$]+(?:\\[A-Za-z0-9 _().,@+=\-$]+)*$') {
+        throw 'Guard service --state-db must be a canonical absolute Windows path.'
+    }
+    foreach ($component in $Path.Substring(3).Split([char[]]@('\'))) {
+        if ([string]::IsNullOrWhiteSpace($component) -or $component -in @('.', '..')) {
+            throw 'Guard service --state-db must be a canonical absolute Windows path.'
+        }
+    }
+    return $Path
+}
+
+function Assert-CanonicalSocketName {
+    param([Parameter(Mandatory)][string]$Socket)
+    if ($Socket -notmatch '^(?:[A-Za-z0-9._-]{1,128}|\\\\[.?]\\pipe\\[A-Za-z0-9._-]{1,128})$') {
+        throw 'Guard service --socket must be a bare pipe name or canonical local named-pipe path.'
+    }
+    return $Socket
+}
+
+function Get-GuardStatePaths {
+    param([Parameter(Mandatory)][string]$ServicePathName)
+    $arguments = ConvertFrom-GuardServiceCommandLine -PathName $ServicePathName
+    $candidates = [Collections.Generic.List[string]]::new()
+    for ($index = 1; $index -lt $arguments.Count; $index++) {
+        if ($arguments[$index] -eq '--state-db') {
+            if ($index + 1 -ge $arguments.Count) {
+                throw 'Guard service --state-db is missing its path value.'
+            }
+            $candidates.Add($arguments[$index + 1])
+            $index++
+        }
+        elseif ($arguments[$index].StartsWith('--state-db=', [StringComparison]::Ordinal)) {
+            $candidates.Add($arguments[$index].Substring('--state-db='.Length))
+        }
+    }
+    if ($candidates.Count -ne 1) {
+        throw 'Guard service must define exactly one --state-db setting.'
+    }
+    $socketCandidates = [Collections.Generic.List[string]]::new()
+    for ($index = 1; $index -lt $arguments.Count; $index++) {
+        if ($arguments[$index] -eq '--socket') {
+            if ($index + 1 -ge $arguments.Count) {
+                throw 'Guard service --socket is missing its pipe value.'
+            }
+            $socketCandidates.Add($arguments[$index + 1])
+            $index++
+        }
+        elseif ($arguments[$index].StartsWith('--socket=', [StringComparison]::Ordinal)) {
+            $socketCandidates.Add($arguments[$index].Substring('--socket='.Length))
+        }
+    }
+    if ($socketCandidates.Count -ne 1) {
+        throw 'Guard service must define exactly one --socket setting.'
+    }
+    $stateDatabase = Assert-CanonicalStateDatabasePath -Path $candidates[0]
+    $stateDirectory = Split-Path -Parent $stateDatabase
+    if ($stateDirectory -match '^[A-Za-z]:\\?$') {
+        throw 'Guard service --state-db must be beneath a dedicated state directory, not a volume root.'
+    }
+    return [pscustomobject]@{
+        StateDb = $stateDatabase
+        AuthorityKey = Join-Path $stateDirectory 'authority.hmac'
+        ApiRevertRoot = Join-Path $stateDirectory 'api-proxy-reverts'
+        SocketName = Assert-CanonicalSocketName -Socket $socketCandidates[0]
+    }
+}
+
+function Assert-GuardSnapshotStatePaths {
+    param([Parameter(Mandatory)]$Snapshot)
+    if ($null -eq $Snapshot.StatePaths -or [string]::IsNullOrWhiteSpace([string]$Snapshot.PathName)) {
+        throw 'Guard service snapshot is missing state path metadata.'
+    }
+    $parsed = Get-GuardStatePaths -ServicePathName ([string]$Snapshot.PathName)
+    if (-not ([string]$Snapshot.StatePaths.StateDb).Equals($parsed.StateDb, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$Snapshot.StatePaths.AuthorityKey).Equals($parsed.AuthorityKey, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$Snapshot.StatePaths.ApiRevertRoot).Equals($parsed.ApiRevertRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$Snapshot.StatePaths.SocketName).Equals($parsed.SocketName, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Guard service snapshot state paths do not match its service command line.'
+    }
+    return $parsed
+}
+
+function Get-GuardStateCompatibilityReport {
+    param(
+        [Parameter(Mandatory)][string]$GuardExe,
+        [Parameter(Mandatory)][string]$StateDb
+    )
+    $output = & $GuardExe state-db check --file $StateDb --json 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The staged Guard candidate rejected the existing state database.'
+    }
+    try { $report = ($output -join [Environment]::NewLine) | ConvertFrom-Json }
+    catch { throw 'The staged Guard candidate produced an invalid state database compatibility report.' }
+    return $report
+}
+
+function Assert-CandidateStateCompatibility {
+    param(
+        [Parameter(Mandatory)][string]$GuardExe,
+        [Parameter(Mandatory)][string]$StateDb
+    )
+    $report = Get-GuardStateCompatibilityReport -GuardExe $GuardExe -StateDb $StateDb
+    if ($report.type -ne 'state_db_compatibility' -or $report.compatible -ne $true -or
+        $report.simulated_open -ne $true -or $null -eq $report.simulated_startup -or
+        $report.simulated_startup.succeeded -ne $true) {
+        throw 'The staged Guard candidate reported that the existing state database is incompatible.'
+    }
+}
+
 function Get-ServiceSnapshot {
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $service) { return $null }
@@ -1042,18 +1612,572 @@ function Get-ServiceSnapshot {
         throw "Existing service '$ServiceName' uses account '$($config.StartName)'; refusing to replace it."
     }
     $servicePathName = Assert-ServicePathName -PathName ([string]$config.PathName)
+    $statePaths = Get-GuardStatePaths -ServicePathName $servicePathName
     if (-not (Test-Path -LiteralPath $DeployedExe -PathType Leaf)) {
         throw "Existing service '$ServiceName' has no installed binary at '$DeployedExe'."
     }
+    $environment = Normalize-KubeEnvironmentAuthority -Environment (Get-ServiceEnvironmentMap) -StatePaths $statePaths
     return [pscustomobject]@{
         WasRunning = $service.Status -eq 'Running'
         StartMode = [string]$config.StartMode
         PathName = $servicePathName
-        Environment = Get-ServiceEnvironmentMap
+        StatePaths = $statePaths
+        SocketName = $statePaths.SocketName
+        Environment = $environment
         CatalogPresent = Test-Path -LiteralPath $VerbsPath -PathType Leaf
+        AuthorityKeyPresent = Test-Path -LiteralPath $statePaths.AuthorityKey -PathType Leaf
         BinaryVersion = Get-GuardVersion -GuardExe $DeployedExe
         BinaryHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedExe).Hash
     }
+}
+
+function Get-ServiceStatusMetadata {
+    $config = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'"
+    $servicePathName = Assert-ServicePathName -PathName ([string]$config.PathName)
+    $statePaths = Get-GuardStatePaths -ServicePathName $servicePathName
+    return [pscustomobject]@{
+        PathName = $servicePathName
+        StatePaths = $statePaths
+        SocketName = $statePaths.SocketName
+    }
+}
+
+function Assert-ExactJournalProperties {
+    param(
+        [Parameter(Mandatory)]$Document,
+        [Parameter(Mandatory)][string[]]$Expected,
+        [Parameter(Mandatory)][string]$Description
+    )
+    if ($Document -isnot [pscustomobject]) {
+        throw "$Description must be a JSON object."
+    }
+    $actual = @($Document.PSObject.Properties.Name)
+    if ($actual.Count -ne $Expected.Count) {
+        throw "$Description contains fields outside its schema."
+    }
+    foreach ($name in $Expected) {
+        if ($actual -cnotcontains $name) {
+            throw "$Description is missing required field '$name'."
+        }
+    }
+}
+
+function Test-JsonInteger {
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) { return $false }
+    return [Type]::GetTypeCode($Value.GetType()) -in @(
+        [TypeCode]::Byte,
+        [TypeCode]::SByte,
+        [TypeCode]::Int16,
+        [TypeCode]::UInt16,
+        [TypeCode]::Int32,
+        [TypeCode]::UInt32,
+        [TypeCode]::Int64,
+        [TypeCode]::UInt64
+    )
+}
+
+function Test-ExactPathValue {
+    param(
+        [AllowNull()]$Value,
+        [Parameter(Mandatory)][string]$Expected
+    )
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) { return $false }
+    try {
+        $fullValue = [IO.Path]::GetFullPath($Value)
+        $fullExpected = [IO.Path]::GetFullPath($Expected)
+        return $Value.Equals($fullValue, [StringComparison]::OrdinalIgnoreCase) -and
+            $fullValue.Equals($fullExpected, [StringComparison]::OrdinalIgnoreCase)
+    }
+    catch { return $false }
+}
+
+function Write-GuardTransactionJournal {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Transaction)
+    Set-MaintenanceAcl
+    $temporary = Join-Path $MaintenanceRoot ".guard-upgrade-$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($Transaction | ConvertTo-Json -Depth 4))
+        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+        Set-ExactFileSystemAcl -Path $temporary -OwnerSid $SidAdmins -Entries (Get-AdministrativeAclEntries)
+        [IO.File]::Move($temporary, $TransactionJournal, $true)
+        Assert-ExactFileSystemAcl -Path $TransactionJournal -OwnerSid $SidAdmins -Entries (Get-AdministrativeAclEntries)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function New-GuardTransactionJournal {
+    param(
+        [Parameter(Mandatory)][ValidateSet('install', 'rollback')][string]$Operation,
+        [Parameter(Mandatory)]$Snapshot
+    )
+    $statePaths = Assert-GuardSnapshotStatePaths -Snapshot $Snapshot
+    if ($Snapshot.PSObject.Properties.Name -notcontains 'AuthorityKeyPresent' -or
+        $Snapshot.AuthorityKeyPresent -isnot [bool] -or
+        $Snapshot.BinaryHash -isnot [string] -or $Snapshot.BinaryHash -notmatch '^[0-9a-fA-F]{64}$' -or
+        $Snapshot.BinaryVersion -isnot [string] -or $Snapshot.BinaryVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or
+        $Snapshot.StartMode -isnot [string] -or $Snapshot.StartMode -cnotin @('Auto', 'Manual', 'Disabled') -or
+        $Snapshot.WasRunning -isnot [bool]) {
+        throw 'Guard service snapshot transaction metadata is invalid.'
+    }
+    $socketName = Assert-CanonicalSocketName -Socket ([string]$statePaths.SocketName)
+    return [ordered]@{
+        format = 'guard-windows-transaction'
+        schema = $TransactionJournalSchema
+        operation = $Operation
+        deployment_absent = $false
+        phase = 'quiescing'
+        backup_name = $null
+        completed_binary_sha256 = $null
+        completed_binary_version = $null
+        completed_service_path_name = $null
+        completed_state_database = $null
+        completed_socket_name = $null
+        completed_authority_key_present = $null
+        completed_start_mode = $null
+        completed_was_running = $null
+        service_path_name = $Snapshot.PathName
+        state_database = $statePaths.StateDb
+        socket_name = $socketName
+        authority_key_present = [bool]$Snapshot.AuthorityKeyPresent
+        binary_sha256 = $Snapshot.BinaryHash.ToLowerInvariant()
+        binary_version = $Snapshot.BinaryVersion
+        start_mode = $Snapshot.StartMode
+        was_running = [bool]$Snapshot.WasRunning
+    }
+}
+
+function Start-NewInstallationTransaction {
+    if (Test-Path -LiteralPath $TransactionJournal) {
+        throw 'An interrupted Guard transaction requires recovery before another deployment action.'
+    }
+    $transaction = [ordered]@{
+        format = 'guard-windows-transaction'
+        schema = $TransactionJournalSchema
+        operation = 'install'
+        deployment_absent = $true
+        phase = 'staging'
+        service_name = $ServiceName
+        service_account = $ServiceAccount
+        service_path_name = $null
+        install_root = [IO.Path]::GetFullPath($InstallRoot)
+        config_root = [IO.Path]::GetFullPath($ConfigRoot)
+        data_directory = [IO.Path]::GetFullPath($DataDir)
+        maintenance_root = [IO.Path]::GetFullPath($MaintenanceRoot)
+    }
+    Write-GuardTransactionJournal -Transaction $transaction
+    return $transaction
+}
+
+function Set-NewInstallationTransactionMutating {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Transaction,
+        [Parameter(Mandatory)][string]$ServicePathName
+    )
+    if ($Transaction['deployment_absent'] -ne $true -or $Transaction['phase'] -ne 'staging') {
+        throw 'New-installation transaction phase transition is invalid.'
+    }
+    $servicePathName = Assert-ServicePathName -PathName $ServicePathName
+    $statePaths = Get-GuardStatePaths -ServicePathName $servicePathName
+    $expectedStatePaths = Get-DeploymentStatePaths -StatePaths $null
+    if (-not $statePaths.StateDb.Equals($expectedStatePaths.StateDb, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $statePaths.SocketName.Equals($expectedStatePaths.SocketName, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'New-installation service command line does not use the managed state and socket paths.'
+    }
+    $Transaction['phase'] = 'mutating'
+    $Transaction['service_path_name'] = $servicePathName
+    Write-GuardTransactionJournal -Transaction $Transaction
+}
+
+function Start-GuardTransaction {
+    param(
+        [Parameter(Mandatory)][ValidateSet('install', 'rollback')][string]$Operation,
+        [Parameter(Mandatory)]$Snapshot
+    )
+    if (Test-Path -LiteralPath $TransactionJournal) {
+        throw 'An interrupted Guard transaction requires recovery before another deployment action.'
+    }
+    $transaction = New-GuardTransactionJournal -Operation $Operation -Snapshot $Snapshot
+    Write-GuardTransactionJournal -Transaction $transaction
+    return $transaction
+}
+
+function Set-GuardTransactionPhase {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Transaction,
+        [Parameter(Mandatory)][ValidateSet('prepared', 'mutating')][string]$Phase,
+        [Parameter(Mandatory)][string]$BackupName
+    )
+    if ($BackupName -notmatch '^before-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{32}$') {
+        throw 'Guard transaction backup name is invalid.'
+    }
+    $Transaction['phase'] = $Phase
+    $Transaction['backup_name'] = $BackupName
+    Write-GuardTransactionJournal -Transaction $Transaction
+}
+
+function Mark-GuardTransactionVerified {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Transaction,
+        [Parameter(Mandatory)]$CompletedSnapshot
+    )
+    $completedStatePaths = Assert-GuardSnapshotStatePaths -Snapshot $CompletedSnapshot
+    if ($Transaction['phase'] -ne 'mutating' -or
+        $CompletedSnapshot.BinaryHash -isnot [string] -or $CompletedSnapshot.BinaryHash -notmatch '^[0-9a-fA-F]{64}$' -or
+        $CompletedSnapshot.BinaryVersion -isnot [string] -or $CompletedSnapshot.BinaryVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or
+        $CompletedSnapshot.StartMode -isnot [string] -or $CompletedSnapshot.StartMode -cnotin @('Auto', 'Manual', 'Disabled') -or
+        $CompletedSnapshot.WasRunning -isnot [bool] -or
+        $CompletedSnapshot.AuthorityKeyPresent -isnot [bool]) {
+        throw 'Guard transaction completion metadata is invalid.'
+    }
+    $Transaction['phase'] = 'verified'
+    $Transaction['completed_binary_sha256'] = $CompletedSnapshot.BinaryHash.ToLowerInvariant()
+    $Transaction['completed_binary_version'] = $CompletedSnapshot.BinaryVersion
+    $Transaction['completed_service_path_name'] = $CompletedSnapshot.PathName
+    $Transaction['completed_state_database'] = $completedStatePaths.StateDb
+    $Transaction['completed_socket_name'] = $completedStatePaths.SocketName
+    $Transaction['completed_authority_key_present'] = [bool]$CompletedSnapshot.AuthorityKeyPresent
+    $Transaction['completed_start_mode'] = $CompletedSnapshot.StartMode
+    $Transaction['completed_was_running'] = [bool]$CompletedSnapshot.WasRunning
+    Write-GuardTransactionJournal -Transaction $Transaction
+}
+
+function Read-GuardTransactionJournal {
+    if (-not (Test-Path -LiteralPath $TransactionJournal)) { return $null }
+    if (-not (Test-Path -LiteralPath $MaintenanceRoot -PathType Container) -or
+        -not (Test-Path -LiteralPath $TransactionJournal -PathType Leaf)) {
+        throw 'Guard transaction journal is not a regular file in the maintenance root.'
+    }
+    Assert-NoReparsePoint -Path $MaintenanceRoot
+    Assert-ExactFileSystemAcl -Path $MaintenanceRoot -OwnerSid $SidAdmins -Entries (Get-AdministrativeAclEntries)
+    Assert-NoReparsePoint -Path $TransactionJournal
+    if (-not (Test-PathWithin -Path $TransactionJournal -Parent $MaintenanceRoot)) {
+        throw 'Guard transaction journal escapes the maintenance root.'
+    }
+    Assert-ExactFileSystemAcl -Path $TransactionJournal -OwnerSid $SidAdmins -Entries (Get-AdministrativeAclEntries)
+    if ((Get-Item -LiteralPath $TransactionJournal -Force).Length -gt 65536) {
+        throw 'Guard transaction journal exceeds the maximum supported size.'
+    }
+    try { $transaction = Get-Content -LiteralPath $TransactionJournal -Raw | ConvertFrom-Json }
+    catch { throw 'Guard transaction journal is not valid JSON.' }
+    if ($transaction -isnot [pscustomobject] -or
+        (@($transaction.PSObject.Properties.Name) -cnotcontains 'deployment_absent') -or
+        $transaction.deployment_absent -isnot [bool]) {
+        throw 'Guard transaction journal metadata is invalid.'
+    }
+    if ($transaction.deployment_absent -eq $true) {
+        $expectedProperties = @(
+            'format',
+            'schema',
+            'operation',
+            'deployment_absent',
+            'phase',
+            'service_name',
+            'service_account',
+            'service_path_name',
+            'install_root',
+            'config_root',
+            'data_directory',
+            'maintenance_root'
+        )
+        Assert-ExactJournalProperties -Document $transaction -Expected $expectedProperties -Description 'New-installation transaction journal'
+        if ($transaction.format -isnot [string] -or $transaction.format -cne 'guard-windows-transaction' -or
+            -not (Test-JsonInteger -Value $transaction.schema) -or [int64]$transaction.schema -ne $TransactionJournalSchema -or
+            $transaction.operation -isnot [string] -or $transaction.operation -cne 'install' -or
+            $transaction.phase -isnot [string] -or $transaction.phase -cnotin @('staging', 'mutating') -or
+            $transaction.service_name -isnot [string] -or $transaction.service_name -cne $ServiceName -or
+            $transaction.service_account -isnot [string] -or $transaction.service_account -cne $ServiceAccount -or
+            -not (Test-ExactPathValue -Value $transaction.install_root -Expected $InstallRoot) -or
+            -not (Test-ExactPathValue -Value $transaction.config_root -Expected $ConfigRoot) -or
+            -not (Test-ExactPathValue -Value $transaction.data_directory -Expected $DataDir) -or
+            -not (Test-ExactPathValue -Value $transaction.maintenance_root -Expected $MaintenanceRoot)) {
+            throw 'New-installation transaction journal metadata is invalid.'
+        }
+        if ($transaction.phase -eq 'staging') {
+            if ($null -ne $transaction.service_path_name) {
+                throw 'Staging new-installation transaction unexpectedly has a service command line.'
+            }
+        }
+        else {
+            if ($transaction.service_path_name -isnot [string]) {
+                throw 'Mutating new-installation transaction has no service command line.'
+            }
+            $servicePathName = Assert-ServicePathName -PathName $transaction.service_path_name
+            $statePaths = Get-GuardStatePaths -ServicePathName $servicePathName
+            $expectedStatePaths = Get-DeploymentStatePaths -StatePaths $null
+            if (-not $statePaths.StateDb.Equals($expectedStatePaths.StateDb, [StringComparison]::OrdinalIgnoreCase) -or
+                -not $statePaths.SocketName.Equals($expectedStatePaths.SocketName, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'New-installation transaction service command line does not use the managed state and socket paths.'
+            }
+        }
+        return [pscustomobject]@{
+            Document = $transaction
+            StatePaths = $null
+            CompletedStatePaths = $null
+        }
+    }
+    $expectedProperties = @(
+        'format',
+        'schema',
+        'operation',
+        'deployment_absent',
+        'phase',
+        'backup_name',
+        'completed_binary_sha256',
+        'completed_binary_version',
+        'completed_service_path_name',
+        'completed_state_database',
+        'completed_socket_name',
+        'completed_authority_key_present',
+        'completed_start_mode',
+        'completed_was_running',
+        'service_path_name',
+        'state_database',
+        'socket_name',
+        'authority_key_present',
+        'binary_sha256',
+        'binary_version',
+        'start_mode',
+        'was_running'
+    )
+    Assert-ExactJournalProperties -Document $transaction -Expected $expectedProperties -Description 'Guard transaction journal'
+    if ($transaction.format -isnot [string] -or $transaction.format -cne 'guard-windows-transaction' -or
+        -not (Test-JsonInteger -Value $transaction.schema) -or [int64]$transaction.schema -ne $TransactionJournalSchema -or
+        $transaction.operation -isnot [string] -or $transaction.operation -cnotin @('install', 'rollback') -or
+        $transaction.deployment_absent -ne $false -or
+        $transaction.phase -isnot [string] -or $transaction.phase -cnotin @('quiescing', 'prepared', 'mutating', 'verified') -or
+        $transaction.service_path_name -isnot [string] -or
+        $transaction.state_database -isnot [string] -or
+        $transaction.socket_name -isnot [string] -or
+        $transaction.binary_sha256 -isnot [string] -or $transaction.binary_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $transaction.binary_version -isnot [string] -or $transaction.binary_version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or
+        $transaction.start_mode -isnot [string] -or $transaction.start_mode -cnotin @('Auto', 'Manual', 'Disabled') -or
+        $transaction.was_running -isnot [bool] -or
+        $transaction.authority_key_present -isnot [bool]) {
+        throw 'Guard transaction journal metadata is invalid.'
+    }
+    $statePaths = Get-GuardStatePaths -ServicePathName ([string]$transaction.service_path_name)
+    if (-not ([string]$transaction.state_database).Equals($statePaths.StateDb, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Guard transaction state path does not match its service command line.'
+    }
+    if (-not ([string]$transaction.socket_name).Equals($statePaths.SocketName, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Guard transaction socket does not match its service command line.'
+    }
+    if ($transaction.phase -eq 'quiescing') {
+        if ($null -ne $transaction.backup_name) { throw 'Quiescing Guard transaction unexpectedly has a backup.' }
+    }
+    else {
+        if ($transaction.backup_name -isnot [string] -or
+            $transaction.backup_name -cnotmatch '^before-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{32}$') {
+            throw 'Guard transaction backup name is invalid.'
+        }
+    }
+    $completedStatePaths = $null
+    if ($transaction.phase -eq 'verified') {
+        if ($transaction.completed_binary_sha256 -isnot [string] -or $transaction.completed_binary_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $transaction.completed_binary_version -isnot [string] -or $transaction.completed_binary_version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or
+            $transaction.completed_service_path_name -isnot [string] -or
+            $transaction.completed_state_database -isnot [string] -or
+            $transaction.completed_socket_name -isnot [string] -or
+            $transaction.completed_start_mode -isnot [string] -or $transaction.completed_start_mode -cnotin @('Auto', 'Manual', 'Disabled') -or
+            $transaction.completed_was_running -isnot [bool] -or
+            $transaction.completed_authority_key_present -isnot [bool]) {
+            throw 'Verified Guard transaction completion metadata is invalid.'
+        }
+        $completedStatePaths = Get-GuardStatePaths -ServicePathName ([string]$transaction.completed_service_path_name)
+        if (-not ([string]$transaction.completed_state_database).Equals($completedStatePaths.StateDb, [StringComparison]::OrdinalIgnoreCase) -or
+            -not ([string]$transaction.completed_socket_name).Equals($completedStatePaths.SocketName, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Verified Guard transaction state paths do not match its completed service command line.'
+        }
+    }
+    elseif (@(
+        $transaction.completed_binary_sha256,
+        $transaction.completed_binary_version,
+        $transaction.completed_service_path_name,
+        $transaction.completed_state_database,
+        $transaction.completed_socket_name,
+        $transaction.completed_authority_key_present,
+        $transaction.completed_start_mode,
+        $transaction.completed_was_running
+    ) | Where-Object { $null -ne $_ }) {
+        throw 'Unverified Guard transaction unexpectedly has completion metadata.'
+    }
+    return [pscustomobject]@{
+        Document = $transaction
+        StatePaths = $statePaths
+        CompletedStatePaths = $completedStatePaths
+    }
+}
+
+function Complete-GuardTransaction {
+    if (-not (Test-Path -LiteralPath $TransactionJournal)) { return }
+    $null = Read-GuardTransactionJournal
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Assert-NoReparsePoint -Path $TransactionJournal
+            Remove-Item -LiteralPath $TransactionJournal -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $TransactionJournal)) { return }
+            $lastError = 'journal still exists after cleanup'
+        }
+        catch { $lastError = $_.Exception.Message }
+        if ($attempt -lt 3) { Start-Sleep -Milliseconds 200 }
+    }
+    throw "Guard transaction journal cleanup failed after 3 attempts: $lastError"
+}
+
+function Restore-SnapshotPrivateServiceAcls {
+    param(
+        [Parameter(Mandatory)]$StatePaths,
+        [Parameter(Mandatory)][string]$GuardSid,
+        [Parameter(Mandatory)][bool]$AuthorityKeyPresent
+    )
+    $authorityKeyExists = Test-Path -LiteralPath $StatePaths.AuthorityKey -PathType Leaf
+    if ($authorityKeyExists -ne $AuthorityKeyPresent) {
+        throw 'The Guard authority file no longer matches the unmutated transaction snapshot.'
+    }
+    if ($AuthorityKeyPresent) {
+        Set-ExactFileSystemAcl -Path $StatePaths.AuthorityKey -OwnerSid $GuardSid -Entries @((New-AclEntry -Sid $GuardSid -Rights ([Security.AccessControl.FileSystemRights]::FullControl)))
+    }
+    foreach ($privateRoot in Get-StatePrivateRoots -StatePaths $StatePaths) {
+        Protect-PrivateServiceTree -Path $privateRoot -GuardSid $GuardSid
+    }
+}
+
+function Recover-UnmutatedGuardTransaction {
+    param([Parameter(Mandatory)]$TransactionRecord)
+    $transaction = $TransactionRecord.Document
+    $snapshot = Get-ServiceSnapshot
+    if ($null -eq $snapshot -or
+        -not $snapshot.PathName.Equals([string]$transaction.service_path_name, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $snapshot.StatePaths.StateDb.Equals($TransactionRecord.StatePaths.StateDb, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $snapshot.StatePaths.SocketName.Equals($TransactionRecord.StatePaths.SocketName, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $snapshot.BinaryHash.Equals([string]$transaction.binary_sha256, [StringComparison]::OrdinalIgnoreCase) -or
+        $snapshot.BinaryVersion -ne $transaction.binary_version) {
+        throw 'Unmutated Guard transaction no longer matches the recorded deployment.'
+    }
+    Restore-SnapshotPrivateServiceAcls -StatePaths $TransactionRecord.StatePaths -GuardSid (Get-GuardSid) -AuthorityKeyPresent ([bool]$transaction.authority_key_present)
+    if ([bool]$transaction.was_running) {
+        Set-GuardServiceConfiguration -PathName $snapshot.PathName -StartMode 'Manual'
+        Start-GuardService -Name $ServiceName
+        Verify-GuardService -ExpectedHash $transaction.binary_sha256 -ExpectedVersion $transaction.binary_version -ExpectedStateDb $TransactionRecord.StatePaths.StateDb -ExpectedSocket $TransactionRecord.StatePaths.SocketName
+    }
+    else {
+        Wait-ServiceStopped -Name $ServiceName
+    }
+    Set-GuardServiceConfiguration -PathName $snapshot.PathName -StartMode $transaction.start_mode
+}
+
+function Wait-GuardServiceAbsent {
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+    throw 'The interrupted new Guard service remains after deletion.'
+}
+
+function Remove-InterruptedNewInstallationService {
+    param([Parameter(Mandatory)]$Transaction)
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $service) { return }
+    if ($Transaction.phase -ne 'mutating') {
+        throw 'A Guard service appeared during a staging-only new-installation transaction.'
+    }
+    $config = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'"
+    if ($null -eq $config -or
+        -not ([string]$config.StartName).Equals([string]$Transaction.service_account, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$config.PathName).Equals([string]$Transaction.service_path_name, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The Guard service does not match the interrupted new-installation transaction.'
+    }
+    Wait-ServiceStopped -Name $ServiceName
+    & sc.exe delete $ServiceName | Out-Null
+    if ($LASTEXITCODE -notin @(0, 1072)) { throw 'Could not remove the interrupted new Guard service.' }
+    Wait-GuardServiceAbsent
+}
+
+function Clear-NewInstallationMaintenanceArtifacts {
+    if (-not (Test-Path -LiteralPath $MaintenanceRoot -PathType Container)) {
+        throw 'New-installation transaction maintenance root is missing.'
+    }
+    Assert-NoReparsePoint -Path $MaintenanceRoot
+    Assert-ExactFileSystemAcl -Path $MaintenanceRoot -OwnerSid $SidAdmins -Entries (Get-AdministrativeAclEntries)
+    foreach ($item in @(Get-ChildItem -LiteralPath $MaintenanceRoot -Force)) {
+        if ($item.FullName.Equals([IO.Path]::GetFullPath($TransactionJournal), [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        Remove-GuardOwnedTree -Path $item.FullName
+    }
+    $remaining = @(Get-ChildItem -LiteralPath $MaintenanceRoot -Force)
+    if ($remaining.Count -ne 1 -or
+        -not $remaining[0].FullName.Equals([IO.Path]::GetFullPath($TransactionJournal), [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'New-installation maintenance cleanup did not retain exactly the transaction journal.'
+    }
+}
+
+function Recover-GuardTransaction {
+    $transactionRecord = Read-GuardTransactionJournal
+    if ($null -eq $transactionRecord) { return }
+    if ($transactionRecord.Document.deployment_absent -eq $true) {
+        Remove-InterruptedNewInstallationService -Transaction $transactionRecord.Document
+        if ($transactionRecord.Document.phase -eq 'staging') {
+            foreach ($path in @($InstallRoot, $ConfigRoot, $DataDir)) {
+                if (Test-Path -LiteralPath $path) {
+                    throw "Staging-only new-installation transaction does not own deployment state at '$path'."
+                }
+            }
+        }
+        else {
+            foreach ($path in @($InstallRoot, $ConfigRoot, $DataDir)) {
+                Remove-GuardOwnedTree -Path $path
+            }
+        }
+        Clear-NewInstallationMaintenanceArtifacts
+        Complete-GuardTransaction
+        Remove-GuardOwnedTree -Path $MaintenanceRoot
+        return
+    }
+    if ($transactionRecord.Document.phase -eq 'verified') {
+        $snapshot = Get-ServiceSnapshot
+        if ($null -eq $snapshot -or
+            -not $snapshot.PathName.Equals([string]$transactionRecord.Document.completed_service_path_name, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $snapshot.StatePaths.StateDb.Equals($transactionRecord.CompletedStatePaths.StateDb, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $snapshot.StatePaths.SocketName.Equals($transactionRecord.CompletedStatePaths.SocketName, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $snapshot.BinaryHash.Equals([string]$transactionRecord.Document.completed_binary_sha256, [StringComparison]::OrdinalIgnoreCase) -or
+            $snapshot.BinaryVersion -ne $transactionRecord.Document.completed_binary_version -or
+            $snapshot.AuthorityKeyPresent -ne [bool]$transactionRecord.Document.completed_authority_key_present) {
+            throw 'Verified Guard transaction no longer matches the completed deployment.'
+        }
+        if ([bool]$transactionRecord.Document.completed_was_running) {
+            Set-GuardServiceConfiguration -PathName $snapshot.PathName -StartMode 'Manual'
+            Start-GuardService -Name $ServiceName
+            Verify-GuardService -ExpectedHash $transactionRecord.Document.completed_binary_sha256 -ExpectedVersion $transactionRecord.Document.completed_binary_version -ExpectedStateDb $transactionRecord.CompletedStatePaths.StateDb -ExpectedSocket $transactionRecord.CompletedStatePaths.SocketName
+        }
+        else {
+            Wait-ServiceStopped -Name $ServiceName
+        }
+        Set-GuardServiceConfiguration -PathName $snapshot.PathName -StartMode $transactionRecord.Document.completed_start_mode
+        Assert-DeploymentAcls -GuardSid (Get-GuardSid) -StatePaths $transactionRecord.CompletedStatePaths -AuthorityKeyPresent ([bool]$transactionRecord.Document.completed_authority_key_present)
+    }
+    elseif ($transactionRecord.Document.phase -eq 'mutating') {
+        $backup = Read-ValidatedGuardBackup -Name ([string]$transactionRecord.Document.backup_name)
+        Restore-GuardInstallation -BackupRecord $backup -GuardSid (Get-GuardSid)
+    }
+    else {
+        Recover-UnmutatedGuardTransaction -TransactionRecord $transactionRecord
+    }
+    Complete-GuardTransaction
 }
 
 function Get-DatabasePaths {
@@ -1095,7 +2219,8 @@ function Copy-BackupFile {
 }
 
 function Get-ApiRevertRoot {
-    return (Join-Path $DataDir 'api-proxy-reverts')
+    param([Parameter(Mandatory)]$StatePaths)
+    return $StatePaths.ApiRevertRoot
 }
 
 function Protect-PrivateServiceTree {
@@ -1117,11 +2242,12 @@ function Protect-PrivateServiceTree {
 function Copy-ApiRevertBackup {
     param(
         [Parameter(Mandatory)][string]$BackupPath,
-        [Parameter(Mandatory)][string]$GuardSid
+        [Parameter(Mandatory)][string]$GuardSid,
+        [Parameter(Mandatory)]$StatePaths
     )
-    $sourceRoot = Get-ApiRevertRoot
+    $sourceRoot = Get-ApiRevertRoot -StatePaths $StatePaths
     if (-not (Test-Path -LiteralPath $sourceRoot -PathType Container)) { return @() }
-    Reset-TreeForAdministrativeMaintenance -Path $sourceRoot
+    Reset-TreeForAdministrativeMaintenance -Path $sourceRoot -AdditionalRoots @(Get-StateDirectory -StatePaths $StatePaths)
     try {
         $result = @()
         $prefixLength = [IO.Path]::GetFullPath($sourceRoot).TrimEnd('\').Length + 1
@@ -1148,6 +2274,12 @@ function New-GuardBackup {
         [Parameter(Mandatory)][string]$GuardSid
     )
     if ($BeforeVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Backup version is invalid.' }
+    $statePaths = Assert-GuardSnapshotStatePaths -Snapshot $Snapshot
+    if ($Snapshot.PSObject.Properties.Name -notcontains 'AuthorityKeyPresent' -or
+        $Snapshot.AuthorityKeyPresent -isnot [bool]) {
+        throw 'Guard service snapshot authority presence is invalid.'
+    }
+    $backupEnvironment = Normalize-KubeEnvironmentAuthority -Environment $Snapshot.Environment -StatePaths $statePaths
     $name = "before-v$BeforeVersion-$(Get-Date -Format 'yyyyMMddTHHmmssZ')-$([guid]::NewGuid().ToString('N'))"
     $path = Join-Path $BackupRoot $name
     New-Item -ItemType Directory -Path $path | Out-Null
@@ -1160,20 +2292,45 @@ function New-GuardBackup {
     if ($Snapshot.CatalogPresent) {
         $files += Copy-BackupFile -Source $VerbsPath -BackupPath $path -RelativePath 'config/verbs.yaml'
     }
-    foreach ($databaseFile in Get-DatabasePaths -Database $StateDb) {
+    foreach ($databaseFile in Get-DatabasePaths -Database $statePaths.StateDb) {
         if (Test-Path -LiteralPath $databaseFile -PathType Leaf) {
-            $files += Copy-BackupFile -Source $databaseFile -BackupPath $path -RelativePath "sqlite/$([IO.Path]::GetFileName($databaseFile))"
+            $suffix = $databaseFile.Substring($statePaths.StateDb.Length)
+            $files += Copy-BackupFile -Source $databaseFile -BackupPath $path -RelativePath "sqlite/state.db$suffix"
         }
     }
-    $apiRevertsPresent = Test-Path -LiteralPath (Get-ApiRevertRoot) -PathType Container
+    $authorityKeyPresent = Test-Path -LiteralPath $statePaths.AuthorityKey -PathType Leaf
+    if ($authorityKeyPresent -ne [bool]$Snapshot.AuthorityKeyPresent) {
+        throw 'The quiesced Guard authority file no longer matches the service snapshot.'
+    }
+    if ($authorityKeyPresent) {
+        Assert-ExactFileSystemAcl -Path $statePaths.AuthorityKey -OwnerSid $GuardSid -Entries @((New-AclEntry -Sid $GuardSid -Rights ([Security.AccessControl.FileSystemRights]::FullControl)))
+        Reset-TreeForAdministrativeMaintenance -Path $statePaths.AuthorityKey -AdditionalRoots @(Get-StateDirectory -StatePaths $statePaths)
+        try {
+            $files += Copy-BackupFile -Source $statePaths.AuthorityKey -BackupPath $path -RelativePath 'authority.hmac'
+        }
+        finally {
+            Set-ExactFileSystemAcl -Path $statePaths.AuthorityKey -OwnerSid $GuardSid -Entries @((New-AclEntry -Sid $GuardSid -Rights ([Security.AccessControl.FileSystemRights]::FullControl)))
+        }
+    }
+    $apiRevertsPresent = Test-Path -LiteralPath (Get-ApiRevertRoot -StatePaths $statePaths) -PathType Container
     if ($apiRevertsPresent) {
-        $files += Copy-ApiRevertBackup -BackupPath $path -GuardSid $GuardSid
+        $files += Copy-ApiRevertBackup -BackupPath $path -GuardSid $GuardSid -StatePaths $statePaths
+    }
+    $activeKubeConfig = Get-ActiveKubeConfigPath -Environment $backupEnvironment -StatePaths $statePaths
+    $kubeAuthorityPresent = $null -ne $activeKubeConfig
+    if ($kubeAuthorityPresent) {
+        if (-not (Test-Path -LiteralPath $activeKubeConfig -PathType Leaf)) {
+            throw 'The active Guard kube authority file is missing.'
+        }
+        Assert-NoReparsePoint -Path (Split-Path -Parent $activeKubeConfig)
+        Assert-NoReparsePoint -Path $activeKubeConfig
+        $files += Copy-BackupFile -Source $activeKubeConfig -BackupPath $path -RelativePath 'config/kube/config'
     }
     if (-not (Test-Path -LiteralPath (Join-Path $path 'sqlite\state.db') -PathType Leaf)) {
         throw 'The quiesced Guard state database is missing; refusing to create an incomplete rollback backup.'
     }
     $environmentPath = Join-Path $path 'service-environment.dpapi'
-    Protect-LocalMachineText -Value ($Snapshot.Environment | ConvertTo-Json -Compress) -Path $environmentPath
+    Protect-LocalMachineText -Value ($backupEnvironment | ConvertTo-Json -Compress) -Path $environmentPath
     $files += [ordered]@{
         path = 'service-environment.dpapi'
         sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $environmentPath).Hash.ToLowerInvariant()
@@ -1185,7 +2342,11 @@ function New-GuardBackup {
         service_name = $ServiceName
         service_account = $ServiceAccount
         installed_path = $DeployedExe
-        state_database = $StateDb
+        state_database = $statePaths.StateDb
+        socket_name = $statePaths.SocketName
+        authority_key = $statePaths.AuthorityKey
+        authority_key_present = [bool]$authorityKeyPresent
+        api_revert_root = $statePaths.ApiRevertRoot
         catalog_path = $VerbsPath
         binary_version = $Snapshot.BinaryVersion
         binary_sha256 = $Snapshot.BinaryHash.ToLowerInvariant()
@@ -1195,6 +2356,7 @@ function New-GuardBackup {
         was_running = [bool]$Snapshot.WasRunning
         service_path_name = $Snapshot.PathName
         api_reverts_present = [bool]$apiRevertsPresent
+        kube_authority_present = [bool]$kubeAuthorityPresent
         files = $files
     }
     $json = $metadata | ConvertTo-Json -Depth 6
@@ -1223,21 +2385,74 @@ function Read-ValidatedGuardBackup {
     Assert-NoReparsePoint -Path $metadataPath
     try { $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json }
     catch { throw 'Backup metadata is not valid JSON.' }
+    $backupSchema = $metadata.metadata_schema
     if ($metadata.format -ne 'guard-windows-backup' -or
-        $metadata.metadata_schema -ne $BackupMetadataSchema -or
+        $backupSchema -notin @(2, 3, 4, $BackupMetadataSchema) -or
         $metadata.service_name -ne $ServiceName -or
         $metadata.service_account -ne $ServiceAccount -or
         $metadata.installed_path -ne $DeployedExe -or
-        $metadata.state_database -ne $StateDb -or
         $metadata.catalog_path -ne $VerbsPath -or
         $metadata.binary_version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or
         $metadata.binary_sha256 -notmatch '^[0-9a-f]{64}$' -or
         $metadata.start_mode -notin @('Auto', 'Manual', 'Disabled')) {
         throw 'Backup metadata does not match this Guard installation.'
     }
-    [void](Assert-ServicePathName -PathName ([string]$metadata.service_path_name))
+    $statePaths = Get-GuardStatePaths -ServicePathName ([string]$metadata.service_path_name)
+    if ($backupSchema -eq 2) {
+        foreach ($property in @('socket_name', 'authority_key', 'authority_key_present', 'api_revert_root', 'kube_authority_present')) {
+            if ($metadata.PSObject.Properties.Name -contains $property) {
+                throw 'Legacy backup metadata contains fields outside its schema.'
+            }
+        }
+        $metadata | Add-Member -NotePropertyName socket_name -NotePropertyValue $statePaths.SocketName
+        $metadata | Add-Member -NotePropertyName authority_key -NotePropertyValue $statePaths.AuthorityKey
+        $metadata | Add-Member -NotePropertyName api_revert_root -NotePropertyValue $statePaths.ApiRevertRoot
+    }
+    $hasSocketName = $metadata.PSObject.Properties.Name -contains 'socket_name'
+    if (($backupSchema -ge 4 -and -not $hasSocketName) -or
+        $metadata.PSObject.Properties.Name -notcontains 'authority_key' -or
+        $metadata.PSObject.Properties.Name -notcontains 'api_revert_root' -or
+        -not ([string]$metadata.state_database).Equals($statePaths.StateDb, [StringComparison]::OrdinalIgnoreCase) -or
+        ($hasSocketName -and -not ([string]$metadata.socket_name).Equals($statePaths.SocketName, [StringComparison]::OrdinalIgnoreCase)) -or
+        -not ([string]$metadata.authority_key).Equals($statePaths.AuthorityKey, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$metadata.api_revert_root).Equals($statePaths.ApiRevertRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Backup state path metadata does not match its service command line.'
+    }
     if ($metadata.api_reverts_present -isnot [bool]) {
         throw 'Backup API revert metadata is invalid.'
+    }
+    $authorityKeyPresent = $false
+    if ($backupSchema -eq $BackupMetadataSchema) {
+        if ($metadata.PSObject.Properties.Name -notcontains 'authority_key_present' -or
+            $metadata.authority_key_present -isnot [bool]) {
+            throw 'Backup authority presence metadata is invalid.'
+        }
+        $authorityKeyPresent = [bool]$metadata.authority_key_present
+    }
+    else {
+        $authorityKeyPresent = $backupSchema -ge 3
+        if ($metadata.PSObject.Properties.Name -contains 'authority_key_present') {
+            $metadata.authority_key_present = $authorityKeyPresent
+        }
+        else {
+            $metadata | Add-Member -NotePropertyName authority_key_present -NotePropertyValue $authorityKeyPresent
+        }
+    }
+    $kubeAuthorityPresent = $false
+    if ($backupSchema -eq $BackupMetadataSchema) {
+        if ($metadata.PSObject.Properties.Name -notcontains 'kube_authority_present' -or
+            $metadata.kube_authority_present -isnot [bool]) {
+            throw 'Backup kube authority metadata is invalid.'
+        }
+        $kubeAuthorityPresent = [bool]$metadata.kube_authority_present
+    }
+    else {
+        if ($metadata.PSObject.Properties.Name -contains 'kube_authority_present') {
+            $metadata.kube_authority_present = $false
+        }
+        else {
+            $metadata | Add-Member -NotePropertyName kube_authority_present -NotePropertyValue $false
+        }
     }
     $operatorScriptPresent = $false
     if ($metadata.PSObject.Properties.Name -contains 'operator_script_present') {
@@ -1250,7 +2465,8 @@ function Read-ValidatedGuardBackup {
         $metadata | Add-Member -NotePropertyName operator_script_present -NotePropertyValue $false
     }
     $allowedFiles = @(
-        'guard.exe', 'guard-operator.ps1', 'config/verbs.yaml', 'service-environment.dpapi',
+        'guard.exe', 'guard-operator.ps1', 'config/verbs.yaml', 'service-environment.dpapi', 'authority.hmac',
+        'config/kube/config',
         'sqlite/state.db', 'sqlite/state.db-wal', 'sqlite/state.db-shm', 'sqlite/state.db-journal'
     )
     $seen = @{}
@@ -1273,11 +2489,17 @@ function Read-ValidatedGuardBackup {
     foreach ($required in @('guard.exe', 'service-environment.dpapi', 'sqlite/state.db')) {
         if (-not $seen.ContainsKey($required)) { throw "Backup is missing required file '$required'." }
     }
+    if ($authorityKeyPresent -ne $seen.ContainsKey('authority.hmac')) {
+        throw 'Backup authority presence metadata is inconsistent.'
+    }
     if ([bool]$metadata.catalog_present -ne $seen.ContainsKey('config/verbs.yaml')) {
         throw 'Backup catalog metadata is inconsistent.'
     }
     if ($operatorScriptPresent -ne $seen.ContainsKey('guard-operator.ps1')) {
         throw 'Backup operator script metadata is inconsistent.'
+    }
+    if ($kubeAuthorityPresent -ne $seen.ContainsKey('config/kube/config')) {
+        throw 'Backup kube authority metadata is inconsistent.'
     }
     if ($metadata.binary_sha256 -ne (@($metadata.files | Where-Object path -eq 'guard.exe')[0].sha256)) {
         throw 'Backup binary metadata is inconsistent.'
@@ -1296,7 +2518,13 @@ function Read-ValidatedGuardBackup {
     $environmentText = Unprotect-LocalMachineText -Path (Join-Path $path 'service-environment.dpapi')
     try { $environment = Convert-EnvironmentObjectToMap -InputObject ($environmentText | ConvertFrom-Json) }
     catch { throw 'Protected service environment backup is invalid.' }
-    return [pscustomobject]@{ Name = $Name; Path = $path; Metadata = $metadata; Environment = $environment }
+    if (-not $kubeAuthorityPresent -and $environment.ContainsKey('KUBECONFIG')) {
+        if ($backupSchema -lt $BackupMetadataSchema) {
+            throw 'Legacy backup references Kubernetes authority that its schema did not capture.'
+        }
+        throw 'Backup environment references Kubernetes authority that the backup records as absent.'
+    }
+    return [pscustomobject]@{ Name = $Name; Path = $path; Metadata = $metadata; Environment = $environment; StatePaths = $statePaths }
 }
 
 function Convert-StartModeForSc {
@@ -1309,24 +2537,45 @@ function Convert-StartModeForSc {
     }
 }
 
+function Get-AtomicReplacementPaths {
+    param([Parameter(Mandatory)][string]$Destination)
+    $destinationDirectory = Split-Path -Parent $Destination
+    $identifier = [guid]::NewGuid().ToString('N')
+    return [pscustomobject]@{
+        Staged = Join-Path $destinationDirectory ".guard-replace-$identifier.tmp"
+        Replaced = Join-Path $destinationDirectory ".guard-replaced-$identifier.tmp"
+    }
+}
+
 function Install-FileAtomically {
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination,
         [Parameter(Mandatory)][string]$ExpectedHash
     )
-    $staged = Join-Path $StagingDir "restore-$([guid]::NewGuid().ToString('N')).tmp"
-    $replaced = Join-Path $StagingDir "replaced-$([guid]::NewGuid().ToString('N')).tmp"
+    $destinationDirectory = Split-Path -Parent $Destination
+    if (-not (Test-Path -LiteralPath $destinationDirectory -PathType Container)) {
+        throw "Atomic replacement destination directory does not exist: '$destinationDirectory'."
+    }
+    Assert-NoReparsePoint -Path $destinationDirectory
+    $replacementPaths = Get-AtomicReplacementPaths -Destination $Destination
+    $staged = $replacementPaths.Staged
+    $replaced = $replacementPaths.Replaced
     try {
         Copy-Item -LiteralPath $Source -Destination $staged
         if ((Get-FileHash -Algorithm SHA256 -LiteralPath $staged).Hash.ToLowerInvariant() -ne $ExpectedHash.ToLowerInvariant()) {
             throw "Staged file for '$Destination' failed integrity validation."
         }
         if (Test-Path -LiteralPath $Destination) {
+            Assert-NoReparsePoint -Path $Destination
+            Set-Acl -LiteralPath $staged -AclObject (Get-Acl -LiteralPath $Destination)
             [IO.File]::Replace($staged, $Destination, $replaced)
             Remove-Item -LiteralPath $replaced -Force -ErrorAction Stop
         }
-        else { Move-Item -LiteralPath $staged -Destination $Destination }
+        else {
+            Set-Acl -LiteralPath $staged -AclObject (Get-Acl -LiteralPath (Split-Path -Parent $Destination))
+            Move-Item -LiteralPath $staged -Destination $Destination
+        }
     }
     finally {
         foreach ($temporaryPath in @($staged, $replaced)) {
@@ -1377,27 +2626,30 @@ function Resolve-InstallServicePath {
 function Verify-GuardService {
     param(
         [Parameter(Mandatory)][string]$ExpectedHash,
-        [Parameter(Mandatory)][string]$ExpectedVersion
+        [Parameter(Mandatory)][string]$ExpectedVersion,
+        [Parameter(Mandatory)][string]$ExpectedStateDb,
+        [Parameter(Mandatory)][string]$ExpectedSocket
     )
+    $ExpectedSocket = Assert-CanonicalSocketName -Socket $ExpectedSocket
     $deadline = (Get-Date).AddSeconds($ServiceReadinessTimeoutSeconds)
     $statusDocument = $null
     do {
         $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if ($service -and $service.Status -eq 'Running') {
-            $statusText = & $DeployedExe status --socket $SocketName --json 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                try { $statusDocument = ($statusText -join [Environment]::NewLine) | ConvertFrom-Json }
-                catch { $statusDocument = $null }
+            try {
+                $statusResult = Invoke-GuardAsOperator -Arguments @('status', '--socket', $ExpectedSocket, '--json') -GuardExe $DeployedExe -JsonOutput
+                if ($statusResult.ExitCode -eq 0) {
+                    $statusDocument = $statusResult.Output | ConvertFrom-Json
+                }
+            }
+            catch {
+                $statusDocument = $null
             }
         }
         if (-not $statusDocument) { Start-Sleep -Milliseconds 400 }
     } while (-not $statusDocument -and (Get-Date) -lt $deadline)
     if (-not $statusDocument) { throw 'Guard did not complete a status handshake before the readiness deadline.' }
-    if ($statusDocument.type -ne 'status' -or $statusDocument.server.version_mismatch -or
-        $statusDocument.client.version -ne $statusDocument.server.version -or
-        $statusDocument.server.version -ne $ExpectedVersion) {
-        throw 'Guard status returned an unexpected client/server version document.'
-    }
+    Assert-GuardStatusDocument -StatusDocument $statusDocument -ExpectedVersion $ExpectedVersion -ExpectedStateDb $ExpectedStateDb -ExpectedSocket $ExpectedSocket
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedExe).Hash.ToLowerInvariant() -ne $ExpectedHash.ToLowerInvariant()) {
         throw 'Installed binary hash differs from the expected release.'
     }
@@ -1406,6 +2658,27 @@ function Verify-GuardService {
     $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($serviceConfig.ProcessId)"
     if (-not $process -or -not [IO.Path]::GetFullPath($process.ExecutablePath).Equals([IO.Path]::GetFullPath($DeployedExe), [StringComparison]::OrdinalIgnoreCase)) {
         throw 'The running service process does not use the installed Guard binary.'
+    }
+}
+
+function Assert-GuardStatusDocument {
+    param(
+        [Parameter(Mandatory)]$StatusDocument,
+        [Parameter(Mandatory)][string]$ExpectedVersion,
+        [Parameter(Mandatory)][string]$ExpectedStateDb,
+        [Parameter(Mandatory)][string]$ExpectedSocket
+    )
+    $ExpectedSocket = Assert-CanonicalSocketName -Socket $ExpectedSocket
+    if ($statusDocument.type -ne 'status' -or $statusDocument.server.version_mismatch -or
+        $statusDocument.client.version -ne $statusDocument.server.version -or
+        $statusDocument.server.version -ne $ExpectedVersion) {
+        throw 'Guard status returned an unexpected client/server version document.'
+    }
+    if ($statusDocument.server.full_restricted -ne $false -or $null -eq $statusDocument.server.full -or
+        [string]::IsNullOrWhiteSpace([string]$statusDocument.server.full.state_db_path) -or
+        -not ([string]$statusDocument.server.full.state_db_path).Equals($ExpectedStateDb, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$statusDocument.server.full.socket_path).Equals($ExpectedSocket, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Guard status did not report the state database and socket selected by the service command line.'
     }
 }
 
@@ -1422,11 +2695,12 @@ function Invoke-InstallerTestFault {
 function Restore-ApiRevertBackup {
     param(
         [Parameter(Mandatory)]$BackupRecord,
-        [Parameter(Mandatory)][string]$GuardSid
+        [Parameter(Mandatory)][string]$GuardSid,
+        [Parameter(Mandatory)]$StatePaths
     )
-    $destinationRoot = Get-ApiRevertRoot
+    $destinationRoot = Get-ApiRevertRoot -StatePaths $StatePaths
     if (Test-Path -LiteralPath $destinationRoot) {
-        Reset-TreeForAdministrativeMaintenance -Path $destinationRoot
+        Reset-TreeForAdministrativeMaintenance -Path $destinationRoot -AdditionalRoots @(Get-StateDirectory -StatePaths $StatePaths)
         Remove-Item -LiteralPath $destinationRoot -Recurse -Force
     }
     if (-not [bool]$BackupRecord.Metadata.api_reverts_present) { return }
@@ -1459,14 +2733,18 @@ function Complete-RestoredServiceVerification {
     param(
         [Parameter(Mandatory)]$Metadata,
         [Parameter(Mandatory)][hashtable]$Environment,
-        [Parameter(Mandatory)][string]$GuardSid
+        [Parameter(Mandatory)][string]$GuardSid,
+        [Parameter(Mandatory)][bool]$AuthorityKeyPresent
     )
+    $statePaths = Get-GuardStatePaths -ServicePathName ([string]$Metadata.service_path_name)
+    $serviceEnvironment = Convert-LegacyKubeEnvironment -Environment $Environment -StatePaths $statePaths
+    $serviceEnvironment = Complete-ManagedKubeEnvironment -Environment $serviceEnvironment
     Set-GuardServiceConfiguration -PathName ([string]$Metadata.service_path_name) -StartMode 'Manual'
-    Set-ServiceEnvironment -Environment $Environment -GuardSid $GuardSid
-    Set-DeploymentAcls -GuardSid $GuardSid
-    Start-Service -Name $ServiceName
-    Verify-GuardService -ExpectedHash $Metadata.binary_sha256 -ExpectedVersion $Metadata.binary_version
-    Assert-DeploymentAcls -GuardSid $GuardSid
+    Set-ServiceEnvironment -Environment $serviceEnvironment -GuardSid $GuardSid
+    Set-DeploymentAcls -GuardSid $GuardSid -StatePaths $statePaths
+    Start-GuardService -Name $ServiceName
+    Verify-GuardService -ExpectedHash $Metadata.binary_sha256 -ExpectedVersion $Metadata.binary_version -ExpectedStateDb $statePaths.StateDb -ExpectedSocket $statePaths.SocketName
+    Assert-DeploymentAcls -GuardSid $GuardSid -StatePaths $statePaths -AuthorityKeyPresent $AuthorityKeyPresent
     if (-not [bool]$Metadata.was_running) { Wait-ServiceStopped -Name $ServiceName }
     Set-GuardServiceConfiguration -PathName ([string]$Metadata.service_path_name) -StartMode ([string]$Metadata.start_mode)
 }
@@ -1478,6 +2756,28 @@ function Restore-GuardInstallation {
     )
     Wait-ServiceStopped -Name $ServiceName
     $metadata = $BackupRecord.Metadata
+    $statePaths = Get-GuardStatePaths -ServicePathName ([string]$metadata.service_path_name)
+    if ($BackupRecord.PSObject.Properties.Name -contains 'StatePaths' -and $null -ne $BackupRecord.StatePaths -and
+        (-not ([string]$BackupRecord.StatePaths.StateDb).Equals($statePaths.StateDb, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$BackupRecord.StatePaths.AuthorityKey).Equals($statePaths.AuthorityKey, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$BackupRecord.StatePaths.ApiRevertRoot).Equals($statePaths.ApiRevertRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$BackupRecord.StatePaths.SocketName).Equals($statePaths.SocketName, [StringComparison]::OrdinalIgnoreCase))) {
+        throw 'Backup record state paths do not match its service command line.'
+    }
+    Set-DeploymentAcls -GuardSid $GuardSid -StatePaths $statePaths
+    if ([bool]$metadata.kube_authority_present) {
+        $kubeAuthorityEntry = @($metadata.files | Where-Object path -eq 'config/kube/config')
+        if ($kubeAuthorityEntry.Count -ne 1) { throw 'Backup is missing kube authority.' }
+        Install-FileAtomically -Source (Join-Path $BackupRecord.Path 'config\kube\config') -Destination $KubeConfig -ExpectedHash $kubeAuthorityEntry[0].sha256
+    }
+    elseif (Test-Path -LiteralPath $KubeConfig) {
+        Assert-NoReparsePoint -Path $KubeDir
+        Assert-NoReparsePoint -Path $KubeConfig
+        Remove-Item -LiteralPath $KubeConfig -Force
+        if (Test-Path -LiteralPath $KubeConfig) {
+            throw 'Managed kube authority remains after restoring a backup that records its absence.'
+        }
+    }
     $binarySource = Join-Path $BackupRecord.Path 'guard.exe'
     Install-FileAtomically -Source $binarySource -Destination $DeployedExe -ExpectedHash $metadata.binary_sha256
     if ([bool]$metadata.operator_script_present) {
@@ -1488,17 +2788,34 @@ function Restore-GuardInstallation {
         Remove-Item -LiteralPath $DeployedOperatorScript -Force
     }
 
-    foreach ($databaseFile in Get-DatabasePaths -Database $StateDb) {
+    foreach ($databaseFile in Get-DatabasePaths -Database $statePaths.StateDb) {
         if (Test-Path -LiteralPath $databaseFile) { Remove-Item -LiteralPath $databaseFile -Force }
     }
     foreach ($name in @('state.db', 'state.db-wal', 'state.db-shm', 'state.db-journal')) {
         $relative = "sqlite/$name"
         $entry = @($metadata.files | Where-Object path -eq $relative)
         if ($entry.Count -eq 1) {
-            Install-FileAtomically -Source (Join-Path $BackupRecord.Path "sqlite\$name") -Destination (Join-Path $DataDir $name) -ExpectedHash $entry[0].sha256
+            $suffix = $name.Substring('state.db'.Length)
+            Install-FileAtomically -Source (Join-Path $BackupRecord.Path "sqlite\$name") -Destination "$($statePaths.StateDb)$suffix" -ExpectedHash $entry[0].sha256
         }
     }
-    Restore-ApiRevertBackup -BackupRecord $BackupRecord -GuardSid $GuardSid
+    if ([bool]$metadata.authority_key_present) {
+        $authorityKeyEntry = @($metadata.files | Where-Object path -eq 'authority.hmac')
+        if ($authorityKeyEntry.Count -ne 1) { throw 'Backup is missing the Guard authority file.' }
+        if (Test-Path -LiteralPath $statePaths.AuthorityKey) {
+            Reset-TreeForAdministrativeMaintenance -Path $statePaths.AuthorityKey -AdditionalRoots @(Get-StateDirectory -StatePaths $statePaths)
+        }
+        Install-FileAtomically -Source (Join-Path $BackupRecord.Path 'authority.hmac') -Destination $statePaths.AuthorityKey -ExpectedHash $authorityKeyEntry[0].sha256
+        Set-ExactFileSystemAcl -Path $statePaths.AuthorityKey -OwnerSid $GuardSid -Entries @((New-AclEntry -Sid $GuardSid -Rights ([Security.AccessControl.FileSystemRights]::FullControl)))
+    }
+    elseif (Test-Path -LiteralPath $statePaths.AuthorityKey) {
+        Reset-TreeForAdministrativeMaintenance -Path $statePaths.AuthorityKey -AdditionalRoots @(Get-StateDirectory -StatePaths $statePaths)
+        Remove-Item -LiteralPath $statePaths.AuthorityKey -Force
+        if (Test-Path -LiteralPath $statePaths.AuthorityKey) {
+            throw 'The Guard authority file remains after restoring a backup that records its absence.'
+        }
+    }
+    Restore-ApiRevertBackup -BackupRecord $BackupRecord -GuardSid $GuardSid -StatePaths $statePaths
     if ([bool]$metadata.catalog_present) {
         $catalogEntry = @($metadata.files | Where-Object path -eq 'config/verbs.yaml')[0]
         Install-FileAtomically -Source (Join-Path $BackupRecord.Path 'config\verbs.yaml') -Destination $VerbsPath -ExpectedHash $catalogEntry.sha256
@@ -1509,7 +2826,7 @@ function Restore-GuardInstallation {
 
     # Verification needs a startable service even when the durable target mode
     # is Disabled. The final transition restores the exact durable mode.
-    Complete-RestoredServiceVerification -Metadata $metadata -Environment $BackupRecord.Environment -GuardSid $GuardSid
+    Complete-RestoredServiceVerification -Metadata $metadata -Environment $BackupRecord.Environment -GuardSid $GuardSid -AuthorityKeyPresent ([bool]$metadata.authority_key_present)
 }
 
 function Assert-NewInstallationRootsAbsent {
@@ -1520,8 +2837,40 @@ function Assert-NewInstallationRootsAbsent {
     }
 }
 
+function Remove-CompletedNewInstallationMaintenanceRoot {
+    if (-not (Test-Path -LiteralPath $MaintenanceRoot -PathType Container) -or
+        (Test-Path -LiteralPath $TransactionJournal)) {
+        return
+    }
+    foreach ($path in @($InstallRoot, $ConfigRoot, $DataDir)) {
+        if (Test-Path -LiteralPath $path) { return }
+    }
+    Assert-NoReparsePoint -Path $MaintenanceRoot
+    Assert-ExactFileSystemAcl -Path $MaintenanceRoot -OwnerSid $SidAdmins -Entries (Get-AdministrativeAclEntries)
+    $allowedEmptyDirectories = @(
+        [IO.Path]::GetFullPath($StagingDir),
+        [IO.Path]::GetFullPath($BackupRoot),
+        [IO.Path]::GetFullPath($TaskOutDir)
+    )
+    foreach ($item in @(Get-ChildItem -LiteralPath $MaintenanceRoot -Force)) {
+        Assert-NoReparsePoint -Path $item.FullName
+        $itemPath = [IO.Path]::GetFullPath($item.FullName)
+        $pathAllowed = @($allowedEmptyDirectories | Where-Object {
+            $_.Equals($itemPath, [StringComparison]::OrdinalIgnoreCase)
+        }).Count -eq 1
+        if (-not $item.PSIsContainer -or
+            -not $pathAllowed -or
+            @(Get-ChildItem -LiteralPath $item.FullName -Force).Count -ne 0) {
+            return
+        }
+        Assert-ExactFileSystemAcl -Path $item.FullName -OwnerSid $SidAdmins -Entries (Get-AdministrativeAclEntries)
+    }
+    Remove-GuardOwnedTree -Path $MaintenanceRoot
+}
+
 function Invoke-Install {
     Assert-Admin -ForAction 'install'
+    Recover-GuardTransaction
     $installRepoRoot = Resolve-InstallRepoRoot
     $sourceExe = Resolve-GuardExe -InstallRepoRoot $installRepoRoot
     $operatorScriptSource = (Resolve-Path -LiteralPath $PSCommandPath).Path
@@ -1529,15 +2878,35 @@ function Invoke-Install {
     $operatorScriptHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $operatorScriptSource).Hash.ToLowerInvariant()
     $expectedHash = Assert-ExpectedCandidateHash
     $serviceBeforeInstall = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if (-not $serviceBeforeInstall) { Assert-NewInstallationRootsAbsent }
-    $candidate = Stage-VerifiedGuardCandidate -SourceExe $sourceExe -ExpectedHash $expectedHash
+    $transaction = $null
+    if (-not $serviceBeforeInstall) {
+        Remove-CompletedNewInstallationMaintenanceRoot
+        Assert-NewInstallationRootsAbsent
+        $transaction = Start-NewInstallationTransaction
+    }
+    try {
+        $candidate = Stage-VerifiedGuardCandidate -SourceExe $sourceExe -ExpectedHash $expectedHash
+    }
+    catch {
+        if ($null -ne $transaction) { Recover-GuardTransaction }
+        throw
+    }
     $stagedExe = $candidate.Path
     $expectedVersion = $candidate.Version
 
     try {
         $snapshot = Get-ServiceSnapshot
+        if ($null -ne $transaction -and $null -ne $snapshot) {
+            throw 'Guard service appeared after the new-installation transaction recorded an absent deployment.'
+        }
+        if ($null -eq $transaction -and $null -eq $snapshot) {
+            throw 'Guard service disappeared before the existing installation could be snapshotted.'
+        }
         if (-not $snapshot -and (Test-Path -LiteralPath $DeployedExe)) {
             throw "Installed binary '$DeployedExe' exists without the Guard service; remove or recover it before installation."
+        }
+        if ($snapshot) {
+            Assert-CandidateStateCompatibility -GuardExe $stagedExe -StateDb $snapshot.StatePaths.StateDb
         }
         $existingEnvironment = if ($snapshot) { $snapshot.Environment } else { @{} }
         $serviceEnvironment = Merge-ServiceEnvironment -Existing $existingEnvironment -Imported (Import-LlmEnvironment -Path $EnvFile)
@@ -1550,14 +2919,22 @@ function Invoke-Install {
         $serviceBinPath = Resolve-InstallServicePath -ExistingPath $existingPath -DesiredPath $stockBinPath
     }
     catch {
+        $preflightError = $_
         if (Test-Path -LiteralPath $stagedExe) { Remove-Item -LiteralPath $stagedExe -Force }
-        throw
+        if ($null -ne $transaction) {
+            try { Recover-GuardTransaction }
+            catch {
+                throw "Installation preflight failed: $($preflightError.Exception.Message) New-installation recovery also failed: $($_.Exception.Message)"
+            }
+        }
+        throw $preflightError
     }
     $createdService = $false
     $backupName = $null
     $guardSid = $null
     try {
         if (-not $snapshot) {
+            Set-NewInstallationTransactionMutating -Transaction $transaction -ServicePathName $stockBinPath
             & sc.exe create $ServiceName binPath= $stockBinPath start= auto obj= $ServiceAccount DisplayName= 'Guard consequence gate' | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Could not create the Guard service.' }
             $createdService = $true
@@ -1566,37 +2943,50 @@ function Invoke-Install {
         }
         $guardSid = Get-GuardSid
         if ($snapshot) {
+            $transaction = Start-GuardTransaction -Operation install -Snapshot $snapshot
             Wait-ServiceStopped -Name $ServiceName
+            $backupName = New-GuardBackup -Snapshot $snapshot -BeforeVersion $snapshot.BinaryVersion -GuardSid $guardSid
+            Set-GuardTransactionPhase -Transaction $transaction -Phase prepared -BackupName $backupName
+            Set-GuardTransactionPhase -Transaction $transaction -Phase mutating -BackupName $backupName
         }
-        Set-DeploymentAcls -GuardSid $guardSid
+        Set-DeploymentAcls -GuardSid $guardSid -StatePaths $(if ($snapshot) { $snapshot.StatePaths } else { $null })
         Set-ServiceRegistryAcl -GuardSid $guardSid
         if ($snapshot) {
-            $backupName = New-GuardBackup -Snapshot $snapshot -BeforeVersion $expectedVersion -GuardSid $guardSid
             Set-GuardServiceConfiguration -PathName $serviceBinPath -StartMode 'Manual'
         }
+        Copy-KubeConfigToAuthorityRoot -StatePaths $(if ($snapshot) { $snapshot.StatePaths } else { $null }) -Environment $serviceEnvironment
+        $serviceEnvironment = Convert-LegacyKubeEnvironment -Environment $serviceEnvironment -StatePaths $(if ($snapshot) { $snapshot.StatePaths } else { Get-DeploymentStatePaths -StatePaths $null })
+        $serviceEnvironment = Complete-ManagedKubeEnvironment -Environment $serviceEnvironment
         Install-FileAtomically -Source $stagedExe -Destination $DeployedExe -ExpectedHash $expectedHash
         Install-FileAtomically -Source $operatorScriptSource -Destination $DeployedOperatorScript -ExpectedHash $operatorScriptHash
         Invoke-InstallerTestFault -Point 'after-binary'
         if (-not (Test-Path -LiteralPath $VerbsPath) -and $haveSourceVerbs) {
             Copy-Item -LiteralPath $sourceVerbs -Destination $VerbsPath
         }
-        Set-DeploymentAcls -GuardSid $guardSid
+        Initialize-GuardServiceLog
+        Set-DeploymentAcls -GuardSid $guardSid -StatePaths $(if ($snapshot) { $snapshot.StatePaths } else { $null })
         Set-ServiceEnvironment -Environment $serviceEnvironment -GuardSid $guardSid
         Invoke-InstallerTestFault -Point 'after-environment'
         if ($createdService) {
             & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Could not configure Guard service failure recovery.' }
         }
-        Start-Service -Name $ServiceName
+        Start-GuardService -Name $ServiceName
         Invoke-InstallerTestFault -Point 'after-service-start'
-        Verify-GuardService -ExpectedHash $expectedHash -ExpectedVersion $expectedVersion
-        Assert-DeploymentAcls -GuardSid $guardSid
+        $expectedStatePaths = if ($snapshot) { $snapshot.StatePaths } else { Get-DeploymentStatePaths -StatePaths $null }
+        Verify-GuardService -ExpectedHash $expectedHash -ExpectedVersion $expectedVersion -ExpectedStateDb $expectedStatePaths.StateDb -ExpectedSocket $expectedStatePaths.SocketName
+        Assert-DeploymentAcls -GuardSid $guardSid -StatePaths $(if ($snapshot) { $snapshot.StatePaths } else { $null })
         if ((Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedOperatorScript).Hash.ToLowerInvariant() -ne $operatorScriptHash) {
             throw 'Installed operator script failed integrity validation.'
         }
         if ($snapshot) {
             if (-not $snapshot.WasRunning) { Wait-ServiceStopped -Name $ServiceName }
             Set-GuardServiceConfiguration -PathName $serviceBinPath -StartMode $snapshot.StartMode
+            Mark-GuardTransactionVerified -Transaction $transaction -CompletedSnapshot (Get-ServiceSnapshot)
+            Complete-GuardTransaction
+        }
+        else {
+            Complete-GuardTransaction
         }
         $finalState = (Get-Service -Name $ServiceName).Status
         Write-Host "Guard $expectedVersion completed a status handshake from $DeployedExe; service state is $finalState."
@@ -1610,23 +3000,12 @@ function Invoke-Install {
     catch {
         $installError = $_
         try {
-            if ($snapshot -and $backupName) {
-                Restore-GuardInstallation -BackupRecord (Read-ValidatedGuardBackup -Name $backupName) -GuardSid $guardSid
+            if ($null -ne $transaction) {
+                Recover-GuardTransaction
             }
             elseif ($snapshot -and $snapshot.WasRunning) {
                 $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-                if ($service -and $service.Status -ne 'Running') { Start-Service -Name $ServiceName }
-            }
-            elseif ($createdService) {
-                Wait-ServiceStopped -Name $ServiceName
-                & sc.exe delete $ServiceName | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw 'Could not remove the failed Guard service.' }
-                if (Test-Path -LiteralPath $InstallRoot) {
-                    Remove-Item -LiteralPath $InstallRoot -Recurse -Force
-                }
-                foreach ($path in @($DataDir, $ConfigRoot, $MaintenanceRoot)) {
-                    Remove-GuardOwnedTree -Path $path
-                }
+                if ($service -and $service.Status -ne 'Running') { Start-GuardService -Name $ServiceName }
             }
         }
         catch {
@@ -1641,22 +3020,29 @@ function Invoke-Install {
 
 function Invoke-Rollback {
     Assert-Admin -ForAction 'rollback'
+    Recover-GuardTransaction
     if (-not $Backup) { throw 'Action rollback requires -Backup <backup-name>.' }
     $target = Read-ValidatedGuardBackup -Name $Backup
     $snapshot = Get-ServiceSnapshot
     if (-not $snapshot) { throw 'Guard is not installed.' }
     $guardSid = Get-GuardSid
-    Wait-ServiceStopped -Name $ServiceName
-    $safetyName = New-GuardBackup -Snapshot $snapshot -BeforeVersion $target.Metadata.binary_version -GuardSid $guardSid
+    $transaction = Start-GuardTransaction -Operation rollback -Snapshot $snapshot
+    $safetyName = $null
     try {
+        Wait-ServiceStopped -Name $ServiceName
+        $safetyName = New-GuardBackup -Snapshot $snapshot -BeforeVersion $snapshot.BinaryVersion -GuardSid $guardSid
+        Set-GuardTransactionPhase -Transaction $transaction -Phase prepared -BackupName $safetyName
+        Set-GuardTransactionPhase -Transaction $transaction -Phase mutating -BackupName $safetyName
         Restore-GuardInstallation -BackupRecord $target -GuardSid $guardSid
+        Mark-GuardTransactionVerified -Transaction $transaction -CompletedSnapshot (Get-ServiceSnapshot)
+        Complete-GuardTransaction
         Write-Host "Guard rollback to $($target.Metadata.binary_version) completed and passed the status handshake."
         Write-Host "Rollback safety backup: $safetyName"
     }
     catch {
         $rollbackError = $_
         try {
-            Restore-GuardInstallation -BackupRecord (Read-ValidatedGuardBackup -Name $safetyName) -GuardSid $guardSid
+            Recover-GuardTransaction
         }
         catch {
             throw "Rollback failed: $($rollbackError.Exception.Message) Safety restoration also failed: $($_.Exception.Message)"
@@ -1668,13 +3054,23 @@ function Invoke-Rollback {
 function Remove-GuardOwnedTree {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return }
-    Reset-TreeForAdministrativeMaintenance -Path $Path
-    Remove-Item -LiteralPath $Path -Recurse -Force
-    if (Test-Path -LiteralPath $Path) { throw "Guard-owned tree still exists after purge: '$Path'." }
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Reset-TreeForAdministrativeMaintenance -Path $Path
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $Path)) { return }
+            $lastError = 'path still exists after cleanup'
+        }
+        catch { $lastError = $_.Exception.Message }
+        if ($attempt -lt 3) { Start-Sleep -Milliseconds 200 }
+    }
+    throw "Guard-owned tree cleanup failed after 3 attempts for '$Path': $lastError"
 }
 
 function Invoke-Uninstall {
     Assert-Admin -ForAction 'uninstall'
+    Recover-GuardTransaction
     Wait-ServiceStopped -Name $ServiceName
     & sc.exe delete $ServiceName | Out-Null
     if ($LASTEXITCODE -ne 0) { Write-Warning "Service deletion returned exit $LASTEXITCODE." }
@@ -1694,14 +3090,17 @@ function Invoke-Status {
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $service) { Write-Host 'Guard service is not installed.'; return }
     Write-Host "Service: $($service.Status)"
-    Write-Host "Pipe: $PipePath"
+    $statusMetadata = Get-ServiceStatusMetadata
+    Write-Host "Pipe: $($statusMetadata.SocketName)"
     if ($service.Status -eq 'Running' -and (Test-Path -LiteralPath $DeployedExe)) {
-        & $DeployedExe status --socket $SocketName
+        & $DeployedExe status --socket $statusMetadata.SocketName
     }
 }
 
 function Invoke-OperatorAction {
-    $result = Invoke-GuardAsOperator -Arguments (Get-GuardActionArguments) -GuardExe $DeployedExe
+    $snapshot = Get-ServiceSnapshot
+    if ($null -eq $snapshot) { throw 'Guard service is not installed.' }
+    $result = Invoke-GuardAsOperator -Arguments (Get-GuardActionArguments -Socket $snapshot.SocketName) -GuardExe $DeployedExe
     if ($Json) {
         Write-Output $result.Output
         if ($result.ExitCode -ne 0) { exit $result.ExitCode }
@@ -1709,12 +3108,44 @@ function Invoke-OperatorAction {
     elseif ($result.Output) { Write-Host $result.Output }
 }
 
+function New-GuardDeploymentMutex {
+    return [Threading.Mutex]::new($false, $DeploymentMutexName)
+}
+
+function Invoke-WithGuardDeploymentLock {
+    param([Parameter(Mandatory)][scriptblock]$Operation)
+    $mutex = New-GuardDeploymentMutex
+    $acquired = $false
+    try {
+        try { $acquired = $mutex.WaitOne(0) }
+        catch {
+            $waitError = $_.Exception
+            $abandoned = $false
+            while ($null -ne $waitError) {
+                if ($waitError -is [Threading.AbandonedMutexException]) {
+                    $abandoned = $true
+                    break
+                }
+                $waitError = $waitError.InnerException
+            }
+            if (-not $abandoned) { throw }
+            $acquired = $true
+        }
+        if (-not $acquired) { throw 'Another Guard deployment action is active.' }
+        & $Operation
+    }
+    finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
 if (-not $env:GUARD_INSTALLER_TEST_MODE) {
     switch ($Action) {
-        'install' { Invoke-Install }
-        'uninstall' { Invoke-Uninstall }
+        'install' { Invoke-WithGuardDeploymentLock { Invoke-Install } }
+        'uninstall' { Invoke-WithGuardDeploymentLock { Invoke-Uninstall } }
         'status' { Invoke-Status }
-        'rollback' { Invoke-Rollback }
+        'rollback' { Invoke-WithGuardDeploymentLock { Invoke-Rollback } }
         default { Invoke-OperatorAction }
     }
 }

@@ -62,6 +62,18 @@ pub(super) async fn handle_grant_read(
         }
     };
 
+    if !server.config.exec_as_caller {
+        let reason = "read-grant denied: fixed-identity execution shares one child UID across requests and cannot safely receive temporary caller-file ACLs".to_string();
+        server.audit_deny(
+            caller,
+            session_token.as_deref(),
+            AUTO_READ_GRANT_LABEL,
+            &grant_read_audit_args(&path, ttl),
+            &reason,
+        );
+        return ExecuteResult::denied(reason);
+    }
+
     // Canonicalize first: resolve symlinks and `..` so the deny-list and the
     // home-boundary check reason about the real target, not a path that only
     // textually sits under a home directory.
@@ -93,6 +105,47 @@ pub(super) async fn handle_grant_read(
         );
         return ExecuteResult::denied(reason);
     }
+
+    // Plan the exact ACL change before evaluation. The evaluator must assess
+    // the real grantee and every filesystem entry the request would modify,
+    // including any ancestor traverse grants.
+    let grantee_uid = caller_uid;
+    let grantee_gid = match resolve_exec_caller_context(grantee_uid) {
+        Ok(ctx) => ctx.gid,
+        Err(e) => {
+            let reason = format!("grantee uid {grantee_uid} could not be resolved: {e}");
+            return ExecuteResult::exec_failed(reason.clone(), reason);
+        }
+    };
+    let home_boundary = match owner_home_boundary(&canonical) {
+        Ok(home) => home,
+        Err(e) => {
+            let reason = format!("read-grant denied: {e}");
+            server.audit_deny(
+                caller,
+                session_token.as_deref(),
+                AUTO_READ_GRANT_LABEL,
+                &audit_args,
+                &reason,
+            );
+            return ExecuteResult::denied(reason);
+        }
+    };
+    let planned = match plan_read_grant(&canonical, grantee_uid, grantee_gid, &home_boundary).await
+    {
+        Ok(planned) => planned,
+        Err(e) => {
+            let reason = format!("read-grant denied: {e}");
+            server.audit_deny(
+                caller,
+                session_token.as_deref(),
+                AUTO_READ_GRANT_LABEL,
+                &audit_args,
+                &reason,
+            );
+            return ExecuteResult::denied(reason);
+        }
+    };
 
     // 2. Session allow/deny globs short-circuit, exactly as for a command: a
     // deny wins before the evaluator; an allow skips it.
@@ -167,20 +220,9 @@ pub(super) async fn handle_grant_read(
             None => None,
         };
         let command_line = format!(
-            "grant guard's brokering service account scoped read access to the file {canonical_str} for {ttl} seconds"
+            "grant authenticated caller uid {caller_uid} scoped read access to the file {canonical_str} for {ttl} seconds"
         );
-        let context = format!(
-            "READ-GRANT ASSESSMENT. A brokered caller is asking guard to add a scoped, \
-             time-boxed POSIX ACL read grant for its own low-privilege service account on \
-             the single file below, so a brokered ansible/helm command can read an operator \
-             config/vars/values file. The grant auto-revokes after the TTL; it is not a \
-             command execution and touches no other path.\n\
-             Target file: {canonical_str}\n\
-             TTL: {ttl} seconds\n\
-             APPROVE if this is an ordinary configuration/vars/values file the operator would \
-             let a brokered tool read. DENY if the path looks like it exposes credentials, \
-             private keys, tokens, or other secrets."
-        );
+        let context = read_grant_evaluator_context(caller_uid, ttl, &planned);
         let prompt_append = match session_prompt {
             Some(sp) if !sp.trim().is_empty() => format!("{context}\n\n{sp}"),
             _ => context,
@@ -240,59 +282,8 @@ pub(super) async fn handle_grant_read(
         );
     }
 
-    // 4. Determine the grantee: guard's own service account by default, or the
-    // caller's uid under --exec-as-caller (where brokered children run as the
-    // caller, not the daemon).
-    let grantee_uid = if server.config.exec_as_caller {
-        caller_uid
-    } else {
-        server.config.daemon_uid
-    };
-    let grantee_gid = match resolve_exec_caller_context(grantee_uid) {
-        Ok(ctx) => ctx.gid,
-        Err(e) => {
-            let reason = format!("grantee uid {grantee_uid} could not be resolved: {e}");
-            return ExecuteResult::exec_failed(reason.clone(), reason);
-        }
-    };
-
-    // The traverse boundary is the home directory of the file's owner: walk no
-    // higher than it so a grant can never add traverse ACLs into shared system
-    // paths above a home. Fail closed if the target is not under it.
-    let home_boundary = match owner_home_boundary(&canonical) {
-        Ok(home) => home,
-        Err(e) => {
-            let reason = format!("read-grant denied: {e}");
-            server.audit_deny(
-                caller,
-                session_token.as_deref(),
-                AUTO_READ_GRANT_LABEL,
-                &audit_args,
-                &reason,
-            );
-            return ExecuteResult::denied(reason);
-        }
-    };
-
-    // Plan the entries, commit the grant row, THEN apply the ACLs, so a crash
-    // mid-apply leaves a recoverable row the reconciler can revoke rather than a
-    // permanently-open grant with no record.
-    let planned = match plan_read_grant(&canonical, grantee_uid, grantee_gid, &home_boundary).await
-    {
-        Ok(planned) => planned,
-        Err(e) => {
-            let reason = format!("read-grant denied: {e}");
-            server.audit_deny(
-                caller,
-                session_token.as_deref(),
-                AUTO_READ_GRANT_LABEL,
-                &audit_args,
-                &reason,
-            );
-            return ExecuteResult::denied(reason);
-        }
-    };
-
+    // Commit the planned row before applying its ACLs, so a crash mid-apply
+    // leaves a recoverable record rather than a permanently-open grant.
     let now = now_unix();
     let grant = ReadGrant {
         handle: new_handle(),
@@ -349,6 +340,44 @@ pub(super) async fn handle_grant_read(
         grant.expires_unix,
     );
     ExecuteResult::completed(reason, Some(0), Some(stdout), None)
+}
+
+/// Render the evaluator context from the ACL plan that will be committed.
+/// The grant path is available only to an authenticated Unix-socket caller,
+/// so the caller UID is both the authenticated principal and the ACL grantee.
+#[cfg(unix)]
+pub(super) fn read_grant_evaluator_context(
+    caller_uid: u32,
+    ttl: u64,
+    planned: &[PlannedAclEntry],
+) -> String {
+    let entries = planned
+        .iter()
+        .map(|planned| {
+            let kind = if planned.entry.perms == "x" {
+                "ancestor traverse"
+            } else {
+                "target read"
+            };
+            format!("- {kind}: {} ({})", planned.entry.path, planned.entry.perms)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "READ-GRANT ASSESSMENT. An authenticated local Unix-socket caller requests a \
+         time-boxed POSIX ACL grant for that same caller. The grant auto-revokes after the \
+         TTL and is not command execution.\n\
+         Grantee: authenticated caller uid {caller_uid}\n\
+         TTL: {ttl} seconds\n\
+         Planned ACL entries:\n{entries}\n\
+         Available execution path: local Unix-socket commands running as this caller via \
+         --exec-as-caller. This grant does not enable fixed-child execution or typed Ansible \
+         or Helm execution.\n\
+         APPROVE only when every listed path is ordinary configuration, vars, or values data \
+         that the caller may read. DENY when any listed path could expose credentials, private \
+         keys, tokens, or other secrets."
+    )
 }
 
 /// The home directory of the file at `target`'s owner, used as the ceiling for
@@ -447,6 +476,18 @@ pub(super) struct PlannedAclEntry {
     entry: AclEntry,
     dev: u64,
     ino: u64,
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn planned_acl_entry_for_test(path: &str, perms: &str) -> PlannedAclEntry {
+    PlannedAclEntry {
+        entry: AclEntry {
+            path: path.to_string(),
+            perms: perms.to_string(),
+        },
+        dev: 0,
+        ino: 0,
+    }
 }
 
 /// Open `path` and verify it is still the exact inode that was vetted, using

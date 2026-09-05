@@ -8,21 +8,24 @@ use guard::gating::approval::{
     bound_approval_transcript, Approval, ApprovalSnapshot, ApprovalStatus,
 };
 use guard::gating::provisional::{
-    ApiRevertPlan, Provisional, ProvisionalRegistry, ProvisionalStatus, REVERT_BODY_CLEANUP_PREFIX,
+    ApiRevertPlan, PersistedCommandAuthorization, Provisional, ProvisionalRegistry,
+    ProvisionalStatus, REVERT_BODY_CLEANUP_PREFIX,
 };
-use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
+use guard::gating::{decide_gate, semantic_executable_key, Coverage, GateOutcome, Reversibility};
 use guard::principal::{scope_eq, PrincipalKey};
 use guard::redact::{
-    command_contains_sensitive_literals, redact_command_line, SENSITIVE_ARGV_REPLAY_GUIDANCE,
+    command_contains_sensitive_literals, named_value_contains_sensitive_literals,
+    redact_command_line, SENSITIVE_ARGV_REPLAY_GUIDANCE,
 };
 use std::path::PathBuf;
 use tokio::io::AsyncWrite;
 
 use super::execute::{
     admit_access_use, audit_command_line, audit_session_fingerprint,
-    exec_after_approval_with_command_authority, exec_after_approval_with_secret_authority,
-    exec_with_read_grant_retry_with_command_authority, resolve_current_tool_env,
-    CommandAuthorization, VerbAuthorityExpectation,
+    capture_approval_process_authority, exec_after_approval_with_command_authority,
+    exec_with_read_grant_retry_with_command_authority, missing_authorized_execution_profile_reason,
+    resolve_current_tool_env, ApprovedEnvironmentSnapshot, CommandAuthorization,
+    ResolvedCurrentToolEnv, VerbAuthorityExpectation,
 };
 use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
 use super::runtime::NotifyEvent;
@@ -84,51 +87,45 @@ pub(super) fn new_handle() -> String {
 /// rather than silently as the daemon. On Unix a principal whose key parses as a
 /// decimal uid reconstructs `Unix { uid }` (round-tripping the legacy uid
 /// identity exactly); on Windows the key is the caller's SID, so it reconstructs
-/// `Windows { sid }`. A `None` owner (or an unparseable Unix key) means the
-/// daemon executes as its own identity (non-exec-as-caller deployments).
+/// `Windows { sid }`. A malformed stored principal fails closed. A `None` owner
+/// carries no persisted caller attribution and uses the recovery path's fallback
+/// identity. Process admission still selects the configured fixed child or
+/// requires a known authenticated caller; it never falls back to the daemon UID.
 pub(super) fn reconstruct_caller(
     principal: Option<PrincipalKey>,
     fallback: &CallerIdentity,
-) -> CallerIdentity {
+) -> Result<CallerIdentity, String> {
     match principal {
         Some(key) => {
             #[cfg(windows)]
             {
-                CallerIdentity::Windows {
-                    sid: key.into_string(),
+                let sid = key.into_string();
+                let parts = sid.split('-').collect::<Vec<_>>();
+                if parts.len() < 4
+                    || !parts[0].eq_ignore_ascii_case("s")
+                    || parts[1..].iter().any(|part| {
+                        part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                {
+                    return Err("persisted caller principal is not a valid Windows SID".to_string());
                 }
+                Ok(CallerIdentity::Windows { sid })
             }
             #[cfg(not(windows))]
             {
                 match key.as_str().parse::<u32>() {
-                    Ok(uid) => CallerIdentity::Unix { uid },
-                    Err(_) => fallback.clone(),
+                    Ok(uid) if uid.to_string() == key.as_str() => Ok(CallerIdentity::Unix { uid }),
+                    _ => Err("persisted caller principal is not a canonical Unix uid".to_string()),
                 }
             }
         }
-        None => fallback.clone(),
+        None => Ok(fallback.clone()),
     }
 }
 
 /// Reject a binary name that is a path, traversal, or contains shell-metachar
 /// noise - the same invariants `execute_command_inner` enforces for the primary
 /// binary, applied to a revert command before it is armed.
-/// Normalize a binary reference to the match key used by the allow-list: its
-/// file name with any directory stripped, a trailing `.exe`/`.EXE` removed, and
-/// lowercased. Lowercasing keeps the operator's list case-insensitive (Windows
-/// paths are case-insensitive; tool names are conventionally lowercase).
-fn binary_match_key(binary: &str) -> String {
-    let name = std::path::Path::new(binary)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(binary);
-    let name = name
-        .strip_suffix(".exe")
-        .or_else(|| name.strip_suffix(".EXE"))
-        .unwrap_or(name);
-    name.to_ascii_lowercase()
-}
-
 /// Whether `binary` is permitted by the optional allow-list. `None` means no
 /// restriction. A bare command name (no path separator) matches an allow-list
 /// entry by match key - the common case, where the daemon's trusted PATH
@@ -143,9 +140,9 @@ pub(super) fn binary_allowed(allowed: &Option<Vec<String>>, binary: &str) -> boo
     if binary.contains('/') || binary.contains('\\') {
         return list.iter().any(|entry| entry == binary);
     }
-    let key = binary_match_key(binary);
+    let key = semantic_executable_key(binary);
     list.iter().any(|entry| {
-        !entry.contains('/') && !entry.contains('\\') && binary_match_key(entry) == key
+        !entry.contains('/') && !entry.contains('\\') && semantic_executable_key(entry) == key
     })
 }
 
@@ -865,8 +862,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
             // revert_binary/revert_args of a shell provisional.
             revert_binary: String::new(),
             revert_args: Vec::new(),
+            revert_authorization: None,
             confirm_check_binary: None,
             confirm_check_args: Vec::new(),
+            confirm_check_authorization: None,
             control_path: Some(format!("daemon API proxy for protocol {}", self.protocol)),
             session_fingerprint: mutation.session_fingerprint.clone(),
             session_revision: mutation.session_revision,
@@ -1253,11 +1252,14 @@ impl guard::proxy::GateSink for DaemonGateSink {
             catalog_version: None,
             verb_digest: None,
             verb_composition_digest: None,
+            verb_environment_authority: false,
+            verb_local_file_authority: false,
             exec_timeout_secs: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal,
             secret_binding: None,
+            process_authority: None,
         };
         let approval = Approval {
             handle: handle.clone(),
@@ -1857,11 +1859,17 @@ async fn access_admission_denial(
 /// Route an approved command through the consequence gate.
 pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
-    request: ExecuteRequest,
+    mut request: ExecuteRequest,
     mut inputs: GateInputs,
     decision_trace: Option<guard::gating::DecisionTrace>,
 ) -> ExecuteResult {
     let server = context.server;
+    if request.cwd.is_none() {
+        request.cwd = match super::execute::safe_default_working_directory() {
+            Ok(cwd) => Some(cwd),
+            Err(reason) => return ExecuteResult::exec_failed(inputs.reason.clone(), reason),
+        };
+    }
     if request.session_token.is_some() {
         let Some(expected) = inputs.authority.as_ref() else {
             return ExecuteResult::denied(
@@ -1990,6 +1998,11 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                     consume_access_verbs: inputs.consume_access_verbs,
                     decision_trace,
                     command_authority,
+                    control_source: if inputs.revert_preauthorized {
+                        guard::gating::approval::DelayedAuthoritySource::TypedControl
+                    } else {
+                        guard::gating::approval::DelayedAuthoritySource::RawControl
+                    },
                 },
             )
             .await
@@ -2029,6 +2042,7 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
             consume_access_verbs: Vec::new(),
             decision_trace: None,
             command_authority: None,
+            control_source: guard::gating::approval::DelayedAuthoritySource::RawControl,
         },
     )
     .await
@@ -2053,6 +2067,7 @@ pub(super) async fn arm_containment_with_access_use_for_test<W: AsyncWrite + Unp
             consume_access_verbs,
             decision_trace: None,
             command_authority: None,
+            control_source: guard::gating::approval::DelayedAuthoritySource::RawControl,
         },
     )
     .await
@@ -2064,6 +2079,32 @@ struct ContainmentInputs {
     consume_access_verbs: Vec<String>,
     decision_trace: Option<guard::gating::DecisionTrace>,
     command_authority: Option<CommandAuthorization>,
+    control_source: guard::gating::approval::DelayedAuthoritySource,
+}
+
+fn persisted_control_request(
+    binary: String,
+    args: Vec<String>,
+    request: &ExecuteRequest,
+) -> ExecuteRequest {
+    ExecuteRequest {
+        binary,
+        args,
+        cwd: request.cwd.clone(),
+        auth_token: None,
+        env: std::collections::HashMap::new(),
+        secrets: request.secrets.clone(),
+        secret_files: request.secret_files.clone(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    }
 }
 
 async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
@@ -2078,6 +2119,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         consume_access_verbs,
         decision_trace,
         command_authority,
+        control_source,
     } = inputs;
     let server = context.server;
     let caller = context.caller;
@@ -2099,6 +2141,9 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     }
 
     if let Some(why) = invalid_binary_reason(&revert.binary) {
+        return ExecuteResult::exec_failed(reason, why);
+    }
+    if let Some(why) = missing_authorized_execution_profile_reason(&revert.binary) {
         return ExecuteResult::exec_failed(reason, why);
     }
     if !binary_allowed(&server.config.allowed_binaries, &revert.binary) {
@@ -2126,9 +2171,15 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 ),
             );
         }
+        if let Some(why) = missing_authorized_execution_profile_reason(&check.binary) {
+            return ExecuteResult::exec_failed(reason, why);
+        }
     }
 
     if server.config.dry_run {
+        if let Some(why) = missing_authorized_execution_profile_reason(&request.binary) {
+            return ExecuteResult::exec_failed(reason, why);
+        }
         return ExecuteResult::dry_run_gated(
             format!(
                 "{} [GATE] would execute inside a containment envelope (auto-revert: {})",
@@ -2183,6 +2234,48 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         },
         None => (String::new(), None),
     };
+    let revert_request =
+        persisted_control_request(revert.binary.clone(), revert.args.clone(), &request);
+    let revert_authorization = match capture_persisted_command_authorization(
+        server,
+        caller,
+        &revert_request,
+        control_source,
+    )
+    .await
+    {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                reason,
+                format!("command was not run: rollback authority could not be bound: {error}"),
+            )
+        }
+    };
+    let confirm_check_authorization = if let Some(check) = &revert.confirm_check {
+        let check_request =
+            persisted_control_request(check.binary.clone(), check.args.clone(), &request);
+        match capture_persisted_command_authorization(
+            server,
+            caller,
+            &check_request,
+            guard::gating::approval::DelayedAuthoritySource::RawControl,
+        )
+        .await
+        {
+            Ok(authorization) => Some(authorization),
+            Err(error) => {
+                return ExecuteResult::exec_failed(
+                    reason,
+                    format!(
+                    "command was not run: confirmation-check authority could not be bound: {error}"
+                ),
+                )
+            }
+        }
+    } else {
+        None
+    };
     let provisional = Provisional {
         handle: handle.clone(),
         principal: caller_principal,
@@ -2202,6 +2295,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             .collect(),
         revert_binary: revert.binary.clone(),
         revert_args: revert.args.clone(),
+        revert_authorization: Some(revert_authorization),
         confirm_check_binary: revert
             .confirm_check
             .as_ref()
@@ -2211,6 +2305,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             .as_ref()
             .map(|check| check.args.clone())
             .unwrap_or_default(),
+        confirm_check_authorization,
         control_path: Some(
             revert
                 .control_path
@@ -2618,6 +2713,9 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
     if command_contains_sensitive_literals(&request.binary, &request.args) {
         return ExecuteResult::denied(SENSITIVE_ARGV_REPLAY_GUIDANCE);
     }
+    if let Some(reason) = missing_authorized_execution_profile_reason(&request.binary) {
+        return ExecuteResult::denied(reason);
+    }
     if server.config.dry_run {
         return ExecuteResult::dry_run_gated(
             format!(
@@ -2627,9 +2725,19 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
             Coverage::hold(),
         );
     }
-    if !request.env.is_empty() {
+    let typed_environment_authority = verb.as_ref().is_some_and(|verb| verb.environment_authority);
+    if !request.env.is_empty() && !typed_environment_authority {
         return ExecuteResult::denied(
-            "approval holds reject plain environment values; use named secret references",
+            "approval holds require every plain environment value to be constrained by an operator-authored typed verb; use typed environment constraints or named secret references",
+        );
+    }
+    if request
+        .env
+        .iter()
+        .any(|(name, value)| named_value_contains_sensitive_literals(name, value))
+    {
+        return ExecuteResult::denied(
+            "approval holds cannot persist credential-shaped plain environment values; use named secret references",
         );
     }
     if let Some(why) = gate_capacity_reason(server, caller_principal.as_ref()).await {
@@ -2639,7 +2747,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
     let handle = new_handle();
     let now = now_unix();
 
-    let tool_secret_sources = match resolve_current_tool_env(
+    let resolved_tool_env = match resolve_current_tool_env(
         server,
         &request.binary,
         caller_principal.as_ref(),
@@ -2647,7 +2755,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
     )
     .await
     {
-        Ok(resolved) => resolved.into_resolved().secret_sources,
+        Ok(resolved) => resolved,
         Err(error) => {
             return ExecuteResult::exec_failed(
                 reason,
@@ -2655,37 +2763,82 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
             )
         }
     };
+    let tool_registry_fingerprint = resolved_tool_env.authority_fingerprint();
+    let mut request_secret_values = std::collections::BTreeMap::new();
+    let mut request_secret_file_values = std::collections::BTreeMap::new();
+    if let Some(principal) = caller_principal.as_ref() {
+        for (environment_name, secret_name) in &request.secrets {
+            let value = match server.state.secrets.get(principal, secret_name).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return ExecuteResult::exec_failed(
+                        reason,
+                        format!(
+                            "approval hold rejected: failed to resolve secret '{}': {error}",
+                            secret_name
+                        ),
+                    )
+                }
+            };
+            request_secret_values.insert(environment_name.clone(), value);
+        }
+        for (environment_name, secret_name) in &request.secret_files {
+            let value = match server.state.secrets.get(principal, secret_name).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return ExecuteResult::exec_failed(
+                        reason,
+                        format!(
+                            "approval hold rejected: failed to resolve secret file '{}': {error}",
+                            secret_name
+                        ),
+                    )
+                }
+            };
+            request_secret_file_values.insert(environment_name.clone(), value);
+        }
+    } else {
+        request_secret_values.extend(request.secrets.keys().cloned().map(|name| (name, None)));
+        request_secret_file_values.extend(
+            request
+                .secret_files
+                .keys()
+                .cloned()
+                .map(|name| (name, None)),
+        );
+    }
 
-    // Secret-value binding: hash each referenced secret value NOW so a
-    // same-principal caller cannot swap its mapped values between this hold and
-    // the operator's approval. The binding is MANDATORY when there are secrets
-    // and a principal: every referenced secret is bound, a resolved one by its
-    // salted hash and an unresolved one by a sentinel. Binding the unresolved
-    // case closes the gap where a caller makes a secret unresolvable at hold
-    // (so it would otherwise be unbound) and then creates it with a chosen value
-    // before approval. Verification at approve time fails closed on any change.
+    // Bind each secret from the same in-memory resolution used to construct
+    // process authority. No value is persisted or formatted into diagnostics.
     let secret_binding = match caller_principal.clone() {
-        Some(principal) => {
+        Some(_) => {
             let salt = hex_encode(&rand::random::<u128>().to_le_bytes());
             let mut hashes = std::collections::BTreeMap::new();
-            for (env_var, secret_name) in request.secrets.iter().chain(&request.secret_files) {
-                let entry = match server.state.secrets.get(&principal, secret_name).await {
-                    Ok(Some(value)) => hash_secret_value(&salt, &value),
-                    _ => SECRET_BINDING_UNRESOLVED.to_string(),
-                };
-                hashes.insert(env_var.clone(), entry);
+            for (environment_name, value) in request_secret_values
+                .iter()
+                .chain(&request_secret_file_values)
+            {
+                let hash = value.as_ref().map_or_else(
+                    || SECRET_BINDING_UNRESOLVED.to_string(),
+                    |value| {
+                        hash_secret_value(server.config.authority_mac_key.as_ref(), &salt, value)
+                    },
+                );
+                hashes.insert(environment_name.clone(), hash);
             }
             let mut tool_hashes = std::collections::BTreeMap::new();
-            for (env_var, secret_name) in tool_secret_sources {
-                let entry = match server.state.secrets.get(&principal, &secret_name).await {
-                    Ok(Some(value)) => hash_secret_value(&salt, &value),
-                    _ => SECRET_BINDING_UNRESOLVED.to_string(),
-                };
+            for (environment_name, secret_name) in &resolved_tool_env.secret_sources {
+                let hash = resolved_tool_env.env.get(environment_name).map_or_else(
+                    || SECRET_BINDING_UNRESOLVED.to_string(),
+                    |value| {
+                        hash_secret_value(server.config.authority_mac_key.as_ref(), &salt, value)
+                    },
+                );
                 tool_hashes.insert(
-                    env_var,
+                    environment_name.clone(),
                     guard::gating::approval::ToolSecretBinding {
-                        secret_name,
-                        hash: entry,
+                        secret_name: secret_name.clone(),
+                        hash,
                     },
                 );
             }
@@ -2697,7 +2850,41 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         }
         _ => None,
     };
-
+    let approved_environment = match ApprovedEnvironmentSnapshot::new(
+        resolved_tool_env,
+        request.secrets.keys().cloned().collect(),
+        request.secret_files.keys().cloned().collect(),
+        request_secret_values,
+        request_secret_file_values,
+    ) {
+        Ok(environment) => environment,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                reason,
+                format!("approval hold rejected: secret snapshot is incomplete: {error}"),
+            )
+        }
+    };
+    let effective_timeout = verb
+        .as_ref()
+        .and_then(|verb| verb.exec_timeout_secs)
+        .unwrap_or(server.config.exec_timeout_secs);
+    let process_authority = match capture_approval_process_authority(
+        server,
+        caller,
+        &request,
+        CommandAuthorization::routed(verb.as_ref(), authority.as_ref(), effective_timeout),
+        &approved_environment,
+        tool_registry_fingerprint,
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                reason,
+                format!("approval hold rejected: process authority could not be bound: {error}"),
+            )
+        }
+    };
     if !session_authority_is_current(server, &request, authority.as_ref()).await {
         return ExecuteResult::denied(
             "session expired, was revoked, or changed before approval hold creation",
@@ -2737,7 +2924,11 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         binary: request.binary.clone(),
         args: request.args.clone(),
         cwd: request.cwd.clone(),
-        env: std::collections::BTreeMap::new(),
+        env: request
+            .env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
         secret_keys: request
             .secrets
             .iter()
@@ -2759,15 +2950,14 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
         verb_digest: verb.as_ref().and_then(|v| v.verb_digest.clone()),
         verb_composition_digest: verb.as_ref().and_then(|v| v.composition_digest.clone()),
-        exec_timeout_secs: Some(
-            verb.as_ref()
-                .and_then(|verb| verb.exec_timeout_secs)
-                .unwrap_or(server.config.exec_timeout_secs),
-        ),
+        verb_environment_authority: verb.as_ref().is_some_and(|verb| verb.environment_authority),
+        verb_local_file_authority: verb.as_ref().is_some_and(|verb| verb.local_file_authority),
+        exec_timeout_secs: Some(effective_timeout),
         access_verbs: consume_access_verbs,
         access_requests,
         principal: caller_principal,
         secret_binding,
+        process_authority: Some(process_authority),
     };
     let approval = Approval {
         handle: handle.clone(),
@@ -3175,18 +3365,254 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Salted SHA-256 of a secret value, hex-encoded. The salt and a 0x00 domain
-/// separator ensure the stored digest is not a reusable plain hash of the
-/// value. The persisted salt does not make a weak secret resistant to offline
-/// guessing, so approval state remains daemon-private. Used only to detect a
-/// value change between hold and approval.
-pub(super) fn hash_secret_value(salt_hex: &str, value: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(salt_hex.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(value.as_bytes());
-    hex_encode(&hasher.finalize())
+/// HMAC-SHA-256 of a secret value under the installation key. The persisted
+/// salt separates rows while the daemon-only key prevents a copied SQLite
+/// database from becoming an offline guessing oracle.
+pub(super) fn hash_secret_value(key: &[u8], salt_hex: &str, value: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts keys of every length");
+    mac.update(b"guard-secret-binding-v1\0");
+    mac.update(salt_hex.as_bytes());
+    mac.update(&[0u8]);
+    mac.update(value.as_bytes());
+    hex_encode(&mac.finalize().into_bytes())
+}
+
+struct ResolvedPersistedEnvironment {
+    tool: ResolvedCurrentToolEnv,
+    request_secrets: std::collections::BTreeMap<String, Option<String>>,
+    request_secret_files: std::collections::BTreeMap<String, Option<String>>,
+}
+
+impl ResolvedPersistedEnvironment {
+    fn secret_binding(&self, key: &[u8]) -> guard::gating::approval::SecretBinding {
+        let salt = hex_encode(&rand::random::<u128>().to_le_bytes());
+        let mut hashes = std::collections::BTreeMap::new();
+        for (environment_name, value) in self
+            .request_secrets
+            .iter()
+            .chain(&self.request_secret_files)
+        {
+            let hash = value.as_ref().map_or_else(
+                || SECRET_BINDING_UNRESOLVED.to_string(),
+                |value| hash_secret_value(key, &salt, value),
+            );
+            hashes.insert(environment_name.clone(), hash);
+        }
+        let tool_hashes = self
+            .tool
+            .secret_sources
+            .iter()
+            .map(|(environment_name, secret_name)| {
+                let hash = self.tool.env.get(environment_name).map_or_else(
+                    || SECRET_BINDING_UNRESOLVED.to_string(),
+                    |value| hash_secret_value(key, &salt, value),
+                );
+                (
+                    environment_name.clone(),
+                    guard::gating::approval::ToolSecretBinding {
+                        secret_name: secret_name.clone(),
+                        hash,
+                    },
+                )
+            })
+            .collect();
+        guard::gating::approval::SecretBinding {
+            salt,
+            hashes,
+            tool_hashes: Some(tool_hashes),
+        }
+    }
+
+    fn validate_secret_binding(
+        &self,
+        key: &[u8],
+        expected: &guard::gating::approval::SecretBinding,
+    ) -> Result<(), String> {
+        let resolved_count = self.request_secrets.len() + self.request_secret_files.len();
+        if expected.hashes.len() != resolved_count {
+            return Err("persisted command secret references changed after arm".to_string());
+        }
+        for (environment_name, value) in self
+            .request_secrets
+            .iter()
+            .chain(&self.request_secret_files)
+        {
+            let Some(expected_hash) = expected.hashes.get(environment_name) else {
+                return Err("persisted command secret references changed after arm".to_string());
+            };
+            let consistent = match (expected_hash.as_str(), value.as_deref()) {
+                (SECRET_BINDING_UNRESOLVED, None) => true,
+                (SECRET_BINDING_UNRESOLVED, Some(_)) => false,
+                (hash, Some(value)) => hash_secret_value(key, &expected.salt, value) == hash,
+                (_, None) => false,
+            };
+            if !consistent {
+                return Err("persisted command secret value changed after arm".to_string());
+            }
+        }
+
+        let Some(expected_tool_hashes) = expected.tool_hashes.as_ref() else {
+            return Err("persisted command lacks bound tool-secret authority".to_string());
+        };
+        if expected_tool_hashes.len() != self.tool.secret_sources.len()
+            || self
+                .tool
+                .secret_sources
+                .iter()
+                .any(|(environment_name, secret_name)| {
+                    expected_tool_hashes
+                        .get(environment_name)
+                        .is_none_or(|bound| bound.secret_name != *secret_name)
+                })
+        {
+            return Err("persisted command tool-secret mappings changed after arm".to_string());
+        }
+        for (environment_name, bound) in expected_tool_hashes {
+            let resolved = self.tool.env.get(environment_name);
+            let consistent = match (bound.hash.as_str(), resolved) {
+                (SECRET_BINDING_UNRESOLVED, None) => true,
+                (SECRET_BINDING_UNRESOLVED, Some(_)) => false,
+                (hash, Some(value)) => hash_secret_value(key, &expected.salt, value) == hash,
+                (_, None) => false,
+            };
+            if !consistent {
+                return Err("persisted command tool-secret value changed after arm".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn into_snapshot(self) -> Result<ApprovedEnvironmentSnapshot, String> {
+        ApprovedEnvironmentSnapshot::new(
+            self.tool,
+            self.request_secrets.keys().cloned().collect(),
+            self.request_secret_files.keys().cloned().collect(),
+            self.request_secrets,
+            self.request_secret_files,
+        )
+    }
+}
+
+async fn resolve_persisted_environment(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    request: &ExecuteRequest,
+) -> Result<ResolvedPersistedEnvironment, String> {
+    let principal = caller.principal();
+    if principal.is_none() && (!request.secrets.is_empty() || !request.secret_files.is_empty()) {
+        return Err("persisted command secret authority requires a known caller principal".into());
+    }
+    let tool = resolve_current_tool_env(
+        server,
+        &request.binary,
+        principal.as_ref(),
+        caller.user_key().as_deref(),
+    )
+    .await
+    .map_err(|error| format!("failed to resolve persisted tool environment: {error}"))?;
+    let mut request_secrets = std::collections::BTreeMap::new();
+    let mut request_secret_files = std::collections::BTreeMap::new();
+    for (file_backed, mappings) in [(false, &request.secrets), (true, &request.secret_files)] {
+        for (environment_name, secret_name) in mappings {
+            let value = match principal.as_ref() {
+                Some(principal) => server
+                    .state
+                    .secrets
+                    .get(principal, secret_name)
+                    .await
+                    .map_err(|error| {
+                        format!("failed to resolve persisted secret '{secret_name}': {error}")
+                    })?,
+                None => None,
+            };
+            if file_backed {
+                request_secret_files.insert(environment_name.clone(), value);
+            } else {
+                request_secrets.insert(environment_name.clone(), value);
+            }
+        }
+    }
+    Ok(ResolvedPersistedEnvironment {
+        tool,
+        request_secrets,
+        request_secret_files,
+    })
+}
+
+pub(super) async fn capture_persisted_command_authorization(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    request: &ExecuteRequest,
+    source: guard::gating::approval::DelayedAuthoritySource,
+) -> Result<PersistedCommandAuthorization, String> {
+    if let Some(reason) = missing_authorized_execution_profile_reason(&request.binary) {
+        return Err(reason);
+    }
+    let resolved = resolve_persisted_environment(server, caller, request).await?;
+    let secret_binding = resolved.secret_binding(server.config.authority_mac_key.as_ref());
+    let tool_registry_fingerprint = resolved.tool.authority_fingerprint();
+    let approved_environment = resolved.into_snapshot()?;
+    let exec_timeout_secs = server.config.exec_timeout_secs;
+    let process_authority = capture_approval_process_authority(
+        server,
+        caller,
+        request,
+        CommandAuthorization::persisted_control_capture(exec_timeout_secs, source),
+        &approved_environment,
+        tool_registry_fingerprint,
+    )?;
+    Ok(PersistedCommandAuthorization {
+        process_authority,
+        secret_binding,
+        exec_timeout_secs,
+    })
+}
+
+pub(super) async fn replay_persisted_command_authorization(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    request: &ExecuteRequest,
+    expected: Option<&PersistedCommandAuthorization>,
+) -> Result<CommandAuthorization, String> {
+    let expected = expected.ok_or_else(|| {
+        "persisted command lacks process and secret authority; re-arm it".to_string()
+    })?;
+    if let Some(reason) = missing_authorized_execution_profile_reason(&request.binary) {
+        return Err(reason);
+    }
+    let resolved = resolve_persisted_environment(server, caller, request).await?;
+    resolved.validate_secret_binding(
+        server.config.authority_mac_key.as_ref(),
+        &expected.secret_binding,
+    )?;
+    let tool_registry_fingerprint = resolved.tool.authority_fingerprint();
+    let approved_environment = resolved.into_snapshot()?;
+    let source = expected
+        .process_authority
+        .delayed_authority
+        .as_ref()
+        .map(|plan| plan.source)
+        .ok_or_else(|| "persisted command lacks a delayed authority plan; re-arm it".to_string())?;
+    let current_process_authority = capture_approval_process_authority(
+        server,
+        caller,
+        request,
+        CommandAuthorization::persisted_control_capture(expected.exec_timeout_secs, source),
+        &approved_environment,
+        tool_registry_fingerprint,
+    )?;
+    if current_process_authority != expected.process_authority {
+        return Err("persisted command process authority changed after arm".to_string());
+    }
+    Ok(CommandAuthorization::persisted_control_replay(
+        expected.exec_timeout_secs,
+        source,
+        expected.process_authority.clone(),
+        approved_environment,
+    ))
 }
 
 /// Execute an approved snapshot verbatim under the original caller's identity,
@@ -3198,7 +3624,16 @@ pub(super) async fn execute_snapshot(
 ) -> ExecuteResult {
     let access_requests =
         (!snapshot.access_requests.is_empty()).then_some(snapshot.access_requests.as_slice());
-    execute_snapshot_with_access_request_inner(server, snapshot, reason, access_requests).await
+    // Approval validation carries resolved environment snapshots and then
+    // enters the full execution state machine. Keep that composite future on
+    // the heap so one approval cannot exhaust a worker thread's stack.
+    Box::pin(execute_snapshot_with_access_request_inner(
+        server,
+        snapshot,
+        reason,
+        access_requests,
+    ))
+    .await
 }
 
 #[cfg(all(test, unix))]
@@ -3208,8 +3643,13 @@ pub(super) async fn execute_snapshot_with_access_request(
     reason: &str,
     preferred_access_requests: Option<&[String]>,
 ) -> ExecuteResult {
-    execute_snapshot_with_access_request_inner(server, snapshot, reason, preferred_access_requests)
-        .await
+    Box::pin(execute_snapshot_with_access_request_inner(
+        server,
+        snapshot,
+        reason,
+        preferred_access_requests,
+    ))
+    .await
 }
 
 async fn execute_snapshot_with_access_request_inner(
@@ -3223,6 +3663,9 @@ async fn execute_snapshot_with_access_request_inner(
             reason.to_string(),
             SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string(),
         );
+    }
+    if let Some(replay_reason) = missing_authorized_execution_profile_reason(&snapshot.binary) {
+        return ExecuteResult::exec_failed(reason.to_string(), replay_reason);
     }
     if !binary_allowed(&server.config.allowed_binaries, &snapshot.binary) {
         return ExecuteResult::exec_failed(
@@ -3279,9 +3722,17 @@ async fn execute_snapshot_with_access_request_inner(
         }
     }
 
-    let caller = reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown);
+    let caller = match reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown) {
+        Ok(caller) => caller,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                format!("approval rejected: {error}"),
+            )
+        }
+    };
 
-    let current_tool_sources = match resolve_current_tool_env(
+    let current_tool_environment = match resolve_current_tool_env(
         server,
         &snapshot.binary,
         snapshot.principal.as_ref(),
@@ -3289,7 +3740,7 @@ async fn execute_snapshot_with_access_request_inner(
     )
     .await
     {
-        Ok(resolved) => resolved.into_resolved().secret_sources,
+        Ok(resolved) => resolved,
         Err(error) => {
             return ExecuteResult::exec_failed(
                 reason.to_string(),
@@ -3297,6 +3748,7 @@ async fn execute_snapshot_with_access_request_inner(
             )
         }
     };
+    let current_tool_sources = &current_tool_environment.secret_sources;
 
     // Legacy holds cannot safely use live secret mappings because no value or
     // tool-environment binding exists for the operator-reviewed snapshot.
@@ -3315,6 +3767,8 @@ async fn execute_snapshot_with_access_request_inner(
     // caller must not have swapped its mapped secret values since the operator
     // reviewed the hold. Fail closed (exec_failed, command not started) on any
     // mismatch, missing binding entry, or re-resolution failure.
+    let mut approved_request_secrets = std::collections::BTreeMap::new();
+    let mut approved_request_secret_files = std::collections::BTreeMap::new();
     if let Some(binding) = &snapshot.secret_binding {
         let Some(principal) = snapshot.principal.clone() else {
             return ExecuteResult::exec_failed(
@@ -3322,52 +3776,58 @@ async fn execute_snapshot_with_access_request_inner(
                 "approval rejected: a secret-value binding is present but the caller principal is unknown".to_string(),
             );
         };
-        for (env_var, secret_name) in snapshot
-            .secret_keys
-            .iter()
-            .chain(&snapshot.secret_file_keys)
-        {
-            // Every secret was bound at hold; a missing entry means the request
-            // was altered between hold and approval. Fail closed.
-            let Some(expected) = binding.hashes.get(env_var) else {
-                return ExecuteResult::exec_failed(
-                    reason.to_string(),
-                    format!(
-                        "approval rejected: secret '{}' was not bound at hold",
-                        secret_name
-                    ),
-                );
-            };
-            let resolved = match server.state.secrets.get(&principal, secret_name).await {
-                Ok(v) => v,
-                Err(e) => {
+        for (file_backed, mappings) in [
+            (false, &snapshot.secret_keys),
+            (true, &snapshot.secret_file_keys),
+        ] {
+            for (environment_name, secret_name) in mappings {
+                // Every secret was bound at hold; a missing entry means the
+                // request was altered between hold and approval. Fail closed.
+                let Some(expected) = binding.hashes.get(environment_name) else {
                     return ExecuteResult::exec_failed(
                         reason.to_string(),
                         format!(
-                            "approval rejected: failed to re-resolve bound secret '{}': {}",
-                            secret_name, e
+                            "approval rejected: secret '{}' was not bound at hold",
+                            secret_name
                         ),
                     );
+                };
+                let resolved = match server.state.secrets.get(&principal, secret_name).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return ExecuteResult::exec_failed(
+                            reason.to_string(),
+                            format!(
+                                "approval rejected: failed to re-resolve bound secret '{}': {}",
+                                secret_name, error
+                            ),
+                        );
+                    }
+                };
+                let consistent = match (expected.as_str(), resolved.as_deref()) {
+                    (SECRET_BINDING_UNRESOLVED, None) => true,
+                    (SECRET_BINDING_UNRESOLVED, Some(_)) => false,
+                    (hash, Some(value)) => {
+                        hash_secret_value(
+                            server.config.authority_mac_key.as_ref(),
+                            &binding.salt,
+                            value,
+                        ) == hash
+                    }
+                    (_, None) => false,
+                };
+                if !consistent {
+                    return ExecuteResult::exec_failed(
+                        reason.to_string(),
+                        "approval rejected: a mapped secret value changed since the command was held"
+                            .to_string(),
+                    );
                 }
-            };
-            let consistent = match (expected.as_str(), resolved) {
-                // Unresolved at hold and still unresolved: consistent (the exec
-                // path surfaces the missing secret on its own).
-                (SECRET_BINDING_UNRESOLVED, None) => true,
-                // Unresolved at hold but now resolves: a value swap between
-                // hold and approval. Reject.
-                (SECRET_BINDING_UNRESOLVED, Some(_)) => false,
-                // Bound to a value: it must still resolve to the same value.
-                (hash, Some(v)) => hash_secret_value(&binding.salt, &v) == hash,
-                // Was bound to a value, now gone. Reject.
-                (_, None) => false,
-            };
-            if !consistent {
-                return ExecuteResult::exec_failed(
-                    reason.to_string(),
-                    "approval rejected: a mapped secret value changed since the command was held"
-                        .to_string(),
-                );
+                if file_backed {
+                    approved_request_secret_files.insert(environment_name.clone(), resolved);
+                } else {
+                    approved_request_secrets.insert(environment_name.clone(), resolved);
+                }
             }
         }
         let Some(tool_hashes) = binding.tool_hashes.as_ref() else {
@@ -3378,13 +3838,29 @@ async fn execute_snapshot_with_access_request_inner(
                         .to_string(),
                 );
             }
-            return execute_snapshot_request(
+            let approved_environment = match ApprovedEnvironmentSnapshot::new(
+                current_tool_environment,
+                snapshot.secret_keys.keys().cloned().collect(),
+                snapshot.secret_file_keys.keys().cloned().collect(),
+                approved_request_secrets,
+                approved_request_secret_files,
+            ) {
+                Ok(environment) => environment,
+                Err(error) => {
+                    return ExecuteResult::exec_failed(
+                        reason.to_string(),
+                        format!("approval rejected: secret snapshot is incomplete: {error}"),
+                    )
+                }
+            };
+            return Box::pin(execute_snapshot_request(
                 server,
                 snapshot,
                 reason,
                 &caller,
                 preferred_access_requests,
-            )
+                approved_environment,
+            ))
             .await;
         };
         if current_tool_sources.len() != tool_hashes.len()
@@ -3400,28 +3876,18 @@ async fn execute_snapshot_with_access_request_inner(
                     .to_string(),
             );
         }
-        for bound in tool_hashes.values() {
-            let resolved = match server
-                .state
-                .secrets
-                .get(&principal, &bound.secret_name)
-                .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    return ExecuteResult::exec_failed(
-                        reason.to_string(),
-                        format!(
-                            "approval rejected: failed to re-resolve tool secret '{}': {error}",
-                            bound.secret_name
-                        ),
-                    )
-                }
-            };
+        for (environment_name, bound) in tool_hashes {
+            let resolved = current_tool_environment.env.get(environment_name);
             let consistent = match (bound.hash.as_str(), resolved) {
                 (SECRET_BINDING_UNRESOLVED, None) => true,
                 (SECRET_BINDING_UNRESOLVED, Some(_)) => false,
-                (hash, Some(value)) => hash_secret_value(&binding.salt, &value) == hash,
+                (hash, Some(value)) => {
+                    hash_secret_value(
+                        server.config.authority_mac_key.as_ref(),
+                        &binding.salt,
+                        value,
+                    ) == hash
+                }
                 (_, None) => false,
             };
             if !consistent {
@@ -3433,7 +3899,30 @@ async fn execute_snapshot_with_access_request_inner(
             }
         }
     }
-    execute_snapshot_request(server, snapshot, reason, &caller, preferred_access_requests).await
+    let approved_environment = match ApprovedEnvironmentSnapshot::new(
+        current_tool_environment,
+        snapshot.secret_keys.keys().cloned().collect(),
+        snapshot.secret_file_keys.keys().cloned().collect(),
+        approved_request_secrets,
+        approved_request_secret_files,
+    ) {
+        Ok(environment) => environment,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                format!("approval rejected: secret snapshot is incomplete: {error}"),
+            )
+        }
+    };
+    Box::pin(execute_snapshot_request(
+        server,
+        snapshot,
+        reason,
+        &caller,
+        preferred_access_requests,
+        approved_environment,
+    ))
+    .await
 }
 
 async fn execute_snapshot_request(
@@ -3442,6 +3931,7 @@ async fn execute_snapshot_request(
     reason: &str,
     caller: &CallerIdentity,
     preferred_access_requests: Option<&[String]>,
+    approved_environment: ApprovedEnvironmentSnapshot,
 ) -> ExecuteResult {
     let mut request = ExecuteRequest {
         binary: snapshot.binary.clone(),
@@ -3517,6 +4007,8 @@ async fn execute_snapshot_request(
             catalog_version: snapshot.catalog_version,
             definition_digest: snapshot.verb_digest.clone(),
             composition_digest: snapshot.verb_composition_digest.clone(),
+            environment_authority: snapshot.verb_environment_authority,
+            local_file_authority: snapshot.verb_local_file_authority,
         });
     let session_authority =
         snapshot
@@ -3526,7 +4018,7 @@ async fn execute_snapshot_request(
                 revision: revision.clone(),
                 secret_entitlements: snapshot.secret_entitlements.clone(),
             });
-    exec_after_approval_with_command_authority(
+    Box::pin(exec_after_approval_with_command_authority(
         &mut context,
         request,
         reason.to_string(),
@@ -3535,8 +4027,10 @@ async fn execute_snapshot_request(
             verb_authority,
             session_authority,
             snapshot.exec_timeout_secs,
+            snapshot.process_authority.clone(),
+            Some(approved_environment),
         )),
-    )
+    ))
     .await
 }
 
@@ -3764,7 +4258,10 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
 
 /// Run the revert for a provisional under the original caller's identity, with no
 /// client stream. Used by the sweeper and operator-initiated reversion.
-async fn run_provisional_revert(server: &ServerContext, p: &Provisional) -> ExecuteResult {
+pub(super) async fn run_provisional_revert(
+    server: &ServerContext,
+    p: &Provisional,
+) -> ExecuteResult {
     if p.api_revert.is_none()
         && command_contains_sensitive_literals(&p.revert_binary, &p.revert_args)
     {
@@ -3788,7 +4285,15 @@ async fn run_provisional_revert(server: &ServerContext, p: &Provisional) -> Exec
             ),
         );
     }
-    let caller = reconstruct_caller(p.principal.clone(), &CallerIdentity::Unknown);
+    let caller = match reconstruct_caller(p.principal.clone(), &CallerIdentity::Unknown) {
+        Ok(caller) => caller,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                format!("auto-revert of provisional {}", p.handle),
+                error,
+            )
+        }
+    };
     let request = ExecuteRequest {
         binary: p.revert_binary.clone(),
         args: p.revert_args.clone(),
@@ -3823,11 +4328,28 @@ async fn run_provisional_revert(server: &ServerContext, p: &Provisional) -> Exec
         stream_output: false,
         stream_writer: &mut sink,
     };
-    exec_after_approval_with_secret_authority(
+    let command_authority = match replay_persisted_command_authorization(
+        server,
+        &caller,
+        &request,
+        p.revert_authorization.as_ref(),
+    )
+    .await
+    {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                format!("auto-revert of provisional {}", p.handle),
+                format!("rollback authorization rejected: {error}"),
+            )
+        }
+    };
+    exec_after_approval_with_command_authority(
         &mut context,
         request,
         format!("auto-revert of provisional {}", p.handle),
         Some(p.secret_entitlements.clone()),
+        Some(command_authority),
     )
     .await
 }
@@ -3858,7 +4380,15 @@ pub(super) async fn run_provisional_check(
             ),
         );
     }
-    let caller = reconstruct_caller(p.principal.clone(), &CallerIdentity::Unknown);
+    let caller = match reconstruct_caller(p.principal.clone(), &CallerIdentity::Unknown) {
+        Ok(caller) => caller,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                format!("confirmation check for provisional {}", p.handle),
+                error,
+            )
+        }
+    };
     let request = ExecuteRequest {
         binary: p.confirm_check_binary.clone().unwrap_or_default(),
         args: p.confirm_check_args.clone(),
@@ -3893,11 +4423,28 @@ pub(super) async fn run_provisional_check(
         stream_output: false,
         stream_writer: &mut sink,
     };
-    exec_after_approval_with_secret_authority(
+    let command_authority = match replay_persisted_command_authorization(
+        server,
+        &caller,
+        &request,
+        p.confirm_check_authorization.as_ref(),
+    )
+    .await
+    {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                format!("confirmation check for provisional {}", p.handle),
+                format!("confirmation-check authorization rejected: {error}"),
+            )
+        }
+    };
+    exec_after_approval_with_command_authority(
         &mut context,
         request,
         format!("confirmation check for provisional {}", p.handle),
         Some(p.secret_entitlements.clone()),
+        Some(command_authority),
     )
     .await
 }
@@ -4241,13 +4788,13 @@ pub(super) async fn finish_revert(
                     started: false,
                     reason,
                     ..
-                } if !p.secret_keys.is_empty() || !p.secret_file_keys.is_empty() => {
+                } => {
                     return defer_revert(
                         server,
                         p,
                         caller,
                         kind,
-                        format!("revert secret resolution or pre-spawn setup failed: {reason}"),
+                        format!("revert authorization or pre-spawn setup failed: {reason}"),
                     )
                     .await;
                 }

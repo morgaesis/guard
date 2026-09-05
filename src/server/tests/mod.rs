@@ -22,6 +22,97 @@ use tracing_subscriber::{layer::SubscriberExt, Layer};
 
 use super::{ServerConfig, ServerContext, ServerState};
 
+#[test]
+fn authority_fingerprint_key_is_stable_and_separate_from_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = super::load_or_create_authority_mac_key(Some(directory.path())).unwrap();
+    let second = super::load_or_create_authority_mac_key(Some(directory.path())).unwrap();
+    assert_eq!(first.as_ref(), second.as_ref());
+    assert_eq!(
+        std::fs::read(directory.path().join("authority.hmac"))
+            .unwrap()
+            .len(),
+        32
+    );
+    assert!(!directory.path().join("state.db").exists());
+}
+
+#[cfg(unix)]
+fn trusted_artifact_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let effective_user = unsafe { libc::geteuid() };
+    let root = std::env::current_dir()
+        .unwrap()
+        .ancestors()
+        .find(|candidate| {
+            let writable = std::fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.uid() == effective_user && metadata.mode() & 0o200 != 0
+            });
+            writable
+                && candidate.ancestors().all(|ancestor| {
+                    std::fs::metadata(ancestor).is_ok_and(|metadata| {
+                        metadata.is_dir()
+                            && (metadata.uid() == effective_user || metadata.uid() == 0)
+                            && metadata.mode() & 0o022 == 0
+                    })
+                })
+        })
+        .map(std::path::Path::to_path_buf)
+        .expect("a trusted writable test ancestor");
+    let directory = tempfile::Builder::new()
+        .prefix("guard-spawn-authority-")
+        .tempdir_in(&root)
+        .unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
+#[cfg(unix)]
+fn write_trusted_artifact(path: &std::path::Path, content: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, content).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[cfg(unix)]
+fn create_trusted_artifact_dir(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir(path).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(unix)]
+static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(unix)]
+struct EnvRestore {
+    key: &'static str,
+    value: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl EnvRestore {
+    fn capture(key: &'static str) -> Self {
+        Self {
+            key,
+            value: std::env::var_os(key),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match &self.value {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 /// Shared-buffer writer for the tracing fmt subscriber. Lets us capture
 /// emitted log lines and assert on their contents.
 #[derive(Clone)]
@@ -136,7 +227,7 @@ fn synthesized_compiler_check_arguments(_request: &str) -> serde_json::Value {
     serde_json::json!({
         "name": "check-compiler",
         "description": "Inspect compiler version",
-        "binary": "rustc",
+        "binary": "uptime",
         "args": ["--version"],
         "params": {},
         "consequence": "reversible",
@@ -149,6 +240,43 @@ fn synthesized_compiler_check_arguments(_request: &str) -> serde_json::Value {
 /// same safe read-only candidate.
 async fn run_verb_synthesis_llm(listener: tokio::net::TcpListener) {
     run_verb_synthesis_llm_with(listener, synthesized_compiler_check_arguments).await;
+}
+
+fn local_test_principal(id: u32) -> guard::principal::PrincipalKey {
+    #[cfg(windows)]
+    {
+        guard::principal::PrincipalKey::from_sid(format!(
+            "S-1-5-21-1000000000-1000000001-1000000002-{id}"
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        guard::principal::PrincipalKey::from_uid(id)
+    }
+}
+
+fn local_test_caller(id: u32) -> super::wire::CallerIdentity {
+    #[cfg(windows)]
+    {
+        super::wire::CallerIdentity::Windows {
+            sid: local_test_principal(id).into_string(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        super::wire::CallerIdentity::Unix { uid: id }
+    }
+}
+
+fn local_test_operator(id: u32) -> super::wire::CallerIdentity {
+    #[cfg(windows)]
+    {
+        local_test_caller(id)
+    }
+    #[cfg(not(windows))]
+    {
+        super::wire::CallerIdentity::UnixAdmin { uid: id }
+    }
 }
 
 fn make_test_config() -> (ServerContext, SharedBuf) {
@@ -167,6 +295,14 @@ fn make_test_config() -> (ServerContext, SharedBuf) {
             None,
         ),
     };
+    #[cfg(unix)]
+    {
+        // The test process owns its temporary fixtures, while the modeled
+        // service child is a distinct untrusted identity. Dedicated lease
+        // tests exercise rejection when both identities are the same.
+        cfg.config.daemon_uid = 777;
+        cfg.config.daemon_principal = guard::principal::PrincipalKey::from_uid(777);
+    }
     let secret_root = tempfile::tempdir()
         .expect("secret-file test parent")
         .keep()
@@ -210,6 +346,11 @@ fn paranoid_test_config() -> ServerContext {
             None,
         ),
     };
+    #[cfg(unix)]
+    {
+        cfg.config.daemon_uid = 777;
+        cfg.config.daemon_principal = guard::principal::PrincipalKey::from_uid(777);
+    }
     let secret_root = tempfile::tempdir()
         .expect("secret-file test parent")
         .keep()

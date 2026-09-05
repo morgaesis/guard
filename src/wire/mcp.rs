@@ -143,8 +143,8 @@ pub struct GuardToolArgs {
     /// that should be allowed.
     #[serde(default)]
     pub reevaluate: bool,
-    /// SSH host-key policy for a guarded `ssh` command. Defaults to
-    /// only-existing (ssh's strict checking) when omitted.
+    /// Legacy SSH host-key policy retained for request compatibility. SSH has
+    /// no executable authority profile and is rejected before process start.
     #[serde(default)]
     pub hostkey: Option<McpSshHostKeyMode>,
 }

@@ -35,56 +35,48 @@ not in command-line arguments.
 | `GUARD_NOTIFY_CMD` | unset | Operator command receiving one JSON gate-lifecycle event on stdin. |
 | `GUARD_NOTIFY_TIMEOUT_SECS` | `10` | Notify command timeout in seconds, from 1 to 60. |
 | `GUARD_VERBS` | state directory when promotion needs it | Typed verb catalog. The packaged Windows service requires an explicit administrator-owned catalog, loads it once, and disables promotion. |
+| `GUARD_IMMUTABLE_VERBS_LOCK` | unset | Lock path for an immutable startup snapshot of `GUARD_VERBS`. When set with a catalog, Guard loads the catalog once, verifies the lock, and disables promotion. |
 | `GUARD_GRANTS` | unset | Reusable saved-grant catalog. |
 
 `--system-prompt <path>` replaces the compiled mode prompt.
 `--system-prompt-append <path>` and `GUARD_PROMPT_APPEND` add local context
 without replacing the base prompt.
 
-The append file is the operator's channel for tool knowledge the evaluator
-lacks. The safe-mode prompt judges unfamiliar tools unevaluable and denies
-their mutations (the readonly prompt instead leans toward allowing ambiguous
-read-only work), so a host that runs in-house or niche tooling under safe mode
-describes each such tool there: what its mutation surface is, which invocations
-are inspection, and which argument shapes are out of bounds. Typed verbs are
-the deterministic alternative for tools whose semantics should not depend on
-evaluator judgment at all.
-
-For example, an operator-provided `site-admin` binary with
-`inspect --service NAME` and `apply --service NAME` subcommands can use this
-prompt supplement:
+The append file is the operator's channel for deployment-specific semantics of
+an executable that already has a built-in authority profile. It cannot add a
+new executable to the authority registry. For example, a host can describe its
+local `systemctl` unit boundaries:
 
 ```text
-Local tool: site-admin
-- `site-admin inspect --service NAME` reads service state and does not mutate it.
-- `site-admin apply --service NAME` reconciles the named service and may change
-  configuration, processes, and remote state. Treat it as an opaque mutation.
-- Reject unknown subcommands, payload arguments, shell fragments, stdin-driven
-  input, and service names that are not visible as one argv element.
+Local systemd policy:
+- `systemctl status api.service` and `systemctl status worker.service` inspect
+  deployment services without changing them.
+- Treat other local units as outside this deployment's intended scope.
 ```
 
-When only a fixed inspection set is required, a typed verb removes evaluator
-ambiguity:
+Use a typed verb when the allowed operation should be deterministic:
 
 ```yaml
 version: 1
 verbs:
-  - name: site-admin-inspect
+  - name: service-status
     description: Inspect one configured service
-    binary: site-admin
-    args: [inspect, --service, "{service}"]
+    binary: systemctl
+    args: [status, "{service}.service"]
     params:
       service:
         enum: [api, worker]
     consequence: reversible
 ```
 
-The prompt supplement explains novel invocations. The typed verb is the
-enforcement surface for repeated commands whose executable shapes are finite.
+The prompt supplement explains local meaning within an existing profile. The
+typed verb is the enforcement surface for repeated command shapes. Executables
+without a built-in authority profile fail closed at catalog load and process
+admission.
 An optional `exec_timeout_secs` field applies a wall-clock limit to one verb and
 overrides `GUARD_EXEC_TIMEOUT_SECS`; setting the field to `0` makes that verb
 unlimited.
-A copyable supplement in this style for an in-house `servicectl` CLI is at
+A copyable supplement in this style for local systemd units is at
 [`examples/system-prompt-append-tools.md`](../examples/system-prompt-append-tools.md).
 
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
@@ -181,13 +173,21 @@ boundaries.
 | `GUARD_GPG_RECIPIENT` | none | GPG recipient for the local backend. |
 | `GUARD_SERVER_UID` | daemon principal | Owner namespace for the daemon's backend `LLM_API_KEY`. |
 | `GUARD_CHILD_ENV` | unset | Daemon environment names copied into approved children. |
+| `GUARD_EXEC_USER` | none | Dedicated Unix account required for local process execution unless `GUARD_EXEC_AS_CALLER=true`. |
 | `GUARD_EXEC_AS_CALLER` | `false` | Unix-only identity drop to the authenticated caller. |
 
 The child starts from a clean environment. Built-in safe variables and
 operator-selected `GUARD_CHILD_ENV` values come from the daemon, not the caller.
-`guard run --secret NAME` injects a stored value as an environment variable;
-`--secret-file ENV=NAME` creates a daemon-only child-lifetime file and exposes
-only its path. The file mode is incompatible with `--exec-as-caller`.
+`guard run --secret NAME` injects a caller-scoped stored value only with
+`--exec-as-caller`. Fixed-identity execution rejects all per-run bindings.
+Secret-file bindings remain part of typed policy and frozen hold snapshots, but
+local execution rejects them because neither supported identity mode provides
+an isolated daemon-to-child credential-file boundary.
+
+Fixed-identity daemon or tool environment may carry `KUBECONFIG` only when the
+document exactly matches the generated schema, endpoint, certificate authority,
+and transport bearer of an active Guard Kubernetes proxy. Alternate clusters,
+contexts, users, proxy settings, extensions, and unknown fields fail closed.
 
 Caller-requested `--env`, `--secret`, and `--secret-file` bindings are part of
 the evaluator subject and cache authority. Raw environment values stay out of
@@ -198,29 +198,29 @@ the daemon.
 ### Tool-owned environment
 
 The daemon loads `tools.yaml` from its Guard configuration directory. Each
-binary can receive fixed environment values and named secrets owned by the
-daemon:
+binary can receive fixed environment values and, in caller mode, named scalar
+secrets owned by the daemon:
 
 ```yaml
 tools:
-  ansible-playbook:
+  printf:
     env:
-      HOME: /var/lib/guard
-      ANSIBLE_LOCAL_TEMP: /var/lib/guard/.ansible/tmp
-      PATH: /opt/ansible-tools/bin:/usr/local/bin:/usr/bin:/bin
+      LANG: C.UTF-8
+      TZ: UTC
 ```
 
-This pattern gives `connection: local` tasks a writable home and temporary
-directory while selecting an operator-managed Python environment for modules.
-Create those directories with service-account ownership before starting Guard.
-Pin `ansible_python_interpreter` in the inventory or a typed verb when a
-playbook must use a particular interpreter. Tool values override the built-in
-safe environment, and a request cannot override the same variable.
+Tool values override the built-in safe environment, and a request cannot
+override the same variable. Fixed identity rejects tool-config secret bindings
+and credential-authority environment such as `SSH_AUTH_SOCK`; a validated
+broker-only kubeconfig with generated transport authentication for an active
+Guard proxy is the narrow kubectl exception. Tool configuration cannot enable
+Ansible or Helm. Caller mode also rejects typed Ansible, Helm, and kubectl
+execution.
 
-Tool configuration is binary-wide. Use separate wrapper binary names when two
-verb families require incompatible environments. Per-user entries under
-`users` can override fixed values or secret references, but the authenticated
-principal's secret namespace remains the source.
+Tool configuration is binary-wide. Use separate executable entries when two
+admitted command families require incompatible environments. Per-user entries
+under `users` can override fixed values or scalar secret references in caller
+mode, but the authenticated principal's secret namespace remains the source.
 
 ## API proxy
 
@@ -229,16 +229,20 @@ principal's secret namespace remains the source.
 | `GUARD_API_PROXY` | unset | Single generic loopback proxy listener. |
 | `GUARD_API_ENDPOINTS` | unset | YAML catalog of named concurrent listeners. |
 | `GUARD_API_PROTOCOL` | `kubernetes` | `kubernetes`, `github`, or `vercel`. |
-| `GUARD_API_UPSTREAM` | none | Generic upstream base URL. |
+| `GUARD_API_UPSTREAM` | none | Generic HTTPS upstream base URL without userinfo, query, or fragment. |
 | `GUARD_API_TOKEN_ENV` | none | Daemon environment name containing the upstream bearer. |
 | `GUARD_API_TOKEN_FILE` | none | Daemon-readable upstream bearer file. |
 | `GUARD_API_CA_OUT` | none | Output path for the local proxy CA. |
+| `GUARD_API_CLIENT_CONFIG_OUT` | none | Protected Unix fixed-worker JSON containing the loopback URL, CA, and generated transport bearer. |
 | `GUARD_KUBE_PROXY` | unset | Kubernetes listener shorthand. |
 | `GUARD_KUBE_PROXY_KUBECONFIG` | none | Daemon-owned upstream kubeconfig. |
 | `GUARD_KUBE_CONTEXT` | kubeconfig current context | Upstream Kubernetes context. |
 | `GUARD_API_POLICY` | none | Hot-reloaded API policy; absence is default deny. |
-| `GUARD_BROKERED_KUBECONFIG_OUT` | none | Operator/bootstrap kubeconfig output for a trusted local API client. |
+| `GUARD_BROKERED_KUBECONFIG_OUT` | none | Protected Unix fixed-worker kubeconfig output; requires `--exec-user`. |
 | `GUARD_API_RARITY_ESCALATION` | `0` | Observation threshold for evaluator or hold escalation. |
+
+API proxy configuration is unsupported on Windows because the platform has no
+race-free, client-specific authority handoff.
 
 API evaluator concurrency, rate, burst, error circuit, and cooldown controls use
 the `GUARD_API_JUDGE_*` variables shown by `guard server start --help`.
@@ -328,13 +332,8 @@ command text, arguments, secret names, reasons, or argv, and the only labels are
 fixed constants such as `outcome="denied"`. Reading it never gates or slows a
 request: counters are lock-free atomics and gauges are read only at scrape time.
 
-## SSH host keys
+## SSH compatibility
 
-`guard run --hostkey <mode>` changes only a brokered `ssh` command:
-
-- `only-existing` preserves strict checking and is the default.
-- `accept-new` trusts a new key but rejects a changed key.
-- `accept-all` disables host authentication and always returns to the evaluator.
-
-Guard injects host-key arguments before evaluation, audit, and spawn, so all
-three surfaces see the same argv.
+`guard run --hostkey <mode>` remains accepted for legacy client compatibility,
+but SSH has no executable authority profile and is rejected before process
+start. Guard does not advertise SSH or host-key options in its MCP contract.

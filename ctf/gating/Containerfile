@@ -1,7 +1,7 @@
 # Self-contained adversarial harness for consequence gating.
-# Builds guard for Linux, sets up an unprivileged daemon (uid 1000) and agent (uid 1001),
-# and runs the attack script. The harness uses deterministic local fixtures and
-# makes no external service calls.
+# Builds guard for Linux, sets up a capability-bounded non-root daemon, dedicated
+# child account, and unprivileged agent, then runs the attack script. The harness
+# uses deterministic local fixtures and makes no external service calls.
 #
 # Build context is the repo root. `.dockerignore` restricts the context to the
 # source and fixture paths this harness copies.
@@ -20,20 +20,43 @@ COPY src ./src
 COPY config ./config
 COPY tests ./tests
 COPY examples ./examples
+COPY .github/dependabot.yml ./.github/dependabot.yml
+COPY .github/workflows/dependabot-automerge.yml .github/workflows/dependabot-enable-automerge.yml ./.github/workflows/
 
 RUN cargo test --release --locked --quiet --no-run \
     && install -m 0755 target/release/guard /usr/local/bin/guard
 
-# Three distinct identities: the daemon/operator (uid 1000) and two agents
-# (uids 1001 and 1002). Peer credentials keep their authority separate.
-RUN useradd -m -u 1000 guarddaemon \
+# Four distinct identities: the operator, two agents, and the untrusted child.
+# The daemon runs as guarddaemon with the production CAP_SETUID/CAP_SETGID
+# capability pair so it can initialize and select the fixed child identity.
+RUN groupadd -g 2000 guard-clients \
+    && useradd -m -u 1000 guarddaemon \
     && useradd -m -u 1001 agent \
-    && useradd -m -u 1002 other-agent
+    && useradd -m -u 1002 other-agent \
+    && useradd -m -u 1003 guardexec \
+    && usermod -aG guard-clients guarddaemon \
+    && usermod -aG guardexec guarddaemon \
+    && usermod -aG guard-clients agent \
+    && usermod -aG guard-clients other-agent
+
+# Catalog validation binds fixed file arguments to trusted ancestors. The
+# attack fixture replaces `/work` with its own bounded filesystem before
+# daemon startup; synthetic scenarios retain these immutable image anchors.
+RUN install -d -o root -g root -m 0755 /work /work/ansible-project
+
+# The daemon's immutable authority mountpoint is anchored directly under the
+# read-only container rootfs, outside every daemon-writable ancestor.
+RUN install -d -o root -g root -m 0555 /authority \
+    && printf 'hello\n' > /authority/seed.txt \
+    && chmod 0444 /authority/seed.txt
+
+# The shared catalog also binds synthetic Ansible coverage to this canonical
+# project directory. Synthetic runs replace `/scenario` with their private
+# fixture volume; the fixed run only needs the trusted path to exist at load.
+RUN install -d -o root -g root -m 0755 /scenario /scenario/ansible
 
 COPY ctf/gating/verbs.yaml /etc/guard/verbs.yaml
-RUN chmod 0644 /etc/guard/verbs.yaml \
-    && install -o guarddaemon -g guarddaemon -m 0600 \
-      /dev/null /etc/guard/.verbs.yaml.learning-lock
+RUN chmod 0644 /etc/guard/verbs.yaml
 COPY ctf/gating/attack.sh /attack.sh
 RUN chmod 0755 /attack.sh
 COPY ctf/gating/synthetic-user.sh /synthetic-user.sh

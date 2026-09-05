@@ -1,0 +1,182 @@
+name: Dependabot enable auto-merge
+
+# Write permission is isolated from the pull request workflow. The job accepts
+# only successful signals from the trusted classifier workflow and live API
+# metadata before asking native repository rules to enable auto-merge.
+
+"on": # zizmor: ignore[dangerous-triggers] No pull request content or code is consumed, and the source workflow blob is verified.
+  workflow_run:
+    workflows: [Dependabot review gate]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  enable-auto-merge:
+    name: Enable native auto-merge
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.actor.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Validate source and enable auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          source_action="$(jq -er '.action | strings' "$GITHUB_EVENT_PATH")"
+          source_run_id="$(jq -er '.workflow_run.id | numbers' "$GITHUB_EVENT_PATH")"
+          source_name="$(jq -er '.workflow_run.name | strings' "$GITHUB_EVENT_PATH")"
+          source_path="$(jq -er '.workflow_run.path | strings' "$GITHUB_EVENT_PATH")"
+          source_event="$(jq -er '.workflow_run.event | strings' "$GITHUB_EVENT_PATH")"
+          source_conclusion="$(jq -er '.workflow_run.conclusion | strings' "$GITHUB_EVENT_PATH")"
+          source_actor="$(jq -er '.workflow_run.actor.login | strings' "$GITHUB_EVENT_PATH")"
+          event_repository="$(jq -er '.repository.full_name | strings' "$GITHUB_EVENT_PATH")"
+          run_repository="$(jq -er '.workflow_run.repository.full_name | strings' "$GITHUB_EVENT_PATH")"
+          pull_count="$(jq -er '.workflow_run.pull_requests | arrays | length' "$GITHUB_EVENT_PATH")"
+          pull_number="$(jq -er '.workflow_run.pull_requests[0].number | numbers' "$GITHUB_EVENT_PATH")"
+          source_head_sha="$(jq -er '.workflow_run.head_sha | strings' "$GITHUB_EVENT_PATH")"
+
+          if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+            echo "Refusing auto-merge: the runtime repository is malformed."
+            exit 1
+          fi
+          if [ "$event_repository" != "$GITHUB_REPOSITORY" ] || [ "$run_repository" != "$GITHUB_REPOSITORY" ]; then
+            echo "Refusing auto-merge: the source repository is unexpected."
+            exit 1
+          fi
+          if [ "$source_action" != "completed" ] || [ "$source_conclusion" != "success" ]; then
+            echo "Refusing auto-merge: the source run did not complete successfully."
+            exit 1
+          fi
+          if ! [[ "$source_run_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Refusing auto-merge: the source run id is malformed."
+            exit 1
+          fi
+          if [ "$source_name" != "Dependabot review gate" ] || [ "$source_path" != ".github/workflows/dependabot-automerge.yml" ]; then
+            echo "Refusing auto-merge: the source workflow is unexpected."
+            exit 1
+          fi
+          if [ "$source_event" != "pull_request" ] || [ "$source_actor" != "dependabot[bot]" ]; then
+            echo "Refusing auto-merge: the source event or actor is unexpected."
+            exit 1
+          fi
+          if [ "$pull_count" != "1" ] || ! [[ "$pull_number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Refusing auto-merge: exactly one valid pull request is required."
+            exit 1
+          fi
+          if ! [[ "$source_head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Refusing auto-merge: the source head commit is malformed."
+            exit 1
+          fi
+
+          source_jobs="$(gh api \
+            --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${source_run_id}/jobs?filter=latest&per_page=100")"
+          reported_job_count="$(jq -er '.total_count | numbers' <<< "$source_jobs")"
+          returned_job_count="$(jq -er '.jobs | arrays | length' <<< "$source_jobs")"
+          if [ "$reported_job_count" != "$returned_job_count" ]; then
+            echo "Refusing auto-merge: the source job response is incomplete."
+            exit 1
+          fi
+
+          classifier_count="$(jq -er --argjson run_id "$source_run_id" '
+            [.jobs[] | select(
+              .run_id == $run_id and .name == "Classify dependency update"
+            )] | length
+          ' <<< "$source_jobs")"
+          eligibility_count="$(jq -er --argjson run_id "$source_run_id" '
+            [.jobs[] | select(
+              .run_id == $run_id and .name == "Auto-merge eligible"
+            )] | length
+          ' <<< "$source_jobs")"
+          if [ "$classifier_count" != "1" ] || [ "$eligibility_count" != "1" ]; then
+            echo "Refusing auto-merge: exactly one classifier and eligibility job are required."
+            exit 1
+          fi
+          if ! jq -e --argjson run_id "$source_run_id" '
+            any(.jobs[];
+              .run_id == $run_id and
+              .name == "Classify dependency update" and
+              .status == "completed" and
+              .conclusion == "success"
+            ) and
+            any(.jobs[];
+              .run_id == $run_id and
+              .name == "Auto-merge eligible" and
+              .status == "completed" and
+              .conclusion == "success"
+            )
+          ' <<< "$source_jobs" >/dev/null; then
+            echo "Refusing auto-merge: the classifier and eligibility jobs must succeed."
+            exit 1
+          fi
+
+          repository_metadata="$(gh api \
+            --method GET \
+            "repos/${GITHUB_REPOSITORY}")"
+          default_branch="$(jq -er '.default_branch | strings' <<< "$repository_metadata")"
+          if [ "$default_branch" != "main" ]; then
+            echo "Refusing auto-merge: the trusted default branch is not main."
+            exit 1
+          fi
+
+          source_workflow_blob="$(gh api \
+            --method GET \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/dependabot-automerge.yml?ref=${source_head_sha}")"
+          trusted_workflow_blob="$(gh api \
+            --method GET \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/dependabot-automerge.yml?ref=main")"
+          source_blob_sha="$(jq -er '
+            select(.type == "file" and .path == ".github/workflows/dependabot-automerge.yml") |
+            .sha | strings | select(test("^[0-9a-f]{40}$"))
+          ' <<< "$source_workflow_blob")"
+          trusted_blob_sha="$(jq -er '
+            select(.type == "file" and .path == ".github/workflows/dependabot-automerge.yml") |
+            .sha | strings | select(test("^[0-9a-f]{40}$"))
+          ' <<< "$trusted_workflow_blob")"
+          if [ "$source_blob_sha" != "$trusted_blob_sha" ]; then
+            echo "Refusing auto-merge: the source classifier workflow differs from main."
+            exit 1
+          fi
+
+          pull_metadata="$(gh api \
+            --method GET \
+            "repos/${GITHUB_REPOSITORY}/pulls/${pull_number}" \
+            --jq '{number, state, author: .user.login, base_ref: .base.ref, head_sha: .head.sha, head_repository: .head.repo.full_name}')"
+
+          current_number="$(jq -er '.number | numbers' <<< "$pull_metadata")"
+          current_state="$(jq -er '.state | strings' <<< "$pull_metadata")"
+          current_author="$(jq -er '.author | strings' <<< "$pull_metadata")"
+          current_base_ref="$(jq -er '.base_ref | strings' <<< "$pull_metadata")"
+          current_head_sha="$(jq -er '.head_sha | strings' <<< "$pull_metadata")"
+          current_head_repository="$(jq -er '.head_repository | strings' <<< "$pull_metadata")"
+
+          if [ "$current_number" != "$pull_number" ] || [ "$current_state" != "open" ]; then
+            echo "Refusing auto-merge: the pull request is not the expected open request."
+            exit 1
+          fi
+          if [ "$current_author" != "dependabot[bot]" ] || [ "$current_base_ref" != "main" ]; then
+            echo "Refusing auto-merge: the pull request author or base branch is unexpected."
+            exit 1
+          fi
+          if [ "$current_head_repository" != "$GITHUB_REPOSITORY" ]; then
+            echo "Refusing auto-merge: the pull request head repository is unexpected."
+            exit 1
+          fi
+          if ! [[ "$current_head_sha" =~ ^[0-9a-f]{40}$ ]] || [ "$current_head_sha" != "$source_head_sha" ]; then
+            echo "Refusing auto-merge: the tested head commit is stale or malformed."
+            exit 1
+          fi
+
+          gh pr merge "$pull_number" \
+            --repo "$GITHUB_REPOSITORY" \
+            --auto \
+            --squash \
+            --match-head-commit "$source_head_sha"

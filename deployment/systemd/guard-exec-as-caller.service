@@ -29,12 +29,12 @@ ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --soc
 Restart=on-failure
 RestartSec=5
 ProtectSystem=strict
-# Approved commands run as the connecting user, so their home directories must
-# stay writable -- host keys accepted via `--hostkey accept-new` are recorded
-# in the caller's own ~/.ssh, not the daemon's. Keep ProtectHome off and list
-# every caller home root here; add any that live outside /home. ProtectSystem
-# above keeps everything else read-only, so widen ReadWritePaths if the approved
-# command set legitimately writes outside these paths (e.g. /srv, /opt).
+# Approved commands run as the connecting user, so caller-owned file inputs and
+# command outputs may require writable home directories. Keep ProtectHome off
+# and list every caller home root here; add any that live outside /home.
+# ProtectSystem above keeps everything else read-only, so widen ReadWritePaths
+# if the approved command set legitimately writes outside these paths (e.g.
+# /srv, /opt).
 ProtectHome=false
 ReadWritePaths=/run/guard /var/lib/guard /home
 

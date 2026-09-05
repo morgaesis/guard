@@ -13,6 +13,7 @@ use crate::session::{
     SessionExecStatus, SessionGrant, SessionInteraction,
 };
 use guard::audit::{AuditEvent, AuditKind};
+use guard::gating::semantic_executable_key;
 use guard::gating::verb::{
     canonical_generated_access_consequence, generated_access_matcher_digest,
     generated_access_matcher_shape, generated_access_verb_name, Verb, VerbCatalog,
@@ -203,11 +204,14 @@ mod regeneration_proposal_tests {
                 catalog_version: None,
                 verb_digest: None,
                 verb_composition_digest: None,
+                verb_environment_authority: false,
+                verb_local_file_authority: false,
                 exec_timeout_secs: None,
                 access_verbs: Vec::new(),
                 access_requests: Vec::new(),
                 principal: Some(PrincipalKey::from_uid(1001)),
                 secret_binding: None,
+                process_authority: None,
             },
             reason: "operator decision required".to_string(),
             risk: Some(9),
@@ -368,11 +372,14 @@ mod regeneration_proposal_tests {
             catalog_version: Some(1),
             verb_digest: None,
             verb_composition_digest: None,
+            verb_environment_authority: false,
+            verb_local_file_authority: false,
             exec_timeout_secs: None,
             access_verbs: vec!["host-inspect".to_string()],
             access_requests: Vec::new(),
             principal: Some(caller),
             secret_binding: None,
+            process_authority: None,
         };
 
         assert_eq!(
@@ -635,7 +642,8 @@ fn validate_access_intent(intent: &str) -> Result<String, String> {
     if normalized.len() > MAX_GRANT_REQUEST_PAYLOAD_BYTES {
         return Err("access intent exceeds the request size limit".to_string());
     }
-    if redact_output_text(&normalized) != normalized {
+    let redacted = redact_output_text(&normalized);
+    if redacted != normalized {
         return Err(
             "access intent appears to contain credential material; name the credential selector without including its value"
                 .to_string(),
@@ -1139,7 +1147,7 @@ mod access_capability_tests {
         let mut verb = Verb {
             name: "access-generated-fixture".to_string(),
             description: format!("password={value}"),
-            binary: "fixturectl".to_string(),
+            binary: "printf".to_string(),
             args: vec!["status".to_string()],
             baseline: true,
             coverage: Vec::new(),
@@ -1147,7 +1155,7 @@ mod access_capability_tests {
             params: std::collections::BTreeMap::new(),
             consequence: guard::gating::Reversibility::Irreversible,
             revert: Some(guard::gating::verb::VerbCommand {
-                binary: "fixturectl".to_string(),
+                binary: "printf".to_string(),
                 args: vec!["undo".to_string()],
             }),
             hold: false,
@@ -1177,7 +1185,7 @@ mod access_capability_tests {
         let mut verb = Verb {
             name: "access-generated-fixture".to_string(),
             description: "fixture".to_string(),
-            binary: "fixturectl".to_string(),
+            binary: "printf".to_string(),
             args: vec!["inspect".to_string(), "{password}".to_string()],
             baseline: false,
             coverage: Vec::new(),
@@ -1212,12 +1220,13 @@ mod access_capability_tests {
         let mut verb = Verb {
             name: "access-generated-fixture".to_string(),
             description: "fixture".to_string(),
-            binary: "fixturectl".to_string(),
+            binary: "printf".to_string(),
             args: vec!["status".to_string()],
             baseline: false,
             coverage: vec![VerbCoverageCell {
                 name: "exact".to_string(),
                 action: CoverageAction::Evaluate,
+                command_path: Vec::new(),
                 required_args: Vec::new(),
                 forbidden_args: Vec::new(),
                 min_args: Some(1),
@@ -1367,7 +1376,13 @@ pub(super) async fn validate_durable_access_provenance(
                     access.request
                 )
             })?;
-            validate_access_request_shape(request)?;
+            validate_access_request_shape(request).map_err(|error| {
+                format!(
+                    "access session {} rejected durable request {}: {error}",
+                    session_reference(&token),
+                    access.request
+                )
+            })?;
             if request.status != GrantRequestStatus::Approved
                 || request.session_token != token
                 || request
@@ -1419,7 +1434,7 @@ pub(super) async fn validate_durable_access_provenance(
 fn approval_options(handle: &str, audience: &AccessAudience, one_shot: bool) -> Vec<String> {
     if !audience.is_operator {
         return vec![format!(
-            "ask your admin to approve request {handle} (see guard access show {handle})"
+            "operator approval required for request {handle} (see guard access show {handle})"
         )];
     }
 
@@ -1620,15 +1635,38 @@ async fn consequence_for_reference(server: &ServerContext, reference: &str) -> S
     }
 }
 
-/// The next command this audience should run against a hold. The operator
-/// decides and then reads the transcript; the requester waits and then resumes.
-fn hold_next_action(handle: &str, state: &str, is_operator: bool) -> String {
-    match (state, is_operator) {
-        ("pending", true) => format!("guard access approve {handle} --once"),
-        ("pending", false) => format!("guard approval show {handle} --wait"),
-        ("armed", true) => format!("guard approval show {handle} --wait"),
-        ("armed", false) => format!("guard approval resume {handle}"),
+/// The next command this audience should run against a hold. A caller who is
+/// both requester and operator resumes its own armed hold rather than being
+/// treated only as the approving operator.
+fn hold_next_action(handle: &str, state: &str, is_operator: bool, is_requester: bool) -> String {
+    match (state, is_operator, is_requester) {
+        ("pending", true, _) => format!("guard access approve {handle} --once"),
+        ("pending", false, _) => format!("guard approval show {handle} --wait"),
+        ("armed", _, true) => format!("guard approval resume {handle}"),
+        ("armed", true, false) => format!("guard approval show {handle} --wait"),
+        ("armed", false, false) => format!("guard approval show {handle}"),
         _ => format!("guard approval show {handle}"),
+    }
+}
+
+#[cfg(test)]
+mod hold_next_action_tests {
+    use super::hold_next_action;
+
+    #[test]
+    fn requester_operator_resumes_its_own_armed_hold() {
+        assert_eq!(
+            hold_next_action("ap-1", "armed", true, true),
+            "guard approval resume ap-1"
+        );
+        assert_eq!(
+            hold_next_action("ap-1", "armed", true, false),
+            "guard approval show ap-1 --wait"
+        );
+        assert_eq!(
+            hold_next_action("ap-1", "pending", true, true),
+            "guard access approve ap-1 --once"
+        );
     }
 }
 
@@ -1719,7 +1757,12 @@ async fn access_item_for_approval(
         default_use_policy: awaiting_decision.then(|| "bounded".to_string()),
         default_uses: awaiting_decision.then_some(1),
         state: projected_state.to_string(),
-        next_action: hold_next_action(&approval.handle, projected_state, audience.is_operator),
+        next_action: hold_next_action(
+            &approval.handle,
+            projected_state,
+            audience.is_operator,
+            scope_eq(&approval.snapshot.principal, &audience.principal),
+        ),
         approval_options: if awaiting_decision {
             approval_options(&approval.handle, audience, true)
         } else {
@@ -1915,7 +1958,8 @@ pub(super) async fn submit_access_request(
     observed_argv: Option<(&str, &[String])>,
 ) -> Result<AccessItem, String> {
     let audience = AccessAudience::from_caller(server, caller);
-    let intent = redact_output_text(&validate_access_intent(intent)?);
+    let intent = validate_access_intent(intent)?;
+    let intent = redact_output_text(&intent);
     let caller_principal = if explicit_target.is_none() {
         Some(authenticated_local_principal(caller)?)
     } else {
@@ -3276,6 +3320,36 @@ fn access_decision_from_response(handle: &str, response: AdminResponse) -> Acces
     }
 }
 
+async fn retire_invalid_durable_access_request(
+    server: &ServerContext,
+    handle: &str,
+) -> Option<AccessDecisionResult> {
+    let store = server.state.session_store.as_ref()?;
+    match store.retire_invalid_grant_request(handle.to_string()).await {
+        Ok(true) => Some(AccessDecisionResult {
+            request: handle.to_string(),
+            success: true,
+            state: "retired".to_string(),
+            target: None,
+            remaining_uses: None,
+            use_policy: "unavailable".to_string(),
+            consequence: String::new(),
+            message: "invalid durable access request was retired".to_string(),
+        }),
+        Ok(false) => None,
+        Err(error) => Some(AccessDecisionResult {
+            request: handle.to_string(),
+            success: false,
+            state: "error".to_string(),
+            target: None,
+            remaining_uses: None,
+            use_policy: "unavailable".to_string(),
+            consequence: String::new(),
+            message: format!("failed to retire invalid durable access request: {error}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 fn stamp_generated_verb(
     mut verb: Verb,
@@ -3327,6 +3401,7 @@ fn stamp_generated_verb(
     verb.coverage = vec![VerbCoverageCell {
         name: "generated".to_string(),
         action: CoverageAction::Evaluate,
+        command_path: Vec::new(),
         required_args: fixed_args,
         forbidden_args: Vec::new(),
         min_args: None,
@@ -3983,7 +4058,17 @@ fn verb_menu_item(verb: &Verb) -> VerbMenuItem {
     VerbMenuItem {
         name: verb.name.clone(),
         description: verb.description.clone(),
+        arg_template: verb
+            .args
+            .iter()
+            .map(|argument| redact_output_text(argument))
+            .collect(),
         params: verb.params.keys().cloned().collect(),
+        param_patterns: verb
+            .params
+            .iter()
+            .map(|(name, spec)| (name.clone(), redact_output_text(&spec.pattern)))
+            .collect(),
         consequence: verb.consequence.as_str().to_string(),
         hold: verb.hold,
         has_revert: verb.revert.is_some(),
@@ -4814,6 +4899,11 @@ async fn dispatch_admin_request(
             }
         }
         AdminRequest::Status => {
+            if !AccessAudience::from_caller(server, caller).is_operator() {
+                return AdminResponse::Error {
+                    message: "full server status requires operator authority".to_string(),
+                };
+            }
             let now = now_unix();
             let session_count = server.state.sessions.read().await.list().len();
             let cache_size = server.state.evaluator.cache_size().await;
@@ -4876,7 +4966,11 @@ async fn dispatch_admin_request(
                     exec_identity: if server.config.exec_as_caller {
                         "caller".to_string()
                     } else {
-                        "daemon".to_string()
+                        server
+                            .config
+                            .exec_user_id
+                            .map(|uid| format!("fixed_uid:{uid}"))
+                            .unwrap_or_else(|| "disabled".to_string())
                     },
                     state_db_path: server
                         .config
@@ -6013,6 +6107,11 @@ async fn dispatch_admin_request(
                     .contains_key(&handle)
                 {
                     decide_grant_request(server, &handle, false, &reason).await
+                } else if let Some(item) =
+                    retire_invalid_durable_access_request(server, &handle).await
+                {
+                    items.push(item);
+                    continue;
                 } else {
                     handle_deny(server, caller, &handle, &reason).await
                 };
@@ -6183,6 +6282,24 @@ async fn dispatch_admin_request(
             }
             AdminResponse::EvaluationBatch { items }
         }
+    }
+}
+
+#[cfg(test)]
+mod status_response_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn status_without_operator_authority_uses_the_compatible_error_shape() {
+        let server = crate::server::tests::config_for_proposal_test();
+        let response = dispatch_admin_request(
+            &server,
+            &CallerIdentity::Unix { uid: 1_001 },
+            AdminRequest::Status,
+        )
+        .await;
+
+        assert!(matches!(response, AdminResponse::Error { .. }));
     }
 }
 
@@ -6365,12 +6482,7 @@ async fn preflight_synthesized_api_policy(
 }
 
 fn synthesized_kubectl_api_operation(binary: &str, args: &[String]) -> Option<guard::proxy::ApiOp> {
-    let binary = std::path::Path::new(binary)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(binary)
-        .trim_end_matches(".exe")
-        .to_ascii_lowercase();
+    let binary = semantic_executable_key(binary);
     if binary != "kubectl" {
         return None;
     }
@@ -7073,9 +7185,9 @@ fn emit_grant_request_event(server: &ServerContext, request: &GrantRequest, even
     });
 }
 
-/// Returns `(is_daemon, caller_principal)` for read-scoping. A caller is the
-/// daemon (operator) when its principal equals the daemon's; row visibility is
-/// then either daemon-wide or scoped to the caller's own principal via
+/// Returns `(is_operator, caller_principal)` for read-scoping. An authenticated
+/// operator has deployment-wide visibility; other callers are scoped to their
+/// own principal via
 /// `scope_eq` (so two unauthenticated `None` callers never share rows).
 fn caller_scope(server: &ServerContext, caller: &CallerIdentity) -> (bool, Option<PrincipalKey>) {
     let p = caller.principal();
@@ -7156,9 +7268,20 @@ mod verb_preview_cache_tests {
 
     fn candidate(name: &str) -> Verb {
         serde_yaml_ng::from_str(&format!(
-            "name: {name}\nbinary: rustc\nargs: ['--version']\nconsequence: reversible\n"
+            "name: {name}\nbinary: uptime\nargs: ['--version']\nconsequence: reversible\n"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn synthesized_kubectl_preflight_uses_canonical_executable_names() {
+        let operation = synthesized_kubectl_api_operation(
+            "Kubectl.ExE",
+            &["get".to_string(), "pods".to_string()],
+        )
+        .expect("mixed-case Windows executable names receive Kubernetes preflight");
+        assert_eq!(operation.verb.as_str(), "list");
+        assert_eq!(operation.resource, "pods");
     }
 
     #[test]
@@ -8283,7 +8406,9 @@ pub(super) async fn handle_admin_request_owned(
     } = request
     else {
         return OwnedAdminResponse {
-            response: dispatch_admin_request(server, caller, request).await,
+            // The dispatcher contains every administrative response shape.
+            // Keep its large async state machine off connection-task stacks.
+            response: Box::pin(dispatch_admin_request(server, caller, request)).await,
             waiter_lease: None,
         };
     };
@@ -8336,7 +8461,7 @@ pub(super) async fn handle_admin_request_owned(
         };
     };
 
-    let decision = dispatch_admin_request(
+    let decision = Box::pin(dispatch_admin_request(
         server,
         caller,
         AdminRequest::AccessApprove {
@@ -8344,7 +8469,7 @@ pub(super) async fn handle_admin_request_owned(
             uses,
             wait_secs: None,
         },
-    )
+    ))
     .await;
     let AdminResponse::AccessDecisions { items, .. } = &decision else {
         return OwnedAdminResponse {

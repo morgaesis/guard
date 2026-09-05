@@ -35,6 +35,7 @@ use hyper::service::service_fn;
 use hyper::{header, HeaderMap, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
@@ -120,6 +121,8 @@ struct SessionAuth {
     token: String,
     context: ApiSessionContext,
 }
+#[derive(Debug, Clone, Copy)]
+struct ProxyTransportAuth;
 struct BufferedRequest {
     parts: Parts,
     body: Bytes,
@@ -138,6 +141,10 @@ pub struct ApiProxy {
     listen: SocketAddr,
     proxy_url: String,
     tls: ProxyTls,
+    /// Per-process transport credential carried only by the protected
+    /// brokered kubeconfig. It authenticates the dedicated worker principal
+    /// without becoming upstream API authority.
+    transport_bearer: String,
     upstream: Upstream,
     /// Answers every protocol-specific question; the loop itself is
     /// protocol-agnostic.
@@ -538,6 +545,7 @@ struct SessionBoundHandoff<'a> {
     sink: Option<&'a Arc<dyn ApiSessionSink>>,
     auth: Option<&'a SessionAuth>,
     context: Option<&'a ApiSessionContext>,
+    transport_authenticated: bool,
     upstream: &'a mut dyn ApiForwardHandoff,
 }
 
@@ -632,7 +640,7 @@ impl ApiForwardHandoff for SessionBoundHandoff<'_> {
                 sink.authorize_forward(&auth.token, context, self.upstream)
                     .await
             }
-            (_, None, None) => self.upstream.forward().await,
+            (_, None, None) if self.transport_authenticated => self.upstream.forward().await,
             _ => Err("session authority context is incomplete".to_string()),
         }
     }
@@ -759,9 +767,10 @@ impl RarityTracker {
 /// provenance matching.
 ///
 /// The `conn` field scopes provenance to the connection that created the
-/// resource. The TLS listener requests no client certificate. Caller scope is
-/// established by a Guard session bearer when one is supplied, and the bearer
-/// is consumed before the request reaches the upstream connection. A delete
+/// resource. Every request presents either the protected proxy transport
+/// bearer or a Guard session bearer, and the bearer is consumed before the
+/// request reaches the upstream connection. Caller scope is established by a
+/// Guard session when one is supplied. A delete
 /// arriving on a different connection than the create never matches, so the
 /// provenance shortcut is scoped to the connection that created a resource; a delete on any other
 /// connection falls through to standard policy evaluation. Kubernetes
@@ -944,11 +953,19 @@ impl ApiProxy {
         policy: ApiPolicy,
         policy_path: Option<PathBuf>,
     ) -> Self {
+        use rand::Rng;
+        let mut transport_bearer_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut transport_bearer_bytes);
+        let transport_bearer = transport_bearer_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let proxy_url = format!("https://{listen}");
         Self {
             listen,
             proxy_url,
             tls,
+            transport_bearer,
             upstream,
             protocol,
             policy: Arc::new(RwLock::new(policy)),
@@ -1250,9 +1267,14 @@ impl ApiProxy {
         &self.proxy_url
     }
 
-    /// The agent-facing brokered kubeconfig without a Guard session bearer.
+    /// The agent-facing brokered kubeconfig with this proxy's generated
+    /// transport bearer and no reusable Guard session authority.
     pub fn brokered_kubeconfig(&self) -> String {
-        super::kubeconfig::brokered_kubeconfig(&self.proxy_url, &self.tls.ca_data_b64())
+        super::kubeconfig::brokered_kubeconfig(
+            &self.proxy_url,
+            &self.tls.ca_data_b64(),
+            &self.transport_bearer,
+        )
     }
 
     pub fn brokered_kubeconfig_with_session(&self, session_token: &str) -> String {
@@ -1260,6 +1282,16 @@ impl ApiProxy {
             &self.proxy_url,
             &self.tls.ca_data_b64(),
             session_token,
+        )
+    }
+
+    /// Generic-client configuration for this loopback proxy. The generated
+    /// bearer authenticates only to Guard and is never forwarded upstream.
+    pub fn brokered_client_config(&self) -> String {
+        super::client_config::brokered_client_config(
+            &self.proxy_url,
+            self.tls.ca_pem(),
+            &self.transport_bearer,
         )
     }
 
@@ -1356,6 +1388,22 @@ impl ApiProxy {
                 return self.status_resp(StatusCode::FORBIDDEN, reason, "Forbidden");
             }
         };
+        let Some(presented_bearer) = session_token else {
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: a proxy transport or session bearer is required",
+                "Forbidden",
+            );
+        };
+        let session_token = if bool::from(
+            presented_bearer
+                .as_bytes()
+                .ct_eq(self.transport_bearer.as_bytes()),
+        ) {
+            None
+        } else {
+            Some(presented_bearer)
+        };
         let session_context = if let Some(token) = session_token.as_deref() {
             let Some(sink) = self.session_sink.get() else {
                 return self.status_resp(
@@ -1413,6 +1461,8 @@ impl ApiProxy {
         }
         if let (Some(token), Some(context)) = (session_token.clone(), session_context.clone()) {
             req.extensions_mut().insert(SessionAuth { token, context });
+        } else {
+            req.extensions_mut().insert(ProxyTransportAuth);
         }
         let response = self.route_inner(req, conn_id, session_context).await;
         if let (Some(token), Some(sink)) = (session_token.as_deref(), self.session_sink.get()) {
@@ -2765,6 +2815,7 @@ impl ApiProxy {
             authorized_body_sha256,
         };
         let auth = parts.extensions.get::<SessionAuth>();
+        let transport_authenticated = parts.extensions.get::<ProxyTransportAuth>().is_some();
         let mut cleanup_handoff = CleanupBoundHandoff {
             proxy: self,
             created: created_cleanup.as_ref(),
@@ -2775,6 +2826,7 @@ impl ApiProxy {
             sink: self.session_sink.get(),
             auth,
             context: session_context.as_ref(),
+            transport_authenticated,
             upstream: &mut cleanup_handoff,
         };
         let authorization_result = if let Some(pending) = authorization {
@@ -3248,7 +3300,8 @@ impl ApiProxy {
 
         // A successful named-object GET is the only read that establishes a
         // write observation. Lists and watches cannot bind one object UID and
-        // version, and anonymous reads never establish mutation authority.
+        // version, and transport-bearer-only reads never establish mutation
+        // authority.
         if status.is_success()
             && op.as_ref().is_some_and(|operation| {
                 self.protocol.name() == "kubernetes"
@@ -3344,9 +3397,26 @@ impl ApiProxy {
         &self,
         parts: &Parts,
     ) -> Result<Option<ApiSessionContext>, ProxyErrorResponse> {
-        let Some(auth) = parts.extensions.get::<SessionAuth>() else {
-            return Ok(None);
+        let auth = parts.extensions.get::<SessionAuth>();
+        let transport_authenticated = parts.extensions.get::<ProxyTransportAuth>().is_some();
+        let Some(auth) = auth else {
+            return if transport_authenticated {
+                Ok(None)
+            } else {
+                Err(Box::new(self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: authenticated client context is missing",
+                    "Forbidden",
+                )))
+            };
         };
+        if transport_authenticated {
+            return Err(Box::new(self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: conflicting authenticated client context",
+                "Forbidden",
+            )));
+        }
         let Some(sink) = self.session_sink.get() else {
             return Err(Box::new(self.status_resp(
                 StatusCode::FORBIDDEN,
@@ -4100,7 +4170,7 @@ fn take_guard_session(headers: &mut HeaderMap) -> Result<Option<String>, &'stati
     if headers.get_all(GUARD_SESSION_HEADER).iter().count() > 1
         || headers.get_all(header::AUTHORIZATION).iter().count() > 1
     {
-        return Err("guard api-proxy: multiple session credentials are not allowed");
+        return Err("guard api-proxy: multiple client credentials are not allowed");
     }
     let alias = match headers.remove(GUARD_SESSION_HEADER) {
         Some(value) => {
@@ -4121,24 +4191,19 @@ fn take_guard_session(headers: &mut HeaderMap) -> Result<Option<String>, &'stati
                 .map_err(|_| "guard api-proxy: invalid Authorization encoding")?;
             let (scheme, token) = value
                 .split_once(' ')
-                .ok_or("guard api-proxy: Authorization must be a Guard session bearer")?;
+                .ok_or("guard api-proxy: Authorization must be a Guard proxy bearer")?;
             if !scheme.eq_ignore_ascii_case("bearer")
                 || !super::kubeconfig::valid_guard_session_token(token)
             {
-                return Err("guard api-proxy: Authorization must be a Guard session bearer");
+                return Err("guard api-proxy: Authorization must be a Guard proxy bearer");
             }
             Some(token.to_string())
         }
         None => None,
     };
-    // The anonymous placeholder from the no-session brokered kubeconfig
-    // identifies nothing: drop it so the request proceeds unattributed instead
-    // of failing closed as an unknown session.
-    let alias = alias.filter(|token| token != super::kubeconfig::ANONYMOUS_SESSION_TOKEN);
-    let bearer = bearer.filter(|token| token != super::kubeconfig::ANONYMOUS_SESSION_TOKEN);
     match (alias, bearer) {
         (Some(alias), Some(bearer)) if alias != bearer => {
-            Err("guard api-proxy: conflicting session credentials")
+            Err("guard api-proxy: conflicting client credentials")
         }
         (Some(token), _) | (_, Some(token)) => Ok(Some(token)),
         (None, None) => Ok(None),
@@ -5169,37 +5234,28 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_placeholder_bearer_is_stripped_and_unattributed() {
+    fn proxy_bearers_are_preserved_for_route_authentication() {
         let mut headers = HeaderMap::new();
+        let transport = format!("transport-{:032x}", rand::random::<u128>());
         headers.insert(
             header::AUTHORIZATION,
-            format!(
-                "Bearer {}",
-                super::super::kubeconfig::ANONYMOUS_SESSION_TOKEN
-            )
-            .parse()
-            .unwrap(),
+            format!("Bearer {transport}").parse().unwrap(),
         );
-        assert_eq!(take_guard_session(&mut headers).unwrap(), None);
+        assert_eq!(
+            take_guard_session(&mut headers).unwrap().as_deref(),
+            Some(transport.as_str())
+        );
         assert!(!headers.contains_key(header::AUTHORIZATION));
 
-        // A real alias next to the placeholder bearer attributes the request
-        // to the alias instead of failing as conflicting credentials.
+        // A different alias and bearer remain conflicting credentials. Route
+        // authentication classifies the proxy bearer after parsing.
         let mut mixed = HeaderMap::new();
         mixed.insert(GUARD_SESSION_HEADER, "live-session".parse().unwrap());
         mixed.insert(
             header::AUTHORIZATION,
-            format!(
-                "Bearer {}",
-                super::super::kubeconfig::ANONYMOUS_SESSION_TOKEN
-            )
-            .parse()
-            .unwrap(),
+            format!("Bearer {transport}").parse().unwrap(),
         );
-        assert_eq!(
-            take_guard_session(&mut mixed).unwrap().as_deref(),
-            Some("live-session")
-        );
+        assert!(take_guard_session(&mut mixed).is_err());
     }
 
     #[test]
@@ -5213,7 +5269,7 @@ mod tests {
         conflicting.insert(header::AUTHORIZATION, "Bearer two".parse().unwrap());
         assert_eq!(
             take_guard_session(&mut conflicting).unwrap_err(),
-            "guard api-proxy: conflicting session credentials"
+            "guard api-proxy: conflicting client credentials"
         );
 
         let mut duplicate = HeaderMap::new();
@@ -5221,7 +5277,7 @@ mod tests {
         duplicate.append(header::AUTHORIZATION, "Bearer two".parse().unwrap());
         assert_eq!(
             take_guard_session(&mut duplicate).unwrap_err(),
-            "guard api-proxy: multiple session credentials are not allowed"
+            "guard api-proxy: multiple client credentials are not allowed"
         );
     }
 

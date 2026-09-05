@@ -184,16 +184,7 @@ fn binary_matches(observed: &str, learned: &str) -> bool {
     {
         return observed == learned;
     }
-    binary_match_key(observed) == binary_match_key(learned)
-}
-
-fn binary_match_key(binary: &str) -> String {
-    let base = binary.rsplit(['/', '\\']).next().unwrap_or(binary);
-    let base = base
-        .strip_suffix(".exe")
-        .or_else(|| base.strip_suffix(".EXE"))
-        .unwrap_or(base);
-    base.to_ascii_lowercase()
+    super::semantic_executable_key(observed) == super::semantic_executable_key(learned)
 }
 
 /// Outcome of recording one LLM denial. Mirrors `learned_rules::LearningOutcome`
@@ -1015,6 +1006,9 @@ mod tests {
             .is_none());
         assert!(store
             .matches("KUBECTL.EXE", &argv(&["delete", "namespace", "prod"]),)
+            .is_some());
+        assert!(store
+            .matches("Kubectl.ExE", &argv(&["delete", "namespace", "prod"]),)
             .is_some());
     }
 

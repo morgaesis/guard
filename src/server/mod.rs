@@ -18,10 +18,7 @@ use guard::evaluate::Evaluator;
 use guard::gating::approval::ApprovalRegistry;
 use guard::gating::provisional::ProvisionalRegistry;
 use guard::gating::read_grant::GrantReadRegistry;
-use guard::gating::ssh_readonly::{
-    command_tokens, is_fixed_readonly_diagnostic, ssh_argument_boundaries,
-    ssh_options_all_readonly_safe,
-};
+use guard::gating::ssh_readonly::{command_tokens, ssh_argument_boundaries};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use guard::learned_rules::{
@@ -33,7 +30,7 @@ use guard::principal::PrincipalKey;
 // Re-export so main.rs can pattern-match on history status without a
 // direct dependency on the `session` module path.
 use crate::tool_config::ToolRegistry;
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -150,6 +147,8 @@ pub(crate) struct ServerConfig {
     #[cfg_attr(windows, allow(dead_code))]
     pub(crate) allowed_uids: Option<Vec<u32>>,
     pub(crate) shim_dir: Option<PathBuf>,
+    #[cfg(test)]
+    pub(crate) test_daemon_path: Option<std::ffi::OsString>,
     pub(crate) dry_run: bool,
     /// Internal non-executing admission preview. It shares evaluator cache
     /// reads/writes but suppresses every other learned or durable side effect.
@@ -163,6 +162,14 @@ pub(crate) struct ServerConfig {
     /// When true, approved Unix-socket requests execute as the connecting
     /// user instead of the daemon UID.
     pub(crate) exec_as_caller: bool,
+    /// Dedicated child UID used when `exec_as_caller` is false. Production
+    /// command execution refuses to share the daemon identity.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) exec_user_id: Option<u32>,
+    /// Unit tests model a distinct child UID while retaining the test
+    /// process's real filesystem identity so fixture execution remains local.
+    #[cfg(test)]
+    pub(crate) preserve_test_process_identity: bool,
     /// Default wall-clock limit for brokered child execution. Zero preserves
     /// unbounded execution unless a matched verb supplies an override.
     pub(crate) exec_timeout_secs: u64,
@@ -170,7 +177,7 @@ pub(crate) struct ServerConfig {
     /// Status admin RPC so callers can compute uptime.
     pub(crate) started_at_unix: u64,
     /// Effective UID of the daemon process. This identifies daemon-owned state
-    /// and the default child execution identity; it grants no admin authority.
+    /// and grants no child or admin authority.
     pub(crate) daemon_uid: u32,
     /// The daemon's own cross-platform principal: its uid on Unix, its process
     /// SID on Windows. This principal owns internal state and proxy-generated
@@ -188,6 +195,10 @@ pub(crate) struct ServerConfig {
     pub(crate) gate: GateMode,
     /// Held-command lifetime. `u64::MAX` represents an unbounded operator hold.
     pub(crate) approval_ttl_secs: u64,
+    /// Installation-specific key for persisted authority fingerprints. The
+    /// production entrypoint loads it from a daemon-only file beside the state
+    /// database, never from SQLite itself.
+    pub(crate) authority_mac_key: Arc<[u8; 32]>,
     #[cfg(test)]
     pub(crate) regeneration_proposal_key: Arc<[u8; 32]>,
     /// Optional server-wide binary allow-list. `None` (the default) imposes no
@@ -199,9 +210,10 @@ pub(crate) struct ServerConfig {
     /// Extra environment variable names the daemon forwards from its own
     /// environment to executed children, in addition to the built-in
     /// platform allowlist. Operator-declared via `--child-env` /
-    /// `GUARD_CHILD_ENV`, this is how brokered credentials reach a tool
-    /// generically without per-tool code - e.g. `KUBECONFIG` so brokered
-    /// kubectl/helm read a config the agent cannot see.
+    /// `GUARD_CHILD_ENV`. Fixed-identity execution accepts only
+    /// non-credential values plus `KUBECONFIG` files that exactly match an
+    /// active Guard proxy's generated transport-authenticated config. Other
+    /// credential-bearing child environment requires caller execution.
     pub(crate) extra_child_env: Vec<String>,
     /// Daemon-only root for child-lifetime secret files.
     pub(crate) secret_file_root: Option<PathBuf>,
@@ -222,10 +234,11 @@ impl Default for ServerConfig {
     /// behavior off, and this process's own identity. The entrypoint
     /// overrides the operator-facing fields via struct update syntax.
     fn default() -> Self {
-        #[cfg(test)]
         use rand::Rng;
         #[cfg(test)]
         let mut regeneration_proposal_key = [0u8; 32];
+        let mut authority_mac_key = [0u8; 32];
+        rand::rng().fill_bytes(&mut authority_mac_key);
         #[cfg(test)]
         rand::rng().fill_bytes(&mut regeneration_proposal_key);
         Self {
@@ -238,11 +251,19 @@ impl Default for ServerConfig {
             socket_group: None,
             allowed_uids: None,
             shim_dir: None,
+            #[cfg(test)]
+            test_daemon_path: None,
             dry_run: false,
             admission_preview: false,
             redact_secrets: Vec::new(),
             preflight: false,
             exec_as_caller: false,
+            #[cfg(test)]
+            exec_user_id: Some(u32::MAX - 1),
+            #[cfg(not(test))]
+            exec_user_id: None,
+            #[cfg(test)]
+            preserve_test_process_identity: true,
             exec_timeout_secs: 0,
             started_at_unix: guard::env::now_unix(),
             daemon_uid: current_uid(),
@@ -254,6 +275,7 @@ impl Default for ServerConfig {
             // populates the registries from persisted state before serving.
             gate: GateMode::Off,
             approval_ttl_secs: APPROVAL_TTL_SECS,
+            authority_mac_key: Arc::new(authority_mac_key),
             #[cfg(test)]
             regeneration_proposal_key: Arc::new(regeneration_proposal_key),
             // No binary restriction by default; the entrypoint sets this from
@@ -266,6 +288,47 @@ impl Default for ServerConfig {
             behavior_limits: SessionBehaviorLimits::default(),
             audit_log_path: None,
             metrics_addr: None,
+        }
+    }
+}
+
+pub(crate) fn load_or_create_authority_mac_key(
+    state_dir: Option<&std::path::Path>,
+) -> Result<Arc<[u8; 32]>> {
+    use rand::Rng;
+    let mut generated = [0u8; 32];
+    rand::rng().fill_bytes(&mut generated);
+    let Some(state_dir) = state_dir else {
+        return Ok(Arc::new(generated));
+    };
+    let path = state_dir.join("authority.hmac");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            if !secure_fs::private_path_is_safe(&path, false) {
+                anyhow::bail!("authority fingerprint key is not daemon-only");
+            }
+            let key: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("authority fingerprint key has an invalid length"))?;
+            Ok(Arc::new(key))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match secure_fs::write_new_private(&path, &generated) {
+                Ok(()) => Ok(Arc::new(generated)),
+                Err(create_error)
+                    if create_error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+                {
+                    load_or_create_authority_mac_key(Some(state_dir))
+                }
+                Err(create_error) => Err(create_error).with_context(|| {
+                    format!("create authority fingerprint key {}", path.display())
+                }),
+            }
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("read authority fingerprint key {}", path.display()))
         }
     }
 }
@@ -538,9 +601,8 @@ impl ServerContext {
     fn caller_is_admin(&self, caller: &CallerIdentity) -> bool {
         // Operator authority is the admin bearer identity or, only when the
         // packaged boundary is enabled, the Windows SYSTEM SID. The daemon's
-        // own uid or service SID grants nothing: brokered children inherit the
-        // daemon identity in the default model and must not inherit its
-        // operator surface with it.
+        // own uid or service SID grants no operator authority, independent of
+        // the separate brokered-child identity boundary.
         (self.config.allow_windows_system_operator && caller.is_windows_system_operator())
             || matches!(
                 caller,
@@ -829,16 +891,11 @@ fn binary_path_candidates(dir: &std::path::Path, binary: &str) -> Vec<PathBuf> {
         let binary_path = std::path::Path::new(binary);
         let mut candidates = vec![dir.join(binary_path)];
         if binary_path.extension().is_none() {
-            let pathext =
-                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-            for ext in pathext.split(';').filter(|ext| !ext.is_empty()) {
-                let ext = if ext.starts_with('.') {
-                    ext.to_string()
-                } else {
-                    format!(".{ext}")
-                };
-                candidates.push(dir.join(format!("{binary}{ext}")));
-            }
+            // Guard gives extensionless program names native executable
+            // semantics. Do not inherit PATHEXT here: it can select a `.com`,
+            // `.cmd`, or `.bat` artifact whose policy identity and execution
+            // semantics differ from the approved `.exe` program.
+            candidates.push(dir.join(format!("{binary}.exe")));
         }
         candidates
     }
@@ -1076,38 +1133,19 @@ fn dangerous_env_name(key: &str) -> bool {
         || upper.starts_with("GIT_CONFIG_VALUE_")
 }
 
-/// Deterministic pre-LLM ALLOW for a small, fixed set of trivially safe
-/// read-only commands: local identity/status (`id`, `whoami`, `hostname`,
-/// `uptime`) and, over `ssh`, a fixed read-only diagnostic as the remote
-/// command. Returns the allow reason, or `None` to fall through to the LLM.
+/// Deterministic pre-LLM ALLOW for a small, fixed set of trivially safe local
+/// identity and status commands (`id`, `whoami`, `hostname`, `uptime`). Returns
+/// the allow reason, or `None` to fall through to the LLM.
 ///
-/// This is a latency/cost optimization only. It is deliberately narrow:
-/// paranoid mode disables it; any shell metacharacter, injected env/secret
-/// (checked by the caller), or risky SSH transport option
-/// (`-L`/`-D`/`-J`/`-W`/`ProxyCommand`/`LocalCommand`/forwarding) forfeits
-/// the fast path back to the model. Like a trusted verb, it is a
-/// deterministic allow and intentionally precedes the evaluator.
+/// This is a latency/cost optimization only. Paranoid mode disables it, and
+/// injected environment or secret bindings are checked by the caller. Like a
+/// trusted verb, it intentionally precedes the evaluator.
 fn deterministic_safe_allow_reason(
     server: &ServerContext,
     binary: &str,
-    args: &[String],
+    _args: &[String],
 ) -> Option<String> {
     if matches!(server.state.evaluator.mode(), Some(PolicyMode::Paranoid)) {
-        return None;
-    }
-
-    if binary == "ssh" {
-        let destination = crate::ssh::extract_destination(args)?;
-        let remote_command = crate::ssh::extract_command(args);
-        if remote_command.trim().is_empty() || !ssh_options_all_readonly_safe(args) {
-            return None;
-        }
-        if is_fixed_readonly_diagnostic(&remote_command) {
-            return Some(format!(
-                "deterministic safe allow: fixed read-only remote command on {}",
-                destination
-            ));
-        }
         return None;
     }
 
@@ -1184,26 +1222,6 @@ async fn validate_request_injections(
         }
     }
 
-    if server.config.exec_as_caller && !request.secret_files.is_empty() {
-        return Err(
-            "--secret-file is unavailable when the daemon uses --exec-as-caller because the caller identity must not receive access to daemon-owned secret files"
-                .to_string(),
-        );
-    }
-
-    let principal = match caller.principal() {
-        Some(principal) if caller.is_local_peer() => principal,
-        _ => {
-            if !request.secrets.is_empty() || !request.secret_files.is_empty() {
-                return Err(
-                    "secret and secret-file injection require an authenticated local caller"
-                        .to_string(),
-                );
-            }
-            return Ok(());
-        }
-    };
-
     for (env_var, secret_key) in &request.secrets {
         if !is_valid_secret_key(secret_key) {
             return Err(format!("invalid secret key: '{}'", secret_key));
@@ -1211,6 +1229,44 @@ async fn validate_request_injections(
         if let Some(reason) = invalid_shell_secret_reference(command_line, env_var, secret_key) {
             return Err(reason);
         }
+    }
+    for secret_key in request.secret_files.values() {
+        if !is_valid_secret_key(secret_key) {
+            return Err(format!("invalid secret key: '{}'", secret_key));
+        }
+    }
+
+    let has_injections =
+        !request.env.is_empty() || !request.secrets.is_empty() || !request.secret_files.is_empty();
+    if has_injections && !caller.is_local_peer() {
+        return Err(
+            "environment and credential injection require an authenticated local caller"
+                .to_string(),
+        );
+    }
+
+    if !server.config.exec_as_caller && has_injections {
+        return Err(
+            "fixed-identity execution cannot receive per-run environment or credentials because the shared child UID is not an execution-isolation boundary"
+                .to_string(),
+        );
+    }
+
+    if server.config.exec_as_caller && !request.secret_files.is_empty() {
+        return Err(
+            "--secret-file is unavailable because caller ownership does not provide an isolated daemon-to-child credential-file boundary"
+                .to_string(),
+        );
+    }
+
+    if request.secrets.is_empty() && request.secret_files.is_empty() {
+        return Ok(());
+    }
+    let principal = caller
+        .principal()
+        .expect("authenticated local callers have a principal");
+
+    for (env_var, secret_key) in &request.secrets {
         match server.state.secrets.get(&principal, secret_key).await {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -1228,9 +1284,6 @@ async fn validate_request_injections(
     }
 
     for (env_var, secret_key) in &request.secret_files {
-        if !is_valid_secret_key(secret_key) {
-            return Err(format!("invalid secret key: '{}'", secret_key));
-        }
         match server.state.secrets.get(&principal, secret_key).await {
             Ok(Some(_)) => {}
             Ok(None) => {

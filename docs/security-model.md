@@ -11,10 +11,14 @@ storage, listener ACLs, and deployment isolation. The evaluator judges command
 or API intent inside those deterministic limits. The agent controls requests
 and project files.
 
-The central bypass-prevention invariant is daemon-held credentials. SSH keys,
-SSH agent sockets, kubeconfigs, API tokens, and secret files belong to the daemon
-principal. Brokered clients receive only the local Guard endpoint and scoped
-Guard authority.
+The central bypass-prevention invariant is daemon-held upstream credentials.
+API tokens, upstream kubeconfigs, and secret-store values belong to the daemon
+principal and enter only protocol brokers or caller-specific execution. The
+shared fixed child receives none of those credentials. Its optional generated
+Kubernetes client config carries only a local transport bearer scoped to the
+active Guard proxy. Operators keep independent credentials inaccessible to it.
+Brokered clients receive only the local Guard endpoint and scoped Guard
+authority.
 
 Guard is not a sandbox. If the agent can read the same credential, connect to
 the upstream directly, modify daemon policy, replace the daemon binary, or gain
@@ -50,16 +54,42 @@ targets are enumerable from the text, and routine means undo it. Execution
 whose effects are defined in files, remote content, or tool state -
 configuration-management applies, infrastructure-as-code, chart releases,
 opaque scripts - fails visibility by construction and is denied toward the
-grant escalation path. Tools outside the evaluator's knowledge are
-unevaluable, not implicitly trusted; operators describe house tools through
-prompt supplements (`--system-prompt-append`) or typed verbs.
+grant escalation path. Tools without a built-in executable authority profile
+are unevaluable, not implicitly trusted. Prompt supplements can improve
+evaluator semantics inside an existing profile but cannot authorize an
+unprofiled executable.
 
-For cwd-dependent opaque carriers (`ansible-playbook`, `terraform`, `helm`,
-`make`, and the rest of the fixed classifier list) the carrier boundary is
-also a deterministic floor under consequence gating, not prompt compliance
-alone: a safe-mode evaluator allow of such a binary is clamped to an operator
-hold unless an operator-authored typed verb covers the command. An evaluator
-deny is never softened, and readonly and paranoid modes are unchanged.
+The profile boundary is a deterministic floor under consequence gating, not
+prompt compliance alone. Fixed-identity kubectl executes only with an immutable
+kubeconfig matching an active Guard proxy. Ansible and Helm are denied because
+their mutable profile state cannot safely cross identities. Caller identity
+denies all three typed profile tools because it has no immutable profile
+snapshot. Evaluator approval, typed verbs, access approval, and replay cannot
+soften these process-admission rules. Unprofiled carriers such as Terraform and
+Make remain denied. An evaluator deny is never softened, and readonly and
+paranoid modes are unchanged.
+
+Authorized execution uses a positive executable-profile registry. Shells,
+language runtimes, generic command-dispatch tools, and every unknown binary
+lack a profile. Verb catalog validation, hold creation, containment arming, and
+process admission reject unprofiled binaries for every authority source.
+Package reviewed logic as a profiled direct executable so Guard can fingerprint
+the complete primary artifact.
+
+Only commands with a built-in closed authority grammar and a mode-compatible
+profile execute under evaluator, verb, approval, or persisted-control authority.
+The executable set consists of fixed-identity active-proxy kubectl commands,
+literal non-starting `systemctl` operations, and an explicit set of primary-only
+system utilities. Structured Ansible and Helm grammars support classification
+but do not authorize process creation in either identity mode. Caller-mode
+kubectl is likewise denied. Unknown executables, SSH, file-testing utilities,
+wrappers, and tools with implicit configuration or program files fail before
+process start. Each frozen command stores a versioned authority plan containing
+its typed or raw provenance, closed profile, normalized command digest, and
+whether secondary PATH discovery exists. Replay regenerates that plan under
+current code and requires exact equality. Command-family classification
+normalizes Windows executable spelling independently of the host-specific
+executable identity used for process lookup.
 
 Session overlays intentionally expand baseline evaluator or readonly coverage
 inside activated verb regions. This gives a short-lived agent bounded mutation
@@ -70,14 +100,44 @@ regardless of whether the client or daemon attached the internal session token.
 
 ## Execution and credential isolation
 
-Approved commands receive the caller's canonical working directory but retain
-the daemon's clean environment, identity, SSH configuration, agent socket, and
-secret bindings. Caller startup variables and SSH credentials are not trusted
-inputs. Guard preserves argv, exit behavior, and tool semantics.
+Approved commands may receive the caller's canonical working directory while
+Guard selects a clean environment and either a fixed child identity or the
+authenticated caller identity. Static coverage accepts a caller working directory
+only when its coverage cell binds that exact directory and Guard holds the
+recursively validated tree for the child lifetime. Guard resolves the primary
+executable to a canonical absolute path and retains it for the child lifetime.
+Typed tools accept injected environment only through a closed authority schema,
+receive the canonical form of their retained server-owned PATH directories, and
+retain every direct custom-directory entry and executable link target found
+there. Missing PATH entries are removed before spawn. Primary-only and
+`systemctl` profiles receive no child PATH; profiles that dispatch subordinate
+executables retain only canonical operator-controlled directories. Endpoint,
+remote identity, signing-key, transport, strategy, plugin, and backend selectors
+are operator-authored literals or finite enumerated sets.
+Caller startup variables and SSH credentials are not trusted inputs in fixed
+mode. A fixed-child kubeconfig is valid only when its entire schema, endpoint,
+certificate authority, and generated transport bearer match an active Guard
+proxy. Existing Ansible and Helm profiles are unavailable in fixed mode, and
+their commands are denied before spawn. Caller mode also denies Ansible, Helm,
+and kubectl because mutable profile discovery is not an immutable execution
+snapshot.
+Credential-bearing fixed-mode profile inputs fail closed. Protected typed tools
+do not inherit the daemon's working directory. Guard preserves argv, exit
+behavior, and tool semantics for admitted commands.
 
-Secret values are resolved after authorization. Environment delivery clears the
-child environment first. Secret-file delivery creates a daemon-only lease for
-the child lifetime. Holds store names and salted value hashes. Audit and session
+The environment floor and disabled kubectl shadow dispatch apply to evaluator
+approvals and exact replays as well as typed verb coverage.
+Authority-bearing scalar environment values require a selected typed cell that
+explicitly covers the value; a surviving verb name is not that capability.
+
+Secret values are resolved after authorization only for caller-specific scalar
+delivery. Environment delivery clears the child environment first. Fixed-mode
+per-run bindings, tool-config secrets, credential-authority environment, and
+temporary read grants fail before spawn. Secret-file delivery is unavailable
+because neither a shared child UID nor caller ownership provides an isolated
+daemon-to-child file boundary. Holds store names and installation-keyed HMACs, never secret
+values. The HMAC key lives outside SQLite in the private state directory, so a
+copied database is not a standalone offline guessing oracle. Audit and session
 history store secret names only. Output redaction covers exact resolved values
 and credential-shaped text.
 
@@ -85,14 +145,14 @@ Execution identity and credential delivery have different compromise bounds:
 
 | Context | Intended use | Compromise bound |
 |---|---|---|
-| Dedicated non-root service identity | Default broker identity with daemon-owned SSH configuration, agent socket, and secret access | An opaque approved child can retain the service account's authority, copy readable credentials, or create persistence available to that account. A grant TTL limits later Guard admissions but cannot undo those effects. |
-| Root service identity | Deployments that require root before an explicit identity drop | A default child inherits root execution authority. Use `--exec-as-caller` or a dedicated non-root service when root is not an intentional part of the grant. Guard is not a sandbox for a root child. |
-| Per-run environment or secret-file lease | One approved process that needs one named credential | Guard removes the file after the child lifetime and does not disclose the value through its protocol. An opaque child can still copy or use the credential while it is available, so lease expiry is exposure reduction rather than revocation of completed effects. |
+| Dedicated child identity | Default Unix identity for commands without upstream or per-run credentials | A child cannot read daemon state, upstream or per-run credentials, unrelated tool-config credentials, or temporary read-grant ACLs. An optional generated Kubernetes client config carries only a local transport bearer scoped to the active Guard proxy. Operators keep independent credentials inaccessible to this account. The UID is shared across executions and is not a process sandbox. |
+| Per-caller child identity | Root Unix socket deployments using `--exec-as-caller` | The child receives the authenticated caller's filesystem authority and may receive caller-scoped scalar secrets. Typed Ansible, Helm, and kubectl profiles are denied. TCP, API proxying, fixed-child credential bindings, and secret-file delivery are unavailable in this mode. |
+| Windows | Named-pipe policy, access administration, and inspection | Local process execution and API proxying fail closed because no distinct worker identity or secure client-authority handoff is available. |
 
-Guard has no general scoped SSH credential endpoint. Brokered SSH-using tools
-receive the service identity's configured SSH context. A narrower SSH transport
-requires a separately authenticated stream protocol, destination and forwarding
-constraints, revocation semantics, and an independent security review.
+Guard has no SSH executable authority profile, so brokered SSH execution is
+rejected before process start in both fixed-identity and `--exec-as-caller`
+modes. Daemon-held SSH requires a separately authenticated stream protocol,
+destination and forwarding constraints, and revocation semantics.
 
 The API proxy injects the endpoint upstream credential only after the request is
 allowed. It strips authentication headers, redacts protocol-classified secret
@@ -108,11 +168,12 @@ users, then Guard isolates their authority by SID; it does not restrict the pipe
 to one configured client SID. On Unix, operator authority for holds,
 provisionals, saved grants, verbs, and detailed status is the admin bearer
 token: the token reaches the daemon through stdin at startup and is presented
-only by the root-owned operator wrapper, so a brokered child running as the
-daemon uid holds no operator authority. On Windows, kernel-authenticated local
+only by the root-owned operator wrapper, so a brokered dedicated child holds no
+operator authority. On Windows, kernel-authenticated local
 SYSTEM is the packaged operator principal. The installer runs operator commands
-in transient SYSTEM tasks, while brokered commands run as the daemon service
-SID. The service SID receives no operator exception. Packaged service mode
+in transient SYSTEM tasks. Local process execution is unavailable because the
+service has no distinct worker identity. The service SID receives no operator
+exception. Packaged service mode
 requires a named pipe and rejects an admin bearer and TCP listener. A foreground
 Windows server can use an explicitly configured admin bearer instead and gives
 SYSTEM no implicit operator authority.
@@ -153,12 +214,26 @@ command admissions cannot become reusable API credentials.
 Reversible work executes immediately. Recoverable work uses a forward, verify,
 and revert envelope. Irreversible, uncertain, or connectivity-unsafe work holds
 before execution. A hold freezes the complete authority and execution snapshot;
-approval cannot pick up later catalog or secret changes.
+approval cannot pick up later catalog or secret changes. The snapshot binds the
+resolved executable, tool registry, ordered executable-search directories,
+operator artifacts, and complete effective child environment. Persisted state
+contains secret references and installation-keyed value HMACs, never secret values or
+ephemeral secret-file paths. A caller-specific replay resolves each scalar
+secret once, validates that in-memory snapshot, and carries the same values
+through process start without a second secret-store read.
+
+Containment freezes independent process and secret authority for the rollback
+and confirmation-check commands before the forward command starts. Each replay
+resolves its referenced secrets once, validates those values and every bound
+process artifact, and carries the validated in-memory values through spawn.
+Rows without these bindings cannot execute a command-shaped check or rollback.
 
 A viable rollback chain enables unattended operation. Guard does not assume
 rollback is safe when the forward action can sever its control path. Persisted
-state survives restart, but startup does not fire overdue rollback commands in
-an unverified environment. These operations require an explicit decision.
+state survives restart. Startup reconstructs and revalidates the frozen
+process, environment, secret, and artifact authority for both the check and
+rollback before re-arming a completed forward command. Missing or changed
+bindings and interrupted outcomes require an explicit operator decision.
 
 ## Process lifetime
 
@@ -184,8 +259,8 @@ names. Ship that stream through the service manager or logging stack.
 
 SQLite stores durable saved grants, sessions, requests, holds, provisionals,
 read grants, and bounded interaction history. It is not a replacement for the
-audit stream. Protect both the database and catalog files from the agent
-principal.
+audit stream. Protect the database, installation HMAC key, and catalog files
+from the agent principal.
 
 Behavioral limits suspend sessions on observable denial or hold patterns. They
 reduce repeated abuse and evaluator spend amplification but cannot prove a
@@ -199,21 +274,20 @@ share one generic gate while retaining separate listener, policy, credential,
 coverage, and revert identities.
 
 Raw SSH is a bidirectional byte stream with forwarding, subsystems, interactive
-shells, and nested transports. Guard brokers ordinary `ssh` commands by
-running the SSH client with daemon-held configuration and credentials. That
-does not make Guard an SSH transport proxy. A raw stream adapter requires its
-own protocol design and security review rather than being treated as a generic
-HTTP proxy configuration.
+shells, and nested transports. Guard rejects SSH command execution because no
+profile closes that authority surface. A daemon-held raw stream adapter requires
+its own protocol design rather than being treated as a generic HTTP proxy
+configuration.
 
 ## Practical limits
 
 Guard can bound visible argv, typed API operations, session lifetime, fanout,
 credential selection, consequence, and observable behavior. It cannot infer all
-effects hidden in arbitrary local files or remote program behavior. An approved
-Ansible playbook, Helm chart, shell-capable tool, or API extension may have wider
-effects than its top-level invocation suggests.
+effects hidden in arbitrary local files or remote program behavior. A
+shell-capable tool or API extension may have wider effects than its top-level
+invocation suggests.
 
-Use narrow verbs and short grants for opaque file-driven tools, protocol-level
-mediation where request semantics are available, and native read-only identities
-where the upstream provides them. Keep irreversible and control-path-changing
-operations behind holds unless their rollback chain is independently viable.
+Use protocol-level mediation where request semantics are available and native
+read-only identities where the upstream provides them. Keep irreversible and
+control-path-changing operations behind holds unless their rollback chain is
+independently viable.

@@ -1,13 +1,12 @@
 #[cfg(unix)]
-use crate::server::execute::{
-    exec_with_read_grant_retry_with_secret_authority, permission_denied_path,
-};
+use crate::server::execute::{exec_with_read_grant_retry_for_test, permission_denied_path};
 #[cfg(unix)]
 use crate::server::gate_runtime::now_unix;
 #[cfg(unix)]
 use crate::server::grants::{
     apply_read_grant, apply_read_grant_entries, finish_read_grant_revert,
-    getfacl_user_has_traverse, handle_grant_read, plan_read_grant, revoke_read_grant_acls,
+    getfacl_user_has_traverse, handle_grant_read, plan_read_grant, planned_acl_entry_for_test,
+    read_grant_evaluator_context, revoke_read_grant_acls,
 };
 #[cfg(unix)]
 use crate::server::wire::CallerIdentity;
@@ -18,6 +17,8 @@ use crate::server::RequestContext;
 #[cfg(unix)]
 use crate::session::SessionGrant;
 #[cfg(unix)]
+use guard::evaluate::{EvalConfig, Evaluator};
+#[cfg(unix)]
 use guard::gating::read_grant::{ReadGrant, ReadGrantStatus};
 #[cfg(unix)]
 use guard::principal::PrincipalKey;
@@ -26,7 +27,13 @@ use std::collections::HashMap;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::process::Command;
+#[cfg(unix)]
+use tokio::sync::oneshot;
 
 #[cfg_attr(not(unix), allow(unused_imports))]
 use super::make_test_config;
@@ -79,7 +86,8 @@ async fn grant_read_deny_list_short_circuits_before_evaluator() {
     // reached it would be denied with "default-deny". A .vault_pass path is
     // instead denied with the deny-list reason, proving the static check
     // ran before any evaluator involvement.
-    let (cfg, _buf) = make_test_config();
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.exec_as_caller = true;
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join(".vault_pass");
     std::fs::write(&vault, "secret").unwrap();
@@ -98,7 +106,8 @@ async fn grant_read_deny_list_short_circuits_before_evaluator() {
 #[cfg(unix)]
 #[tokio::test]
 async fn grant_read_denies_kubeconfig() {
-    let (cfg, _buf) = make_test_config();
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.exec_as_caller = true;
     let dir = tempfile::tempdir().unwrap();
     let kube = dir.path().join(".kube");
     std::fs::create_dir_all(&kube).unwrap();
@@ -118,10 +127,139 @@ async fn grant_read_denies_kubeconfig() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn fixed_identity_refuses_temporary_read_grants() {
+    let (cfg, _buf) = make_test_config();
+    let target = tempfile::NamedTempFile::new().unwrap();
+    let caller = CallerIdentity::Unix {
+        uid: unsafe { libc::geteuid() },
+    };
+
+    let result = handle_grant_read(&cfg, &caller, target.path().display().to_string(), None).await;
+
+    assert!(!result.policy_allowed());
+    assert!(result.policy_reason().contains("fixed-identity execution"));
+    assert!(cfg.state.read_grants.read().await.list().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn read_grant_evaluator_prompt_captures_authenticated_grantee_and_full_acl_plan() {
+    let prompt = read_grant_evaluator_context(
+        4242,
+        300,
+        &[
+            planned_acl_entry_for_test("/home/operator/private", "x"),
+            planned_acl_entry_for_test("/home/operator/private/values.yaml", "r"),
+        ],
+    );
+
+    assert!(prompt.contains("Grantee: authenticated caller uid 4242"));
+    assert!(prompt.contains("ancestor traverse: /home/operator/private (x)"));
+    assert!(prompt.contains("target read: /home/operator/private/values.yaml (r)"));
+    assert!(prompt.contains("--exec-as-caller"));
+    assert!(prompt.contains("does not enable fixed-child execution or typed Ansible or Helm"));
+    assert!(!prompt.contains("service account"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_grant_evaluator_receives_the_planned_acl_assessment() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let evaluator_url = format!("http://{}", listener.local_addr().unwrap());
+    let (captured_tx, captured_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept evaluator request");
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("read evaluator request");
+            assert!(read > 0, "evaluator closed before sending a request");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .expect("evaluator content length");
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        let _ = captured_tx.send(String::from_utf8_lossy(&request).into_owned());
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "decision",
+                        "type": "function",
+                        "function": {
+                            "name": "decide",
+                            "arguments": "{\"decision\":\"APPROVE\",\"reason\":\"fixture\",\"risk\":1}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.exec_as_caller = true;
+    cfg.config.dry_run = true;
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .cache_enabled(false)
+                .llm_api_key(format!("fixture-{}", std::process::id()))
+                .llm_api_url(evaluator_url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+
+    let directory = tempfile::Builder::new()
+        .prefix("guard-read-grant-evaluator-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    let target = directory.path().join("values.yaml");
+    std::fs::write(&target, "setting: value\n").unwrap();
+    let caller_uid = unsafe { libc::geteuid() as u32 };
+    let caller = CallerIdentity::Unix { uid: caller_uid };
+
+    let result = handle_grant_read(&cfg, &caller, target.display().to_string(), None).await;
+    assert!(result.policy_allowed(), "grant should use evaluator allow");
+
+    let captured = captured_rx.await.expect("capture evaluator request");
+    let target_path = target.canonicalize().unwrap().display().to_string();
+    assert!(captured.contains(&format!("Grantee: authenticated caller uid {caller_uid}")));
+    assert!(captured.contains(&format!("target read: {target_path} (r)")));
+    assert!(captured.contains("--exec-as-caller"));
+    assert!(!captured.contains("service account"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn read_grant_revert_marks_seeded_grant_revoked() {
     // The kept revocation path operates on the active registry entry and only
     // removes access. It does not depend on a caller token or grant RPC.
-    let (cfg, _buf) = make_test_config();
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.exec_as_caller = true;
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("values.yaml");
     std::fs::write(&target, "k: v").unwrap();
@@ -195,7 +333,8 @@ fn permission_denied_path_understands_common_error_shapes() {
 #[cfg(unix)]
 #[tokio::test]
 async fn read_grant_retry_returns_original_failure_when_grant_denied() {
-    let (cfg, _buf) = make_test_config();
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.exec_as_caller = true;
     let caller = CallerIdentity::Unix {
         uid: unsafe { libc::geteuid() },
     };
@@ -221,7 +360,7 @@ async fn read_grant_retry_returns_original_failure_when_grant_denied() {
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    let result = exec_with_read_grant_retry_with_secret_authority(
+    let result = exec_with_read_grant_retry_for_test(
         &mut RequestContext {
             server: &cfg,
             caller: &caller,
@@ -273,8 +412,9 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
     let flag = dir.path().join("ran-once");
 
     let (mut cfg, _buf) = make_test_config();
-    // The grantee must resolve to a real account for the ACL to apply.
-    cfg.config.daemon_uid = unsafe { libc::geteuid() };
+    cfg.config.exec_as_caller = true;
+    // make_test_config assigns the real test account as the modeled child and
+    // keeps the daemon identity distinct.
     // A session allow rule authorizes the grant deterministically, so the
     // test never reaches the (unconfigured) evaluator.
     cfg.state.sessions.write().await.grant(
@@ -327,7 +467,7 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
         uid: unsafe { libc::geteuid() },
     };
     let mut sink = tokio::io::sink();
-    let result = exec_with_read_grant_retry_with_secret_authority(
+    let result = exec_with_read_grant_retry_for_test(
         &mut RequestContext {
             server: &cfg,
             caller: &caller,

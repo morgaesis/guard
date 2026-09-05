@@ -1,5 +1,5 @@
 use crate::server::deterministic_safe_allow_reason;
-use crate::server::execute::execute_command;
+use crate::server::execute::{execute_command, missing_authorized_execution_profile_reason};
 use crate::server::wire::{CallerIdentity, ExecuteRequest, SshHostKeyMode};
 use guard::gating::ssh_readonly::{
     is_fixed_readonly_diagnostic, ssh_o_directive_readonly_safe, ssh_options_all_readonly_safe,
@@ -13,28 +13,25 @@ use tokio::sync::RwLock;
 use super::{args, make_test_config};
 
 #[test]
-fn safe_allow_accepts_fixed_ssh_diagnostic() {
+fn safe_allow_rejects_fixed_ssh_diagnostic_without_a_profile() {
     let (cfg, _buf) = make_test_config();
     let reason = deterministic_safe_allow_reason(&cfg, "ssh", &args(&["host01", "id"]));
-    assert!(reason.is_some(), "fixed ssh diagnostic should be allowed");
+    assert!(reason.is_none(), "SSH has no executable authority profile");
 }
 
 #[test]
-fn safe_allow_accepts_vetted_option_before_remote_command() {
+fn safe_allow_rejects_vetted_ssh_option_without_a_profile() {
     let (cfg, _buf) = make_test_config();
     let reason = deterministic_safe_allow_reason(
         &cfg,
         "ssh",
         &args(&["host01", "-o", "ConnectTimeout=5", "id"]),
     );
-    assert!(
-        reason.is_some(),
-        "vetted option should stay in the SSH option zone"
-    );
+    assert!(reason.is_none(), "SSH has no executable authority profile");
 }
 
 #[tokio::test]
-async fn explicit_access_overlay_leaves_unmatched_fixed_ssh_on_baseline_policy() {
+async fn explicit_access_overlay_cannot_authorize_unprofiled_ssh() {
     let (mut cfg, _buf) = make_test_config();
     cfg.config.dry_run = true;
     cfg.state.verbs = Arc::new(RwLock::new(
@@ -84,19 +81,16 @@ verbs:
     let baseline = execute_command(ssh_request(None, &["host01", "id"]), &cfg, &caller)
         .await
         .into_response();
-    assert!(baseline.allowed, "baseline SSH diagnostic: {baseline:?}");
+    assert!(!baseline.allowed, "baseline SSH diagnostic: {baseline:?}");
+    assert!(baseline.reason.contains("default-deny"));
+    assert!(missing_authorized_execution_profile_reason("ssh").is_some());
 
     let mut explicit_request = ssh_request(None, &["host01", "id"]);
     explicit_request.session_token = Some("ssh-access-overlay".to_string());
     let explicit = execute_command(explicit_request, &cfg, &caller)
         .await
         .into_response();
-    assert!(
-        explicit.allowed,
-        "an unmatched access overlay must not narrow fixed SSH: {explicit:?}"
-    );
-    assert_eq!(explicit.reason, baseline.reason);
-    assert!(!explicit.reason.contains("session policy-only mode"));
+    assert!(!explicit.allowed, "SSH remains unprofiled: {explicit:?}");
     assert_eq!(
         cfg.state
             .sessions
@@ -179,20 +173,18 @@ fn apply_ssh_hostkey_is_noop_for_non_ssh() {
 }
 
 #[test]
-fn accept_new_hostkey_keeps_fixed_diagnostic_on_fast_path() {
-    // The options accept-new injects are allow-listed, so a fixed
-    // diagnostic still qualifies for the deterministic fast path.
+fn accept_new_hostkey_does_not_authorize_ssh() {
     let (cfg, _buf) = make_test_config();
     let mut req = ssh_request(Some(SshHostKeyMode::AcceptNew), &["host01", "id"]);
     req.apply_ssh_hostkey_options();
-    assert!(deterministic_safe_allow_reason(&cfg, "ssh", &req.args).is_some());
+    assert!(deterministic_safe_allow_reason(&cfg, "ssh", &req.args).is_none());
 }
 
 #[test]
-fn accept_all_hostkey_forfeits_fast_path() {
+fn accept_all_hostkey_fails_legacy_classifier() {
     // accept-all injects StrictHostKeyChecking=no, which the option
-    // allow-list rejects, so even a fixed diagnostic forfeits to the
-    // evaluator rather than auto-allowing over an unauthenticated channel.
+    // allow-list rejects, so even a fixed diagnostic fails the
+    // legacy classifier over an unauthenticated channel.
     let (cfg, _buf) = make_test_config();
     let mut req = ssh_request(Some(SshHostKeyMode::AcceptAll), &["host01", "id"]);
     req.apply_ssh_hostkey_options();
@@ -237,7 +229,7 @@ fn ssh_options_allow_list_permits_only_vetted_options() {
         &["--", "host01", "id"][..],
         &["host01", "--", "id"][..],
         // Host-key handling injected by the --hostkey mode must not
-        // knock the diagnostic off the fast path.
+        // fail the legacy option classifier.
         &[
             "-o",
             "StrictHostKeyChecking=accept-new",
@@ -247,7 +239,7 @@ fn ssh_options_allow_list_permits_only_vetted_options() {
             "id",
         ][..],
         // OpenSSH accepts vetted options between the destination and remote
-        // command, so this form shares the same fast path as pre-destination
+        // command, so this form shares the same classification as pre-destination
         // options.
         &["host01", "-o", "ConnectTimeout=5", "-oBatchMode=yes", "id"][..],
     ] {
@@ -257,7 +249,7 @@ fn ssh_options_allow_list_permits_only_vetted_options() {
         );
     }
 
-    // Every unvetted option forfeits the fast path. This covers the
+    // Every unvetted option fails the legacy classifier. This covers the
     // classes an allow-list must reject: forwarding, proxy/jump, tunnel,
     // external config (-F) and PKCS#11 module (-I), identity/log/socket
     // files, and any -o directive outside the vetted keyword set.
@@ -281,15 +273,15 @@ fn ssh_options_allow_list_permits_only_vetted_options() {
         &["-o", "RemoteCommand=cat /etc/shadow", "host01", "id"][..],
         &["-o", "PermitLocalCommand=yes", "host01", "id"][..],
         &["-o", "Include=/tmp/evil", "host01", "id"][..],
-        // Combined short flags are not decomposed; forfeit conservatively.
+        // Combined short flags are not decomposed; reject conservatively.
         &["-Cq", "host01", "id"][..],
-        // A value option with no following value is malformed; forfeit.
+        // A value option with no following value is malformed; reject it.
         &["-p"][..],
         &["host01", "-l"][..],
     ] {
         assert!(
             !ssh_options_all_readonly_safe(&args(bad)),
-            "option should forfeit the fast path: {bad:?}"
+            "option should fail the legacy classifier: {bad:?}"
         );
     }
 }
@@ -299,7 +291,7 @@ fn ssh_options_reject_dangerous_option_between_host_and_command() {
     // ssh honors options placed between the destination and the remote
     // command (confirmed against `ssh -G`), so the allow-list must scan
     // past the destination up to the command token. A proxy/forward/jump
-    // in that position must forfeit the fast path.
+    // in that position must fail the classifier.
     for bad in [
         &["host01", "-o", "ProxyCommand=nc x 22", "id"][..],
         &["host01", "-L", "8080:localhost:80", "id"][..],
@@ -309,12 +301,12 @@ fn ssh_options_reject_dangerous_option_between_host_and_command() {
     ] {
         assert!(
             !ssh_options_all_readonly_safe(&args(bad)),
-            "option between host and command must forfeit: {bad:?}"
+            "option between host and command must fail: {bad:?}"
         );
     }
     // An option that appears *after* the command token is a command
     // argument, not an ssh option, and ssh does not re-parse it; it does
-    // not affect the fast-path decision for the (fixed) command itself.
+    // not affect classification of the fixed command itself.
     assert!(ssh_options_all_readonly_safe(&args(&[
         "host01",
         "id",
@@ -337,8 +329,8 @@ fn safe_allow_rejects_post_command_dash_arguments() {
 #[test]
 fn ssh_option_terminator_preserves_remote_command_boundary() {
     let (cfg, _buf) = make_test_config();
-    assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args(&["--", "host01", "id"])).is_some());
-    assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args(&["host01", "--", "id"])).is_some());
+    assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args(&["--", "host01", "id"])).is_none());
+    assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args(&["host01", "--", "id"])).is_none());
 
     // After the terminator, a dash-prefixed token is the remote command, not
     // a local option. It cannot match the fixed read-only command allow-list.
@@ -367,20 +359,20 @@ fn ssh_o_directive_rejects_newline_smuggled_second_directive() {
         "host01",
         "id"
     ])));
-    // The same keyword without a newline stays on the fast path.
+    // The same keyword without a newline passes the legacy classifier.
     assert!(ssh_o_directive_readonly_safe("ConnectTimeout=5"));
 }
 
 #[test]
 fn ssh_o_stricthostkeychecking_permits_only_secure_values() {
-    // Security-preserving values keep the fast path (accept-new is what
+    // Security-preserving values pass the legacy classifier (accept-new is what
     // the --hostkey mode injects).
     assert!(ssh_o_directive_readonly_safe("StrictHostKeyChecking=yes"));
     assert!(ssh_o_directive_readonly_safe(
         "StrictHostKeyChecking=accept-new"
     ));
-    // Disabling or deferring host-key verification forfeits to the
-    // evaluator rather than auto-allowing over an unauthenticated channel.
+    // Disabling or deferring host-key verification fails the
+    // classifier rather than treating an unauthenticated channel as safe.
     for weak in [
         "StrictHostKeyChecking=no",
         "StrictHostKeyChecking=off",
@@ -389,10 +381,10 @@ fn ssh_o_stricthostkeychecking_permits_only_secure_values() {
     ] {
         assert!(
             !ssh_o_directive_readonly_safe(weak),
-            "{weak} should forfeit the fast path"
+            "{weak} should fail the legacy classifier"
         );
     }
-    // And the whole invocation forfeits when the caller disables it.
+    // The whole invocation also fails when the caller disables it.
     let (cfg, _buf) = make_test_config();
     assert!(deterministic_safe_allow_reason(
         &cfg,
@@ -414,16 +406,16 @@ fn safe_allow_rejects_ssh_forwarding_and_proxy() {
     ] {
         assert!(
             deterministic_safe_allow_reason(&cfg, "ssh", &args(reject)).is_none(),
-            "ssh with {reject:?} must not take the fast path"
+            "ssh with {reject:?} must fail the legacy classifier"
         );
     }
-    // A benign, vetted option still allows the fixed diagnostic.
+    // A benign, vetted option still cannot authorize an unprofiled executable.
     assert!(deterministic_safe_allow_reason(
         &cfg,
         "ssh",
         &args(&["-o", "ConnectTimeout=5", "host01", "id"])
     )
-    .is_some());
+    .is_none());
 }
 
 #[test]

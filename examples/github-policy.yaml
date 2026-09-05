@@ -2,9 +2,12 @@
 #
 # When the daemon fronts the GitHub API (`guard server start
 # --api-proxy 127.0.0.1:8444 --api-protocol github --api-upstream
-# https://api.github.com --api-token-env GH_BROKER_TOKEN`), every request is
-# parsed into a typed operation and matched against this policy. The daemon
-# holds the real token; the brokered client talks only to the proxy.
+# https://api.github.com --api-token-env GH_BROKER_TOKEN
+# --api-client-config-out /run/guard/github-client.json --exec-user guard-exec`),
+# the generated client has policy-filtered read-only access. Declare the same
+# listener through `--api-endpoints` with `mode: policy` to enable this file's
+# scoped write rules. The daemon holds the real token; the brokered client talks
+# only to the proxy.
 #
 # The GitHub mapping: a repository (`owner/repo`) or an organization is the
 # namespace, so rules scope per repo/org the way Kubernetes rules scope per

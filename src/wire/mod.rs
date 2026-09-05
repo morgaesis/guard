@@ -10,10 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// How ssh should treat the remote host key for a guarded ssh command.
-/// Default (`OnlyExisting`) preserves ssh's own strict behavior: the daemon
-/// injects nothing, so a first-contact host still fails closed. The relaxed
-/// modes are opt-in and only ever apply when `binary == "ssh"`.
+/// Legacy SSH host-key policy retained for request compatibility.
+/// Current executable admission rejects SSH before process start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SshHostKeyMode {
@@ -98,9 +96,8 @@ pub struct ExecuteRequest {
     /// Safe for any caller: its only effect is "ask the LLM again."
     #[serde(default)]
     pub reevaluate: bool,
-    /// SSH host-key behavior for first-contact workflows. Only applied when
-    /// `binary == "ssh"`; the default (`None`/`OnlyExisting`) preserves ssh's
-    /// existing strict host-key checking.
+    /// Legacy SSH host-key behavior retained for wire compatibility. SSH has
+    /// no executable authority profile and is rejected before process start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_hostkey: Option<SshHostKeyMode>,
     /// Caller working directory, captured by the authenticated client and
@@ -111,10 +108,9 @@ pub struct ExecuteRequest {
 }
 
 impl ExecuteRequest {
-    /// Prepend the ssh `-o` options implied by the requested host-key mode so
-    /// the policy decision, the evaluator, the audit log, and the spawned
-    /// process all see the identical command. A no-op for non-ssh binaries and
-    /// for `OnlyExisting`/absent modes, which keep ssh's strict default.
+    /// Prepend legacy ssh `-o` options before policy evaluation. A no-op for
+    /// non-ssh binaries and for `OnlyExisting` or absent modes. Current
+    /// executable admission rejects SSH before process start.
     pub fn apply_ssh_hostkey_options(&mut self) {
         if self.binary != "ssh" {
             return;
@@ -211,7 +207,7 @@ pub fn validate_binary_name(binary: &str) -> Result<(), String> {
             binary.contains(char::is_whitespace) || binary.contains('"') || binary.contains('\'');
         let reason = if looks_like_shell_string {
             format!(
-                "invalid binary name: '{}'. guard run expects `<binary> [args...]`, not a shell string. Pass the command as separate arguments; e.g. `guard run ssh host 'remote cmd'` instead of `guard run 'ssh host \"remote cmd\"'`.",
+                "invalid binary name: '{}'. guard run expects `<binary> [args...]`, not a shell string. Pass the command as separate arguments; e.g. `guard run systemctl status sshd` instead of `guard run 'systemctl status sshd'`.",
                 binary
             )
         } else {

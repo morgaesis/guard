@@ -336,7 +336,7 @@ impl ProtocolConfig for KubernetesProtocol {
                 "exec" | "attach" | "portforward" | "proxy" | "ephemeralcontainers"
             ) {
                 return Some(format!(
-                    "guard api-proxy: kubernetes subresource '{sub}' is not permitted"
+                    "guard api-proxy: kubernetes subresource '{sub}' is not permitted; Guard's brokered kubeconfig supports non-interactive typed kubectl operations only; use an operator-approved typed Kubernetes diagnostic that avoids interactive subresources"
                 ));
             }
         }
@@ -362,7 +362,7 @@ impl ProtocolConfig for KubernetesProtocol {
 
     fn reject_misleading_redaction(&self, value: &Value) -> Option<String> {
         k8s::contains_helm_release_secret(value).then(|| {
-            "guard api-proxy: Helm release storage is unavailable through filtered Secret reads; use an operator-approved typed Helm verb with the daemon-owned kubeconfig"
+            "guard api-proxy: Helm release storage is unavailable through filtered Secret reads, and local Helm execution is not supported; use a non-Helm typed Kubernetes operation that does not require Secret values"
                 .to_string()
         })
     }
@@ -645,6 +645,8 @@ mod tests {
             let o = op("POST", &format!("/api/v1/namespaces/d/pods/web-0/{sub}"));
             let reason = p.deny_outright(&o).expect("denied");
             assert!(reason.contains(sub));
+            assert!(reason.contains("non-interactive typed kubectl operations only"));
+            assert!(reason.contains("operator-approved typed Kubernetes diagnostic"));
         }
         let ec = op(
             "PATCH",

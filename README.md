@@ -6,8 +6,13 @@
 Guard is a policy-gated command and API broker for AI agents. Agents submit
 ordinary commands or API requests and describe missing access in prose. The
 Guard daemon applies policy, reduces approved intent to bounded enforcement
-coverage, evaluates risk, and executes approved work with credentials the agent
-cannot read.
+coverage, evaluates risk, and keeps daemon-held upstream credentials behind
+brokered API boundaries. Fixed-identity execution uses a non-root child account
+that differs from the daemon account, receives no upstream or per-run
+credentials, and cannot read daemon state. An optional generated Kubernetes
+client config carries only a local transport bearer scoped to the active Guard
+proxy. Operators must keep independent credentials inaccessible to that child
+account.
 
 ```console
 $ guard run uptime
@@ -42,12 +47,23 @@ Bug reports, development setup, and the pull-request process are documented in
 
 ```bash
 export GUARD_LLM_API_KEY="..."
-guard server start &
+sudo --preserve-env=GUARD_LLM_API_KEY guard server start \
+  --socket /run/guard/guard.sock \
+  --socket-group "$(id -gn)" \
+  --exec-as-caller &
 
+guard config set-server /run/guard/guard.sock
 guard run uptime
-guard run cat /var/log/syslog
 guard run rm -rf /tmp/example
 ```
+
+This foreground quick start uses the authenticated caller as the child
+identity. It is convenient for local evaluation, but it does not isolate
+caller-owned files or scalar secrets from other processes owned by that caller.
+Use the packaged fixed-identity service for a worker that receives no
+Guard-managed credentials and cannot read daemon state.
+Raw local-file reads are rejected. Load a typed verb catalog and invoke its
+bounded local-file verb when a workflow needs file authority.
 
 The daemon reads its mode, policy, and credentials at startup. Client-side
 environment changes do not alter daemon policy.
@@ -65,7 +81,11 @@ subject to normal file permissions.
 Set the mode where the daemon starts:
 
 ```bash
-GUARD_MODE=safe guard server start
+sudo --preserve-env=GUARD_LLM_API_KEY \
+  env GUARD_MODE=safe guard server start \
+    --socket /run/guard/guard.sock \
+    --socket-group "$(id -gn)" \
+    --exec-as-caller
 ```
 
 Use a separate dry-run daemon to evaluate commands without spawning approved
@@ -92,10 +112,11 @@ Legacy grant, session, and appeal commands return a direct error pointing to
 `guard access`; they cannot mint, modify, or print authority.
 
 Internally, a verb coverage cell is silent outside its declared bounds.
-Allowing Ansible `--check` mode does not generate denies for unrelated commands,
-so ordinary read-only work such as `guard run ssh host uptime` remains
-independently evaluable. Raw commands reverse-match every applicable verb cell,
-which lets agents benefit from verbs without changing their normal tool syntax.
+Allowing one active-proxy `kubectl get` cell does not generate denies for
+unrelated commands, so ordinary read-only work such as
+`guard run systemctl status sshd.service` remains independently evaluable. Raw commands
+reverse-match every applicable verb cell, which lets agents benefit from verbs
+without changing their normal tool syntax.
 
 Session coverage may expand a baseline readonly or evaluator posture inside its
 activated regions. It does not override hard invariants, sticky operator cells,
@@ -135,42 +156,52 @@ changes run inside an auto-revert envelope, and irreversible or uncertain work
 is held. A viable forward, verify, and revert chain can finish autonomously.
 Holds are the exception path for missing or unsafe authority.
 
-```bash
-guard server start --gate consequence \
-  --socket /run/guard/guard.sock \
-  --verbs /etc/guard/verbs.yaml
+Provision the dedicated `guard` and `guard-exec` accounts first, using the
+[Unix service setup](DEPLOYMENT.md#unix-service).
 
-guard access request 'Restart nginx and verify that it is healthy.'
-guard access whoami
-guard access approve <request> --once
-guard approval resume <request>
-guard access status <session>
-guard approval show <request>
-guard run systemctl restart nginx
-guard provisionals
-sudo guard-operator confirm <handle>
+```bash
+sudo install -d -o root -g root -m 0755 /run/guard
+sudo install -o root -g guard-exec -m 0640 /dev/null /run/guard/kubeconfig
+sudo env KUBECONFIG=/run/guard/kubeconfig \
+  guard server start --gate consequence \
+  --socket /run/guard/guard.sock \
+  --exec-user guard-exec \
+  --verbs /etc/guard/verbs.yaml \
+  --child-env KUBECONFIG \
+  --kube-proxy 127.0.0.1:8443 \
+  --kubeconfig /etc/guard/upstream.kubeconfig \
+  --brokered-kubeconfig-out /run/guard/kubeconfig \
+  --api-policy /etc/guard/api-policy.yaml
+
+guard config set-server /run/guard/guard.sock
+guard run kubectl get pods -n production -o wide
 ```
 
 On Windows, run
 `& 'C:\Program Files\Guard\guard-operator.ps1' -Action confirm -Reference <handle>`
 from an elevated PowerShell instead of using the Unix wrapper.
 
-Guard preserves the command's argv, working directory, exit behavior, and tool
-semantics. It does not reinterpret Ansible, Helm, SSH, or another tool. See
-[Consequence gating](docs/consequence-gating.md).
+Guard preserves an admitted command's argv, working directory, exit behavior,
+and native tool semantics. See [Consequence gating](docs/consequence-gating.md).
 
 ## Brokered tools and APIs
 
 Shims preserve familiar command names while routing them through `guard run`:
 
 ```bash
-guard shim ssh kubectl helm ansible ansible-playbook
+guard shim kubectl systemctl
 ```
 
-The caller supplies argv and its working directory. The daemon supplies its own
-identity, clean environment, SSH configuration and agent socket, and approved
-secret bindings. File-driven tools run in place, without staging or copying
-their project files. See [Agent integration](docs/agent-integration.md).
+The caller supplies argv and its working directory. The daemon selects the
+execution identity, a clean environment, and operator-owned non-credential tool
+settings. Fixed-identity mode refuses per-run environment and credential
+delivery because its shared UID is not an execution sandbox. A fixed-child
+`KUBECONFIG` is accepted only when its complete schema, endpoint, CA, and inert
+bearer match an active Guard proxy. Fixed identity denies Ansible and Helm
+because their mutable profile state cannot safely cross identities. Caller
+identity denies Ansible, Helm, and kubectl because it has no immutable typed
+profile snapshot. See
+[Agent integration](docs/agent-integration.md).
 
 For tools that make HTTP requests in-process, the API proxy gates each typed
 request and re-originates allowed traffic with daemon-held upstream credentials.
@@ -183,11 +214,14 @@ command-only and export no API bearer. See [API proxy](docs/api-proxy.md).
 
 ## Security boundary
 
-Credential ownership prevents bypass. The daemon account owns remote SSH and API
-credentials, while the agent account can reach only the Guard socket, named
-pipe, or a loopback broker endpoint. Output redaction, audit records, behavioral
-session limits, and frozen hold snapshots reduce exposure after a request enters
-the broker.
+Credential ownership prevents bypass. The fixed child account receives no
+upstream or per-run credentials, while the daemon retains secret-backend and
+API upstream authority. Its optional generated Kubernetes client config carries
+only a local transport bearer scoped to the active Guard proxy. Operators keep
+unrelated credentials inaccessible to the child. The agent account can reach
+only the Guard socket, named pipe, or a loopback broker endpoint. Output
+redaction, audit records, behavioral session limits, and frozen hold snapshots
+reduce exposure after a request enters the broker.
 
 Guard cannot contain an agent that can read the same credentials or reach the
 same upstream by another path. Pair it with operating-system isolation,

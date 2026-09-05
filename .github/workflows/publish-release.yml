@@ -8,6 +8,7 @@ name: Release
 
 permissions:
   actions: read
+  checks: read
   contents: read
 
 concurrency:
@@ -20,12 +21,14 @@ jobs:
     uses: ./.github/workflows/release.yml
     permissions:
       actions: read
+      checks: read
       contents: read
 
   release:
     name: Create GitHub Release
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write  # Publishes release assets and release notes.
       id-token: write  # Requests the OIDC token that signs the provenance.
@@ -64,29 +67,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          mapfile -d '' archives < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.cdx.json' \) -print0)
-          test "${#archives[@]}" -gt 0
-          if is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
-            if [ "$is_draft" != "true" ]; then
-              echo "published release already exists for ${RELEASE_TAG}"
-              exit 1
-            fi
-            mapfile -t expected_assets < <(printf '%s\n' "${archives[@]}" SHA256SUMS | xargs -n1 basename | LC_ALL=C sort -u)
-            mapfile -t existing_assets < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | LC_ALL=C sort -u)
-            for asset in "${existing_assets[@]}"; do
-              if ! printf '%s\n' "${expected_assets[@]}" | grep -Fxq -- "$asset"; then
-                gh release delete-asset "$RELEASE_TAG" "$asset" --yes
-              fi
-            done
-            gh release upload "$RELEASE_TAG" --clobber "${archives[@]}" SHA256SUMS
-            mapfile -t actual_assets < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | LC_ALL=C sort -u)
-            diff -u <(printf '%s\n' "${expected_assets[@]}") <(printf '%s\n' "${actual_assets[@]}")
-            gh release edit "$RELEASE_TAG" --draft=false
-          else
-            gh release create "$RELEASE_TAG" \
-              --generate-notes \
-              --verify-tag \
-              "${archives[@]}" \
-              SHA256SUMS
-          fi
+        run: scripts/publish-release.sh --artifacts-dir artifacts --checksums SHA256SUMS

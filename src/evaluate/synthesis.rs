@@ -197,9 +197,7 @@ impl Evaluator {
         body: &serde_json::Value,
     ) -> Result<Verb> {
         let response = self
-            .http_client
-            .post(api_url)
-            .header("Authorization", format!("Bearer {}", api_key))
+            .provider_post(api_url, api_key)?
             .header("Content-Type", "application/json")
             .json(body)
             .send()
@@ -288,9 +286,7 @@ impl Evaluator {
         body: &serde_json::Value,
     ) -> Result<Option<(String, String)>> {
         let response = self
-            .http_client
-            .post(api_url)
-            .header("Authorization", format!("Bearer {}", api_key))
+            .provider_post(api_url, api_key)?
             .header("Content-Type", "application/json")
             .json(body)
             .send()

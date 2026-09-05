@@ -22,6 +22,7 @@ use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls::{self, pki_types};
+use tokio_rustls::TlsAcceptor;
 
 use guard::proxy::{
     ApiListenerMode, ApiPolicy, ApiProxy, GithubProtocol, ProtocolConfig, ProxyTls, Upstream,
@@ -31,12 +32,21 @@ use guard::proxy::{
 /// Requests the mock upstream actually served: (method, path?query).
 type Hits = Arc<Mutex<Vec<(String, String)>>>;
 
+fn generated_fixture_value(label: &str) -> String {
+    format!("{label}-{:032x}", rand::random::<u128>())
+}
+
 async fn spawn_recording_upstream(
     hits: Hits,
     body_for: fn(&str) -> Value,
-) -> (String, tokio::task::JoinHandle<()>) {
+) -> (Upstream, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let tls = ProxyTls::generate().expect("mock upstream TLS");
+    let ca_data = tls.ca_data_b64();
+    let mut server_config = (*tls.server_config()).clone();
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let task = tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
@@ -44,7 +54,11 @@ async fn spawn_recording_upstream(
                 Err(_) => continue,
             };
             let hits = hits.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
+                let Ok(stream) = acceptor.accept(stream).await else {
+                    return;
+                };
                 let io = TokioIo::new(stream);
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let hits = hits.clone();
@@ -72,7 +86,13 @@ async fn spawn_recording_upstream(
             });
         }
     });
-    (format!("http://{addr}"), task)
+    let kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"https://{addr}\", certificate-authority-data: \"{ca_data}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
+    );
+    (
+        Upstream::from_kubeconfig_str(&kubeconfig, None).expect("TLS mock upstream"),
+        task,
+    )
 }
 
 struct TestProxy {
@@ -80,6 +100,7 @@ struct TestProxy {
     base: String,
     port: u16,
     ca_pem: String,
+    transport_bearer: String,
     hits: Hits,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -110,11 +131,7 @@ async fn spawn_proxy(
     policy_yaml: &str,
 ) -> TestProxy {
     let hits: Hits = Arc::new(Mutex::new(Vec::new()));
-    let (mock_base, upstream_task) = spawn_recording_upstream(hits.clone(), body_for).await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
-    );
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let (upstream, upstream_task) = spawn_recording_upstream(hits.clone(), body_for).await;
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
@@ -127,6 +144,14 @@ async fn spawn_proxy(
         ApiProxy::with_protocol(protocol, listen, tls, upstream, policy, None)
             .with_listener_mode(ApiListenerMode::Policy),
     );
+    let brokered: Value = serde_json::from_str(&proxy.brokered_client_config()).unwrap();
+    assert_eq!(brokered["base_url"], format!("https://127.0.0.1:{port}"));
+    assert_eq!(brokered["certificate_authority_pem"], ca_pem);
+    assert_eq!(brokered["authorization"]["scheme"], "Bearer");
+    let transport_bearer = brokered["authorization"]["token"]
+        .as_str()
+        .expect("generic client config carries the generated transport bearer")
+        .to_string();
     let proxy_task = tokio::spawn(async move {
         proxy
             .serve_on(listener)
@@ -135,6 +160,14 @@ async fn spawn_proxy(
     });
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {transport_bearer}").parse().unwrap(),
+            );
+            headers
+        })
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
         .build()
@@ -144,6 +177,7 @@ async fn spawn_proxy(
         base: format!("https://127.0.0.1:{port}"),
         port,
         ca_pem,
+        transport_bearer,
         hits,
         tasks: vec![upstream_task, proxy_task],
     }
@@ -179,8 +213,10 @@ async fn raw_tls_request(proxy: &TestProxy, method: &str, raw_path: &str) -> Str
         .expect("server name")
         .to_owned();
     let mut stream = connector.connect(sni, tcp).await.expect("tls handshake");
-    let req =
-        format!("{method} {raw_path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let req = format!(
+        "{method} {raw_path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        proxy.transport_bearer
+    );
     stream
         .write_all(req.as_bytes())
         .await
@@ -201,12 +237,12 @@ fn github_body(path: &str) -> Value {
             json!({
                 "total_count": 2,
                 "secrets": [
-                    {"name": "DEPLOY_KEY", "created_at": "2026-01-01T00:00:00Z", "value": "leaked-plaintext"},
-                    {"name": "API_TOKEN", "created_at": "2026-01-01T00:00:00Z", "encrypted_value": "leaked-cipher"}
+                    {"name": "DEPLOY_KEY", "created_at": "2026-01-01T00:00:00Z", "value": generated_fixture_value("plaintext")},
+                    {"name": "API_TOKEN", "created_at": "2026-01-01T00:00:00Z", "encrypted_value": generated_fixture_value("ciphertext")}
                 ]
             })
         } else {
-            json!({"name": "DEPLOY_KEY", "created_at": "2026-01-01T00:00:00Z", "value": "leaked-plaintext"})
+            json!({"name": "DEPLOY_KEY", "created_at": "2026-01-01T00:00:00Z", "value": generated_fixture_value("plaintext")})
         }
     } else if path.contains("/issues") {
         json!({"number": 42, "title": "an issue", "state": "open"})
@@ -511,12 +547,12 @@ fn vercel_body(path: &str) -> Value {
     if path.ends_with("/env") || path.ends_with("/ENV") {
         json!({
             "envs": [
-                {"id": "e1", "key": "DATABASE_URL", "value": "postgres://user:pw@host/db", "target": ["production"]},
+                {"id": "e1", "key": "DATABASE_URL", "value": generated_fixture_value("database-url"), "target": ["production"]},
                 {"id": "e2", "key": "PUBLIC_FLAG", "value": "on", "target": ["preview"]}
             ]
         })
     } else if path.contains("/env/") {
-        json!({"id": "e1", "key": "DATABASE_URL", "value": "postgres://user:pw@host/db"})
+        json!({"id": "e1", "key": "DATABASE_URL", "value": generated_fixture_value("database-url")})
     } else if path.contains("/projects") {
         json!({"id": "prj_123", "name": "web"})
     } else {

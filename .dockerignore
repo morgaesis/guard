@@ -13,6 +13,11 @@
 !tests/**
 !examples/
 !examples/**
+!.github/
+!.github/dependabot.yml
+!.github/workflows/
+!.github/workflows/dependabot-automerge.yml
+!.github/workflows/dependabot-enable-automerge.yml
 !.clusterfuzzlite/
 !.clusterfuzzlite/**
 !fuzz/
