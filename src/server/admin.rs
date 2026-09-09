@@ -3117,10 +3117,25 @@ async fn approve_held_access(
         };
         drop(transition);
         return match handle_approve_claimed(server, caller, handle, snapshot).await {
-            AdminResponse::GateAction { message, .. } => AccessDecisionResult {
+            AdminResponse::GateAction {
+                message,
+                policy,
+                execution_failure,
+                exit_code,
+                ..
+            } => AccessDecisionResult {
                 request: handle.to_string(),
-                success: true,
-                state: "approved".to_string(),
+                success: policy.as_ref().is_none_or(|p| p.allowed)
+                    && execution_failure.is_none()
+                    && exit_code.is_none_or(|code| code == 0),
+                state: if policy.as_ref().is_some_and(|p| !p.allowed) {
+                    "denied"
+                } else if execution_failure.is_some() {
+                    "exec_failed"
+                } else {
+                    "approved"
+                }
+                .to_string(),
                 target: None,
                 remaining_uses: None,
                 use_policy: "unavailable".to_string(),
@@ -7321,14 +7336,22 @@ async fn handle_manual_revert(
         }
     }
     let outcome = finish_revert(server, &claimed, caller, "manual").await;
+    let response = outcome.result.into_response();
+    let exit_code = if response.execution_failure.is_some() {
+        Some(crate::EXIT_GUARD_ERROR)
+    } else if !response.allowed {
+        Some(crate::EXIT_GUARD_DENIED)
+    } else {
+        response.exit_code.or(Some(crate::EXIT_GUARD_ERROR))
+    };
     AdminResponse::GateAction {
-        policy: None,
-        execution_failure: None,
-        decision_source: None,
-        message: outcome.0,
-        exit_code: outcome.1,
-        stdout: None,
-        stderr: None,
+        policy: response.policy,
+        execution_failure: response.execution_failure,
+        decision_source: Some(response.decision_source),
+        message: outcome.message,
+        exit_code,
+        stdout: response.stdout,
+        stderr: response.stderr,
     }
 }
 
@@ -7640,7 +7663,7 @@ async fn arm_held_command(
     }
 }
 
-async fn handle_approve_claimed(
+pub(super) async fn handle_approve_claimed(
     server: &ServerContext,
     caller: &CallerIdentity,
     handle: &str,
@@ -7870,6 +7893,22 @@ async fn handle_approve_claimed(
                 next,
             )
         }
+        ExecOutcome::NotAttempted if !policy.as_ref().expect("execution policy").allowed => {
+            let detail = policy.as_ref().expect("execution policy").reason.clone();
+            let mut next = expected.clone();
+            next.status = ApprovalStatus::Denied;
+            next.decided_unix = Some(now);
+            next.decided_reason = Some(detail.clone());
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::Denied)
+                    .execution(policy.clone().expect("execution policy"), None)
+                    .decision_source(decision_source.as_deref().unwrap_or("validation"))
+                    .handle(handle)
+                    .caller(caller)
+                    .reason(&detail),
+            );
+            (detail, Some(crate::EXIT_GUARD_DENIED), None, None, next)
+        }
         ExecOutcome::Failed { reason: detail, .. } => {
             server.emit_audit_ungated(
                 AuditEvent::new(AuditKind::ApproveExecFailed)
@@ -7903,7 +7942,7 @@ async fn handle_approve_claimed(
             };
             (
                 format!("approved {} but execution failed: {}", handle, detail),
-                None,
+                Some(crate::EXIT_GUARD_ERROR),
                 None,
                 None,
                 next,
@@ -8056,8 +8095,14 @@ async fn handle_resume(
             stdout: None,
             stderr: None,
         },
-        ExecOutcome::NotAttempted => AdminResponse::Error {
+        ExecOutcome::NotAttempted => AdminResponse::GateAction {
+            policy,
+            execution_failure,
+            decision_source,
             message: result.policy_reason().to_string(),
+            exit_code: Some(crate::EXIT_GUARD_DENIED),
+            stdout: None,
+            stderr: None,
         },
         _ => AdminResponse::Error {
             message: format!("held command {handle} did not produce a terminal execution result"),

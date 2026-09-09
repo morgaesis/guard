@@ -418,6 +418,12 @@ impl ApprovalRegistry {
                 row.decided_unix = Some(now);
                 row.decided_reason =
                     Some("daemon restarted while executing; outcome unknown".to_string());
+                row.execution_failure = Some(crate::wire::ExecutionFailure {
+                    started: None,
+                    stage: crate::wire::ExecutionStage::Unknown,
+                    errno: None,
+                    message: "daemon restarted while executing; outcome unknown".to_string(),
+                });
                 recovered.push(row.handle.clone());
             }
             items.insert(row.handle.clone(), row);

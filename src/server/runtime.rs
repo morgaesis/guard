@@ -188,10 +188,17 @@ impl CommandAdmission {
         &self,
         scope: &str,
     ) -> Result<CommandEvaluatorPermit, &'static str> {
+        self.admit_evaluator_at(scope, Instant::now())
+    }
+
+    fn admit_evaluator_at(
+        &self,
+        scope: &str,
+        now: Instant,
+    ) -> Result<CommandEvaluatorPermit, &'static str> {
         self.counters
             .evaluator_attempted
             .fetch_add(1, Ordering::Relaxed);
-        let now = Instant::now();
         let (_, principal) = self.scope_state(scope, now).inspect_err(|_| {
             self.counters
                 .evaluator_concurrency_limited
@@ -252,7 +259,10 @@ impl CommandAdmission {
     }
 
     pub(super) fn complete_evaluator(&self, scope: &str, error: bool, provider_spend: bool) {
-        let now = Instant::now();
+        self.complete_evaluator_at(scope, error, provider_spend, Instant::now());
+    }
+
+    fn complete_evaluator_at(&self, scope: &str, error: bool, provider_spend: bool, now: Instant) {
         let mut states = self.scopes.lock().expect("command admission lock");
         if let Some(state) = states.get_mut(scope) {
             state.touched_at = now;
@@ -462,44 +472,271 @@ fn bounded_notify_event(mut event: NotifyEvent) -> NotifyEvent {
     event
 }
 
+// Child ownership is registered with a runtime-independent cleanup worker
+// before spawn. Signaling and reaping use the same lock, so a reaped PID is
+// never retained as a target for a delayed group signal.
+#[derive(Clone)]
+pub(super) struct ChildOwnership(Arc<Mutex<OwnedChildState>>);
+
+struct OwnedChildState {
+    child: Option<std::process::Child>,
+    status: Option<std::process::ExitStatus>,
+    pending_launch: bool,
+    cleanup: ChildCleanup,
+    secret_files: Option<super::secure_fs::SecretFileLease>,
+    #[cfg(test)]
+    signals: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ChildCleanup {
+    Running,
+    Graceful(Instant),
+    Forced,
+}
+
+impl OwnedChildState {
+    fn signal(&mut self, graceful: bool) {
+        if let Some(child) = self.child.as_mut() {
+            #[cfg(test)]
+            {
+                self.signals += 1;
+            }
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(
+                    -(child.id() as i32),
+                    if graceful {
+                        libc::SIGTERM
+                    } else {
+                        libc::SIGKILL
+                    },
+                );
+            }
+            // Windows uses the retained process handle. On Unix this also
+            // covers a leader that moved itself out of its original group.
+            if !graceful || !cfg!(unix) {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        // Keep the leader unreaped until the final group signal. Its PID
+        // cannot be reused while the grace deadline is outstanding.
+        if matches!(self.cleanup, ChildCleanup::Graceful(_)) {
+            return Ok(None);
+        }
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let status = child.try_wait()?;
+        if let Some(status) = status {
+            self.status = Some(status);
+            self.child = None;
+            self.secret_files = None;
+        }
+        Ok(status)
+    }
+
+    fn cleanup_tick(&mut self) -> bool {
+        if let ChildCleanup::Graceful(deadline) = self.cleanup {
+            if Instant::now() >= deadline {
+                self.signal(false);
+                self.cleanup = ChildCleanup::Forced;
+            }
+        }
+        if matches!(self.cleanup, ChildCleanup::Forced) {
+            // Errors retain ownership for a later attempt; a foreground
+            // timeout never discards an unreaped child or its secret lease.
+            let _ = self.try_wait();
+        }
+        !self.pending_launch && self.child.is_none()
+    }
+}
+
+fn register_child_cleanup(state: Arc<Mutex<OwnedChildState>>) -> std::io::Result<()> {
+    type Sender = std::sync::mpsc::Sender<Arc<Mutex<OwnedChildState>>>;
+    static WORKER: std::sync::OnceLock<Mutex<Option<Sender>>> = std::sync::OnceLock::new();
+    let mut sender = WORKER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if sender.is_none() {
+        let (tx, rx) = std::sync::mpsc::channel::<Arc<Mutex<OwnedChildState>>>();
+        std::thread::Builder::new()
+            .name("guard-child-cleanup".into())
+            .spawn(move || {
+                let mut children = Vec::new();
+                loop {
+                    let received = if children.is_empty() {
+                        rx.recv()
+                            .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                    } else {
+                        rx.recv_timeout(Duration::from_millis(10))
+                    };
+                    match received {
+                        Ok(child) => children.push(child),
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                            if children.is_empty() =>
+                        {
+                            break
+                        }
+                        Err(_) => {}
+                    }
+                    children.extend(rx.try_iter());
+                    children.retain(|child| {
+                        !child
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .cleanup_tick()
+                    });
+                }
+            })?;
+        *sender = Some(tx);
+    }
+    if sender
+        .as_ref()
+        .expect("cleanup sender initialized")
+        .send(state)
+        .is_err()
+    {
+        *sender = None;
+        return Err(std::io::Error::other("child cleanup worker is unavailable"));
+    }
+    Ok(())
+}
+
+impl ChildOwnership {
+    pub(super) fn prepare(
+        secret_files: Option<super::secure_fs::SecretFileLease>,
+    ) -> std::io::Result<Self> {
+        let state = Arc::new(Mutex::new(OwnedChildState {
+            child: None,
+            status: None,
+            pending_launch: true,
+            cleanup: ChildCleanup::Running,
+            secret_files,
+            #[cfg(test)]
+            signals: 0,
+        }));
+        register_child_cleanup(state.clone())?;
+        Ok(Self(state))
+    }
+
+    pub(super) fn adopt(&self, child: std::process::Child) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.child = Some(child);
+        state.pending_launch = false;
+    }
+
+    pub(super) fn id(&self) -> Option<u32> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .child
+            .as_ref()
+            .map(std::process::Child::id)
+    }
+
+    pub(super) fn take_stdout(&self) -> Option<std::process::ChildStdout> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .child
+            .as_mut()?
+            .stdout
+            .take()
+    }
+
+    pub(super) fn take_stderr(&self) -> Option<std::process::ChildStderr> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .child
+            .as_mut()?
+            .stderr
+            .take()
+    }
+
+    pub(super) fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_wait()
+    }
+
+    pub(super) fn terminate(&self, graceful: bool) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending_launch = false;
+        if state.child.is_none() {
+            state.secret_files = None;
+            return;
+        }
+        if graceful && matches!(state.cleanup, ChildCleanup::Running) {
+            state.signal(true);
+            state.cleanup = if cfg!(unix) {
+                ChildCleanup::Graceful(Instant::now() + Duration::from_secs(2))
+            } else {
+                ChildCleanup::Forced
+            };
+        } else if !graceful {
+            state.signal(false);
+            state.cleanup = ChildCleanup::Forced;
+        }
+    }
+
+    pub(super) async fn wait_for_cleanup(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while self.id().is_some() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct ProcessTracker {
-    active: Arc<Mutex<HashMap<u32, u64>>>,
+    active: Arc<Mutex<HashMap<u64, ChildOwnership>>>,
     next_generation: Arc<AtomicU64>,
 }
 
 impl ProcessTracker {
-    pub(super) fn track(&self, pid: u32) -> ProcessGuard {
+    pub(super) fn track(&self, child: ChildOwnership) -> ProcessGuard {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         self.active
             .lock()
             .expect("process tracker poisoned")
-            .insert(pid, generation);
+            .insert(generation, child);
         ProcessGuard {
-            pid,
             generation,
             tracker: self.clone(),
             armed: true,
         }
     }
 
-    fn take(&self, pid: u32, generation: u64) -> bool {
-        let mut active = self.active.lock().expect("process tracker poisoned");
-        if active.get(&pid) == Some(&generation) {
-            active.remove(&pid);
-            true
-        } else {
-            false
-        }
+    fn take(&self, generation: u64) -> Option<ChildOwnership> {
+        self.active
+            .lock()
+            .expect("process tracker poisoned")
+            .remove(&generation)
     }
 
     pub(super) fn terminate_all(&self) {
         let active = {
             let mut active = self.active.lock().expect("process tracker poisoned");
-            active.drain().map(|(pid, _)| pid).collect::<Vec<_>>()
+            active.drain().map(|(_, child)| child).collect::<Vec<_>>()
         };
-        for pid in active {
-            terminate_process_tree(pid);
+        for child in active {
+            child.terminate(false);
         }
     }
 
@@ -517,7 +754,6 @@ impl Drop for ShutdownGuard {
 }
 
 pub(super) struct ProcessGuard {
-    pid: u32,
     generation: u64,
     tracker: ProcessTracker,
     armed: bool,
@@ -525,67 +761,28 @@ pub(super) struct ProcessGuard {
 
 impl ProcessGuard {
     pub(super) fn complete(mut self) {
-        self.tracker.take(self.pid, self.generation);
+        self.tracker.take(self.generation);
         self.armed = false;
     }
 
     pub(super) async fn terminate_gracefully(mut self) {
-        if self.tracker.take(self.pid, self.generation) {
-            terminate_process_tree_gracefully(self.pid).await;
+        if let Some(child) = self.tracker.take(self.generation) {
+            child.terminate(true);
+            self.armed = false;
+            child.wait_for_cleanup().await;
         }
-        self.armed = false;
     }
 }
 
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
-        if self.armed && self.tracker.take(self.pid, self.generation) {
-            terminate_process_tree(self.pid);
+        if self.armed {
+            if let Some(child) = self.tracker.take(self.generation) {
+                child.terminate(false);
+            }
         }
     }
 }
-
-#[cfg(unix)]
-fn terminate_process_tree(pid: u32) {
-    unsafe {
-        // Brokered children are process-group leaders. A negative pid targets
-        // the whole group while a setsid descendant remains intentionally
-        // outside it.
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-}
-
-#[cfg(unix)]
-async fn terminate_process_tree_gracefully(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGTERM);
-    }
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    terminate_process_tree(pid);
-}
-
-#[cfg(windows)]
-fn terminate_process_tree(pid: u32) {
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-    unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if !handle.is_null() {
-            let _ = TerminateProcess(handle, 1);
-            windows_sys::Win32::Foundation::CloseHandle(handle);
-        }
-    }
-}
-
-#[cfg(windows)]
-async fn terminate_process_tree_gracefully(pid: u32) {
-    terminate_process_tree(pid);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn terminate_process_tree(_pid: u32) {}
-
-#[cfg(not(any(unix, windows)))]
-async fn terminate_process_tree_gracefully(_pid: u32) {}
 
 #[cfg(test)]
 mod tests {
@@ -707,10 +904,12 @@ mod tests {
             &marker.display().to_string(),
         ]);
         command.as_std_mut().process_group(0);
-        let mut child = command.spawn().expect("spawn process group");
-        let guard = ProcessTracker::default().track(child.id().expect("child pid"));
+        let child = ChildOwnership::prepare(None).expect("cleanup owner");
+        child.adopt(command.as_std_mut().spawn().expect("spawn process group"));
+        let guard = ProcessTracker::default().track(child.clone());
         drop(guard);
-        let _ = child.wait().await;
+        child.wait_for_cleanup().await;
+        assert!(child.id().is_none(), "child must be reaped");
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
         assert!(!marker.exists(), "the grandchild escaped its owned group");
     }
@@ -730,8 +929,9 @@ mod tests {
             ready.display()
         ));
         command.as_std_mut().process_group(0);
-        let mut child = command.spawn().expect("spawn process group");
-        let guard = ProcessTracker::default().track(child.id().expect("child pid"));
+        let child = ChildOwnership::prepare(None).expect("cleanup owner");
+        child.adopt(command.as_std_mut().spawn().expect("spawn process group"));
+        let guard = ProcessTracker::default().track(child.clone());
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !ready.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -741,31 +941,111 @@ mod tests {
         .expect("shell installed its SIGTERM trap");
 
         guard.terminate_gracefully().await;
-        let _ = child.wait().await.expect("reap terminated process");
+        assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "term");
     }
 
-    #[test]
-    fn stale_guard_does_not_remove_a_reused_pid() {
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cleanup_retains_leader_and_secret_lease_until_final_signal() {
+        use std::os::unix::process::CommandExt;
+        let directory = tempfile::tempdir().unwrap();
+        let (lease, bindings) = super::super::secure_fs::SecretFileLease::create(
+            directory.path(),
+            &[("FIXTURE_FILE".into(), "fixture-value".into())],
+        )
+        .unwrap();
+        let child = ChildOwnership::prepare(Some(lease)).unwrap();
+        let mut command = std::process::Command::new("true");
+        command.process_group(0);
+        child.adopt(command.spawn().unwrap());
+        let pid = child.id().unwrap();
+        child.terminate(true);
+        // Even an exited leader remains waitable, anchoring the process group
+        // until the cleanup owner has sent its last signal.
+        assert_eq!(child.try_wait().unwrap(), None);
+        assert_eq!(child.id(), Some(pid));
+        assert!(bindings[0].1.exists());
+        child.terminate(false);
+        child.wait_for_cleanup().await;
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(child.id().is_none());
+        assert!(!bindings[0].1.exists());
+        let signals = child.0.lock().unwrap().signals;
+        child.terminate(true);
+        child.terminate(false);
+        assert_eq!(child.0.lock().unwrap().signals, signals);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cleanup_deadline_retains_unreaped_child_and_secret_lease() {
+        use std::os::unix::process::CommandExt;
+        let directory = tempfile::tempdir().unwrap();
+        let (lease, bindings) = super::super::secure_fs::SecretFileLease::create(
+            directory.path(),
+            &[("FIXTURE_FILE".into(), "fixture-value".into())],
+        )
+        .unwrap();
+        let child = ChildOwnership::prepare(Some(lease)).unwrap();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30").process_group(0);
+        child.adopt(command.spawn().unwrap());
+        child.terminate(true);
+        child.0.lock().unwrap().cleanup =
+            ChildCleanup::Graceful(Instant::now() + Duration::from_secs(60));
+        tokio::time::timeout(Duration::from_secs(4), child.wait_for_cleanup())
+            .await
+            .unwrap();
+        let retained_child = child.id().is_some();
+        let retained_lease = bindings[0].1.exists();
+        child.terminate(false);
+        child.wait_for_cleanup().await;
+        assert!(retained_child, "foreground timeout must retain ownership");
+        assert!(
+            retained_lease,
+            "foreground timeout must retain secret files"
+        );
+        assert!(child.id().is_none());
+        assert!(!bindings[0].1.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tracker_shutdown_and_guard_drop_do_not_signal_reaped_children() {
+        use std::os::unix::process::CommandExt;
+        let child = ChildOwnership::prepare(None).unwrap();
+        let mut command = std::process::Command::new("true");
+        command.process_group(0);
+        child.adopt(command.spawn().unwrap());
         let tracker = ProcessTracker::default();
-        let first = tracker.track(42);
-        tracker
+        let guard = tracker.track(child.clone());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while child.try_wait().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tracker.terminate_all();
+        drop(guard);
+        assert_eq!(child.0.lock().unwrap().signals, 0);
+    }
+
+    #[test]
+    fn stale_guard_does_not_remove_a_new_registration() {
+        let tracker = ProcessTracker::default();
+        let child = ChildOwnership::prepare(None).unwrap();
+        let first = tracker.track(child.clone());
+        let second = tracker.track(child.clone());
+        first.complete();
+        assert!(tracker
             .active
             .lock()
-            .expect("process tracker poisoned")
-            .clear();
-        let second = tracker.track(42);
-
-        first.complete();
-        assert_eq!(
-            tracker
-                .active
-                .lock()
-                .expect("process tracker poisoned")
-                .get(&42),
-            Some(&second.generation)
-        );
+            .unwrap()
+            .contains_key(&second.generation));
         second.complete();
+        child.terminate(false);
     }
 
     #[test]
@@ -794,17 +1074,22 @@ mod tests {
             evaluator_circuit_cooldown: Duration::from_millis(10),
             ..CommandAdmissionConfig::default()
         });
-        let first = admission.admit_evaluator("alice").expect("first call");
+        let now = Instant::now();
+        let first = admission
+            .admit_evaluator_at("alice", now)
+            .expect("first call");
         drop(first);
-        admission.complete_evaluator("alice", true, true);
-        assert!(admission.admit_evaluator("alice").is_err());
-        std::thread::sleep(Duration::from_millis(20));
+        admission.complete_evaluator_at("alice", true, true, now);
+        assert!(admission
+            .admit_evaluator_at("alice", now + Duration::from_millis(9))
+            .is_err());
+        let recovered_at = now + Duration::from_millis(10);
         let second = admission
-            .admit_evaluator("alice")
+            .admit_evaluator_at("alice", recovered_at)
             .expect("circuit recovered");
         drop(second);
-        admission.complete_evaluator("alice", false, true);
-        assert!(admission.admit_evaluator("alice").is_err());
+        admission.complete_evaluator_at("alice", false, true, recovered_at);
+        assert!(admission.admit_evaluator_at("alice", recovered_at).is_err());
         let status = admission.snapshot();
         assert_eq!(status.evaluator_admitted, 2);
         assert_eq!(status.evaluator_circuit_rejections, 1);

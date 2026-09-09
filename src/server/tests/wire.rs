@@ -442,7 +442,7 @@ fn execution_failure_preserves_policy_in_buffered_and_streamed_results() {
         );
         assert_eq!(response.decision_source, "static_policy");
         let failure = response.execution_failure.as_ref().unwrap();
-        assert!(!failure.started);
+        assert_eq!(failure.started, Some(false));
         assert_eq!(failure.stage, stage);
         assert_eq!(failure.errno, Some(13));
         let encoded = serde_json::to_value(&response).unwrap();
@@ -464,7 +464,7 @@ fn execution_failure_unknown_preserves_started_and_legacy_deserialization() {
         let started = matches!(result.exec, ExecOutcome::Failed { started: true, .. });
         let response = result.into_response();
         let failure = response.execution_failure.as_ref().unwrap();
-        assert_eq!(failure.started, started);
+        assert_eq!(failure.started, Some(started));
         assert_eq!(failure.stage, ExecutionStage::Unknown);
         assert_eq!(failure.errno, None);
     }
@@ -477,6 +477,15 @@ fn execution_failure_unknown_preserves_started_and_legacy_deserialization() {
     )
     .unwrap();
     assert_eq!(unknown.stage, ExecutionStage::Unknown);
+    let unknown_start: guard::wire::ExecutionFailure = serde_json::from_value(
+        serde_json::json!({"stage":"future_stage","errno":null,"message":"outcome unknown"}),
+    )
+    .unwrap();
+    assert_eq!(unknown_start.started, None);
+    assert_eq!(
+        serde_json::to_value(unknown_start).unwrap()["started"],
+        serde_json::Value::Null
+    );
     let denied = ExecuteResult::denied("policy rejects this").into_response();
     assert!(!denied.policy.unwrap().allowed);
     assert!(denied.execution_failure.is_none());
@@ -517,7 +526,7 @@ fn execution_failure_held_projection_retains_admission_and_started_state() {
         let summary = crate::server::wire::ApprovalSummary::from_row(&approval);
         assert_eq!(summary.execution_failure, approval.execution_failure);
         let response = crate::server::gate_runtime::approval_to_result(&approval).into_response();
-        assert_eq!(response.execution_failure.unwrap().started, started);
+        assert_eq!(response.execution_failure.unwrap().started, Some(started));
         assert_eq!(response.decision_source, "static_policy");
         assert_eq!(
             response.policy.unwrap(),

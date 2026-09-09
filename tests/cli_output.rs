@@ -142,3 +142,95 @@ async fn execution_failure_cli_distinguishes_policy_in_text_and_json() {
         }
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn execution_result_consumers_share_failure_denial_and_child_exits() {
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    for command in [
+        vec!["verb", "run", "fixture"],
+        vec!["server", "connect", "true"],
+        vec!["revert", "pv-fixture"],
+        vec!["resume", "ap-fixture"],
+    ] {
+        for (started, denied, child_exit) in [
+            (Some(false), false, None),
+            (Some(true), false, None),
+            (None, false, None),
+            (None, true, None),
+            (None, false, Some(7)),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("guard.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let failed = !denied && child_exit.is_none();
+            let mut response = json!({"allowed": child_exit.is_some(), "reason": "fixture outcome",
+                "policy": {"allowed": !denied, "reason": "fixture policy"}, "decision_source": "validation",
+                "exit_code": child_exit});
+            if failed {
+                response["execution_failure"] = json!({"started": started, "stage": "cwd",
+                "errno": 13, "message": "working directory permission denied"});
+            }
+            let admin = matches!(command[0], "revert" | "resume");
+            if admin {
+                response["result"] = json!("gate_action");
+                response["message"] = json!("fixture outcome");
+                // A null legacy exit must not hide a typed failure or denial.
+                response["exit_code"] = json!(child_exit);
+            }
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let payload = if request["execute"]["stream"] == true {
+                    json!({"type": "result", "response": response})
+                } else {
+                    response
+                };
+                writer
+                    .write_all(format!("{payload}\n").as_bytes())
+                    .await
+                    .unwrap();
+            };
+            let client = async {
+                tokio::process::Command::new(GUARD_BIN)
+                    .env_clear()
+                    .env("XDG_CONFIG_HOME", directory.path())
+                    .current_dir(directory.path())
+                    .kill_on_drop(true)
+                    .args(&command)
+                    .arg("--socket")
+                    .arg(&socket)
+                    .output()
+                    .await
+                    .unwrap()
+            };
+            let (_, output) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(server, client)
+            })
+            .await
+            .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(if failed {
+                    125
+                } else if denied {
+                    126
+                } else {
+                    7
+                }),
+                "{command:?}: {stderr}"
+            );
+            if failed {
+                assert!(stderr.contains("EXECUTION FAILED"), "{command:?}: {stderr}");
+                assert!(!stderr.contains("DENIED") && !stderr.contains("appeal:"));
+            } else if denied {
+                assert!(stderr.contains("DENIED"), "{command:?}: {stderr}");
+            }
+        }
+    }
+}

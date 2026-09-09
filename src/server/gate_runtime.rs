@@ -3079,6 +3079,15 @@ pub(super) async fn resume_approval(
             terminal.result_stdout = bound_persisted_transcript(stdout.clone());
             terminal.result_stderr = bound_persisted_transcript(stderr.clone());
         }
+        ExecOutcome::NotAttempted if !result.policy_allowed() => {
+            terminal.status = ApprovalStatus::Denied;
+            terminal.decided_unix = Some(completed_unix);
+            terminal.decided_reason = Some(result.policy_reason().to_string());
+            terminal.execution_failure = None;
+            terminal.result_exit = None;
+            terminal.result_stdout = None;
+            terminal.result_stderr = None;
+        }
         ExecOutcome::Failed { reason, .. } => {
             terminal.status = ApprovalStatus::ExecFailed;
             terminal.decided_unix = Some(completed_unix);
@@ -3101,6 +3110,9 @@ pub(super) async fn resume_approval(
     if let Err(error) =
         commit_resumed_approval(server, claimed.clone(), terminal.clone(), true).await
     {
+        if !result.policy_allowed() {
+            return result;
+        }
         let message = format!("held command result was not durable: {error}");
         let failed = if matches!(
             &result.exec,
@@ -3113,19 +3125,30 @@ pub(super) async fn resume_approval(
         return failed.with_admission_trace(claimed.decision_trace.as_ref());
     }
     server.emit_audit_ungated(
-        AuditEvent::new(AuditKind::ApprovedExecuted)
-            .handle(handle)
-            .caller(caller)
-            .session_fingerprint(
-                claimed
-                    .snapshot
-                    .session_fingerprint
-                    .as_deref()
-                    .unwrap_or("none"),
-            )
-            .field("phase", "completed")
-            .field("status", terminal.status.as_str())
-            .field("exit", format!("{:?}", terminal.result_exit)),
+        AuditEvent::new(if !result.policy_allowed() {
+            AuditKind::Denied
+        } else if result.execution_failure().is_some() {
+            AuditKind::ApproveExecFailed
+        } else {
+            AuditKind::ApprovedExecuted
+        })
+        .execution(
+            result.policy_decision(),
+            result.execution_failure().cloned(),
+        )
+        .decision_source(result.decision_source())
+        .handle(handle)
+        .caller(caller)
+        .session_fingerprint(
+            claimed
+                .snapshot
+                .session_fingerprint
+                .as_deref()
+                .unwrap_or("none"),
+        )
+        .field("phase", "completed")
+        .field("status", terminal.status.as_str())
+        .field("exit", format!("{:?}", terminal.result_exit)),
     );
     server.emit_event(NotifyEvent {
         event: "decision_made",
@@ -3157,7 +3180,7 @@ pub(super) fn approval_to_result(a: &Approval) -> ExecuteResult {
         ApprovalStatus::Expired => {
             ExecuteResult::denied("expired without operator approval (fail-closed)")
         }
-        ApprovalStatus::ExecFailed => ExecuteResult::exec_failed(
+        ApprovalStatus::ExecFailed => ExecuteResult::exec_failed_unknown_start(
             a.reason.clone(),
             a.decided_reason
                 .clone()
@@ -3247,8 +3270,7 @@ async fn execute_snapshot_with_access_request_inner(
         );
     }
     if snapshot.session_fingerprint.is_some() != snapshot.session_revision.is_some() {
-        return ExecuteResult::exec_failed(
-            reason.to_string(),
+        return ExecuteResult::denied(
             "approval rejected: originating session identity is incomplete".to_string(),
         );
     }
@@ -3266,8 +3288,7 @@ async fn execute_snapshot_with_access_request_inner(
             || expected.is_empty()
             || expected != supplied
         {
-            return ExecuteResult::exec_failed(
-                reason.to_string(),
+            return ExecuteResult::denied(
                 "approval rejected: originating access session expired or was revoked, or the held access binding is incomplete"
                     .to_string(),
             );
@@ -3284,8 +3305,7 @@ async fn execute_snapshot_with_access_request_inner(
             .await
             .effective_revision_for_fingerprint(fingerprint);
         if current.as_deref() != Some(expected_revision) {
-            return ExecuteResult::exec_failed(
-                reason.to_string(),
+            return ExecuteResult::denied(
                 "approval rejected: the issued session changed or was revoked after hold"
                     .to_string(),
             );
@@ -3503,16 +3523,12 @@ async fn execute_snapshot_request(
     match admit_access_use(server, &request, &selected_verbs, preferred_access_requests).await {
         Ok(Some(_)) => {}
         Ok(None) if preferred_access_requests.is_some() => {
-            return ExecuteResult::exec_failed(
-                reason.to_string(),
-                "approval rejected: originating access session expired or was revoked before held-command admission"
-                    .to_string(),
+            return ExecuteResult::denied(
+                "originating access session expired or was revoked before held-command admission",
             )
         }
         Ok(None) => {}
-        Err(admission_reason) => {
-            return ExecuteResult::exec_failed(reason.to_string(), admission_reason)
-        }
+        Err(admission_reason) => return ExecuteResult::denied(admission_reason),
     }
     let mut sink = tokio::io::sink();
     let mut context = RequestContext {
@@ -3915,10 +3931,15 @@ pub(super) async fn run_provisional_check(
     .await
 }
 
+pub(super) struct RevertResult {
+    pub message: String,
+    pub result: ExecuteResult,
+}
+
 pub(super) async fn finish_due_provisional(
     server: &ServerContext,
     p: &Provisional,
-) -> (String, Option<i32>) {
+) -> RevertResult {
     if p.confirm_check_binary.is_none() {
         return finish_revert(server, p, &CallerIdentity::Unknown, "auto").await;
     }
@@ -3927,10 +3948,13 @@ pub(super) async fn finish_due_provisional(
         run_provisional_check(server, p),
     )
     .await;
-    let check_exit = checked.ok().and_then(|result| match result.exec {
-        ExecOutcome::Completed { exit_code, .. } => exit_code,
-        _ => None,
+    let checked = checked.unwrap_or_else(|_| {
+        ExecuteResult::exec_failed_unknown_start(
+            "provisional confirmation check authorized",
+            "confirmation check timed out; outcome unknown",
+        )
     });
+    let check_exit = checked.exit_code();
     if check_exit == Some(0) {
         let expected = server
             .state
@@ -3973,10 +3997,10 @@ pub(super) async fn finish_due_provisional(
                             status: Some("confirmed".to_string()),
                             behavior: None,
                         });
-                        return (
-                            format!("provisional {} confirmed by independent check", p.handle),
-                            Some(0),
-                        );
+                        return RevertResult {
+                            message: format!("provisional {} confirmed by independent check", p.handle),
+                            result: checked,
+                        };
                     }
                     Ok(false) => tracing::warn!(
                         "confirmation check succeeded but provisional {} changed before publication",
@@ -3999,6 +4023,11 @@ pub(super) async fn finish_due_provisional(
     }
     server.emit_audit_ungated(
         AuditEvent::new(AuditKind::ProvisionalCheckFailed)
+            .execution(
+                checked.policy_decision(),
+                checked.execution_failure().cloned(),
+            )
+            .decision_source(checked.decision_source())
             .handle(&p.handle)
             .reason("running rollback")
             .field("exit", format!("{check_exit:?}")),
@@ -4159,7 +4188,8 @@ async fn defer_revert(
     caller: &CallerIdentity,
     kind: &str,
     detail: String,
-) -> (String, Option<i32>) {
+    result: ExecuteResult,
+) -> RevertResult {
     let updated = {
         let mut reg = server.state.provisional.write().await;
         reg.set_needs_operator_decision(&p.handle, detail.clone());
@@ -4172,17 +4202,22 @@ async fn defer_revert(
                 p.handle,
                 error
             );
-            return (
-                format!(
+            return RevertResult {
+                message: format!(
                     "provisional {} revert was deferred but its durable state could not be recorded; retry the operator action",
                     p.handle
                 ),
-                None,
-            );
+                result,
+            };
         }
     }
     server.emit_audit_ungated(
         AuditEvent::new(AuditKind::RevertDeferred)
+            .execution(
+                result.policy_decision(),
+                result.execution_failure().cloned(),
+            )
+            .decision_source(result.decision_source())
             .handle(&p.handle)
             .caller(caller)
             .reason(&detail)
@@ -4198,84 +4233,81 @@ async fn defer_revert(
         status: Some("needs_operator_decision".to_string()),
         behavior: None,
     });
-    (
-        format!("provisional {} revert deferred: {}", p.handle, detail),
-        None,
-    )
+    RevertResult {
+        message: format!("provisional {} revert deferred: {}", p.handle, detail),
+        result,
+    }
 }
 
-/// Run a claimed (`Reverting`) provisional's revert and record the outcome.
-/// Returns `(message, exit_code)`.
+/// Run a claimed provisional's revert and retain its policy and execution outcome.
 pub(super) async fn finish_revert(
     server: &ServerContext,
     p: &Provisional,
     caller: &CallerIdentity,
     kind: &str,
-) -> (String, Option<i32>) {
-    // Bound the revert so a hung rollback cannot pin the sweeper (which also
-    // drives fail-closed hold expiry). A timeout is recorded as RevertFailed.
-    let (status_ok, exit, detail) = if let Some(api) = &p.api_revert {
+) -> RevertResult {
+    // A timeout leaves the operation's start and completion unknown.
+    let result = if let Some(api) = &p.api_revert {
+        let reason = "provisional API rollback authorized";
         match tokio::time::timeout(
             std::time::Duration::from_secs(REVERT_EXEC_TIMEOUT_SECS),
             run_api_revert(server, p, api),
         )
         .await
         {
-            Ok(Ok(())) => (true, Some(0), None),
-            // Recoverable (no proxy for the protocol right now): route to the
-            // operator instead of terminal-failing, so a restart or flag change
-            // does not silently strand a live mutation.
+            Ok(Ok(())) => ExecuteResult::completed(reason, Some(0), None, None),
             Ok(Err(RevertError::Retryable(detail))) => {
-                return defer_revert(server, p, caller, kind, detail).await;
+                let result = ExecuteResult::exec_failed_unknown_start(reason, detail.clone());
+                return defer_revert(server, p, caller, kind, detail, result).await;
             }
-            Ok(Err(RevertError::Failed(reason))) => (false, None, Some(reason)),
-            Err(_) => (
-                false,
-                None,
-                Some(format!(
-                    "api revert timed out after {}s",
-                    REVERT_EXEC_TIMEOUT_SECS
-                )),
+            Ok(Err(RevertError::Failed(detail))) => {
+                ExecuteResult::exec_failed_unknown_start(reason, detail)
+            }
+            Err(_) => ExecuteResult::exec_failed_unknown_start(
+                reason,
+                "API rollback timed out; outcome unknown",
             ),
         }
     } else {
-        match tokio::time::timeout(
+        let result = tokio::time::timeout(
             std::time::Duration::from_secs(REVERT_EXEC_TIMEOUT_SECS),
             run_provisional_revert(server, p),
         )
         .await
+        .unwrap_or_else(|_| {
+            ExecuteResult::exec_failed_unknown_start(
+                "provisional rollback authorized",
+                "rollback timed out; outcome unknown",
+            )
+        });
+        if matches!(&result.exec, ExecOutcome::Failed { started: false, .. })
+            && (!p.secret_keys.is_empty() || !p.secret_file_keys.is_empty())
         {
-            Ok(result) => match &result.exec {
-                ExecOutcome::Completed { exit_code, .. } => {
-                    let ok = exit_code.unwrap_or(-1) == 0;
-                    (ok, *exit_code, None)
-                }
-                ExecOutcome::Failed {
-                    started: false,
-                    reason,
-                    ..
-                } if !p.secret_keys.is_empty() || !p.secret_file_keys.is_empty() => {
-                    return defer_revert(
-                        server,
-                        p,
-                        caller,
-                        kind,
-                        format!("revert secret resolution or pre-spawn setup failed: {reason}"),
-                    )
-                    .await;
-                }
-                ExecOutcome::Failed { reason, .. } => (false, None, Some(reason.clone())),
-                _ => (false, None, Some("unexpected revert outcome".to_string())),
-            },
-            Err(_) => (
-                false,
-                None,
-                Some(format!(
-                    "revert timed out after {}s",
-                    REVERT_EXEC_TIMEOUT_SECS
-                )),
-            ),
+            let detail = format!(
+                "revert secret resolution or pre-spawn setup failed: {}",
+                result
+                    .execution_failure()
+                    .expect("typed execution failure")
+                    .message
+            );
+            return defer_revert(server, p, caller, kind, detail, result).await;
         }
+        result
+    };
+    let exit = result.exit_code();
+    let status_ok = matches!(
+        &result.exec,
+        ExecOutcome::Completed {
+            exit_code: Some(0),
+            ..
+        }
+    );
+    let detail = if let Some(failure) = result.execution_failure() {
+        Some(failure.message.clone())
+    } else if !result.policy_allowed() {
+        Some(result.policy_reason().to_string())
+    } else {
+        None
     };
     // `kind` names who drove this rollback ("auto"/"auto-check-failed" for the
     // deadline sweeper, "manual" for operator reversion). Only the sweeper's own
@@ -4315,13 +4347,18 @@ pub(super) async fn finish_revert(
                 p.handle,
                 diagnostic
             );
-            return (
-                format!(
+            return RevertResult {
+                message: format!(
                     "provisional {} rollback completed but its terminal state could not be recorded: {}",
                     p.handle, diagnostic
                 ),
-                exit,
-            );
+                result: if result.execution_failure().is_some() || !result.policy_allowed() {
+                    result
+                } else {
+                    ExecuteResult::exec_failed_after_start(result.policy_reason(),
+                        "rollback result could not be persisted")
+                },
+            };
         }
     }
     // The revert is terminal (whether it succeeded or failed); drop any
@@ -4330,6 +4367,11 @@ pub(super) async fn finish_revert(
     if status_ok {
         server.emit_audit_ungated(
             AuditEvent::new(AuditKind::Revert)
+                .execution(
+                    result.policy_decision(),
+                    result.execution_failure().cloned(),
+                )
+                .decision_source(result.decision_source())
                 .handle(&p.handle)
                 .caller(caller)
                 .field("kind", kind)
@@ -4345,13 +4387,18 @@ pub(super) async fn finish_revert(
             status: Some("reverted".to_string()),
             behavior: None,
         });
-        (
-            format!("provisional {} reverted (exit {:?})", p.handle, exit),
-            exit,
-        )
+        RevertResult {
+            message: format!("provisional {} reverted (exit {:?})", p.handle, exit),
+            result,
+        }
     } else {
         server.emit_audit_ungated(
             AuditEvent::new(AuditKind::RevertFailed)
+                .execution(
+                    result.policy_decision(),
+                    result.execution_failure().cloned(),
+                )
+                .decision_source(result.decision_source())
                 .handle(&p.handle)
                 .caller(caller)
                 .field("kind", kind)
@@ -4368,15 +4415,15 @@ pub(super) async fn finish_revert(
             status: Some("revert_failed".to_string()),
             behavior: None,
         });
-        (
-            format!(
+        RevertResult {
+            message: format!(
                 "REVERT FAILED for provisional {} (exit {:?}); the change may still be in place: {}",
                 p.handle,
                 exit,
                 detail.unwrap_or_default()
             ),
-            exit,
-        )
+            result,
+        }
     }
 }
 

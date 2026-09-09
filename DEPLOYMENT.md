@@ -249,9 +249,13 @@ admin envelope accepts only the current operation and field grammar, so removed
 or malformed authority operations fail closed instead of selecting a
 compatibility path.
 
-The state database uses schema version 14. Startup migrates an older database in
+The state database uses schema version 15. Startup migrates an older database in
 place. Treat the installed binary, configuration, API-revert body tree, and
-complete SQLite file set as one rollback unit. Before the first schema-14
+complete SQLite file set as one rollback unit. Schema 15 adds nullable execution-failure
+details to session history; rows without these details carry no launch-stage or
+start-state evidence. An older reader refuses the migrated database. Rollback
+requires the matching stopped binary and its consistent pre-upgrade snapshot,
+not an older binary pointed at the migrated database. Before the first schema-15
 startup, resolve armed provisionals where practical, stop the service, verify
 that it is inactive, and create a consistent SQLite backup with the SQLite
 backup API. Copying only `state.db` while a process can write it can omit

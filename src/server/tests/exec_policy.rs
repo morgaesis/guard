@@ -2738,7 +2738,7 @@ async fn launch_failures_are_typed_in_buffered_and_streaming_execution() {
                 ExecOutcome::Failed { started: false, .. }
             ));
             let failure = result.execution_failure().expect("typed launch failure");
-            assert!(!failure.started);
+            assert_eq!(failure.started, Some(false));
             assert_eq!(failure.stage, stage, "{failure:?}");
             assert_eq!(failure.errno, Some(errno));
             assert!(!failure.message.contains(cwd.to_str().unwrap()));

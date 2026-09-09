@@ -37,7 +37,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::process::{Child, Command};
+use tokio::process::{ChildStderr, ChildStdout, Command};
 use tokio::sync::mpsc;
 #[cfg(unix)]
 use uzers::os::unix::UserExt;
@@ -53,7 +53,7 @@ use super::learning::{
 };
 #[cfg(unix)]
 use super::path_with_shim_dir;
-use super::runtime::{NotifyEvent, ProcessGuard};
+use super::runtime::{ChildOwnership, NotifyEvent, ProcessGuard};
 use super::transport::{write_policy_decision, write_stream_message};
 #[cfg(unix)]
 use super::wire::ExecOutcome;
@@ -500,6 +500,7 @@ async fn revalidate_exec_cwd(cwd: &Path) -> std::result::Result<(), LaunchError>
     })?;
     if canonical != cwd {
         return Err(LaunchError {
+            started: false,
             stage: ExecutionStage::Cwd,
             errno: None,
             message: "working directory changed before exec: canonical path differs",
@@ -514,6 +515,7 @@ async fn revalidate_exec_cwd(cwd: &Path) -> std::result::Result<(), LaunchError>
     })?;
     if !meta.is_dir() {
         return Err(LaunchError {
+            started: false,
             stage: ExecutionStage::Cwd,
             errno: None,
             message: "working directory changed before exec: not a directory",
@@ -2914,6 +2916,7 @@ fn drop_brokered_child_capabilities() -> std::io::Result<()> {
 
 #[derive(Debug)]
 struct LaunchError {
+    started: bool,
     stage: ExecutionStage,
     errno: Option<i32>,
     message: &'static str,
@@ -2922,6 +2925,7 @@ struct LaunchError {
 impl LaunchError {
     fn from_io(stage: ExecutionStage, message: &'static str, error: &std::io::Error) -> Self {
         Self {
+            started: false,
             stage,
             errno: error.raw_os_error(),
             message,
@@ -2937,7 +2941,17 @@ impl LaunchError {
             ),
             None => self.message.to_string(),
         };
-        ExecuteResult::launch_failed(policy_reason, self.stage, self.errno, message)
+        if self.started {
+            let result = ExecuteResult::exec_failed_after_start(policy_reason, message);
+            let failure = result.execution_failure().cloned().map(|mut failure| {
+                failure.stage = self.stage;
+                failure.errno = self.errno;
+                failure
+            });
+            result.with_execution_failure(failure)
+        } else {
+            ExecuteResult::launch_failed(policy_reason, self.stage, self.errno, message)
+        }
     }
 }
 
@@ -3000,6 +3014,7 @@ fn prepare_child_setup(
         .map(|path| CString::new(path.as_os_str().as_bytes()))
         .transpose()
         .map_err(|_| LaunchError {
+            started: false,
             stage: ExecutionStage::Cwd,
             errno: Some(libc::EINVAL),
             message: "working directory contains an invalid path byte",
@@ -3131,35 +3146,163 @@ fn read_child_setup_error(
         _ => return None,
     };
     (errno > 0 && spawn_error.raw_os_error() == Some(errno)).then_some(LaunchError {
+        started: false,
         stage,
         errno: Some(errno),
         message,
     })
 }
 
-fn spawn_brokered_command(
+struct ManagedChild {
+    ownership: ChildOwnership,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+}
+
+impl std::fmt::Debug for ManagedChild {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedChild")
+            .field("id", &self.id())
+            .finish()
+    }
+}
+
+impl ManagedChild {
+    fn id(&self) -> Option<u32> {
+        self.ownership.id()
+    }
+
+    fn attach_stdout(&mut self) -> std::result::Result<(), LaunchError> {
+        self.stdout = self
+            .ownership
+            .take_stdout()
+            .map(ChildStdout::from_std)
+            .transpose()
+            .map_err(|error| LaunchError {
+                started: true,
+                stage: ExecutionStage::Unknown,
+                errno: error.raw_os_error(),
+                message: "the command started but its standard output could not be managed",
+            })?;
+        Ok(())
+    }
+
+    fn attach_stderr(&mut self) -> std::result::Result<(), LaunchError> {
+        self.stderr = self
+            .ownership
+            .take_stderr()
+            .map(ChildStderr::from_std)
+            .transpose()
+            .map_err(|error| LaunchError {
+                started: true,
+                stage: ExecutionStage::Unknown,
+                errno: error.raw_os_error(),
+                message: "the command started but its standard error could not be managed",
+            })?;
+        Ok(())
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.ownership.try_wait()? {
+                return Ok(status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        let stdout = self.stdout.take();
+        let stderr = self.stderr.take();
+        let read_stdout = async move {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = stdout {
+                pipe.read_to_end(&mut bytes).await?;
+            }
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let read_stderr = async move {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = stderr {
+                pipe.read_to_end(&mut bytes).await?;
+            }
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let (stdout, stderr) = tokio::try_join!(read_stdout, read_stderr)?;
+        let status = self.wait().await?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        self.ownership.terminate(false);
+    }
+}
+
+fn spawn_owned_command(
     mut cmd: Command,
     cwd: Option<&Path>,
     identity: Option<&PreparedExecIdentity>,
-) -> std::result::Result<Child, LaunchError> {
+    secret_files: Option<super::secure_fs::SecretFileLease>,
+) -> std::result::Result<ManagedChild, LaunchError> {
+    let child = ManagedChild {
+        ownership: ChildOwnership::prepare(secret_files).map_err(|error| {
+            LaunchError::from_io(
+                ExecutionStage::Unknown,
+                "cannot prepare child cleanup ownership",
+                &error,
+            )
+        })?,
+        stdout: None,
+        stderr: None,
+    };
+    #[cfg(unix)]
+    cmd.as_std_mut().process_group(0);
     #[cfg(unix)]
     let mut report = prepare_child_setup(&mut cmd, cwd, identity)?;
     #[cfg(not(unix))]
     let _ = (cwd, identity);
-    let spawned = cmd.spawn();
-    // Release the parent's copy of the report writer before inspecting it.
-    drop(cmd);
-    spawned.map_err(|error| {
-        #[cfg(unix)]
-        if let Some(reported) = read_child_setup_error(&mut report, &error) {
-            return reported;
+    // This is the OS spawn boundary. Tokio output registration happens only
+    // after the standard child has a runtime-independent cleanup owner.
+    let spawned = cmd.as_std_mut().spawn();
+    match spawned {
+        Ok(process) => {
+            child.ownership.adopt(process);
+            drop(cmd);
+            Ok(child)
         }
-        LaunchError::from_io(
-            ExecutionStage::Unknown,
-            "process launch failed without a child setup report",
-            &error,
-        )
-    })
+        Err(error) => {
+            drop(cmd);
+            #[cfg(unix)]
+            if let Some(reported) = read_child_setup_error(&mut report, &error) {
+                return Err(reported);
+            }
+            Err(LaunchError::from_io(
+                ExecutionStage::Unknown,
+                "process launch failed without a child setup report",
+                &error,
+            ))
+        }
+    }
+}
+
+fn spawn_brokered_command(
+    cmd: Command,
+    cwd: Option<&Path>,
+    identity: Option<&PreparedExecIdentity>,
+    secret_files: Option<super::secure_fs::SecretFileLease>,
+) -> std::result::Result<ManagedChild, LaunchError> {
+    let mut child = spawn_owned_command(cmd, cwd, identity, secret_files)?;
+    child.attach_stdout()?;
+    child.attach_stderr()?;
+    Ok(child)
 }
 
 #[cfg(unix)]
@@ -3889,9 +4032,6 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         }
     }
 
-    #[cfg(unix)]
-    cmd.as_std_mut().process_group(0);
-
     // Learned deny, composed verb authority, and live session state are held
     // only through the finite process-start handoff. A revocation that commits
     // first prevents spawn; a revocation after spawn applies to later uses.
@@ -3920,10 +4060,22 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = match spawn_brokered_command(cmd, request.cwd.as_deref(), exec_caller.as_ref())
-    {
+    let mut child = match spawn_brokered_command(
+        cmd,
+        request.cwd.as_deref(),
+        exec_caller.as_ref(),
+        secret_file_lease,
+    ) {
         Ok(child) => child,
-        Err(error) => return error.into_result(allow_reason),
+        Err(error) => {
+            if error.started {
+                audit_credential_access(server, caller, &request, &credential_references);
+                return error
+                    .into_result(allow_reason)
+                    .with_credential_references(credential_references);
+            }
+            return error.into_result(allow_reason);
+        }
     };
     drop(tool_mapping_lease);
     drop(initiation_lease);
@@ -3948,13 +4100,10 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             &mut *context.stream_writer,
         )
         .await;
-        drop(secret_file_lease);
         return result;
     }
 
-    let mut process_guard = child
-        .id()
-        .map(|pid| server.state.process_tracker.track(pid));
+    let mut process_guard = Some(server.state.process_tracker.track(child.ownership.clone()));
     audit_credential_access(server, caller, &request, &credential_references);
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -4093,7 +4242,6 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         }
     }
 
-    drop(secret_file_lease);
     ExecuteResult::completed(allow_reason, exit_code, stdout, stderr)
         .with_credential_references(credential_references)
 }
@@ -4286,7 +4434,7 @@ impl Drop for StreamTaskCleanup {
 }
 
 async fn cleanup_streaming_failure(
-    child: &mut tokio::process::Child,
+    child: &mut ManagedChild,
     process_guard: &mut Option<ProcessGuard>,
     stream_tasks: &mut StreamTaskCleanup,
 ) {
@@ -4295,15 +4443,15 @@ async fn cleanup_streaming_failure(
 }
 
 async fn terminate_spawned_child(
-    child: &mut tokio::process::Child,
+    child: &mut ManagedChild,
     process_guard: &mut Option<ProcessGuard>,
 ) {
     if let Some(guard) = process_guard.take() {
         guard.terminate_gracefully().await;
     } else {
-        let _ = child.kill().await;
+        child.ownership.terminate(false);
+        child.ownership.wait_for_cleanup().await;
     }
-    let _ = child.wait().await;
 }
 
 fn exec_timeout_reason(timeout_secs: u64) -> String {
@@ -4399,7 +4547,7 @@ struct OutputRedactionContext<'a> {
 }
 
 async fn execute_streaming_child<W: AsyncWrite + Unpin>(
-    mut child: Child,
+    mut child: ManagedChild,
     allow_reason: String,
     exec_timeout_secs: u64,
     server: &ServerContext,
@@ -4407,9 +4555,7 @@ async fn execute_streaming_child<W: AsyncWrite + Unpin>(
     audit: SpawnAuditContext<'_>,
     writer: &mut W,
 ) -> ExecuteResult {
-    let mut process_guard = child
-        .id()
-        .map(|pid| server.state.process_tracker.track(pid));
+    let mut process_guard = Some(server.state.process_tracker.track(child.ownership.clone()));
     audit_credential_access(
         server,
         audit.caller,
@@ -4943,6 +5089,143 @@ mod child_launch_tests {
         cmd
     }
 
+    fn wait_for_fixture(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture deadline exceeded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn assert_child_reaped(ownership: &ChildOwnership, pid: u32) {
+        wait_for_fixture(|| ownership.id().is_none());
+        assert!(ownership.try_wait().unwrap().is_some());
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn child_launch_registration_failure_reports_started_and_reaps_without_runtime() {
+        for partial_registration in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("started");
+            let (lease, bindings) = super::super::secure_fs::SecretFileLease::create(
+                directory.path(),
+                &[("FIXTURE_FILE".into(), "fixture-value".into())],
+            )
+            .unwrap();
+            let secret_path = bindings[0].1.clone();
+            let mut child = spawn_owned_command(
+                shell("printf started > started; exec sleep 30"),
+                Some(directory.path()),
+                None,
+                Some(lease),
+            )
+            .unwrap();
+            let ownership = child.ownership.clone();
+            let pid = child.id().unwrap();
+            wait_for_fixture(|| marker.exists());
+            assert!(secret_path.exists());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let handle = runtime.handle().clone();
+            if partial_registration {
+                let _entered = handle.enter();
+                child.attach_stdout().unwrap();
+            }
+            drop(runtime);
+            let error = {
+                let _entered = handle.enter();
+                if partial_registration {
+                    child.attach_stderr()
+                } else {
+                    child.attach_stdout()
+                }
+            }
+            .unwrap_err();
+            assert!(error.started);
+            assert_eq!(error.stage, ExecutionStage::Unknown);
+            assert_eq!(error.errno, None);
+            let result = error.into_result("fixture policy approval".into());
+            assert!(result.policy_allowed());
+            assert!(matches!(
+                result.exec,
+                ExecOutcome::Failed { started: true, .. }
+            ));
+            let failure = result.execution_failure().unwrap();
+            assert_eq!(failure.stage, ExecutionStage::Unknown);
+            assert_eq!(failure.started, Some(true));
+            drop(child);
+            assert_child_reaped(&ownership, pid);
+            assert!(
+                !secret_path.exists(),
+                "secret lease survives only until reaping"
+            );
+            assert!(marker.exists(), "the child performed an actual side effect");
+        }
+    }
+
+    #[test]
+    fn child_launch_runtime_shutdown_cancels_owned_wait_and_reaps_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("started");
+        let survivor = directory.path().join("survived");
+        let (lease, bindings) = super::super::secure_fs::SecretFileLease::create(
+            directory.path(),
+            &[("FIXTURE_FILE".into(), "fixture-value".into())],
+        )
+        .unwrap();
+        let secret_path = bindings[0].1.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut child = {
+            let _entered = runtime.enter();
+            spawn_brokered_command(
+                shell("(sleep 0.4; printf survived > survived) & printf started > started; wait"),
+                Some(directory.path()),
+                None,
+                Some(lease),
+            )
+            .unwrap()
+        };
+        let ownership = child.ownership.clone();
+        let pid = child.id().unwrap();
+        let task = runtime.spawn(async move { child.wait().await });
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !marker.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        assert!(!task.is_finished());
+        assert!(secret_path.exists());
+        drop(runtime);
+        assert_child_reaped(&ownership, pid);
+        assert!(!secret_path.exists());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !survivor.exists(),
+            "a same-group descendant survived cancellation"
+        );
+    }
+
     #[tokio::test]
     async fn child_launch_distinguishes_cwd_and_executable_failures() {
         if unsafe { libc::geteuid() } == 0 {
@@ -4958,7 +5241,7 @@ mod child_launch_tests {
             .unwrap();
         assert!(denied.canonicalize().unwrap().metadata().unwrap().is_dir());
         let error =
-            spawn_brokered_command(shell("printf started"), Some(&denied), None).unwrap_err();
+            spawn_brokered_command(shell("printf started"), Some(&denied), None, None).unwrap_err();
         std::fs::remove_dir(&denied).unwrap();
         assert_eq!(error.stage, ExecutionStage::Cwd);
         assert_eq!(error.errno, Some(libc::EACCES));
@@ -4968,13 +5251,14 @@ mod child_launch_tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o000)).unwrap();
         let error =
-            spawn_brokered_command(shell("printf started"), Some(&nested), None).unwrap_err();
+            spawn_brokered_command(shell("printf started"), Some(&nested), None, None).unwrap_err();
         std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(error.stage, ExecutionStage::Cwd);
         assert_eq!(error.errno, Some(libc::EACCES));
 
         let missing = cwd.join("missing-executable");
-        let error = spawn_brokered_command(Command::new(missing), Some(&cwd), None).unwrap_err();
+        let error =
+            spawn_brokered_command(Command::new(missing), Some(&cwd), None, None).unwrap_err();
         assert_eq!(error.stage, ExecutionStage::Exec);
         assert_eq!(error.errno, Some(libc::ENOENT));
 
@@ -4985,8 +5269,8 @@ mod child_launch_tests {
             .mode(0o600)
             .open(&denied_executable)
             .unwrap();
-        let error =
-            spawn_brokered_command(Command::new(denied_executable), Some(&cwd), None).unwrap_err();
+        let error = spawn_brokered_command(Command::new(denied_executable), Some(&cwd), None, None)
+            .unwrap_err();
         assert_eq!(error.stage, ExecutionStage::Exec);
         assert_eq!(error.errno, Some(libc::EACCES));
     }
@@ -5007,7 +5291,7 @@ mod child_launch_tests {
         std::fs::write(temp.path().join("relative-input"), "relative-cwd-ok").unwrap();
         let mut cmd = Command::new("./relative-tool");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = spawn_brokered_command(cmd, Some(temp.path()), None).unwrap();
+        let child = spawn_brokered_command(cmd, Some(temp.path()), None, None).unwrap();
         let output = child.wait_with_output().await.unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_eq!(output.stdout, b"relative-cwd-ok");
@@ -5017,7 +5301,7 @@ mod child_launch_tests {
     async fn child_launch_keeps_unobserved_setup_failures_unknown() {
         let mut cmd = shell("printf started");
         cmd.arg("invalid\0argument");
-        let error = spawn_brokered_command(cmd, None, None).unwrap_err();
+        let error = spawn_brokered_command(cmd, None, None, None).unwrap_err();
         assert_eq!(error.stage, ExecutionStage::Unknown);
         assert_eq!(error.errno, None);
     }
@@ -5034,7 +5318,7 @@ mod child_launch_tests {
         groups.push(unsafe { libc::getegid() });
         groups.sort_unstable();
         groups.dedup();
-        let child = spawn_brokered_command(shell("id -u; id -g; id -G"), None, None).unwrap();
+        let child = spawn_brokered_command(shell("id -u; id -g; id -G"), None, None, None).unwrap();
         let output = child.wait_with_output().await.unwrap();
         assert!(output.status.success());
         let output = String::from_utf8(output.stdout).unwrap();
@@ -5074,9 +5358,13 @@ mod child_launch_tests {
         .unwrap();
         assert!(identity.groups.contains(&identity.context.gid));
         let missing = tempfile::tempdir().unwrap().path().join("missing");
-        let error =
-            spawn_brokered_command(shell("printf started"), Some(&missing), Some(&identity))
-                .unwrap_err();
+        let error = spawn_brokered_command(
+            shell("printf started"),
+            Some(&missing),
+            Some(&identity),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error.stage, ExecutionStage::Identity);
         assert_eq!(error.errno, Some(libc::EPERM));
     }
@@ -5090,7 +5378,7 @@ mod child_launch_tests {
         }
         let mut cmd = Command::new("cat");
         cmd.arg("/proc/self/status").stdout(Stdio::piped());
-        let output = spawn_brokered_command(cmd, None, None)
+        let output = spawn_brokered_command(cmd, None, None, None)
             .unwrap()
             .wait_with_output()
             .await

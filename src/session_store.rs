@@ -3028,6 +3028,7 @@ fn valid_approval_transition(previous: &Approval, next: &Approval) -> Result<boo
             | (ApprovalStatus::Pending, ApprovalStatus::Denied)
             | (ApprovalStatus::Pending, ApprovalStatus::Expired)
             | (ApprovalStatus::Pending, ApprovalStatus::ExecFailed)
+            | (ApprovalStatus::Approving, ApprovalStatus::Denied)
             | (ApprovalStatus::Approving, ApprovalStatus::Approved)
             | (ApprovalStatus::Approving, ApprovalStatus::ExecFailed)
             | (ApprovalStatus::Approved, ApprovalStatus::Approved)
@@ -4516,7 +4517,7 @@ mod tests {
         let path = directory.path().join("state.db");
         let store = SessionStore::open(path.clone(), 3600).await.unwrap();
         let failure = ExecutionFailure {
-            started: false,
+            started: Some(false),
             stage: ExecutionStage::Cwd,
             errno: Some(13),
             message: "permission denied".into(),
@@ -4577,6 +4578,142 @@ mod tests {
                 .decision_source,
             "static_policy"
         );
+    }
+
+    #[tokio::test]
+    async fn populated_schema_14_migrates_without_changing_authority_and_snapshot_stays_14() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let snapshot = directory.path().join("snapshot-14.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let registry = SessionRegistry::from_typed_parts(
+            HashMap::new(),
+            Vec::new(),
+            vec![StoredSessionInteraction::from_typed_parts(
+                "fixture-session".into(),
+                SessionInteraction {
+                    execution_failure: None,
+                    at_unix: guard::env::now_unix(),
+                    command: "true".into(),
+                    allowed: true,
+                    source: SessionDecisionSource::StaticPolicy,
+                    reason: "approved fixture".into(),
+                    risk: None,
+                    exec_status: SessionExecStatus::Failed,
+                    exit_code: None,
+                    exposed_secret_refs: Vec::new(),
+                    decision_trace: Some(guard::gating::DecisionTrace::source("static_policy")),
+                },
+                Vec::new(),
+            )],
+            3600,
+        );
+        store.persist_registry(&registry).await.unwrap();
+        let approval = pending_approval("ap-schema");
+        store.save_approval(approval.clone()).await.unwrap();
+        let provisional = provisional_row("pv-schema", ProvisionalStatus::Armed);
+        store.save_provisional(provisional.clone()).await.unwrap();
+        let request = generated_access_request();
+        store.save_grant_request(request.clone()).await.unwrap();
+        let grant = crate::grant_profile::SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: inspect\n    activated_verbs: [inspect-fixture]\n    ttl_secs: 300\n"
+        ).unwrap().get("inspect").unwrap().clone();
+        store.save_saved_grant(grant).await.unwrap();
+        drop(store);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE session_interactions DROP COLUMN execution_failure_json; PRAGMA user_version = 14;").unwrap();
+        // VACUUM INTO creates a consistent fixture snapshot without copying a live WAL.
+        conn.execute("VACUUM INTO ?1", params![snapshot.to_str().unwrap()])
+            .unwrap();
+        fn authority_rows(conn: &Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+            [
+                "gating_approval",
+                "gating_provisional",
+                "saved_grants",
+                "grant_requests",
+                "session_grants",
+                "session_history",
+            ]
+            .into_iter()
+            .map(|table| {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let count = stmt.column_count();
+                stmt.query_map([], |row| (0..count).map(|i| row.get(i)).collect())
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<Vec<rusqlite::types::Value>>>>()
+                    .unwrap()
+            })
+            .collect()
+        }
+        let authority = authority_rows(&conn);
+        drop(conn);
+        let migrated = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            15
+        );
+        assert_eq!(authority_rows(&conn), authority);
+        let failure: Option<String> = conn
+            .query_row(
+                "SELECT execution_failure_json FROM session_interactions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(failure, None);
+        let interaction = migrated
+            .load_registry()
+            .await
+            .unwrap()
+            .typed_interactions_snapshot()
+            .pop()
+            .unwrap()
+            .1;
+        assert!(interaction.allowed);
+        assert_eq!(interaction.source, SessionDecisionSource::StaticPolicy);
+        assert!(interaction.execution_failure.is_none());
+        assert_eq!(
+            migrated.load_approvals().await.unwrap()[0].snapshot,
+            approval.snapshot
+        );
+        assert_eq!(migrated.load_provisionals().await.unwrap()[0], provisional);
+        assert_eq!(migrated.load_grant_requests().await.unwrap(), vec![request]);
+        drop(conn);
+        drop(migrated);
+        let before_refusal = std::fs::read(&path).unwrap();
+        let reader =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let version = reader
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert!(ensure_supported_schema_version(version, 14)
+            .unwrap_err()
+            .to_string()
+            .contains("newer than supported"));
+        drop(reader);
+        assert_eq!(std::fs::read(&path).unwrap(), before_refusal);
+        let rollback =
+            Connection::open_with_flags(&snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let version = rollback
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(version, 14);
+        ensure_supported_schema_version(version, 14).unwrap();
+        assert_eq!(authority_rows(&rollback), authority);
+        assert!(rollback
+            .prepare("SELECT execution_failure_json FROM session_interactions")
+            .is_err());
+        let count = rollback
+            .query_row("SELECT COUNT(*) FROM session_interactions", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     fn pending_approval(handle: &str) -> Approval {
@@ -7670,11 +7807,15 @@ mod tests {
         let mut denied = approving.clone();
         denied.status = ApprovalStatus::Denied;
         denied.decided_unix = Some(2);
-        denied.decided_reason = Some("late denial".to_string());
-        assert!(store
-            .compare_and_swap_approval(approving, denied)
+        denied.decided_reason = Some("originating authority was revoked".to_string());
+        store
+            .compare_and_swap_approval(approving.clone(), denied.clone())
             .await
-            .is_err());
+            .unwrap();
+        assert!(store.save_approval(approving).await.is_err());
+        let terminal = store.load_approvals().await.unwrap().pop().unwrap();
+        assert_eq!(terminal.status, ApprovalStatus::Denied);
+        assert_eq!(terminal.decided_reason, denied.decided_reason);
     }
 
     #[tokio::test]

@@ -1577,12 +1577,11 @@ pub(super) enum ExecOutcome {
         stdout: Option<String>,
         stderr: Option<String>,
     },
-    /// Policy approved, but the child failed. `started` distinguishes a
-    /// spawn/setup failure where the child never ran (e.g. ENOENT on the binary)
-    /// from a failure after it was launched (e.g. the client stream dropped
-    /// mid-run). A contained forward command that fails with `started: true` may
-    /// already have applied its mutation, so the containment envelope keeps the
-    /// auto-revert armed rather than dropping it.
+    /// Policy approved, but execution failed. `started: false` establishes
+    /// that the command never started. `true` includes both a known start and
+    /// an unknown start state, distinguished by the public `ExecutionFailure`.
+    /// Interrupted containment requires operator judgment because the command
+    /// may already have applied its mutation.
     Failed { reason: String, started: bool },
     /// Policy approved, but the server intentionally did not spawn the child.
     /// Carries gate coverage when the dry-run was routed by the consequence gate.
@@ -1709,7 +1708,7 @@ impl ExecuteResult {
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
             execution_failure: Some(ExecutionFailure {
-                started: false,
+                started: Some(false),
                 stage: ExecutionStage::Unknown,
                 errno: None,
                 message: exec_reason,
@@ -1741,7 +1740,7 @@ impl ExecuteResult {
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
             execution_failure: Some(ExecutionFailure {
-                started: true,
+                started: Some(true),
                 stage: ExecutionStage::Unknown,
                 errno: None,
                 message: exec_reason,
@@ -1762,7 +1761,7 @@ impl ExecuteResult {
         let message = Self::sanitize_prose(message);
         Self::exec_failed(policy_reason, message.clone()).with_execution_failure(Some(
             ExecutionFailure {
-                started: false,
+                started: Some(false),
                 stage,
                 errno,
                 message,
@@ -1775,10 +1774,26 @@ impl ExecuteResult {
         {
             let failure = failure.sanitized();
             *reason = failure.message.clone();
-            *started = failure.started;
+            // The internal containment flag is conservative when start is unknown.
+            *started = failure.started.unwrap_or(true);
             self.execution_failure = Some(failure);
         }
         self
+    }
+
+    pub(super) fn exec_failed_unknown_start(
+        policy_reason: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        let message = Self::sanitize_prose(message);
+        Self::exec_failed_after_start(policy_reason, message.clone()).with_execution_failure(Some(
+            ExecutionFailure {
+                started: None,
+                stage: ExecutionStage::Unknown,
+                errno: None,
+                message,
+            },
+        ))
     }
 
     pub(super) fn execution_failure(&self) -> Option<&ExecutionFailure> {
@@ -2025,6 +2040,9 @@ impl ExecuteResult {
     }
 
     pub(super) fn with_admission_trace(mut self, trace: Option<&DecisionTrace>) -> Self {
+        if !self.policy_allowed() {
+            return self;
+        }
         if let Some(trace) = trace {
             self.decision_source =
                 serde_json::from_value(serde_json::Value::String(trace.decision_source.clone()))
