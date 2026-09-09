@@ -4952,7 +4952,10 @@ mod child_launch_tests {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
         let denied = cwd.join("denied-directory");
-        std::fs::DirBuilder::new().mode(0).create(&denied).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o000)
+            .create(&denied)
+            .unwrap();
         assert!(denied.canonicalize().unwrap().metadata().unwrap().is_dir());
         let error =
             spawn_brokered_command(shell("printf started"), Some(&denied), None).unwrap_err();
@@ -4963,7 +4966,7 @@ mod child_launch_tests {
         let ancestor = cwd.join("ancestor");
         let nested = ancestor.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
-        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o000)).unwrap();
         let error =
             spawn_brokered_command(shell("printf started"), Some(&nested), None).unwrap_err();
         std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();

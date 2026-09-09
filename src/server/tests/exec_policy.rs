@@ -2665,7 +2665,7 @@ async fn launch_failures_are_typed_in_buffered_and_streaming_execution() {
     let cwd = temp.path().canonicalize().unwrap();
     let denied_cwd = cwd.join("denied-directory");
     std::fs::DirBuilder::new()
-        .mode(0)
+        .mode(0o000)
         .create(&denied_cwd)
         .unwrap();
     let denied_binary = cwd.join("denied-executable");
@@ -2819,7 +2819,7 @@ async fn launch_failure_is_recorded_as_an_allowed_session_interaction_after_rest
             .unwrap(),
     );
     let cwd = temp.path().join("denied-directory");
-    std::fs::DirBuilder::new().mode(0).create(&cwd).unwrap();
+    std::fs::DirBuilder::new().mode(0o000).create(&cwd).unwrap();
     let token = format!("launch-failure-{}", std::process::id());
     let mut grant = unrestricted_session();
     grant.owner = crate::session::SessionOwner::Principal(PrincipalKey::from_uid(uid));
@@ -3485,14 +3485,18 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
     req.session_token = Some(token);
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
 
+    assert!(result.policy_allowed());
+    let failure = result.execution_failure().unwrap();
+    assert_eq!(failure.stage, guard::wire::ExecutionStage::Exec);
+    assert_eq!(failure.errno, None);
     match result.exec {
         ExecOutcome::Failed { reason, started } => {
             assert!(!started);
             assert!(
-                reason.contains("underlying executable 'missing-tool' is unavailable"),
+                reason.contains("cannot be resolved on the configured command path"),
                 "got: {reason}"
             );
-            assert!(reason.contains("non-shim directory"), "got: {reason}");
+            assert!(!reason.contains("missing-tool"), "got: {reason}");
         }
         other => panic!("expected pre-start exec failure, got {:?}", other),
     }
@@ -3561,14 +3565,18 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
     req.session_token = Some(token);
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
 
+    assert!(result.policy_allowed());
+    let failure = result.execution_failure().unwrap();
+    assert_eq!(failure.stage, guard::wire::ExecutionStage::Exec);
+    assert_eq!(failure.errno, None);
     match result.exec {
         ExecOutcome::Failed { reason, started } => {
             assert!(!started);
             assert!(
-                reason.contains("underlying executable 'allowed-tool' is unavailable"),
+                reason.contains("cannot be resolved on the configured command path"),
                 "got: {reason}"
             );
-            assert!(reason.contains("non-shim directory"), "got: {reason}");
+            assert!(!reason.contains("allowed-tool"), "got: {reason}");
         }
         other => panic!("expected pre-start exec failure, got {:?}", other),
     }
