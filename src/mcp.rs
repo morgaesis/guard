@@ -1794,7 +1794,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         );
         properties.insert("execution_failure".to_string(), json!({
             "type": ["object", "null"], "properties": {
-                "started": {"type": "boolean"}, "stage": {"type": "string"},
+                "started": {"type": ["boolean", "null"]}, "stage": {"type": "string"},
                 "errno": {"type": ["integer", "null"]}, "message": {"type": "string"}
             }, "required": ["started", "stage", "errno", "message"], "additionalProperties": false
         }));
@@ -2048,8 +2048,11 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 stdout,
                 stderr,
             }) => {
+                let denied = policy.as_ref().is_some_and(|policy| !policy.allowed);
                 let label = if execution_failure.is_some() {
                     "EXECUTION FAILED: "
+                } else if denied {
+                    "DENIED: "
                 } else {
                     ""
                 };
@@ -2058,7 +2061,9 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                     stdout.as_deref().unwrap_or_default(),
                     stderr.as_deref().unwrap_or_default()
                 );
-                let is_error = execution_failure.is_some();
+                let is_error = execution_failure.is_some()
+                    || denied
+                    || exit_code.is_some_and(|code| code != 0);
                 let mut response = admin_tool_result(
                     "approval_resume",
                     text,

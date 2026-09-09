@@ -626,7 +626,7 @@ async fn held_replay_rejects_session_revision_amendment_before_process_start() {
             .get(&handle)
             .unwrap()
             .status,
-        ApprovalStatus::ExecFailed
+        ApprovalStatus::Denied
     );
 }
 
@@ -711,7 +711,7 @@ async fn held_replay_rejects_interaction_suspension_before_process_start() {
             .get(&handle)
             .unwrap()
             .status,
-        ApprovalStatus::ExecFailed
+        ApprovalStatus::Denied
     );
 }
 
@@ -797,7 +797,7 @@ verbs:
             .get(&handle)
             .unwrap()
             .status,
-        ApprovalStatus::ExecFailed
+        ApprovalStatus::Denied
     );
 }
 

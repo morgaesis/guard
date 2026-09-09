@@ -36,7 +36,9 @@ impl ExecutionStage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionFailure {
-    pub started: bool,
+    /// None means the execution may have started, but no observation survives.
+    #[serde(default)]
+    pub started: Option<bool>,
     pub stage: ExecutionStage,
     pub errno: Option<i32>,
     pub message: String,

@@ -1709,7 +1709,7 @@ impl ExecuteResult {
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
             execution_failure: Some(ExecutionFailure {
-                started: false,
+                started: Some(false),
                 stage: ExecutionStage::Unknown,
                 errno: None,
                 message: exec_reason,
@@ -1741,7 +1741,7 @@ impl ExecuteResult {
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
             execution_failure: Some(ExecutionFailure {
-                started: true,
+                started: Some(true),
                 stage: ExecutionStage::Unknown,
                 errno: None,
                 message: exec_reason,
@@ -1762,7 +1762,7 @@ impl ExecuteResult {
         let message = Self::sanitize_prose(message);
         Self::exec_failed(policy_reason, message.clone()).with_execution_failure(Some(
             ExecutionFailure {
-                started: false,
+                started: Some(false),
                 stage,
                 errno,
                 message,
@@ -1775,10 +1775,26 @@ impl ExecuteResult {
         {
             let failure = failure.sanitized();
             *reason = failure.message.clone();
-            *started = failure.started;
+            // The internal containment flag is conservative when start is unknown.
+            *started = failure.started.unwrap_or(true);
             self.execution_failure = Some(failure);
         }
         self
+    }
+
+    pub(super) fn exec_failed_unknown_start(
+        policy_reason: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        let message = Self::sanitize_prose(message);
+        Self::exec_failed_after_start(policy_reason, message.clone()).with_execution_failure(Some(
+            ExecutionFailure {
+                started: None,
+                stage: ExecutionStage::Unknown,
+                errno: None,
+                message,
+            },
+        ))
     }
 
     pub(super) fn execution_failure(&self) -> Option<&ExecutionFailure> {
@@ -2025,6 +2041,9 @@ impl ExecuteResult {
     }
 
     pub(super) fn with_admission_trace(mut self, trace: Option<&DecisionTrace>) -> Self {
+        if !self.policy_allowed() {
+            return self;
+        }
         if let Some(trace) = trace {
             self.decision_source =
                 serde_json::from_value(serde_json::Value::String(trace.decision_source.clone()))

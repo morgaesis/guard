@@ -1879,7 +1879,7 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
     );
     let outcome = finish_due_provisional(&cfg, &due[0]).await;
 
-    assert_eq!(outcome.1, Some(0));
+    assert_eq!(outcome.result.exit_code(), Some(0));
     let row = cfg
         .state
         .provisional
@@ -1888,7 +1888,12 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         .get(&handle)
         .cloned()
         .unwrap();
-    assert_eq!(row.status, ProvisionalStatus::Confirmed, "{}", outcome.0);
+    assert_eq!(
+        row.status,
+        ProvisionalStatus::Confirmed,
+        "{}",
+        outcome.message
+    );
     assert_eq!(
         row.session_fingerprint.as_deref(),
         Some(audit_session_fingerprint(Some("check-session")).as_str())
@@ -1950,7 +1955,7 @@ async fn due_failed_confirm_check_runs_the_rollback() {
         .unwrap();
     let outcome = finish_due_provisional(&cfg, &due[0]).await;
 
-    assert_eq!(outcome.1, Some(0));
+    assert_eq!(outcome.result.exit_code(), Some(0));
     assert_eq!(
         cfg.state
             .provisional
@@ -2108,13 +2113,15 @@ async fn provisional_revert_reresolves_secret_after_restart() {
         .await
         .begin_revert(&handle)
         .expect("claim recovered provisional");
-    let (message, exit) = finish_revert(
+    let outcome = finish_revert(
         &restarted,
         &missing_claim,
         &CallerIdentity::Unknown,
         "operator",
     )
     .await;
+    let exit = outcome.result.exit_code();
+    let message = outcome.message;
     assert_eq!(exit, None);
     assert!(message.contains("deferred"), "got: {message}");
     assert_eq!(
@@ -2143,8 +2150,19 @@ async fn provisional_revert_reresolves_secret_after_restart() {
         .await
         .begin_revert(&handle)
         .expect("retry deferred provisional");
-    let (_message, exit) =
-        finish_revert(&restarted, &retry, &CallerIdentity::Unknown, "operator").await;
+    let expected = store
+        .load_provisionals()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.handle == handle)
+        .unwrap();
+    store
+        .compare_and_swap_provisional(expected, retry.clone())
+        .await
+        .unwrap();
+    let outcome = finish_revert(&restarted, &retry, &CallerIdentity::Unknown, "operator").await;
+    let exit = outcome.result.exit_code();
     assert_eq!(exit, Some(0));
     assert_eq!(
         std::fs::read_to_string(&output).expect("read revert output"),
@@ -2282,7 +2300,9 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
     // A missing proxy is recoverable: the change is still live, so the revert
     // is deferred to the operator (NeedsOperatorDecision) rather than burned as
     // a terminal RevertFailed.
-    let (message, exit) = finish_revert(&cfg, &provisional, &CallerIdentity::Unknown, "auto").await;
+    let outcome = finish_revert(&cfg, &provisional, &CallerIdentity::Unknown, "auto").await;
+    let exit = outcome.result.exit_code();
+    let message = outcome.message;
     assert!(message.contains("deferred"), "got: {message}");
     assert_eq!(exit, None);
     let row = cfg
@@ -2362,7 +2382,9 @@ async fn failed_revert_is_durable_queryable_and_notifies_operator() {
         .await
         .expect("persist reverting claim");
 
-    let (message, exit) = finish_revert(&cfg, &claimed, &CallerIdentity::Unknown, "auto").await;
+    let outcome = finish_revert(&cfg, &claimed, &CallerIdentity::Unknown, "auto").await;
+    let exit = outcome.result.exit_code();
+    let message = outcome.message;
     assert_eq!(exit, Some(1));
     assert!(message.contains("REVERT FAILED"), "got: {message}");
 
@@ -2548,7 +2570,9 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
         .await
         .insert(provisional.clone());
 
-    let (message, exit) = finish_revert(&cfg, &provisional, &CallerIdentity::Unknown, "auto").await;
+    let outcome = finish_revert(&cfg, &provisional, &CallerIdentity::Unknown, "auto").await;
+    let exit = outcome.result.exit_code();
+    let message = outcome.message;
     assert!(message.contains("reverted"), "got: {message}");
     assert_eq!(exit, Some(0));
     let row = cfg
@@ -3390,7 +3414,9 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
         },
     )
     .await;
-    assert!(matches!(refused, AdminResponse::Error { .. }));
+    assert!(
+        matches!(refused, AdminResponse::GateAction { exit_code: Some(crate::EXIT_GUARD_DENIED), policy: Some(ref policy), .. } if !policy.allowed)
+    );
     assert!(!marker.exists());
 
     let resumed = handle_admin_request_for_test(
@@ -3433,7 +3459,9 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
         },
     )
     .await;
-    assert!(matches!(replay, AdminResponse::Error { .. }));
+    assert!(
+        matches!(replay, AdminResponse::GateAction { exit_code: Some(crate::EXIT_GUARD_DENIED), policy: Some(ref policy), .. } if !policy.allowed)
+    );
 
     let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
         &cfg,
@@ -3640,7 +3668,9 @@ async fn armed_hold_expires_across_restart_without_execution() {
         },
     )
     .await;
-    assert!(matches!(response, AdminResponse::Error { .. }));
+    assert!(
+        matches!(response, AdminResponse::GateAction { exit_code: Some(crate::EXIT_GUARD_DENIED), policy: Some(ref policy), .. } if !policy.allowed)
+    );
     assert!(!marker.exists());
     let durable = store.load_approvals().await.unwrap();
     assert_eq!(
@@ -4180,11 +4210,11 @@ async fn held_snapshot_does_not_fall_through_to_overlapping_authority() {
     assert!(items[0].success);
     assert_eq!(items[0].state, "armed");
     let resumed = resume_approval(&cfg, &agent, &handle).await;
-    assert!(matches!(
-        resumed.exec,
-        ExecOutcome::Failed { ref reason, .. }
-            if reason.contains("access use limit is exhausted")
-    ));
+    assert!(matches!(resumed.exec, ExecOutcome::NotAttempted));
+    assert!(!resumed.policy_allowed());
+    assert!(resumed
+        .policy_reason()
+        .contains("access use limit is exhausted"));
     assert_eq!(
         cfg.state
             .sessions
@@ -4498,13 +4528,9 @@ async fn held_access_replay_fails_if_staged_session_was_revoked() {
         Some(&access_requests),
     )
     .await;
-    assert!(matches!(
-        result.exec,
-        ExecOutcome::Failed {
-            started: false,
-            ref reason
-        } if reason.contains("expired or was revoked")
-    ));
+    assert!(matches!(result.exec, ExecOutcome::NotAttempted));
+    assert!(!result.policy_allowed());
+    assert!(result.policy_reason().contains("expired or was revoked"));
 }
 
 #[cfg(unix)]
@@ -6554,7 +6580,7 @@ async fn held_approval_catalog_race_is_linearized(replacement: VerbCatalog) {
             .get(&handle)
             .unwrap()
             .status,
-        ApprovalStatus::ExecFailed
+        ApprovalStatus::Denied
     );
 }
 
@@ -7060,7 +7086,9 @@ async fn sensitive_provisional_snapshots_are_redacted_and_cannot_replay() {
         .write()
         .await
         .insert(provisional.clone());
-    let (message, exit) = finish_revert(&cfg, &provisional, &agent, "operator retry").await;
+    let outcome = finish_revert(&cfg, &provisional, &agent, "operator retry").await;
+    let exit = outcome.result.exit_code();
+    let message = outcome.message;
     assert_eq!(exit, None);
     assert!(!message.contains(&sensitive));
     let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
@@ -7188,7 +7216,9 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         .await
         .unwrap();
     cfg.state.provisional.write().await.insert(viable.clone());
-    let (_, exit) = finish_revert(&cfg, &viable, &agent, "test").await;
+    let outcome = finish_revert(&cfg, &viable, &agent, "test").await;
+    let exit = outcome.result.exit_code();
+    let _ = outcome.message;
     assert_eq!(exit, Some(0));
     assert_eq!(
         cfg.state
@@ -7258,11 +7288,11 @@ async fn approved_snapshot_rejects_changed_session_revision() {
     };
     assert!(cfg.state.sessions.write().await.revoke(token));
     let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
-    assert!(matches!(
-        result.exec,
-        ExecOutcome::Failed { started: false, ref reason }
-            if reason.contains("session changed or was revoked")
-    ));
+    assert!(matches!(result.exec, ExecOutcome::NotAttempted));
+    assert!(!result.policy_allowed());
+    assert!(result
+        .policy_reason()
+        .contains("session changed or was revoked"));
 }
 
 #[tokio::test]
@@ -7495,9 +7525,15 @@ async fn provisional_revert_executes_in_snapshotted_cwd() {
         .await
         .insert(provisional.clone());
 
-    let (_message, exit) = finish_revert(&cfg, &provisional, &agent, "test").await;
+    let outcome = finish_revert(&cfg, &provisional, &agent, "test").await;
+    let exit = outcome.result.exit_code();
 
-    assert_eq!(exit, Some(0));
+    assert_eq!(exit, None);
+    assert_eq!(
+        outcome.result.execution_failure().unwrap().started,
+        Some(true)
+    );
+    assert!(outcome.message.contains("could not be recorded"));
     assert_eq!(
         std::fs::read_to_string(temp.path().join("provisional-cwd.txt")).unwrap(),
         "reverted"
@@ -7533,4 +7569,489 @@ fn provisional_result_carries_contain_coverage() {
     assert_eq!(response.auto_revert_durable, Some(true));
     assert_eq!(response.confirm_deadline_unix, Some(1_700_000_300));
     assert_eq!(response.confirm_window_secs, Some(300));
+}
+
+#[cfg(unix)]
+async fn contract_hold(
+    cfg: &ServerContext,
+    agent: &CallerIdentity,
+    request: ExecuteRequest,
+    reason: &str,
+) -> String {
+    let authority = match request.session_token.as_deref() {
+        Some(token) => live_authority(cfg, token).await,
+        None => None,
+    };
+    let mut sink = tokio::io::sink();
+    let result = hold_for_approval_with_trace(
+        &mut RequestContext {
+            server: cfg,
+            caller: agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: reason.into(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority,
+            consume_access_verbs: Vec::new(),
+            force_hold: false,
+        },
+        Some(guard::gating::DecisionTrace::source("static_policy")),
+    )
+    .await;
+    match result.exec {
+        ExecOutcome::Held { handle, .. } => handle,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[cfg(unix)]
+async fn contract_launch_failure_tool(cfg: &ServerContext, directory: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = directory.join("fixture-launch-failure");
+    std::fs::write(&executable, "#!/nonexistent-guard-fixture-interpreter\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    *cfg.state.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(directory.join("tools.yaml")).unwrap();
+    cfg.state
+        .tool_registry
+        .write()
+        .await
+        .set(
+            "fixture-launch-failure",
+            crate::tool_config::ToolConfig {
+                env: HashMap::from([("PATH".into(), directory.to_string_lossy().into_owned())]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_and_crash_recovered_approval_keep_unknown_start_after_real_side_effect() {
+    for crash in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let marker = directory.path().join("effects");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let (mut cfg, _, agent) = gating_config(7090, 1000);
+        cfg.state.session_store = Some(store.clone());
+        let handle = contract_hold(
+            &cfg,
+            &agent,
+            held_request(
+                "sh",
+                vec!["-c".into(), format!("printf x >> '{}'", marker.display())],
+                None,
+            ),
+            "approved fixture",
+        )
+        .await;
+        let pending = cfg
+            .state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .clone();
+        let mut claimed = pending.clone();
+        claimed.status = ApprovalStatus::Approving;
+        store
+            .compare_and_swap_approval(pending, claimed.clone())
+            .await
+            .unwrap();
+        let ran = execute_snapshot(&cfg, &claimed.snapshot, &claimed.reason).await;
+        assert_eq!(ran.exit_code(), Some(0));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x");
+        if !crash {
+            let mut legacy = claimed.clone();
+            legacy.status = ApprovalStatus::ExecFailed;
+            legacy.decided_unix = Some(now_unix());
+            legacy.decided_reason = Some("legacy interrupted execution".into());
+            assert!(legacy.execution_failure.is_none());
+            store
+                .compare_and_swap_approval(claimed, legacy)
+                .await
+                .unwrap();
+        }
+        drop(cfg);
+        drop(store);
+        let reopened = SessionStore::open(path, 3600).await.unwrap();
+        let (registry, recovered) = guard::gating::approval::ApprovalRegistry::from_rows(
+            reopened.load_approvals().await.unwrap(),
+            now_unix(),
+        );
+        assert_eq!(recovered.len(), usize::from(crash));
+        let approval = registry.get(&handle).unwrap();
+        let replay = approval_to_result(approval);
+        assert!(
+            matches!(replay.exec, ExecOutcome::Failed { started: true, .. }),
+            "unknown must contain conservatively"
+        );
+        let response = replay.into_response();
+        assert!(!response.allowed);
+        assert!(response.policy.unwrap().allowed);
+        let failure = response.execution_failure.unwrap();
+        assert_eq!(failure.started, None);
+        assert_eq!(failure.stage, guard::wire::ExecutionStage::Unknown);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "x",
+            "observation never replays the command"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn requester_resume_launch_failure_preserves_completion_audit_and_restart_redaction() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let (mut cfg, operator, agent) = gating_config(7091, 1000);
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    cfg.state.session_store = Some(SessionStore::open(path.clone(), 3600).await.unwrap());
+    contract_launch_failure_tool(&cfg, directory.path()).await;
+    let handle = contract_hold(
+        &cfg,
+        &agent,
+        held_request("fixture-launch-failure", Vec::new(), None),
+        "policy permits password=fixture-resume-private",
+    )
+    .await;
+    let armed = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::Approve {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(armed, AdminResponse::GateAction { .. }),
+        "{armed:?}"
+    );
+    let result = resume_approval(&cfg, &agent, &handle).await;
+    assert!(result.policy_allowed(), "{}", result.policy_reason());
+    let failure = result
+        .execution_failure()
+        .expect("actual failed launch")
+        .clone();
+    assert_eq!(failure.started, Some(false));
+    let response = result.into_response();
+    let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    assert!(!audit.contains("fixture-resume-private"));
+    let completion = contract_audit_events(audit_directory.path())
+        .into_iter()
+        .find(|event| event.fields.contains(&("phase".into(), "completed".into())))
+        .expect("completion audit");
+    assert_eq!(completion.execution_failure, Some(failure));
+    assert!(completion.policy.as_ref().unwrap().allowed);
+    assert_eq!(completion.decision_source.as_deref(), Some("static_policy"));
+    drop(cfg);
+    let reopened = SessionStore::open(path, 3600).await.unwrap();
+    let approval = reopened.load_approvals().await.unwrap().pop().unwrap();
+    let replay = approval_to_result(&approval).into_response();
+    assert_eq!(replay.execution_failure, response.execution_failure);
+    assert_eq!(replay.policy, response.policy);
+    assert!(!serde_json::to_string(&approval)
+        .unwrap()
+        .contains("fixture-resume-private"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn revoked_held_authority_stays_denied_in_immediate_persisted_and_replayed_results() {
+    for immediate in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let marker = directory.path().join("must-not-run");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let (mut cfg, operator, agent) = gating_config(7092, 1000);
+        cfg.state.session_store = Some(store.clone());
+        cfg.state
+            .sessions
+            .write()
+            .await
+            .grant("revoked-fixture".into(), active_session());
+        store
+            .persist_registry(&cfg.state.sessions.read().await.clone())
+            .await
+            .unwrap();
+        let mut request = held_request(
+            "sh",
+            vec!["-c".into(), format!("printf x > '{}'", marker.display())],
+            None,
+        );
+        request.session_token = Some("revoked-fixture".into());
+        let handle = contract_hold(&cfg, &agent, request, "original admission").await;
+        let armed = handle_admin_request_for_test(
+            &cfg,
+            &operator,
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(armed, AdminResponse::GateAction { .. }),
+            "{armed:?}"
+        );
+        cfg.state.sessions.write().await.revoke("revoked-fixture");
+        let response = if immediate {
+            let armed = cfg
+                .state
+                .approvals
+                .read()
+                .await
+                .get(&handle)
+                .unwrap()
+                .clone();
+            let mut claimed = armed.clone();
+            claimed.status = ApprovalStatus::Approving;
+            store
+                .compare_and_swap_approval(armed, claimed.clone())
+                .await
+                .unwrap();
+            cfg.state
+                .approvals
+                .write()
+                .await
+                .install_persisted(claimed.clone(), false);
+            crate::server::admin::handle_approve_claimed(&cfg, &operator, &handle, claimed.snapshot)
+                .await
+        } else {
+            handle_admin_request_for_test(
+                &cfg,
+                &agent,
+                AdminRequest::Resume {
+                    handle: handle.clone(),
+                },
+            )
+            .await
+        };
+        let AdminResponse::GateAction {
+            policy,
+            execution_failure,
+            exit_code,
+            ..
+        } = response
+        else {
+            panic!("{response:?}")
+        };
+        assert_eq!(exit_code, Some(crate::EXIT_GUARD_DENIED));
+        assert!(execution_failure.is_none());
+        let policy = policy.unwrap();
+        assert!(!policy.allowed);
+        assert!(policy.reason.contains("revoked"));
+        assert!(!marker.exists());
+        drop(cfg);
+        drop(store);
+        let reopened = SessionStore::open(path, 3600).await.unwrap();
+        let approval = reopened.load_approvals().await.unwrap().pop().unwrap();
+        assert_eq!(approval.status, ApprovalStatus::Denied);
+        let replay = approval_to_result(&approval).into_response();
+        assert_eq!(replay.policy, Some(policy));
+        assert!(!replay.allowed && replay.execution_failure.is_none());
+        assert_eq!(replay.decision_source, "validation");
+        assert!(!marker.exists());
+    }
+}
+
+#[cfg(unix)]
+fn contract_audit_events(directory: &std::path::Path) -> Vec<guard::audit::AuditEvent> {
+    std::fs::read_to_string(directory.join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<guard::audit::AuditRecord>(line)
+                .unwrap()
+                .event
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manual_rollback_retains_launch_failure_and_completed_nonzero() {
+    for launch_failure in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        let (mut cfg, operator, agent) = gating_config(7093, 1000);
+        cfg.state.session_store = Some(store.clone());
+        let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+        contract_launch_failure_tool(&cfg, directory.path()).await;
+        let revert = if launch_failure {
+            RevertSpec::new("fixture-launch-failure", Vec::new())
+        } else {
+            RevertSpec::new("sh", vec!["-c".into(), "exit 9".into()])
+        };
+        let mut sink = tokio::io::sink();
+        let forward = arm_containment_with_authority(
+            &mut RequestContext {
+                server: &cfg,
+                caller: &agent,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            contain_request("true", &[], revert),
+            agent.principal(),
+            "permitted change".into(),
+            None,
+        )
+        .await;
+        let ExecOutcome::Provisional { handle, .. } = forward.exec else {
+            panic!("{:?}", forward.exec)
+        };
+        let response =
+            handle_admin_request_for_test(&cfg, &operator, AdminRequest::Revert { handle }).await;
+        let AdminResponse::GateAction {
+            policy,
+            execution_failure,
+            exit_code,
+            decision_source,
+            ..
+        } = response
+        else {
+            panic!("{response:?}")
+        };
+        assert!(policy.as_ref().unwrap().allowed);
+        assert_eq!(
+            exit_code,
+            Some(if launch_failure {
+                crate::EXIT_GUARD_ERROR
+            } else {
+                9
+            })
+        );
+        assert_eq!(execution_failure.is_some(), launch_failure);
+        if let Some(failure) = &execution_failure {
+            assert_eq!(failure.started, Some(false));
+        }
+        let event = contract_audit_events(audit_directory.path())
+            .into_iter()
+            .find(|event| event.kind == guard::audit::AuditKind::RevertFailed)
+            .unwrap();
+        assert_eq!(event.execution_failure, execution_failure);
+        assert_eq!(event.policy, policy);
+        assert_eq!(event.decision_source, decision_source);
+        let terminal = store.load_provisionals().await.unwrap().pop().unwrap();
+        assert_eq!(terminal.status, ProvisionalStatus::RevertFailed);
+        assert_eq!(
+            terminal.revert_exit,
+            if launch_failure { None } else { Some(9) }
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn confirmation_check_audits_launch_failure_separately_and_preserves_rollback() {
+    for launch_failure in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("rolled-back");
+        let store = SessionStore::open(directory.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        let (mut cfg, _, agent) = gating_config(7094, 1000);
+        cfg.state.session_store = Some(store.clone());
+        let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+        contract_launch_failure_tool(&cfg, directory.path()).await;
+        let mut revert = RevertSpec::new(
+            "sh",
+            vec!["-c".into(), format!("printf x > '{}'", marker.display())],
+        );
+        revert.confirm_check = Some(crate::server::CommandSpec {
+            binary: if launch_failure {
+                "fixture-launch-failure"
+            } else {
+                "false"
+            }
+            .into(),
+            args: Vec::new(),
+        });
+        let mut sink = tokio::io::sink();
+        let forward = arm_containment_with_authority(
+            &mut RequestContext {
+                server: &cfg,
+                caller: &agent,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            contain_request("true", &[], revert),
+            agent.principal(),
+            "permitted change".into(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(forward.exec, ExecOutcome::Provisional { .. }),
+            "{:?}",
+            forward.exec
+        );
+        let due = cfg
+            .state
+            .provisional
+            .write()
+            .await
+            .take_due(now_unix() + 10_000_000)
+            .pop()
+            .unwrap();
+        let durable = store.load_provisionals().await.unwrap().pop().unwrap();
+        store
+            .compare_and_swap_provisional(durable, due.clone())
+            .await
+            .unwrap();
+        let expected_check = run_provisional_check(&cfg, &due).await;
+        let rollback = finish_due_provisional(&cfg, &due).await;
+        assert_eq!(rollback.result.exit_code(), Some(0));
+        assert!(rollback.result.execution_failure().is_none());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x");
+        let events = contract_audit_events(audit_directory.path());
+        let check = events
+            .iter()
+            .find(|event| event.kind == guard::audit::AuditKind::ProvisionalCheckFailed)
+            .unwrap();
+        assert!(check.policy.as_ref().unwrap().allowed);
+        assert!(check.decision_source.is_some());
+        assert_eq!(check.execution_failure.is_some(), launch_failure);
+        assert_eq!(
+            check.execution_failure.as_ref(),
+            expected_check.execution_failure()
+        );
+        assert_eq!(check.policy, Some(expected_check.policy_decision()));
+        assert_eq!(
+            check.decision_source.as_deref(),
+            Some(expected_check.decision_source())
+        );
+        if let Some(failure) = &check.execution_failure {
+            assert_eq!(failure.started, Some(false));
+            assert!(!failure.message.is_empty());
+        } else {
+            assert!(check.fields.contains(&("exit".into(), "Some(1)".into())));
+        }
+        let reverted = events
+            .iter()
+            .find(|event| event.kind == guard::audit::AuditKind::Revert)
+            .unwrap();
+        assert!(reverted.execution_failure.is_none());
+        assert!(reverted.policy.as_ref().unwrap().allowed);
+        assert_eq!(
+            store.load_provisionals().await.unwrap()[0].status,
+            ProvisionalStatus::Reverted
+        );
+    }
 }

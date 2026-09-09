@@ -146,7 +146,10 @@ The optional `execution_failure` object carries `started`, `stage`, `errno`,
 and a sanitized `message`. Stages are `identity`, `capabilities`, `cwd`,
 `exec`, or `unknown`; `unknown` means no precise failing stage is established.
 The legacy `allowed` field remains false for an execution failure. Policy
-approval does not establish that the command started or completed.
+approval does not establish that the command started or completed. `started` is
+`true` or `false` only for an observed start outcome. A `null` or absent value
+means execution may have started, including an interrupted approval recovered
+after restart. Such an outcome must not be retried automatically.
 
 ## MCP
 
