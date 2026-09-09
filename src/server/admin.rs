@@ -187,6 +187,7 @@ mod regeneration_proposal_tests {
 
     fn held_approval(handle: &str) -> Approval {
         Approval {
+            execution_failure: None,
             handle: handle.to_string(),
             snapshot: guard::gating::approval::ApprovalSnapshot {
                 binary: "host-maintain".to_string(),
@@ -3645,6 +3646,7 @@ async fn handle_session_appeal(
                     server,
                     Some(&token),
                     SessionInteraction {
+                        execution_failure: None,
                         at_unix: 0,
                         command: command_line.clone(),
                         allowed: false,
@@ -3702,6 +3704,7 @@ async fn handle_session_appeal(
                 server,
                 Some(&token),
                 SessionInteraction {
+                    execution_failure: None,
                     at_unix: 0,
                     command: command_line.clone(),
                     allowed: true,
@@ -3770,6 +3773,7 @@ async fn handle_session_appeal(
                 server,
                 Some(&token),
                 SessionInteraction {
+                    execution_failure: None,
                     at_unix: 0,
                     command: command_line.clone(),
                     allowed: false,
@@ -7143,6 +7147,9 @@ async fn handle_confirm(
         behavior: None,
     });
     AdminResponse::GateAction {
+        policy: None,
+        execution_failure: None,
+        decision_source: None,
         message: format!("provisional {} confirmed; change kept", handle),
         exit_code: None,
         stdout: None,
@@ -7315,6 +7322,9 @@ async fn handle_manual_revert(
     }
     let outcome = finish_revert(server, &claimed, caller, "manual").await;
     AdminResponse::GateAction {
+        policy: None,
+        execution_failure: None,
+        decision_source: None,
         message: outcome.0,
         exit_code: outcome.1,
         stdout: None,
@@ -7620,6 +7630,9 @@ async fn arm_held_command(
         behavior: None,
     });
     AdminResponse::GateAction {
+        policy: None,
+        execution_failure: None,
+        decision_source: None,
         message: format!("approved held command {handle}; awaiting requester-bound resume"),
         exit_code: None,
         stdout: None,
@@ -7692,6 +7705,9 @@ async fn handle_approve_claimed(
             behavior: None,
         });
         return AdminResponse::GateAction {
+            policy: None,
+            execution_failure: None,
+            decision_source: None,
             message: format!("approved held API request {handle}; the proxy is forwarding it"),
             exit_code: None,
             stdout: None,
@@ -7804,16 +7820,26 @@ async fn handle_approve_claimed(
             message: super::AUDIT_UNAVAILABLE_REASON.to_string(),
         };
     }
-    let reason = format!("operator-approved held command {}", handle);
+    let Some(approval) = server.state.approvals.read().await.get(handle).cloned() else {
+        return AdminResponse::Error {
+            message: format!("approval {handle} disappeared before execution"),
+        };
+    };
+    let reason = approval.reason.clone();
     drop(_held_verb_lease);
-    let result = super::gate_runtime::execute_snapshot(server, &snapshot, &reason).await;
+    let result = super::gate_runtime::execute_snapshot(server, &snapshot, &reason)
+        .await
+        .with_admission_trace(approval.decision_trace.as_ref());
     let now = now_unix();
     let Some(expected) = server.state.approvals.read().await.get(handle).cloned() else {
         return AdminResponse::Error {
             message: format!("approval {handle} disappeared before terminal persistence"),
         };
     };
-    let (message, exit, stdout, stderr, next) = match result.exec {
+    let policy = Some(result.policy_decision());
+    let execution_failure = result.execution_failure().cloned();
+    let decision_source = Some(result.decision_source().to_string());
+    let (message, exit, stdout, stderr, mut next) = match result.exec {
         ExecOutcome::Completed {
             exit_code,
             stdout,
@@ -7847,6 +7873,11 @@ async fn handle_approve_claimed(
         ExecOutcome::Failed { reason: detail, .. } => {
             server.emit_audit_ungated(
                 AuditEvent::new(AuditKind::ApproveExecFailed)
+                    .execution(
+                        policy.clone().expect("execution policy"),
+                        execution_failure.clone(),
+                    )
+                    .decision_source(decision_source.as_deref().unwrap_or("validation"))
                     .handle(handle)
                     .caller(caller)
                     .session_fingerprint(snapshot.session_fingerprint.as_deref().unwrap_or("none"))
@@ -7879,6 +7910,7 @@ async fn handle_approve_claimed(
             )
         }
     };
+    next.execution_failure = execution_failure.clone();
     let terminal_status = next.status.as_str().to_string();
     if let Err(message) = commit_terminal_approval(server, expected, next).await {
         return AdminResponse::Error { message };
@@ -7893,9 +7925,17 @@ async fn handle_approve_claimed(
         status: Some(terminal_status),
         behavior: None,
     });
+    let exit_code = if execution_failure.is_some() {
+        Some(crate::EXIT_GUARD_ERROR)
+    } else {
+        exit
+    };
     AdminResponse::GateAction {
+        policy,
+        execution_failure,
+        decision_source,
         message,
-        exit_code: exit,
+        exit_code,
         stdout,
         stderr,
     }
@@ -7990,18 +8030,32 @@ async fn handle_resume(
     handle: &str,
 ) -> AdminResponse {
     let result = resume_approval(server, caller, handle).await;
+    let policy = Some(result.policy_decision());
+    let execution_failure = result.execution_failure().cloned();
+    let decision_source = Some(result.decision_source().to_string());
     match result.exec.clone() {
         ExecOutcome::Completed {
             exit_code,
             stdout,
             stderr,
         } => AdminResponse::GateAction {
+            policy,
+            execution_failure,
+            decision_source,
             message: format!("resumed held command {handle} (exit {exit_code:?})"),
             exit_code,
             stdout,
             stderr,
         },
-        ExecOutcome::Failed { reason, .. } => AdminResponse::Error { message: reason },
+        ExecOutcome::Failed { reason, .. } => AdminResponse::GateAction {
+            policy,
+            execution_failure,
+            decision_source,
+            message: reason,
+            exit_code: Some(crate::EXIT_GUARD_ERROR),
+            stdout: None,
+            stderr: None,
+        },
         ExecOutcome::NotAttempted => AdminResponse::Error {
             message: result.policy_reason().to_string(),
         },
@@ -8163,6 +8217,9 @@ async fn handle_deny(
         behavior: None,
     });
     AdminResponse::GateAction {
+        policy: None,
+        execution_failure: None,
+        decision_source: None,
         message: reason.to_string(),
         exit_code: None,
         stdout: None,

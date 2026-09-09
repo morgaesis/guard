@@ -64,3 +64,81 @@ fn missing_subcommand_remains_invalid_usage() {
     let usage = format!("Usage: {executable} verb");
     assert!(String::from_utf8_lossy(&output.stderr).contains(&usage));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn execution_failure_cli_distinguishes_policy_in_text_and_json() {
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    for json_output in [false, true] {
+        for execution_failed in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("guard.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let mut response = json!({
+                "allowed": false, "reason": "fixture failure", "decision_source": "static_policy",
+                "policy": {"allowed": execution_failed, "reason": "fixture admission"}
+            });
+            if execution_failed {
+                response["execution_failure"] = json!({"started": false, "stage": "cwd", "errno": 13, "message": "working directory permission denied"});
+            }
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let payload = if request["execute"]["stream"] == true {
+                    json!({"type": "result", "response": response})
+                } else {
+                    response
+                };
+                writer
+                    .write_all(format!("{payload}\n").as_bytes())
+                    .await
+                    .unwrap();
+            };
+            let client = async {
+                let mut command = tokio::process::Command::new(GUARD_BIN);
+                command
+                    .env_clear()
+                    .env("XDG_CONFIG_HOME", directory.path())
+                    .current_dir(directory.path())
+                    .kill_on_drop(true)
+                    .args(["run", "--socket"])
+                    .arg(&socket);
+                if json_output {
+                    command.arg("--json");
+                }
+                command.arg("true").output().await.unwrap()
+            };
+            let (_, output) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(server, client)
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if execution_failed { 125 } else { 126 })
+            );
+            if json_output {
+                let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(document["response"]["policy"]["allowed"], execution_failed);
+                assert_eq!(document["response"]["allowed"], false);
+                if execution_failed {
+                    assert_eq!(document["response"]["execution_failure"]["stage"], "cwd");
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if execution_failed {
+                    assert!(stderr.contains("EXECUTION FAILED"));
+                    assert!(!stderr.contains("DENIED"));
+                    assert!(!stderr.contains("appeal:"));
+                } else {
+                    assert!(stderr.contains("DENIED"));
+                    assert!(stderr.contains("appeal:"));
+                }
+            }
+        }
+    }
+}

@@ -535,6 +535,7 @@ async fn interaction_suspension_before_process_start_denies_execution() {
     server.state.sessions.write().await.record_interaction(
         token,
         SessionInteraction {
+            execution_failure: None,
             at_unix: guard::env::now_unix(),
             command: "denied command".to_string(),
             allowed: false,
@@ -682,6 +683,7 @@ async fn held_replay_rejects_interaction_suspension_before_process_start() {
     server.state.sessions.write().await.record_interaction(
         token,
         SessionInteraction {
+            execution_failure: None,
             at_unix: guard::env::now_unix(),
             command: "denied command".to_string(),
             allowed: false,

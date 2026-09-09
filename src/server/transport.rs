@@ -231,6 +231,7 @@ mod admin_response_lease_tests {
 
     fn approval() -> Approval {
         Approval {
+            execution_failure: None,
             handle: "lease-test".to_string(),
             snapshot: ApprovalSnapshot {
                 binary: "true".to_string(),
@@ -455,6 +456,7 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
             &self.server,
             Some(token),
             SessionInteraction {
+                execution_failure: None,
                 at_unix: 0,
                 command: format!("api:{} {}", event.endpoint, event.operation),
                 allowed: event.allowed,
@@ -1959,6 +1961,8 @@ where
 /// Denial response for a request rejected before policy evaluation.
 fn validation_error_response(reason: String) -> ExecuteResponse {
     ExecuteResponse {
+        policy: None,
+        execution_failure: None,
         allowed: false,
         reason,
         exit_code: None,
@@ -2346,8 +2350,8 @@ pub(super) fn emit_audit_events(
     // If the policy allowed but exec failed, emit a second event so the
     // audit stream can distinguish "LLM denied" from "LLM approved but
     // exec failed". Ignored by legacy grep patterns.
-    if let ExecOutcome::Failed { reason, .. } = &result.exec {
-        server.log_audit_exec_failed(caller, None, binary, args, reason);
+    if let ExecOutcome::Failed { .. } = &result.exec {
+        server.log_audit_exec_failed(caller, None, binary, args, result);
     }
 }
 
@@ -2359,8 +2363,8 @@ fn emit_exec_audit_events(
     args: &[String],
     result: &ExecuteResult,
 ) {
-    if let ExecOutcome::Failed { reason, .. } = &result.exec {
-        server.log_audit_exec_failed(caller, session_token, binary, args, reason);
+    if let ExecOutcome::Failed { .. } = &result.exec {
+        server.log_audit_exec_failed(caller, session_token, binary, args, result);
     }
 }
 

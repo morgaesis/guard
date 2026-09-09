@@ -48,7 +48,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 /// canonicalizes the full generated-access proposal envelope. Version 14 adds
 /// the inert pre-handoff provisional state and classifies ambiguous v13 API
 /// dispatch rows before older binaries can interpret their rollback authority.
-const SCHEMA_VERSION: i64 = 14;
+/// Version 15 retains typed execution failures alongside session admission.
+const SCHEMA_VERSION: i64 = 15;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
@@ -895,7 +896,7 @@ impl SessionStore {
         let mut interactions = Vec::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json, decision_trace_json
+                "SELECT token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json, decision_trace_json, execution_failure_json
                  FROM session_interactions
                  ORDER BY at_unix ASC, id ASC",
             )?;
@@ -908,6 +909,20 @@ impl SessionStore {
                 Ok(StoredSessionInteraction::from_typed_parts(
                     token,
                     SessionInteraction {
+                        execution_failure: row
+                            .get::<_, Option<String>>(11)?
+                            .map(|json| {
+                                serde_json::from_str::<guard::wire::ExecutionFailure>(&json)
+                                    .map(guard::wire::ExecutionFailure::sanitized)
+                            })
+                            .transpose()
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    11,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
                         at_unix: decode_u64(row.get(1)?)?,
                         command: row.get(2)?,
                         allowed: row.get::<_, i64>(3)? != 0,
@@ -1149,6 +1164,9 @@ impl SessionStore {
         {
             interaction.command = redact_output_text(&interaction.command);
             interaction.reason = guard::gating::sanitize_gate_text(&interaction.reason);
+            interaction.execution_failure = interaction
+                .execution_failure
+                .map(guard::wire::ExecutionFailure::sanitized);
             if let Some(trace) = interaction.decision_trace.as_mut() {
                 trace.sanitize_explanatory_text();
             }
@@ -1157,8 +1175,8 @@ impl SessionStore {
             }
             tx.execute(
                 "INSERT INTO session_interactions
-                 (token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json, decision_trace_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 (token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json, decision_trace_json, execution_failure_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     token,
                     encode_u64(interaction.at_unix)?,
@@ -1174,7 +1192,8 @@ impl SessionStore {
                         .decision_trace
                         .as_ref()
                         .map(serde_json::to_string)
-                        .transpose()?
+                        .transpose()?,
+                    interaction.execution_failure.as_ref().map(serde_json::to_string).transpose()?
                 ],
             )?;
         }
@@ -1468,6 +1487,12 @@ impl SessionStore {
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(&tx, "session_interactions", "decision_trace_json", "TEXT")?;
+        ensure_column(
+            &tx,
+            "session_interactions",
+            "execution_failure_json",
+            "TEXT",
+        )?;
         // Schema v7: bind sessions to their creating principal. Rows migrated
         // from v6 default to the `Unowned` sentinel and are refused for
         // execution until reissued.
@@ -2991,6 +3016,7 @@ fn valid_approval_transition(previous: &Approval, next: &Approval) -> Result<boo
         || previous.ttl_secs != next.ttl_secs
         || !serialized_prefix(&previous.notes, &next.notes)?
         || !option_only_adds_or_preserves(&previous.decision_trace, &next.decision_trace)?
+        || !option_only_adds_or_preserves(&previous.execution_failure, &next.execution_failure)?
     {
         return Ok(false);
     }
@@ -3515,7 +3541,7 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
         repair_sensitive_session_exact_authority(conn)?;
     {
         let mut stmt = conn.prepare(
-            "SELECT rowid, command, reason, secret_refs_json, decision_trace_json FROM session_interactions",
+            "SELECT rowid, command, reason, secret_refs_json, decision_trace_json, execution_failure_json FROM session_interactions",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -3525,29 +3551,39 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (rowid, command, reason, secret_refs_json, trace_json) in rows {
+        for (rowid, command, reason, secret_refs_json, trace_json, failure_json) in rows {
             let sanitized_command = redact_output_text(&command);
             let sanitized_reason = redact_output_text(&reason);
             let sanitized_secret_refs = sanitize_string_vec_json(&secret_refs_json);
             let sanitized_trace = trace_json.as_deref().and_then(sanitize_decision_trace_json);
+            let sanitized_failure = failure_json
+                .as_deref()
+                .map(|json| {
+                    let failure: guard::wire::ExecutionFailure = serde_json::from_str(json)?;
+                    serde_json::to_string(&failure.sanitized())
+                })
+                .transpose()?;
             if sanitized_command != command
                 || sanitized_reason != reason
                 || sanitized_secret_refs != secret_refs_json
                 || sanitized_trace != trace_json
+                || sanitized_failure != failure_json
             {
                 conn.execute(
                     "UPDATE session_interactions
                      SET command = ?1, reason = ?2, secret_refs_json = ?3,
-                         decision_trace_json = ?4
-                     WHERE rowid = ?5",
+                         decision_trace_json = ?4, execution_failure_json = ?5
+                     WHERE rowid = ?6",
                     params![
                         sanitized_command,
                         sanitized_reason,
                         sanitized_secret_refs,
                         sanitized_trace,
+                        sanitized_failure,
                         rowid
                     ],
                 )?;
@@ -4473,8 +4509,79 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
+    #[tokio::test]
+    async fn execution_failure_survives_session_and_approval_restart() {
+        use guard::wire::{ExecutionFailure, ExecutionStage};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let failure = ExecutionFailure {
+            started: false,
+            stage: ExecutionStage::Cwd,
+            errno: Some(13),
+            message: "permission denied".into(),
+        };
+        let registry = SessionRegistry::from_typed_parts(
+            HashMap::new(),
+            Vec::new(),
+            vec![StoredSessionInteraction::from_typed_parts(
+                "fixture-session".into(),
+                SessionInteraction {
+                    execution_failure: Some(failure.clone()),
+                    at_unix: guard::env::now_unix(),
+                    command: "true".into(),
+                    allowed: true,
+                    source: SessionDecisionSource::StaticPolicy,
+                    reason: "policy permits command".into(),
+                    risk: None,
+                    exec_status: SessionExecStatus::Failed,
+                    exit_code: None,
+                    exposed_secret_refs: Vec::new(),
+                    decision_trace: None,
+                },
+                Vec::new(),
+            )],
+            3600,
+        );
+        store.persist_registry(&registry).await.unwrap();
+        let pending = pending_approval("ap-failure");
+        store.save_approval(pending.clone()).await.unwrap();
+        let mut approval = pending.clone();
+        approval.status = ApprovalStatus::ExecFailed;
+        approval.decided_unix = Some(guard::env::now_unix());
+        approval.decided_reason = Some(failure.message.clone());
+        approval.execution_failure = Some(failure.clone());
+        approval.decision_trace = Some(guard::gating::DecisionTrace::source("static_policy"));
+        store
+            .compare_and_swap_approval(pending, approval)
+            .await
+            .unwrap();
+        drop(store);
+        let reopened = SessionStore::open(path, 3600).await.unwrap();
+        let registry = reopened.load_registry().await.unwrap();
+        let interactions = registry.typed_interactions_snapshot();
+        assert_eq!(interactions.len(), 1);
+        assert_eq!(interactions[0].1.execution_failure.as_ref(), Some(&failure));
+        assert!(interactions[0].1.allowed);
+        assert_eq!(
+            interactions[0].1.source,
+            SessionDecisionSource::StaticPolicy
+        );
+        let approvals = reopened.load_approvals().await.unwrap();
+        assert_eq!(approvals[0].execution_failure.as_ref(), Some(&failure));
+        assert_eq!(
+            approvals[0]
+                .decision_trace
+                .as_ref()
+                .unwrap()
+                .decision_source,
+            "static_policy"
+        );
+    }
+
     fn pending_approval(handle: &str) -> Approval {
         Approval {
+            execution_failure: None,
             handle: handle.to_string(),
             snapshot: guard::gating::approval::ApprovalSnapshot {
                 binary: "fixture-command".to_string(),
@@ -7024,6 +7131,7 @@ mod tests {
         interaction.record_interaction(
             &token,
             SessionInteraction {
+                execution_failure: None,
                 at_unix: guard::env::now_unix(),
                 command: "host-inspect".to_string(),
                 allowed: true,
@@ -7368,6 +7476,7 @@ mod tests {
             vec![StoredSessionInteraction::from_typed_parts(
                 "expired-token".into(),
                 SessionInteraction {
+                    execution_failure: None,
                     at_unix: guard::env::now_unix().saturating_sub(60),
                     command: "true".into(),
                     allowed: true,
@@ -7400,6 +7509,7 @@ mod tests {
         let first = SessionStore::open(path.clone(), 3600).await.unwrap();
         let second = SessionStore::open(path, 3600).await.unwrap();
         let pending = Approval {
+            execution_failure: None,
             handle: "ap-shared-claim".to_string(),
             snapshot: guard::gating::approval::ApprovalSnapshot {
                 binary: "fixture-command".to_string(),
@@ -8372,6 +8482,7 @@ mod tests {
             vec![StoredSessionInteraction::from_typed_parts(
                 "tok".into(),
                 SessionInteraction {
+                    execution_failure: None,
                     at_unix: now.saturating_sub(1),
                     command: "echo hi".into(),
                     allowed: true,
@@ -8469,6 +8580,7 @@ mod tests {
         registry.record_interaction(
             "safe",
             SessionInteraction {
+                execution_failure: None,
                 at_unix: guard::env::now_unix(),
                 command: "fixturectl status".to_string(),
                 allowed: true,
@@ -8542,6 +8654,7 @@ mod tests {
         registry.record_interaction(
             "safe",
             SessionInteraction {
+                execution_failure: None,
                 at_unix: guard::env::now_unix(),
                 command: "fixturectl status".to_string(),
                 allowed: true,

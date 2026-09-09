@@ -10,6 +10,52 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// The observed failing operation during command setup or execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStage {
+    Identity,
+    Capabilities,
+    Cwd,
+    Exec,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ExecutionStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Capabilities => "capabilities",
+            Self::Cwd => "cwd",
+            Self::Exec => "exec",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionFailure {
+    pub started: bool,
+    pub stage: ExecutionStage,
+    pub errno: Option<i32>,
+    pub message: String,
+}
+
+impl ExecutionFailure {
+    pub fn sanitized(mut self) -> Self {
+        self.message = crate::gating::sanitize_gate_text(&self.message);
+        self
+    }
+}
+
+/// Admission remains independent of whether the approved command ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDecision {
+    pub allowed: bool,
+    pub reason: String,
+}
+
 /// How ssh should treat the remote host key for a guarded ssh command.
 /// Default (`OnlyExisting`) preserves ssh's own strict behavior: the daemon
 /// injects nothing, so a first-contact host still fails closed. The relaxed

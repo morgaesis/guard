@@ -3812,6 +3812,7 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
     let handle = "held-access-projection".to_string();
     let principal = PrincipalKey::from_uid(1_001);
     cfg.state.approvals.write().await.enqueue(Approval {
+        execution_failure: None,
         handle: handle.clone(),
         snapshot: ApprovalSnapshot {
             binary: "true".to_string(),
@@ -5930,6 +5931,7 @@ fn held_verb_approval(
     principal: Option<PrincipalKey>,
 ) -> Approval {
     Approval {
+        execution_failure: None,
         handle: handle.to_string(),
         snapshot: ApprovalSnapshot {
             binary: "true".to_string(),

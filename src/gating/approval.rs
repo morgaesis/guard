@@ -225,6 +225,8 @@ pub struct ApprovalNote {
 /// One held command awaiting operator approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Approval {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_failure: Option<crate::wire::ExecutionFailure>,
     pub handle: String,
     pub snapshot: ApprovalSnapshot,
     /// Caller-facing rationale for the hold (the evaluator's allow reason).
@@ -267,6 +269,9 @@ impl Approval {
         }
 
         let mut changed = sanitize(&mut self.reason);
+        if let Some(failure) = self.execution_failure.as_mut() {
+            changed |= sanitize(&mut failure.message);
+        }
         if let Some(trace) = self.decision_trace.as_mut() {
             changed |= trace.sanitize_explanatory_text();
         }
@@ -763,6 +768,7 @@ mod tests {
 
     fn held(handle: &str, created: u64, ttl: u64) -> Approval {
         Approval {
+            execution_failure: None,
             handle: handle.to_string(),
             snapshot: snap("rm"),
             reason: "destructive".into(),

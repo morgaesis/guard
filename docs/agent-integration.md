@@ -125,7 +125,7 @@ propagates the executed child's exit status untranslated:
 
 | Code  | Meaning                                                          |
 | ----- | ---------------------------------------------------------------- |
-| 125   | Guard operational error (daemon unreachable, protocol failure)   |
+| 125   | Guard operational error, including execution failure              |
 | 126   | Denied by policy                                                 |
 | 127   | Held for operator approval                                       |
 | 2     | Invalid guard CLI usage (argument parsing)                       |
@@ -135,9 +135,18 @@ The reserved range collides with codes a child can produce on its own: `sh -c`
 exits 127 when the named command is missing, and `git bisect skip` uses 125. An
 exit code of 125-127 therefore suggests, but cannot prove, a guard-origin
 outcome. An agent that needs certainty runs with `--json` and reads the
-`allowed` and `status` fields; the exit code is a convenience for shell
-pipelines, not the authoritative decision channel. `guard run` prints this
-contract in its own help output (`guard help run`).
+`policy`, `execution_failure`, `allowed`, and `status` fields; the exit code is
+a convenience for shell pipelines, not the authoritative decision channel.
+`guard run` prints this contract in its own help output (`guard help run`).
+
+An approved command that fails during setup or execution reports
+`EXECUTION FAILED` and exits 125. The optional `policy` object preserves the
+admission result and reason, and `decision_source` identifies that admission.
+The optional `execution_failure` object carries `started`, `stage`, `errno`,
+and a sanitized `message`. Stages are `identity`, `capabilities`, `cwd`,
+`exec`, or `unknown`; `unknown` means no precise failing stage is established.
+The legacy `allowed` field remains false for an execution failure. Policy
+approval does not establish that the command started or completed.
 
 ## MCP
 

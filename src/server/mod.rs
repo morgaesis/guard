@@ -649,25 +649,33 @@ impl ServerContext {
         self.log_audit_policy(caller, session_token, binary, args, true, reason)
     }
 
-    /// Log a failed exec attempt. Only emitted when the policy allowed
-    /// the command but the kernel refused to run it (ENOENT, EACCES,
-    /// etc.). Paired with a corresponding `[AUDIT] ALLOWED` line so
-    /// downstream tooling can distinguish "policy denied" from "policy
-    /// approved, exec failed".
+    /// Record an execution failure separately from admission. Typed detail
+    /// retains whether the command started and names a stage only when that
+    /// failing operation is observed.
     fn log_audit_exec_failed(
         &self,
         caller: &CallerIdentity,
         session_token: Option<&str>,
         binary: &str,
         args: &[String],
-        reason: &str,
+        result: &wire::ExecuteResult,
     ) {
         self.emit_audit_ungated(
             AuditEvent::new(AuditKind::ExecFailed)
+                .execution(
+                    result.policy_decision(),
+                    result.execution_failure().cloned(),
+                )
+                .decision_source(result.decision_source())
                 .caller(caller)
                 .session_fingerprint(audit_session_fingerprint(session_token))
                 .cmd(self.redact_command_line(binary, args))
-                .reason(reason),
+                .reason(
+                    result
+                        .execution_failure()
+                        .map(|failure| failure.message.as_str())
+                        .unwrap_or("execution failed"),
+                ),
         );
     }
 }

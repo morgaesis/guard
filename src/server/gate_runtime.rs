@@ -1260,6 +1260,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             secret_binding: None,
         };
         let approval = Approval {
+            execution_failure: None,
             handle: handle.clone(),
             snapshot,
             reason: reason.to_string(),
@@ -2770,6 +2771,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         secret_binding,
     };
     let approval = Approval {
+        execution_failure: None,
         handle: handle.clone(),
         snapshot,
         reason: reason.clone(),
@@ -3058,8 +3060,10 @@ pub(super) async fn resume_approval(
         );
     }
 
-    let reason = format!("requester resumed operator-approved hold {handle}");
-    let result = execute_snapshot(server, &claimed.snapshot, &reason).await;
+    let reason = claimed.reason.clone();
+    let result = execute_snapshot(server, &claimed.snapshot, &reason)
+        .await
+        .with_admission_trace(claimed.decision_trace.as_ref());
     let completed_unix = now_unix();
     let mut terminal = claimed.clone();
     match &result.exec {
@@ -3079,6 +3083,7 @@ pub(super) async fn resume_approval(
             terminal.status = ApprovalStatus::ExecFailed;
             terminal.decided_unix = Some(completed_unix);
             terminal.decided_reason = Some(reason.clone());
+            terminal.execution_failure = result.execution_failure().cloned();
             terminal.result_exit = None;
             terminal.result_stdout = None;
             terminal.result_stderr = None;
@@ -3096,10 +3101,16 @@ pub(super) async fn resume_approval(
     if let Err(error) =
         commit_resumed_approval(server, claimed.clone(), terminal.clone(), true).await
     {
-        return ExecuteResult::exec_failed(
-            reason,
-            format!("held command ran but its result was not durable: {error}"),
-        );
+        let message = format!("held command result was not durable: {error}");
+        let failed = if matches!(
+            &result.exec,
+            ExecOutcome::Failed { started: false, .. } | ExecOutcome::NotAttempted
+        ) {
+            ExecuteResult::exec_failed(reason, message)
+        } else {
+            ExecuteResult::exec_failed_after_start(reason, message)
+        };
+        return failed.with_admission_trace(claimed.decision_trace.as_ref());
     }
     server.emit_audit_ungated(
         AuditEvent::new(AuditKind::ApprovedExecuted)
@@ -3131,7 +3142,7 @@ pub(super) async fn resume_approval(
 
 /// Build the client-facing result from a decided approval record.
 pub(super) fn approval_to_result(a: &Approval) -> ExecuteResult {
-    match a.status {
+    let result = match a.status {
         ApprovalStatus::Approved => ExecuteResult::completed(
             a.reason.clone(),
             a.result_exit,
@@ -3151,11 +3162,13 @@ pub(super) fn approval_to_result(a: &Approval) -> ExecuteResult {
             a.decided_reason
                 .clone()
                 .unwrap_or_else(|| "approved command failed to execute".to_string()),
-        ),
+        )
+        .with_execution_failure(a.execution_failure.clone()),
         ApprovalStatus::Pending | ApprovalStatus::Approving => {
             ExecuteResult::held(a.reason.clone(), a.handle.clone(), Coverage::hold())
         }
-    }
+    };
+    result.with_admission_trace(a.decision_trace.as_ref())
 }
 
 /// Sentinel stored in a [`SecretBinding`] for a secret that did not resolve at

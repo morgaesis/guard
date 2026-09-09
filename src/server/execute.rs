@@ -850,6 +850,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
         phase.server,
         phase.session_token.as_deref(),
         SessionInteraction {
+            execution_failure: None,
             at_unix: 0,
             command: durable_command,
             allowed: false,
@@ -907,6 +908,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
         phase.server,
         phase.session_token.as_deref(),
         SessionInteraction {
+            execution_failure: None,
             at_unix: 0,
             command: interaction_command,
             allowed: true,
@@ -5328,6 +5330,7 @@ mod transactional_access_tests {
         advanced.record_interaction(
             &token,
             SessionInteraction {
+                execution_failure: None,
                 at_unix: guard::env::now_unix(),
                 command: "fixture interaction".to_string(),
                 allowed: true,
@@ -5517,6 +5520,7 @@ mod transactional_access_tests {
         sessions.record_interaction(
             &token,
             SessionInteraction {
+                execution_failure: None,
                 at_unix: guard::env::now_unix(),
                 command: "newer interaction".to_string(),
                 allowed: false,

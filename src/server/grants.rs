@@ -313,14 +313,15 @@ pub(super) async fn handle_grant_read(
         // Nothing survived the in-apply rollback, so drop the committed row too.
         delete_read_grant_row(server, &grant.target_path).await;
         let exec_reason = format!("failed to apply read grant: {e}");
+        let result = ExecuteResult::exec_failed(reason, exec_reason);
         server.log_audit_exec_failed(
             caller,
             session_token.as_deref(),
             AUTO_READ_GRANT_LABEL,
             &audit_args,
-            &exec_reason,
+            &result,
         );
-        return ExecuteResult::exec_failed(reason, exec_reason);
+        return result;
     }
 
     let traverse_count = grant.entries.len().saturating_sub(1);
