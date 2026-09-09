@@ -7389,7 +7389,7 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
             assert!(
                 reason.contains("working directory")
                     && reason.contains("changed before exec")
-                    && reason.contains(cwd.to_str().unwrap()),
+                    && !reason.contains(cwd.to_str().unwrap()),
                 "unexpected reason: {reason}"
             );
         }
@@ -7442,7 +7442,7 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
             assert!(
                 reason.contains("working directory")
                     && reason.contains("changed before exec")
-                    && reason.contains(cwd.to_str().unwrap()),
+                    && !reason.contains(cwd.to_str().unwrap()),
                 "unexpected reason: {reason}"
             );
         }

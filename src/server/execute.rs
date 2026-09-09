@@ -17,10 +17,17 @@ use guard::redact::{
     command_contains_exact_secrets, command_line, redact_command_line, redact_exact_secrets,
     redact_output_text, redact_output_with_state, ExactSecretStreamRedactor, RedactionState,
 };
+use guard::wire::ExecutionStage;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(unix)]
 use std::ffi::CString;
+#[cfg(unix)]
+use std::io::{PipeReader, Read};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -30,7 +37,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 #[cfg(unix)]
 use uzers::os::unix::UserExt;
@@ -483,33 +490,34 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn revalidate_exec_cwd(cwd: &Path) -> std::result::Result<(), String> {
-    let canonical = tokio::fs::canonicalize(cwd).await.map_err(|e| {
-        format!(
-            "working directory '{}' changed before exec: cannot canonicalize: {}",
-            cwd.display(),
-            e
+async fn revalidate_exec_cwd(cwd: &Path) -> std::result::Result<(), LaunchError> {
+    let canonical = tokio::fs::canonicalize(cwd).await.map_err(|error| {
+        LaunchError::from_io(
+            ExecutionStage::Cwd,
+            "working directory changed before exec: cannot canonicalize",
+            &error,
         )
     })?;
     if canonical != cwd {
-        return Err(format!(
-            "working directory '{}' changed before exec: canonical path is now '{}'",
-            cwd.display(),
-            canonical.display()
-        ));
+        return Err(LaunchError {
+            stage: ExecutionStage::Cwd,
+            errno: None,
+            message: "working directory changed before exec: canonical path differs",
+        });
     }
-    let meta = tokio::fs::metadata(&canonical).await.map_err(|e| {
-        format!(
-            "working directory '{}' changed before exec: cannot stat: {}",
-            canonical.display(),
-            e
+    let meta = tokio::fs::metadata(&canonical).await.map_err(|error| {
+        LaunchError::from_io(
+            ExecutionStage::Cwd,
+            "working directory changed before exec: cannot inspect directory",
+            &error,
         )
     })?;
     if !meta.is_dir() {
-        return Err(format!(
-            "working directory '{}' changed before exec: not a directory",
-            canonical.display()
-        ));
+        return Err(LaunchError {
+            stage: ExecutionStage::Cwd,
+            errno: None,
+            message: "working directory changed before exec: not a directory",
+        });
     }
     Ok(())
 }
@@ -908,7 +916,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
         phase.server,
         phase.session_token.as_deref(),
         SessionInteraction {
-            execution_failure: None,
+            execution_failure: result.execution_failure().cloned(),
             at_unix: 0,
             command: interaction_command,
             allowed: true,
@@ -1063,11 +1071,6 @@ struct CommandInitiationLease {
     _learned_deny: Option<guard::evaluate::LearnedDenyUseLease>,
     _verb: Option<guard::learned_rules::AuthorityUseLease<VerbCatalog>>,
     _session: Option<tokio::sync::OwnedRwLockReadGuard<SessionRegistry>>,
-}
-
-struct ProcessInitiationLeases {
-    command: CommandInitiationLease,
-    tool_mapping: ToolMappingSpawnLease,
 }
 
 #[cfg(all(test, unix))]
@@ -2775,12 +2778,18 @@ pub(super) fn resolve_exec_caller_context(uid: u32) -> Result<ExecCallerContext>
     })
 }
 
+#[derive(Clone)]
+struct PreparedExecIdentity {
+    context: ExecCallerContext,
+    #[cfg(unix)]
+    groups: Vec<libc::gid_t>,
+}
+
 #[cfg(unix)]
-fn apply_exec_identity(
-    cmd: &mut Command,
+fn resolve_exec_identity(
     server: &ServerContext,
     caller: &CallerIdentity,
-) -> Result<Option<ExecCallerContext>> {
+) -> Result<Option<PreparedExecIdentity>> {
     if !server.config.exec_as_caller {
         return Ok(None);
     }
@@ -2792,59 +2801,45 @@ fn apply_exec_identity(
     let context = resolve_exec_caller_context(caller_uid)?;
     let username = CString::new(context.username.clone())
         .context("caller username contains an interior NUL byte")?;
-    let gid = context.gid;
-
-    cmd.gid(gid);
-    cmd.uid(context.uid);
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::initgroups(username.as_ptr(), gid as _) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    let mut groups = vec![0; 16];
+    // NSS lookup and allocation happen in the parent, before the fork.
+    for _ in 0..3 {
+        let mut count = groups.len() as libc::c_int;
+        let result = unsafe {
+            libc::getgrouplist(
+                username.as_ptr(),
+                context.gid as _,
+                groups.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        let count = usize::try_from(count).context("invalid supplementary group count")?;
+        if result >= 0 && count > 0 && count <= groups.len() {
+            groups.truncate(count);
+            return Ok(Some(PreparedExecIdentity { context, groups }));
+        }
+        // Linux permits at most 65536 supplementary groups. This also bounds
+        // allocation when a group database returns an invalid required size.
+        if count <= groups.len() || count > 65536 {
+            bail!("cannot resolve supplementary groups for the execution identity");
+        }
+        groups.resize(count, 0);
     }
-
-    Ok(Some(context))
+    bail!("supplementary group membership changed repeatedly during lookup")
 }
 
 #[cfg(not(unix))]
-fn apply_exec_identity(
-    _cmd: &mut Command,
+fn resolve_exec_identity(
     server: &ServerContext,
     _caller: &CallerIdentity,
-) -> Result<Option<ExecCallerContext>> {
+) -> Result<Option<PreparedExecIdentity>> {
     if server.config.exec_as_caller {
         bail!("--exec-as-caller is not supported on this platform");
     }
     Ok(None)
 }
 
-/// Strip inherited capabilities from a brokered child before `execve`.
-///
-/// Under the packaged unit the daemon holds `CAP_FOWNER` and
-/// `CAP_DAC_READ_SEARCH` in its ambient set so its own read-grant `setfacl`/
-/// `getfacl` calls can manipulate ACLs on files it does not own. Ambient
-/// capabilities are, by design, preserved across `execve()` for a non-privileged
-/// process, so without this every caller-requested command (a plain
-/// `cat /etc/shadow`, an `ansible-playbook` reading arbitrary files) would
-/// inherit those capabilities and bypass file DAC entirely -- `CAP_DAC_READ_SEARCH`
-/// bypasses file read permission checks and `CAP_FOWNER` bypasses the file-owner
-/// checks `chmod`/`setfacl` enforce -- defeating the scoped, policy-gated read
-/// grants. This clears the ambient set (so nothing survives `execve`) and zeroes
-/// the inheritable set (so a target binary carrying its own file-inheritable caps
-/// cannot pick anything up via the `P(inh) & F(inh)` intersection).
-///
-/// Applies only inside the forked child via `pre_exec`; the long-lived daemon
-/// keeps its capabilities for its own direct `setfacl`/`getfacl` `Command`s,
-/// which are separate and never pass through here. Clearing capabilities needs
-/// no privilege (only raising them does), so it is safe under both the default
-/// service-identity model and `--exec-as-caller`.
-///
-/// The capget/capset structs and version magic are declared here because the
-/// `libc` crate does not expose `capget`/`capset` or the `cap_user_*` types; the
-/// calls go through `libc::syscall` with the stable `SYS_capget`/`SYS_capset`
-/// numbers.
+// Linux capget/capset structures are not exposed by the libc crate.
 #[cfg(all(unix, target_os = "linux"))]
 #[repr(C)]
 struct CapUserHeader {
@@ -2866,63 +2861,305 @@ struct CapUserData {
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
 #[cfg(unix)]
-fn drop_brokered_child_capabilities(cmd: &mut Command) {
-    // SAFETY: the closure runs in the forked child after `fork()` and before
-    // `execve`. It calls only async-signal-safe raw syscalls (prctl/capget/
-    // capset) and performs no allocation.
+fn drop_brokered_child_capabilities() -> std::io::Result<()> {
+    // SAFETY: raw capability syscalls operate on stack data only. The caller
+    // invokes this after installing the child identity and before chdir.
+    #[cfg(target_os = "linux")]
     unsafe {
-        cmd.pre_exec(|| {
-            #[cfg(target_os = "linux")]
+        if libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapUserData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        // An explicitly root execution identity retains its root
+        // authority. Non-root children lose every capability before
+        // directory traversal, including the daemon's DAC privileges.
+        if libc::geteuid() == 0 {
+            if libc::syscall(
+                libc::SYS_capget,
+                &mut header as *mut CapUserHeader,
+                data.as_mut_ptr(),
+            ) != 0
             {
-                // 1. Clear the ambient set: these are the capabilities that would
-                //    otherwise be preserved across `execve` for a non-privileged
-                //    process.
-                if libc::prctl(
-                    libc::PR_CAP_AMBIENT,
-                    libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
-                    0 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                ) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
+                return Err(std::io::Error::last_os_error());
+            }
+            data[0].inheritable = 0;
+            data[1].inheritable = 0;
+        }
+        if libc::syscall(
+            libc::SYS_capset,
+            &header as *const CapUserHeader,
+            data.as_ptr(),
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct LaunchError {
+    stage: ExecutionStage,
+    errno: Option<i32>,
+    message: &'static str,
+}
+
+impl LaunchError {
+    fn from_io(stage: ExecutionStage, message: &'static str, error: &std::io::Error) -> Self {
+        Self {
+            stage,
+            errno: error.raw_os_error(),
+            message,
+        }
+    }
+
+    fn into_result(self, policy_reason: String) -> ExecuteResult {
+        let message = match self.errno {
+            Some(errno) => format!(
+                "{}: {}",
+                self.message,
+                std::io::Error::from_raw_os_error(errno)
+            ),
+            None => self.message.to_string(),
+        };
+        ExecuteResult::launch_failed(policy_reason, self.stage, self.errno, message)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum ChildSetupStage {
+    SupplementaryGroups = 1,
+    GroupIdentity = 2,
+    UserIdentity = 3,
+    Capabilities = 4,
+    Cwd = 5,
+    Ready = 6,
+}
+
+#[cfg(unix)]
+fn write_child_setup_report(
+    writer: &OwnedFd,
+    stage: ChildSetupStage,
+    errno: i32,
+) -> std::io::Result<()> {
+    let mut record = [0u8; 8];
+    record[0] = stage as u8;
+    record[4..].copy_from_slice(&errno.to_ne_bytes());
+    loop {
+        // The empty private pipe receives exactly one record, below PIPE_BUF.
+        let written =
+            unsafe { libc::write(writer.as_raw_fd(), record.as_ptr().cast(), record.len()) };
+        if written == record.len() as isize {
+            return Ok(());
+        }
+        if written < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+    }
+}
+
+#[cfg(unix)]
+fn report_child_setup_failure(
+    writer: &OwnedFd,
+    stage: ChildSetupStage,
+    error: std::io::Error,
+) -> std::io::Error {
+    let _ = write_child_setup_report(writer, stage, error.raw_os_error().unwrap_or(libc::EIO));
+    error
+}
+
+#[cfg(unix)]
+fn prepare_child_setup(
+    cmd: &mut Command,
+    cwd: Option<&Path>,
+    identity: Option<&PreparedExecIdentity>,
+) -> std::result::Result<PipeReader, LaunchError> {
+    let cwd = cwd
+        .map(|path| CString::new(path.as_os_str().as_bytes()))
+        .transpose()
+        .map_err(|_| LaunchError {
+            stage: ExecutionStage::Cwd,
+            errno: Some(libc::EINVAL),
+            message: "working directory contains an invalid path byte",
+        })?;
+    let identity = identity.cloned();
+    // std creates both ends close-on-exec. A nonblocking reader also avoids
+    // waiting for unrelated forked children that briefly inherit a pipe end.
+    let (reader, writer) = std::io::pipe().map_err(|error| {
+        LaunchError::from_io(
+            ExecutionStage::Unknown,
+            "cannot create child setup report channel",
+            &error,
+        )
+    })?;
+    let mut writer: OwnedFd = writer.into();
+    if writer.as_raw_fd() <= libc::STDERR_FILENO {
+        let descriptor = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if descriptor < 0 {
+            return Err(LaunchError::from_io(
+                ExecutionStage::Unknown,
+                "cannot protect child setup report channel from stdio setup",
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: fcntl returns a fresh descriptor owned by this launch.
+        writer = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    }
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(LaunchError::from_io(
+            ExecutionStage::Unknown,
+            "cannot configure child setup report channel",
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: this hook only reads parent-prepared buffers, makes raw identity,
+    // capability, chdir and write syscalls, and constructs errno-only errors.
+    // It performs no allocation, NSS lookup, logging, or locking after fork.
+    unsafe {
+        cmd.pre_exec(move || {
+            if let Some(identity) = &identity {
+                if libc::setgroups(identity.groups.len() as _, identity.groups.as_ptr()) != 0 {
+                    return Err(report_child_setup_failure(
+                        &writer,
+                        ChildSetupStage::SupplementaryGroups,
+                        std::io::Error::last_os_error(),
+                    ));
                 }
-                // 2. Zero the inheritable set. Reading the current sets first and
-                //    only clearing `inheritable` leaves `permitted`/`effective`
-                //    untouched (they collapse to the ambient set at `execve`
-                //    anyway for a non-privileged target). Dropping bits is always
-                //    permitted; only raising them requires CAP_SETPCAP.
-                let mut header = CapUserHeader {
-                    version: LINUX_CAPABILITY_VERSION_3,
-                    pid: 0,
-                };
-                let mut data = [CapUserData {
-                    effective: 0,
-                    permitted: 0,
-                    inheritable: 0,
-                }; 2];
-                if libc::syscall(
-                    libc::SYS_capget,
-                    &mut header as *mut CapUserHeader,
-                    data.as_mut_ptr(),
-                ) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
+                if libc::setgid(identity.context.gid as _) != 0 {
+                    return Err(report_child_setup_failure(
+                        &writer,
+                        ChildSetupStage::GroupIdentity,
+                        std::io::Error::last_os_error(),
+                    ));
                 }
-                data[0].inheritable = 0;
-                data[1].inheritable = 0;
-                if libc::syscall(
-                    libc::SYS_capset,
-                    &header as *const CapUserHeader,
-                    data.as_ptr(),
-                ) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
+                if libc::setuid(identity.context.uid as _) != 0 {
+                    return Err(report_child_setup_failure(
+                        &writer,
+                        ChildSetupStage::UserIdentity,
+                        std::io::Error::last_os_error(),
+                    ));
                 }
             }
-            Ok(())
+            drop_brokered_child_capabilities().map_err(|error| {
+                report_child_setup_failure(&writer, ChildSetupStage::Capabilities, error)
+            })?;
+            if let Some(cwd) = &cwd {
+                if libc::chdir(cwd.as_ptr()) != 0 {
+                    return Err(report_child_setup_failure(
+                        &writer,
+                        ChildSetupStage::Cwd,
+                        std::io::Error::last_os_error(),
+                    ));
+                }
+            }
+            write_child_setup_report(&writer, ChildSetupStage::Ready, 0)
         });
     }
+    Ok(reader)
+}
+
+#[cfg(unix)]
+fn read_child_setup_error(
+    reader: &mut PipeReader,
+    spawn_error: &std::io::Error,
+) -> Option<LaunchError> {
+    let mut record = [0u8; 8];
+    loop {
+        match reader.read(&mut record) {
+            Ok(8) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            _ => return None,
+        }
+    }
+    let errno = i32::from_ne_bytes(record[4..].try_into().ok()?);
+    if record[1..4] != [0; 3] {
+        return None;
+    }
+    let (stage, message) = match record[0] {
+        1 => (
+            ExecutionStage::Identity,
+            "cannot install the child supplementary groups",
+        ),
+        2 => (
+            ExecutionStage::Identity,
+            "cannot install the child group identity",
+        ),
+        3 => (
+            ExecutionStage::Identity,
+            "cannot install the child user identity",
+        ),
+        4 => (
+            ExecutionStage::Capabilities,
+            "cannot remove the child inherited capabilities",
+        ),
+        5 => (
+            ExecutionStage::Cwd,
+            "the child execution identity cannot enter the requested working directory",
+        ),
+        6 if errno == 0 => {
+            return Some(LaunchError::from_io(
+                ExecutionStage::Exec,
+                "cannot launch the executable after child setup",
+                spawn_error,
+            ))
+        }
+        _ => return None,
+    };
+    (errno > 0 && spawn_error.raw_os_error() == Some(errno)).then_some(LaunchError {
+        stage,
+        errno: Some(errno),
+        message,
+    })
+}
+
+fn spawn_brokered_command(
+    mut cmd: Command,
+    cwd: Option<&Path>,
+    identity: Option<&PreparedExecIdentity>,
+) -> std::result::Result<Child, LaunchError> {
+    #[cfg(unix)]
+    let mut report = prepare_child_setup(&mut cmd, cwd, identity)?;
+    #[cfg(not(unix))]
+    let _ = (cwd, identity);
+    let spawned = cmd.spawn();
+    // Release the parent's copy of the report writer before inspecting it.
+    drop(cmd);
+    spawned.map_err(|error| {
+        #[cfg(unix)]
+        if let Some(reported) = read_child_setup_error(&mut report, &error) {
+            return reported;
+        }
+        LaunchError::from_io(
+            ExecutionStage::Unknown,
+            "process launch failed without a child setup report",
+            &error,
+        )
+    })
 }
 
 #[cfg(unix)]
@@ -3526,15 +3763,25 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
 
     let exec_binary = match resolve_primary_binary(server, &request.binary) {
         Ok(binary) => binary,
-        Err(e) => return ExecuteResult::exec_failed(allow_reason, e.to_string()),
+        Err(error) => {
+            return ExecuteResult::launch_failed(
+                allow_reason,
+                ExecutionStage::Exec,
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+                "the executable cannot be resolved on the configured command path",
+            );
+        }
     };
     let mut cmd = Command::new(&exec_binary);
     cmd.args(&request.args);
     cmd.stdin(Stdio::null());
     if let Some(cwd) = &request.cwd {
-        if let Err(reason) = revalidate_exec_cwd(cwd).await {
-            return ExecuteResult::exec_failed(allow_reason, reason);
+        if let Err(error) = revalidate_exec_cwd(cwd).await {
+            return error.into_result(allow_reason);
         }
+        #[cfg(not(unix))]
         cmd.current_dir(cwd);
     }
 
@@ -3583,18 +3830,19 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         cmd.env(key, value);
     }
 
-    let exec_caller = match apply_exec_identity(&mut cmd, server, caller) {
+    let exec_caller = match resolve_exec_identity(server, caller) {
         Ok(context) => context,
-        Err(e) => {
-            return ExecuteResult::exec_failed(allow_reason, format!("exec identity error: {}", e));
+        Err(error) => {
+            return ExecuteResult::launch_failed(
+                allow_reason,
+                ExecutionStage::Identity,
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+                "the child execution identity cannot be prepared",
+            );
         }
     };
-
-    // Drop the daemon's read-grant capabilities (CAP_FOWNER / CAP_DAC_READ_SEARCH)
-    // from the brokered child so they never survive execve into a caller-requested
-    // command. Applies to both the default and --exec-as-caller models.
-    #[cfg(unix)]
-    drop_brokered_child_capabilities(&mut cmd);
 
     for (key, value) in &trusted_tool_env {
         cmd.env(key, value);
@@ -3603,7 +3851,8 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         cmd.env(key, value);
     }
 
-    if let Some(context) = &exec_caller {
+    if let Some(identity) = &exec_caller {
+        let context = &identity.context;
         cmd.env("HOME", &context.home_dir);
         cmd.env("USER", &context.username);
         cmd.env("LOGNAME", &context.username);
@@ -3669,9 +3918,21 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         .and_then(|authority| authority.exec_timeout_secs)
         .unwrap_or(server.config.exec_timeout_secs);
 
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = match spawn_brokered_command(cmd, request.cwd.as_deref(), exec_caller.as_ref())
+    {
+        Ok(child) => child,
+        Err(error) => return error.into_result(allow_reason),
+    };
+    drop(tool_mapping_lease);
+    drop(initiation_lease);
+    #[cfg(all(test, unix))]
+    signal_command_started_for_test(server);
+
     if context.stream_output {
-        let result = execute_spawn_streaming(
-            cmd,
+        let result = execute_streaming_child(
+            child,
             allow_reason,
             exec_timeout_secs,
             server,
@@ -3685,31 +3946,12 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                 credential_references,
             },
             &mut *context.stream_writer,
-            ProcessInitiationLeases {
-                command: initiation_lease,
-                tool_mapping: tool_mapping_lease,
-            },
         )
         .await;
         drop(secret_file_lease);
         return result;
     }
 
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            return ExecuteResult::exec_failed(
-                allow_reason,
-                format!("failed to execute '{}': {}", request.binary, e),
-            );
-        }
-    };
-    drop(tool_mapping_lease);
-    drop(initiation_lease);
-    #[cfg(all(test, unix))]
-    signal_command_started_for_test(server);
     let mut process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
@@ -4156,33 +4398,15 @@ struct OutputRedactionContext<'a> {
     exact_secrets: &'a [String],
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
-    mut cmd: Command,
+async fn execute_streaming_child<W: AsyncWrite + Unpin>(
+    mut child: Child,
     allow_reason: String,
     exec_timeout_secs: u64,
     server: &ServerContext,
     redaction: OutputRedactionContext<'_>,
     audit: SpawnAuditContext<'_>,
     writer: &mut W,
-    leases: ProcessInitiationLeases,
 ) -> ExecuteResult {
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            return ExecuteResult::exec_failed(
-                allow_reason,
-                format!("failed to execute '{}': {}", audit.request.binary, e),
-            );
-        }
-    };
-    drop(leases.tool_mapping);
-    drop(leases.command);
-    #[cfg(all(test, unix))]
-    signal_command_started_for_test(server);
     let mut process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
@@ -4704,6 +4928,223 @@ pub(super) fn merge_envelope_context(
     match session_prompt {
         Some(prompt) if !prompt.trim().is_empty() => Some(format!("{envelope}\n\n{prompt}")),
         _ => Some(envelope),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod child_launch_tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    fn shell(command: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", command]);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd
+    }
+
+    #[tokio::test]
+    async fn child_launch_distinguishes_cwd_and_executable_failures() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("unprivileged cwd permission test requires a non-root test identity");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let denied = cwd.join("denied-directory");
+        std::fs::DirBuilder::new().mode(0).create(&denied).unwrap();
+        assert!(denied.canonicalize().unwrap().metadata().unwrap().is_dir());
+        let error =
+            spawn_brokered_command(shell("printf started"), Some(&denied), None).unwrap_err();
+        std::fs::remove_dir(&denied).unwrap();
+        assert_eq!(error.stage, ExecutionStage::Cwd);
+        assert_eq!(error.errno, Some(libc::EACCES));
+
+        let ancestor = cwd.join("ancestor");
+        let nested = ancestor.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0)).unwrap();
+        let error =
+            spawn_brokered_command(shell("printf started"), Some(&nested), None).unwrap_err();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(error.stage, ExecutionStage::Cwd);
+        assert_eq!(error.errno, Some(libc::EACCES));
+
+        let missing = cwd.join("missing-executable");
+        let error = spawn_brokered_command(Command::new(missing), Some(&cwd), None).unwrap_err();
+        assert_eq!(error.stage, ExecutionStage::Exec);
+        assert_eq!(error.errno, Some(libc::ENOENT));
+
+        let denied_executable = cwd.join("denied-executable");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&denied_executable)
+            .unwrap();
+        let error =
+            spawn_brokered_command(Command::new(denied_executable), Some(&cwd), None).unwrap_err();
+        assert_eq!(error.stage, ExecutionStage::Exec);
+        assert_eq!(error.errno, Some(libc::EACCES));
+    }
+
+    #[tokio::test]
+    async fn child_launch_resolves_relative_executable_and_file_in_requested_cwd() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("relative-tool");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(executable)
+            .unwrap();
+        file.write_all(b"#!/bin/sh\ncat relative-input\n").unwrap();
+        drop(file);
+        std::fs::write(temp.path().join("relative-input"), "relative-cwd-ok").unwrap();
+        let mut cmd = Command::new("./relative-tool");
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = spawn_brokered_command(cmd, Some(temp.path()), None).unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"relative-cwd-ok");
+    }
+
+    #[tokio::test]
+    async fn child_launch_keeps_unobserved_setup_failures_unknown() {
+        let mut cmd = shell("printf started");
+        cmd.arg("invalid\0argument");
+        let error = spawn_brokered_command(cmd, None, None).unwrap_err();
+        assert_eq!(error.stage, ExecutionStage::Unknown);
+        assert_eq!(error.errno, None);
+    }
+
+    #[tokio::test]
+    async fn child_launch_default_identity_preserves_supplementary_groups() {
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0);
+        let mut groups = vec![0; count as usize];
+        assert_eq!(
+            unsafe { libc::getgroups(count, groups.as_mut_ptr()) },
+            count
+        );
+        groups.push(unsafe { libc::getegid() });
+        groups.sort_unstable();
+        groups.dedup();
+        let child = spawn_brokered_command(shell("id -u; id -g; id -G"), None, None).unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        let mut lines = output.lines();
+        assert_eq!(lines.next().unwrap().parse::<u32>().unwrap(), unsafe {
+            libc::geteuid()
+        });
+        assert_eq!(lines.next().unwrap().parse::<u32>().unwrap(), unsafe {
+            libc::getegid()
+        });
+        let mut child_groups: Vec<libc::gid_t> = lines
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .map(|group| group.parse().unwrap())
+            .collect();
+        child_groups.sort_unstable();
+        child_groups.dedup();
+        assert_eq!(child_groups, groups);
+    }
+
+    #[tokio::test]
+    async fn child_launch_reports_identity_failure_before_cwd() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("unprivileged identity failure test requires a non-root test identity");
+            return;
+        }
+        let mut server = super::super::tests::config_for_proposal_test();
+        server.config.exec_as_caller = true;
+        let identity = resolve_exec_identity(
+            &server,
+            &CallerIdentity::Unix {
+                uid: unsafe { libc::geteuid() },
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(identity.groups.contains(&identity.context.gid));
+        let missing = tempfile::tempdir().unwrap().path().join("missing");
+        let error =
+            spawn_brokered_command(shell("printf started"), Some(&missing), Some(&identity))
+                .unwrap_err();
+        assert_eq!(error.stage, ExecutionStage::Identity);
+        assert_eq!(error.errno, Some(libc::EPERM));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn child_launch_non_root_capabilities_are_empty() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("non-root capability test requires a non-root test identity");
+            return;
+        }
+        let mut cmd = Command::new("cat");
+        cmd.arg("/proc/self/status").stdout(Stdio::piped());
+        let output = spawn_brokered_command(cmd, None, None)
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let status = String::from_utf8(output.stdout).unwrap();
+        for field in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
+            let value = status
+                .lines()
+                .find_map(|line| line.strip_prefix(field))
+                .expect("child capability field");
+            assert_eq!(u64::from_str_radix(value.trim(), 16).unwrap(), 0, "{field}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn child_setup_report_descriptors_are_close_on_exec() {
+        let mut cmd =
+            shell("for descriptor in /proc/self/fd/*; do readlink \"$descriptor\"; done; exit 0");
+        let report = prepare_child_setup(&mut cmd, None, None).unwrap();
+        let report_pipe =
+            std::fs::read_link(format!("/proc/self/fd/{}", report.as_raw_fd())).unwrap();
+        let output = cmd.output().await.unwrap();
+        assert!(output.status.success());
+        assert!(!String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line == report_pipe.to_str().unwrap()));
+    }
+
+    #[test]
+    fn child_setup_report_requires_a_complete_matching_record() {
+        use std::io::Write;
+        for record in [
+            vec![5],
+            vec![99, 0, 0, 0, 13, 0, 0, 0],
+            vec![5, 1, 0, 0, 13, 0, 0, 0],
+            vec![5, 0, 0, 0, 0, 0, 0, 0],
+        ] {
+            let (mut reader, mut writer) = std::io::pipe().unwrap();
+            writer.write_all(&record).unwrap();
+            drop(writer);
+            assert!(read_child_setup_error(
+                &mut reader,
+                &std::io::Error::from_raw_os_error(libc::EACCES)
+            )
+            .is_none());
+        }
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let writer: OwnedFd = writer.into();
+        write_child_setup_report(&writer, ChildSetupStage::Cwd, libc::EACCES).unwrap();
+        assert!(read_child_setup_error(
+            &mut reader,
+            &std::io::Error::from_raw_os_error(libc::ENOENT)
+        )
+        .is_none());
     }
 }
 

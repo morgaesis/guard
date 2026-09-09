@@ -2650,6 +2650,226 @@ async fn local_caller_cwd_is_canonicalized_and_used_for_execution() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn launch_failures_are_typed_in_buffered_and_streaming_execution() {
+    use guard::wire::ExecutionStage;
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let _env_guard = TEST_ENV_LOCK.lock().await;
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_timeout_secs = 5;
+    let caller = CallerIdentity::Unix {
+        uid: unsafe { libc::geteuid() },
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().canonicalize().unwrap();
+    let denied_cwd = cwd.join("denied-directory");
+    std::fs::DirBuilder::new()
+        .mode(0)
+        .create(&denied_cwd)
+        .unwrap();
+    let denied_binary = cwd.join("denied-executable");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&denied_binary)
+        .unwrap();
+    let missing_binary = cwd.join("missing-executable");
+    let missing_interpreter = cwd.join("missing-interpreter");
+    let mut script = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&missing_interpreter)
+        .unwrap();
+    script
+        .write_all(b"#!/guard-nonexistent-interpreter\n")
+        .unwrap();
+    drop(script);
+
+    for streaming in [false, true] {
+        let mut cases = vec![
+            (
+                missing_binary.to_str().unwrap(),
+                &cwd,
+                ExecutionStage::Exec,
+                libc::ENOENT,
+            ),
+            (
+                denied_binary.to_str().unwrap(),
+                &cwd,
+                ExecutionStage::Exec,
+                libc::EACCES,
+            ),
+            (
+                missing_interpreter.to_str().unwrap(),
+                &cwd,
+                ExecutionStage::Exec,
+                libc::ENOENT,
+            ),
+        ];
+        if unsafe { libc::geteuid() } != 0 {
+            cases.push(("sh", &denied_cwd, ExecutionStage::Cwd, libc::EACCES));
+        }
+        for (binary, requested_cwd, stage, errno) in cases {
+            let mut request = basic_request(
+                binary,
+                vec!["-c".to_string(), "printf unexpected".to_string()],
+            );
+            request.cwd = Some(requested_cwd.clone());
+            let mut stream = Vec::new();
+            let result = exec_after_approval_with_secret_authority(
+                &mut RequestContext {
+                    server: &cfg,
+                    caller: &caller,
+                    depth: 0,
+                    stream_output: streaming,
+                    stream_writer: &mut stream,
+                },
+                request,
+                "fixture policy approval".to_string(),
+                None,
+            )
+            .await;
+            assert!(result.policy_allowed());
+            assert!(matches!(
+                result.exec,
+                ExecOutcome::Failed { started: false, .. }
+            ));
+            let failure = result.execution_failure().expect("typed launch failure");
+            assert!(!failure.started);
+            assert_eq!(failure.stage, stage, "{failure:?}");
+            assert_eq!(failure.errno, Some(errno));
+            assert!(!failure.message.contains(cwd.to_str().unwrap()));
+            assert!(!failure.message.contains("unexpected"));
+            assert!(stream.is_empty(), "a failed launch emits no child output");
+        }
+    }
+    std::fs::remove_dir(denied_cwd).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_preserves_relative_file_access_in_both_output_modes() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
+    let (mut cfg, _) = make_test_config();
+    cfg.config.exec_timeout_secs = 5;
+    let caller = CallerIdentity::Unix {
+        uid: unsafe { libc::geteuid() },
+    };
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("relative-input"), "cwd-content").unwrap();
+    for streaming in [false, true] {
+        let mut request = basic_request(
+            "sh",
+            vec!["-c".to_string(), "cat relative-input".to_string()],
+        );
+        request.cwd = Some(temp.path().canonicalize().unwrap());
+        let mut stream = Vec::new();
+        let result = exec_after_approval_with_secret_authority(
+            &mut RequestContext {
+                server: &cfg,
+                caller: &caller,
+                depth: 0,
+                stream_output: streaming,
+                stream_writer: &mut stream,
+            },
+            request,
+            "fixture policy approval".to_string(),
+            None,
+        )
+        .await;
+        assert!(result.policy_allowed());
+        assert!(result.execution_failure().is_none());
+        match result.exec {
+            ExecOutcome::Completed {
+                exit_code, stdout, ..
+            } => {
+                assert_eq!(exit_code, Some(0));
+                if streaming {
+                    assert!(String::from_utf8(stream).unwrap().contains("cwd-content"));
+                } else {
+                    assert_eq!(stdout.as_deref(), Some("cwd-content"));
+                }
+            }
+            other => panic!("expected completed relative-file execution: {other:?}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_failure_is_recorded_as_an_allowed_session_interaction_after_restart() {
+    use guard::wire::ExecutionStage;
+    use std::os::unix::fs::DirBuilderExt;
+
+    let _env_guard = TEST_ENV_LOCK.lock().await;
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 {
+        eprintln!("cwd permission test requires a non-root test identity");
+        return;
+    }
+    let (mut cfg, _) = make_test_config();
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("state.db");
+    cfg.state.session_store = Some(
+        crate::session_store::SessionStore::open(database.clone(), 3600)
+            .await
+            .unwrap(),
+    );
+    let cwd = temp.path().join("denied-directory");
+    std::fs::DirBuilder::new().mode(0).create(&cwd).unwrap();
+    let token = format!("launch-failure-{}", std::process::id());
+    let mut grant = unrestricted_session();
+    grant.owner = crate::session::SessionOwner::Principal(PrincipalKey::from_uid(uid));
+    grant.static_only = true;
+    grant.allow_exact = vec![SessionExactRule::with_cwd("id", Vec::new(), cwd.clone())];
+    cfg.state.sessions.write().await.grant(token.clone(), grant);
+    let mut request = basic_request("id", Vec::new());
+    request.cwd = Some(cwd.clone());
+    request.session_token = Some(token.clone());
+
+    let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid }).await;
+    std::fs::remove_dir(cwd).unwrap();
+    assert!(result.policy_allowed());
+    let failure = result.execution_failure().unwrap().clone();
+    assert_eq!(failure.stage, ExecutionStage::Cwd);
+    let interactions = cfg.state.sessions.read().await.interactions_snapshot();
+    let (_, interaction) = interactions.iter().find(|(key, _)| key == &token).unwrap();
+    assert!(interaction.allowed);
+    assert_eq!(
+        interaction.exec_status,
+        crate::session::SessionExecStatus::Failed
+    );
+    assert_eq!(interaction.execution_failure.as_ref(), Some(&failure));
+    let source = interaction.source;
+    drop(cfg);
+
+    let (mut restarted, _) = make_test_config();
+    let reopened = crate::session_store::SessionStore::open(database, 3600)
+        .await
+        .unwrap();
+    *restarted.state.sessions.write().await = reopened.load_registry().await.unwrap();
+    restarted.state.session_store = Some(reopened);
+    let interactions = restarted
+        .state
+        .sessions
+        .read()
+        .await
+        .interactions_snapshot();
+    let (_, interaction) = interactions.iter().find(|(key, _)| key == &token).unwrap();
+    assert!(interaction.allowed);
+    assert_eq!(interaction.source, source);
+    assert_eq!(
+        interaction.exec_status,
+        crate::session::SessionExecStatus::Failed
+    );
+    assert_eq!(interaction.execution_failure.as_ref(), Some(&failure));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn default_service_execution_does_not_forward_ssh_auth_sock() {
     let (cfg, _) = make_test_config();
     let _restore = EnvRestore::capture("SSH_AUTH_SOCK");
