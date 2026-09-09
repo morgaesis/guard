@@ -1,12 +1,19 @@
 # Saved grants activate typed verbs and carry bounded evaluator context.
 # Load this catalog with:
 #
-#   guard server start --socket /run/guard/guard.sock \
+#   KUBECONFIG=/run/guard/kubeconfig guard server start \
+#       --socket /run/guard/guard.sock \
+#       --exec-user guard-exec \
+#       --child-env KUBECONFIG \
+#       --kube-proxy 127.0.0.1:8443 \
+#       --kubeconfig /etc/guard/upstream.kubeconfig \
+#       --brokered-kubeconfig-out /run/guard/kubeconfig \
+#       --verbs /etc/guard/verbs-kubectl.yaml \
 #       --grants /etc/guard/saved-grants.yaml
 #
 # Agents request matching bounded authority through the access workflow:
 #
-#   agent$ guard access request "Apply bounded Ansible changes to host-a"
+#   agent$ guard access request "Inspect Kubernetes resources through the Guard proxy"
 #   operator$ guard access approve <request> --uses 3
 #
 # `--profiles`, GUARD_PROFILES, and legacy `profiles:` catalogs remain accepted
@@ -15,66 +22,22 @@
 # Ambiguous globs fail loading instead of becoming a parallel policy language.
 
 grants:
-  - name: ansible-host-a-apply
-    description: Apply bounded Ansible changes to host-a
-    ttl_secs: 1800
-    evaluation_mode: evaluator
-    activated_verbs:
-      - ansible-host-a-apply
-    override_markers:
-      - operator:ansible-apply
-    prompt_append: >
-      This session applies the operator-authored host-a capability. Other
-      Ansible targets and inventories remain outside the grant.
-    ceiling:
-      verbs:
-        - ansible-host-a-apply
-      max_ttl_secs: 1800
-      allow_prompt_append: false
-      evaluation_modes:
-        - evaluator
-
   - name: kube-readonly
     description: Read-only Kubernetes inspection through typed catalog verbs
     ttl_secs: 3600
     evaluation_mode: read_only
     activated_verbs:
-      - kube-get
-      - kube-describe
-      - kube-logs
+      - k-get
+      - k-describe
+      - k-logs
     prompt_append: >
       This session is read-only Kubernetes inspection. Missing operation areas
       remain evaluator-routed; mutations are outside this saved grant.
     ceiling:
       verbs:
-        - kube-get
-        - kube-describe
-        - kube-logs
+        - k-get
+        - k-describe
+        - k-logs
       max_ttl_secs: 3600
       evaluation_modes:
         - read_only
-
-  - name: cert-manager-rotation
-    description: Rotate cert-manager certificates in one namespace
-    ttl_secs: 1800
-    evaluation_mode: evaluator
-    activated_verbs:
-      - cert-manager-read
-      - cert-manager-rotate
-    secret_names:
-      - CERT_MANAGER_KUBECONFIG
-    prompt_append: >
-      Certificate reads and bounded leaf-certificate rotation in the
-      cert-manager namespace are expected. Namespace deletion and unrelated
-      system secret changes are outside this grant.
-    auto_approve_requests: true
-    ceiling:
-      verbs:
-        - cert-manager-read
-        - cert-manager-rotate
-      secret_names:
-        - CERT_MANAGER_KUBECONFIG
-      max_ttl_secs: 1800
-      allow_prompt_append: false
-      evaluation_modes:
-        - evaluator

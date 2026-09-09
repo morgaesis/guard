@@ -1,0 +1,1705 @@
+#!/usr/bin/env bash
+# Install or restore a Guard systemd deployment as a verified transaction.
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly PROGRAM_NAME="${0##*/}"
+readonly DEFAULT_ROOT=""
+
+action=""
+release_directory=""
+release_archive=""
+expected_release_sha256=""
+release_stage=""
+backup_directory=""
+root_prefix="$DEFAULT_ROOT"
+dry_run=0
+active_unit=""
+rollback_source=""
+recovery_backup=""
+failure_restore_source=""
+handling_failure=0
+service_recovery_armed=0
+transaction_directory=""
+test_mode_active=0
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  upgrade-guard install --release-archive ARCHIVE --expected-sha256 SHA256 [--backup-dir DIRECTORY] [--dry-run]
+  upgrade-guard rollback --backup-dir DIRECTORY [--dry-run]
+
+Install authenticates the complete archive, extracts it into protected staging,
+verifies `INSTALL-SHA256`, creates a stopped-service backup, and starts the
+verified release. Rollback verifies a backup manifest and restores it.
+`--dry-run` validates the selected release or backup without changing the host.
+USAGE
+}
+
+die() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+  if (( service_recovery_armed == 1 && handling_failure == 0 )); then
+    recover_from_failure "$failure_restore_source" 1
+  fi
+  exit 1
+}
+
+is_test_mode() {
+  (( test_mode_active == 1 ))
+}
+
+validate_test_environment() {
+  local -a controls=("${!GUARD_UPGRADE_TEST_@}")
+  (( ${#controls[@]} == 0 )) && return
+  [[ "${GUARD_UPGRADE_TEST_MODE:-}" == "1" ]] || \
+    die "GUARD_UPGRADE_TEST_* controls require GUARD_UPGRADE_TEST_MODE=1"
+  [[ -n "$root_prefix" && "$root_prefix" != "/" ]] || \
+    die "GUARD_UPGRADE_TEST_* controls require a non-root isolated --root"
+}
+
+rooted_path() {
+  local path="$1"
+  printf '%s%s\n' "$root_prefix" "$path"
+}
+
+require_directory() {
+  local path="$1"
+  [[ -d "$path" ]] || die "directory does not exist: $path"
+}
+
+require_regular_file() {
+  local path="$1"
+  [[ -f "$path" && ! -L "$path" ]] || die "regular file does not exist: $path"
+}
+
+canonical_directory() {
+  local path="$1"
+  require_directory "$path"
+  readlink -f -- "$path"
+}
+
+validate_root_prefix() {
+  [[ -z "$root_prefix" ]] && return
+  [[ "${GUARD_UPGRADE_TEST_MODE:-}" == "1" ]] || \
+    die "--root is reserved for the isolated test harness"
+  root_prefix="$(canonical_directory "$root_prefix")"
+  [[ "$root_prefix" != "/" ]] || die "--root must be an isolated test directory"
+  test_mode_active=1
+}
+
+validate_backup_directory() {
+  local candidate="$1" backup_name
+  local expected_root metadata_unit metadata_owner metadata_group
+  expected_root="$(rooted_path /var/backups/guard)"
+  validate_protected_directory "$expected_root" "Guard backup root" 700
+  expected_root="$(canonical_directory "$expected_root")"
+  validate_protected_directory "$candidate" "Guard backup directory" 700
+  backup_directory="$(canonical_directory "$candidate")"
+  [[ "$backup_directory" == "$expected_root"/guard-* ]] || \
+    die "backup directory must be below $expected_root and start with guard-"
+  backup_name="$(basename "$backup_directory")"
+  validate_backup_name "$backup_name"
+  [[ -z "$(find "$backup_directory" -type l -print -quit)" ]] || \
+    die "backup directory contains a symbolic link"
+  [[ -z "$(find "$backup_directory" ! -type d ! -type f -print -quit)" ]] || \
+    die "backup directory contains a special file"
+  [[ -z "$(find "$backup_directory" -type f -links +1 -print -quit)" ]] || \
+    die "backup directory contains a hard-linked file"
+  require_regular_file "$backup_directory/SHA256SUMS"
+  validate_protected_file "$backup_directory/SHA256SUMS" "Guard backup manifest"
+  verify_manifest "$backup_directory"
+  require_regular_file "$backup_directory/metadata/service-unit"
+  require_regular_file "$backup_directory/metadata/state-db"
+  require_regular_file "$backup_directory/metadata/socket"
+  require_regular_file "$backup_directory/metadata/state-owner"
+  require_regular_file "$backup_directory/metadata/state-group"
+  metadata_unit="$(<"$backup_directory/metadata/service-unit")"
+  metadata_owner="$(<"$backup_directory/metadata/state-owner")"
+  metadata_group="$(<"$backup_directory/metadata/state-group")"
+  case "$metadata_unit:$metadata_owner:$metadata_group" in
+    guard.service:guard:guard|guard-exec-as-caller.service:root:root) ;;
+    *) die "backup service metadata is invalid" ;;
+  esac
+  state_database_from_backup "$backup_directory" >/dev/null
+  socket_from_backup "$backup_directory" >/dev/null
+  backup_service_active_state "$backup_directory" >/dev/null
+  backup_service_enabled_state "$backup_directory" >/dev/null
+}
+
+validate_new_backup_destination() {
+  local candidate="$1"
+  local expected_root candidate_parent candidate_name
+  [[ "$candidate" == /* ]] || die "backup directory must be absolute"
+  expected_root="$(canonical_directory "$(rooted_path /var/backups/guard)")"
+  candidate_parent="$(canonical_directory "$(dirname "$candidate")")"
+  candidate_name="$(basename "$candidate")"
+  [[ "$candidate_parent" == "$expected_root" ]] || \
+    die "backup directory must be directly below $expected_root"
+  validate_backup_name "$candidate_name"
+  backup_directory="$candidate_parent/$candidate_name"
+  [[ ! -e "$backup_directory" ]] || die "backup destination already exists: $backup_directory"
+}
+
+validate_backup_name() {
+  local name="$1"
+  [[ "$name" =~ ^guard-[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+    die "backup directory name must match guard-[A-Za-z0-9][A-Za-z0-9._-]*"
+}
+
+install_file() {
+  local source="$1"
+  local destination="$2"
+  local mode="$3"
+  if is_test_mode; then
+    install -m "$mode" "$source" "$destination"
+  else
+    install -o root -g root -m "$mode" "$source" "$destination"
+  fi
+}
+
+install_owned_file() {
+  local source="$1"
+  local destination="$2"
+  local mode="$3"
+  local owner="$4"
+  local group="$5"
+  if is_test_mode; then
+    install -m "$mode" "$source" "$destination"
+  else
+    install -o "$owner" -g "$group" -m "$mode" "$source" "$destination"
+  fi
+}
+
+copy_tree() {
+  local source="$1"
+  local destination="$2"
+  cp -a -- "$source" "$destination"
+}
+
+require_root() {
+  if ! is_test_mode; then
+    [[ "$(id -u)" == "0" ]] || die "run as root"
+  fi
+}
+
+require_status_json_parser() {
+  jq --version >/dev/null 2>&1 || die "jq is required to verify Guard server status"
+}
+
+cleanup_release_stage() {
+  if [[ -n "$release_stage" && -d "$release_stage" ]]; then
+    rm -r -- "$release_stage"
+    release_stage=""
+  fi
+}
+
+release_staging_root_path() {
+  printf '%s/release-staging\n' "$(transaction_root_path)"
+}
+
+ensure_release_staging_root() {
+  local root
+  ensure_transaction_root
+  root="$(release_staging_root_path)"
+  if [[ -e "$root" ]]; then
+    validate_protected_directory "$root" "Guard release staging root" 700
+    return
+  fi
+  if is_test_mode; then
+    install -d -m 0700 "$root"
+  else
+    install -d -o root -g root -m 0700 "$root"
+  fi
+  validate_protected_directory "$root" "Guard release staging root" 700
+}
+
+cleanup_stale_release_stages() {
+  local root stage name
+  root="$(release_staging_root_path)"
+  [[ -e "$root" ]] || return 0
+  ensure_transaction_root
+  validate_protected_directory "$root" "Guard release staging root" 700
+  while IFS= read -r -d '' stage; do
+    name="$(basename "$stage")"
+    [[ "$name" =~ ^release\.[A-Za-z0-9]{8}$ ]] || \
+      die "Guard release staging root contains an unexpected entry: $name"
+    validate_protected_directory "$stage" "Guard stale release stage" 700
+    rm -r -- "$stage"
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
+  sync_path "$root"
+}
+
+acquire_upgrade_lock() {
+  local lock_file lock_path_identity lock_descriptor_identity
+  ensure_transaction_root
+  lock_file="$(transaction_root_path)/upgrade.lock"
+  if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then
+    if is_test_mode; then
+      install -m 0600 /dev/null "$lock_file"
+    else
+      install -o root -g root -m 0600 /dev/null "$lock_file"
+    fi
+  fi
+  validate_protected_file "$lock_file" "Guard upgrade lock"
+  exec 9<>"$lock_file"
+  validate_protected_file "$lock_file" "Guard upgrade lock"
+  lock_path_identity="$(stat -c '%d:%i' -- "$lock_file")"
+  lock_descriptor_identity="$(stat -Lc '%d:%i' -- "/proc/$$/fd/9")"
+  [[ "$lock_descriptor_identity" == "$lock_path_identity" ]] || \
+    die "Guard upgrade lock changed while it was opened"
+  flock -n 9 || die "another Guard upgrade or rollback is active"
+}
+
+transaction_path() {
+  printf '%s/upgrade-transaction\n' "$(transaction_root_path)"
+}
+
+transaction_root_path() {
+  rooted_path /var/lib/guard-upgrade
+}
+
+expected_transaction_owner() {
+  if is_test_mode; then
+    id -u
+  else
+    printf '%s\n' 0
+  fi
+}
+
+validate_protected_directory() {
+  local path="$1"
+  local description="$2"
+  local expected_mode="$3"
+  local owner mode
+  [[ -d "$path" && ! -L "$path" ]] || die "$description is not a directory"
+  owner="$(stat -c '%u' -- "$path")"
+  mode="$(stat -c '%a' -- "$path")"
+  [[ "$owner" == "$(expected_transaction_owner)" ]] || \
+    die "$description is not owned by the upgrade authority"
+  [[ "$mode" == "$expected_mode" ]] || \
+    die "$description has mode $mode; expected $expected_mode"
+}
+
+validate_protected_file() {
+  local path="$1"
+  local description="$2"
+  local owner mode links
+  require_regular_file "$path"
+  owner="$(stat -c '%u' -- "$path")"
+  mode="$(stat -c '%a' -- "$path")"
+  links="$(stat -c '%h' -- "$path")"
+  [[ "$owner" == "$(expected_transaction_owner)" ]] || \
+    die "$description is not owned by the upgrade authority"
+  [[ "$mode" == 600 ]] || die "$description has mode $mode; expected 600"
+  [[ "$links" == 1 ]] || die "$description must have exactly one hard link"
+}
+
+ensure_transaction_root() {
+  local root
+  root="$(transaction_root_path)"
+  if [[ -e "$root" ]]; then
+    validate_protected_directory "$root" "Guard transaction root" 700
+    return
+  fi
+  if is_test_mode; then
+    install -d -m 0700 "$root"
+  else
+    install -d -o root -g root -m 0700 "$root"
+  fi
+  validate_protected_directory "$root" "Guard transaction root" 700
+}
+
+validate_transaction_journal() {
+  local journal phase
+  ensure_transaction_root
+  journal="${transaction_directory:-$(transaction_path)}"
+  validate_protected_directory "$journal" "Guard transaction journal" 700
+  validate_protected_file "$journal/service-unit" "Guard transaction service unit"
+  if [[ -e "$journal/service-active" || -e "$journal/service-enabled" ]]; then
+    [[ -e "$journal/service-active" && -e "$journal/service-enabled" ]] || \
+      die "Guard transaction service state metadata is incomplete"
+    validate_protected_file "$journal/service-active" "Guard transaction service active state"
+    validate_protected_file "$journal/service-enabled" "Guard transaction service enabled state"
+  fi
+  validate_protected_file "$journal/phase" "Guard transaction phase"
+  transaction_service_active_state "$journal" >/dev/null
+  transaction_service_enabled_state "$journal" >/dev/null
+  phase="$(<"$journal/phase")"
+  case "$phase" in
+    quiescing)
+      validate_protected_file "$journal/state-db" "Guard transaction state database"
+      validate_protected_file "$journal/socket" "Guard transaction socket"
+      validate_state_database_setting "$(<"$journal/state-db")"
+      validate_socket_setting "$(<"$journal/socket")"
+      ;;
+    prepared|mutating)
+      validate_protected_file "$journal/restore-source" "Guard transaction restore source"
+      ;;
+    *) die "Guard transaction journal phase is invalid" ;;
+  esac
+}
+
+sync_path() {
+  sync -f -- "$1"
+}
+
+validate_service_active_state() {
+  case "$1" in
+    active|inactive) ;;
+    *) die "Guard service active state is not stable: $1" ;;
+  esac
+}
+
+validate_service_enabled_state() {
+  case "$1" in
+    enabled|enabled-runtime|disabled|masked|masked-runtime|static|indirect) ;;
+    *) die "Guard service enabled state is unsupported: $1" ;;
+  esac
+}
+
+transaction_service_active_state() {
+  local journal="$1" state
+  if [[ ! -e "$journal/service-active" ]]; then
+    printf '%s\n' active
+    return
+  fi
+  state="$(<"$journal/service-active")"
+  validate_service_active_state "$state"
+  printf '%s\n' "$state"
+}
+
+transaction_service_enabled_state() {
+  local journal="$1" state
+  if [[ ! -e "$journal/service-enabled" ]]; then
+    printf '%s\n' preserve
+    return
+  fi
+  state="$(<"$journal/service-enabled")"
+  validate_service_enabled_state "$state"
+  printf '%s\n' "$state"
+}
+
+begin_quiesce_transaction() {
+  local unit="$1"
+  local state_database="$2"
+  local socket="$3"
+  local parent temporary service_active service_enabled
+  service_active="$(service_active_state "$unit")"
+  service_enabled="$(service_enabled_state "$unit")"
+  ensure_transaction_root
+  transaction_directory="$(transaction_path)"
+  parent="$(transaction_root_path)"
+  [[ ! -e "$transaction_directory" ]] || die "an incomplete Guard transaction already exists"
+  temporary="$parent/.upgrade-transaction.$$.${RANDOM}"
+  mkdir "$temporary"
+  chmod 0700 "$temporary"
+  printf '%s\n' "$unit" > "$temporary/service-unit"
+  printf '%s\n' "$service_active" > "$temporary/service-active"
+  printf '%s\n' "$service_enabled" > "$temporary/service-enabled"
+  printf '%s\n' "$state_database" > "$temporary/state-db"
+  printf '%s\n' "$socket" > "$temporary/socket"
+  printf '%s\n' quiescing > "$temporary/phase"
+  chmod 0600 \
+    "$temporary/service-unit" \
+    "$temporary/service-active" \
+    "$temporary/service-enabled" \
+    "$temporary/state-db" \
+    "$temporary/socket" \
+    "$temporary/phase"
+  sync_path "$temporary/service-unit"
+  sync_path "$temporary/service-active"
+  sync_path "$temporary/service-enabled"
+  sync_path "$temporary/state-db"
+  sync_path "$temporary/socket"
+  sync_path "$temporary/phase"
+  sync_path "$temporary"
+  mv -- "$temporary" "$transaction_directory"
+  sync_path "$parent"
+  validate_transaction_journal
+  service_recovery_armed=1
+}
+
+set_transaction_phase() {
+  local phase="$1"
+  local temporary
+  [[ -n "$transaction_directory" ]] || die "Guard transaction journal is unavailable"
+  temporary="$transaction_directory/.phase.$$.${RANDOM}"
+  printf '%s\n' "$phase" > "$temporary"
+  chmod 0600 "$temporary"
+  sync_path "$temporary"
+  mv -f -- "$temporary" "$transaction_directory/phase"
+  sync_path "$transaction_directory"
+}
+
+record_transaction_restore_source() {
+  local restore_source="$1"
+  local temporary
+  [[ -n "$transaction_directory" ]] || die "Guard transaction journal is unavailable"
+  validate_transaction_journal
+  [[ "$(<"$transaction_directory/phase")" == quiescing ]] || \
+    die "Guard transaction journal is not awaiting a backup"
+  temporary="$transaction_directory/.restore-source.$$.${RANDOM}"
+  printf '%s\n' "$restore_source" > "$temporary"
+  chmod 0600 "$temporary"
+  sync_path "$temporary"
+  mv -- "$temporary" "$transaction_directory/restore-source"
+  sync_path "$transaction_directory"
+  set_transaction_phase prepared
+  validate_transaction_journal
+  failure_restore_source="$restore_source"
+}
+
+mark_transaction_mutating() {
+  [[ -n "$transaction_directory" ]] || die "Guard transaction journal is unavailable"
+  validate_transaction_journal
+  [[ "$(<"$transaction_directory/phase")" == prepared ]] || \
+    die "Guard transaction journal is not prepared for mutation"
+  set_transaction_phase mutating
+  validate_transaction_journal
+}
+
+complete_transaction() {
+  local parent
+  [[ -n "$transaction_directory" ]] || die "Guard transaction journal is unavailable"
+  validate_transaction_journal
+  parent="$(transaction_root_path)"
+  rm -r -- "$transaction_directory"
+  sync_path "$parent"
+  transaction_directory=""
+  failure_restore_source=""
+  service_recovery_armed=0
+}
+
+systemctl_active() {
+  systemctl is-active "$1" 2>/dev/null || true
+}
+
+service_active_state() {
+  local state
+  state="$(systemctl_active "$1")"
+  validate_service_active_state "$state"
+  printf '%s\n' "$state"
+}
+
+service_enabled_state() {
+  local state
+  state="$(systemctl is-enabled "$1" 2>/dev/null || true)"
+  validate_service_enabled_state "$state"
+  printf '%s\n' "$state"
+}
+
+wait_for_service_state() {
+  local unit="$1"
+  local accepted_states="$2"
+  local state
+  local remaining=40
+  while (( remaining > 0 )); do
+    state="$(systemctl_active "$unit")"
+    case ":$accepted_states:" in
+      *":$state:"*) printf '%s\n' "$state"; return 0 ;;
+    esac
+    sleep 0.25
+    remaining=$((remaining - 1))
+  done
+  printf '%s\n' "$state"
+  return 1
+}
+
+select_active_unit() {
+  local standard_state caller_state
+  standard_state="$(systemctl_active guard.service)"
+  caller_state="$(systemctl_active guard-exec-as-caller.service)"
+  case "$standard_state:$caller_state" in
+    active:active) die "both packaged Guard services are active" ;;
+    active:*) active_unit="guard.service" ;;
+    *:active) active_unit="guard-exec-as-caller.service" ;;
+    *) die "no packaged Guard service is active" ;;
+  esac
+}
+
+validate_state_database_setting() {
+  validate_absolute_service_path "$1" "--state-db"
+}
+
+validate_socket_setting() {
+  validate_absolute_service_path "$1" "--socket"
+}
+
+validate_absolute_service_path() {
+  local path="$1"
+  local option="$2"
+  local component
+  local -a components=()
+  [[ "$path" =~ ^/[A-Za-z0-9._/@:+-]+$ ]] || \
+    die "Guard service $option must be an absolute canonical path"
+  [[ "$path" != *'//' && "$path" != */./* && "$path" != */../* && \
+    "$path" != */. && "$path" != */.. ]] || \
+    die "Guard service $option path is not canonical"
+  IFS=/ read -r -a components <<< "${path#/}"
+  for component in "${components[@]}"; do
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || \
+      die "Guard service $option path is not canonical"
+  done
+}
+
+unit_option_value() {
+  local unit="$1"
+  local option="$2"
+  local description="$3"
+  local exec_start match remainder candidate
+  local -a candidates=()
+  exec_start="$(systemctl show "$unit" --property=ExecStart --value)" || \
+    die "cannot read ExecStart for active Guard service: $unit"
+  [[ -n "$exec_start" && "$exec_start" != *$'\n'* ]] || \
+    die "active Guard service has no unambiguous ExecStart setting"
+  [[ "$exec_start" != *['"'\\]* ]] || \
+    die "active Guard service ExecStart uses an unsupported escaped argument"
+
+  remainder="$exec_start"
+  while [[ "$remainder" =~ (^|[[:space:];])$option(=|[[:space:]]+)([^[:space:];]+) ]]; do
+    match="${BASH_REMATCH[0]}"
+    candidate="${BASH_REMATCH[3]}"
+    candidates+=("$candidate")
+    remainder="${remainder#*"$match"}"
+  done
+  [[ "${#candidates[@]}" == 1 ]] || \
+    die "active Guard service must define exactly one $description setting"
+  printf '%s\n' "${candidates[0]}"
+}
+
+state_database_from_unit() {
+  local path
+  path="$(unit_option_value "$1" --state-db "--state-db")"
+  validate_state_database_setting "$path"
+  printf '%s\n' "$path"
+}
+
+socket_from_unit() {
+  local path
+  path="$(unit_option_value "$1" --socket "--socket")"
+  validate_socket_setting "$path"
+  printf '%s\n' "$path"
+}
+
+state_database_from_backup() {
+  local source="$1"
+  local path
+  require_regular_file "$source/metadata/state-db"
+  path="$(<"$source/metadata/state-db")"
+  validate_state_database_setting "$path"
+  printf '%s\n' "$path"
+}
+
+socket_from_backup() {
+  local source="$1"
+  local path
+  require_regular_file "$source/metadata/socket"
+  path="$(<"$source/metadata/socket")"
+  validate_socket_setting "$path"
+  printf '%s\n' "$path"
+}
+
+api_proxy_reverts_directory() {
+  local state_database="$1"
+  printf '%s/api-proxy-reverts\n' "$(dirname "$(rooted_path "$state_database")")"
+}
+
+state_owner() {
+  case "$1" in
+    guard.service) printf '%s\n' guard ;;
+    guard-exec-as-caller.service) printf '%s\n' root ;;
+    *) die "unsupported Guard service unit: $1" ;;
+  esac
+}
+
+state_group() {
+  state_owner "$1"
+}
+
+validate_standard_execution_account() {
+  local passwd_record group_record daemon_uid exec_uid exec_gid exec_home exec_shell group_gid
+  [[ "$active_unit" == guard.service ]] || return
+
+  if is_test_mode; then
+    [[ -d "$(rooted_path /var/lib/guard-exec/.ssh)" ]] || \
+      die "the standard service requires a pre-provisioned guard-exec account and home"
+    [[ -z "$(find "$(rooted_path /var/lib/guard-exec/.ssh)" -mindepth 1 -print -quit)" ]] || \
+      die "the shared guard-exec home must not contain SSH credentials"
+    return
+  fi
+
+  passwd_record="$(getent passwd guard-exec)" || \
+    die "the standard service requires a pre-provisioned guard-exec account; see DEPLOYMENT.md"
+  IFS=: read -r _ _ exec_uid exec_gid _ exec_home exec_shell <<<"$passwd_record"
+  group_record="$(getent group guard-exec)" || \
+    die "cannot read the guard-exec group"
+  IFS=: read -r _ _ group_gid _ <<<"$group_record"
+  daemon_uid="$(id -u guard)" || die "cannot read the guard daemon account"
+
+  [[ "$exec_uid" =~ ^[0-9]+$ && "$exec_gid" =~ ^[0-9]+$ ]] || \
+    die "the guard-exec account has invalid numeric identifiers"
+  [[ "$group_gid" == "$exec_gid" ]] || \
+    die "the guard-exec account does not use the guard-exec primary group"
+  [[ "$exec_uid" != "$daemon_uid" ]] || \
+    die "the guard and guard-exec accounts must have distinct user IDs"
+  [[ "$exec_home" == /var/lib/guard-exec ]] || \
+    die "the guard-exec account home must be /var/lib/guard-exec"
+  case "$exec_shell" in
+    /usr/sbin/nologin|/sbin/nologin) ;;
+    *) die "the guard-exec account must use a nologin shell" ;;
+  esac
+
+  [[ -d /var/lib/guard-exec/.ssh ]] || \
+    die "the guard-exec account requires a provisioned 0700 home and .ssh directory"
+  [[ "$(stat -c '%U:%G:%a' /var/lib/guard-exec)" == guard-exec:guard-exec:700 ]] || \
+    die "the guard-exec home must be owned by guard-exec:guard-exec with mode 0700"
+  [[ "$(stat -c '%U:%G:%a' /var/lib/guard-exec/.ssh)" == guard-exec:guard-exec:700 ]] || \
+    die "the guard-exec .ssh directory must be owned by guard-exec:guard-exec with mode 0700"
+  [[ -z "$(find /var/lib/guard-exec/.ssh -mindepth 1 -print -quit)" ]] || \
+    die "the shared guard-exec home must not contain SSH credentials"
+}
+
+ensure_stopped() {
+  # Record recovery intent before `systemctl stop`: a signal can arrive after
+  # the unit stops but before this function regains control.
+  service_recovery_armed=1
+  systemctl stop "$active_unit"
+  fault_boundary service-stop-command-returned
+  [[ "$(wait_for_service_state "$active_unit" "inactive:failed")" == "inactive" ]] || \
+    die "Guard service did not stop: $active_unit"
+}
+
+verify_manifest() {
+  local directory="$1"
+  cmp -s -- "$directory/SHA256SUMS" <(
+    cd "$directory"
+    find . -type f ! -path ./SHA256SUMS -print0 |
+      LC_ALL=C sort -z |
+      xargs -0r sha256sum
+  ) || die "backup manifest does not exactly match the backup contents"
+}
+
+create_manifest() {
+  local directory="$1"
+  local manifest_temporary
+  manifest_temporary="$(mktemp "$(dirname "$directory")/.${PROGRAM_NAME}.manifest.XXXXXX")"
+  (
+    cd "$directory"
+    find . -type f ! -path ./SHA256SUMS -print0 |
+      LC_ALL=C sort -z |
+      xargs -0r sha256sum > "$manifest_temporary"
+    mv -- "$manifest_temporary" SHA256SUMS
+  )
+  verify_manifest "$directory"
+}
+
+backup_service_active_state() {
+  local directory="$1" state
+  if [[ ! -e "$directory/metadata/service-active" ]]; then
+    # Backups created before service-state metadata always restarted the unit.
+    printf '%s\n' active
+    return
+  fi
+  require_regular_file "$directory/metadata/service-active"
+  state="$(<"$directory/metadata/service-active")"
+  validate_service_active_state "$state"
+  printf '%s\n' "$state"
+}
+
+backup_service_enabled_state() {
+  local directory="$1" state
+  if [[ ! -s "$directory/metadata/service-enabled" ]]; then
+    # Legacy backups did not require a usable enabled-state result.
+    printf '%s\n' preserve
+    return
+  fi
+  require_regular_file "$directory/metadata/service-enabled"
+  state="$(<"$directory/metadata/service-enabled")"
+  validate_service_enabled_state "$state"
+  printf '%s\n' "$state"
+}
+
+sqlite_string_literal() {
+  local value="$1"
+  value="${value//\'/\'\'}"
+  printf "'%s'" "$value"
+}
+
+backup_sqlite_database() {
+  local source="$1"
+  local destination="$2"
+  local quoted_destination
+  quoted_destination="$(sqlite_string_literal "$destination")"
+  sqlite3 "$source" "VACUUM INTO $quoted_destination;"
+}
+
+backup_file() {
+  local source="$1"
+  local name="$2"
+  local destination="$backup_directory/files/$name"
+  if [[ -L "$source" ]]; then
+    die "refusing to back up a symbolic link: $source"
+  elif [[ -f "$source" ]]; then
+    cp -a -- "$source" "$destination"
+  else
+    : > "$backup_directory/files/$name.absent"
+  fi
+}
+
+backup_tree() {
+  local source="$1"
+  local name="$2"
+  if [[ -L "$source" ]]; then
+    die "refusing to back up a symbolic link: $source"
+  elif [[ -d "$source" ]]; then
+    [[ -z "$(find "$source" -type l -print -quit)" ]] || \
+      die "refusing to back up a tree containing a symbolic link: $source"
+    copy_tree "$source" "$backup_directory/trees/$name"
+  else
+    : > "$backup_directory/trees/$name.absent"
+  fi
+}
+
+create_backup() {
+  local destination="$1"
+  local unit="$2"
+  local state_db state_db_setting socket_setting authority_key config_directory api_directory
+  local saved_active saved_enabled
+  [[ ! -e "$destination" ]] || die "backup destination already exists: $destination"
+  state_db_setting="$(state_database_from_unit "$unit")"
+  socket_setting="$(socket_from_unit "$unit")"
+  state_db="$(rooted_path "$state_db_setting")"
+  authority_key="$(dirname "$state_db")/authority.hmac"
+  mkdir "$destination"
+  chmod 0700 "$destination"
+  mkdir "$destination/files" "$destination/trees" "$destination/database" "$destination/metadata"
+  backup_directory="$destination"
+  active_unit="$unit"
+  validate_transaction_journal
+  [[ "$(<"$transaction_directory/service-unit")" == "$unit" ]] || \
+    die "transaction service does not match the backup service"
+  saved_active="$(transaction_service_active_state "$transaction_directory")"
+  saved_enabled="$(transaction_service_enabled_state "$transaction_directory")"
+  if [[ "$saved_enabled" == preserve ]]; then
+    saved_enabled="$(service_enabled_state "$unit")"
+  fi
+
+  config_directory="$(rooted_path /etc/guard)"
+  api_directory="$(api_proxy_reverts_directory "$state_db_setting")"
+  require_regular_file "$(rooted_path /usr/local/bin/guard)"
+  backup_file "$(rooted_path /usr/local/bin/guard)" guard
+  backup_file "$(rooted_path /usr/local/sbin/guard-operator)" guard-operator
+  backup_file "$(rooted_path /usr/local/sbin/upgrade-guard)" upgrade-guard
+  backup_file "$(rooted_path /etc/systemd/system/guard.service)" guard.service
+  backup_file "$(rooted_path /etc/systemd/system/guard-exec-as-caller.service)" guard-exec-as-caller.service
+  backup_file "$authority_key" authority.hmac
+  require_regular_file "$state_db"
+  backup_sqlite_database "$state_db" "$backup_directory/database/state.db"
+  [[ -s "$backup_directory/database/state.db" ]] || die "SQLite backup is empty"
+  fault_boundary backup-database
+  backup_tree "$config_directory" config
+  backup_tree "$api_directory" api-proxy-reverts
+  printf '%s\n' "$unit" > "$backup_directory/metadata/service-unit"
+  printf '%s\n' "$saved_active" > "$backup_directory/metadata/service-active"
+  printf '%s\n' "$saved_enabled" > "$backup_directory/metadata/service-enabled"
+  printf '%s\n' "$state_db_setting" > "$backup_directory/metadata/state-db"
+  printf '%s\n' "$socket_setting" > "$backup_directory/metadata/socket"
+  printf '%s\n' "$(state_owner "$unit")" > "$backup_directory/metadata/state-owner"
+  printf '%s\n' "$(state_group "$unit")" > "$backup_directory/metadata/state-group"
+  create_manifest "$backup_directory"
+  validate_backup_directory "$backup_directory"
+  sync_path "$backup_directory"
+  sync_path "$(dirname "$backup_directory")"
+}
+
+new_backup_directory() {
+  local label="$1"
+  local backup_root candidate
+  backup_root="$(ensure_guard_backup_root)"
+  candidate="$backup_root/guard-${label}-$(date +%Y%m%d%H%M%S)-$$"
+  [[ ! -e "$candidate" ]] || die "backup name collision: $candidate"
+  printf '%s\n' "$candidate"
+}
+
+ensure_guard_backup_root() {
+  local backup_root shared_backup_root
+  shared_backup_root="$(rooted_path /var/backups)"
+  if [[ -e "$shared_backup_root" ]]; then
+    require_directory "$shared_backup_root"
+  else
+    install -d -m 0755 "$shared_backup_root"
+  fi
+  backup_root="$shared_backup_root/guard"
+  if [[ -e "$backup_root" ]]; then
+    validate_protected_directory "$backup_root" "Guard backup root" 700
+  elif is_test_mode; then
+    install -d -m 0700 "$backup_root"
+  else
+    install -d -o root -g root -m 0700 "$backup_root"
+  fi
+  validate_protected_directory "$backup_root" "Guard backup root" 700
+  printf '%s\n' "$backup_root"
+}
+
+reject_tar_environment() {
+  local variable
+  for variable in TAR_OPTIONS GZIP GZIP_OPT TAPE RMT_COMMAND RSH TAR_RSH; do
+    [[ -z "${!variable+x}" ]] || \
+      die "release archive extraction refuses inherited $variable"
+  done
+}
+
+validate_release_member_name() {
+  local member="$1"
+  local component
+  local -a components=()
+  [[ "$member" != /* && "$member" != *'//' ]] || \
+    die "release archive contains an absolute or empty member path"
+  member="${member%/}"
+  [[ -n "$member" ]] || die "release archive contains an empty member path"
+  IFS=/ read -r -a components <<< "$member"
+  for component in "${components[@]}"; do
+    [[ "$component" != . && "$component" != .. && \
+      "$component" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || \
+      die "release archive contains an invalid member path"
+  done
+}
+
+validate_release_archive_members() {
+  local archive="$1"
+  local listing mode owner size date time member remainder type member_path
+  local top_level=""
+  local top_level_entry_seen=0
+  local -a components=()
+  local -A seen_members=()
+  listing="$(LC_ALL=C TZ=UTC tar --list --verbose --full-time \
+    --quoting-style=escape --file "$archive")" || \
+    die "cannot list release archive members"
+  while IFS=$' \t' read -r mode owner size date time member remainder; do
+    [[ -n "$mode" ]] || continue
+    [[ -n "$owner" && "$size" =~ ^[0-9]+$ && -n "$date" && -n "$time" && \
+      -n "$member" && -z "$remainder" ]] || \
+      die "release archive member metadata is invalid"
+    type="${mode:0:1}"
+    case "$type" in
+      -|d) ;;
+      *) die "release archive contains a link, device, or unsupported member type" ;;
+    esac
+    if [[ "$type" == d ]]; then
+      [[ "$member" == */ ]] || die "release archive directory member has an invalid layout"
+    else
+      [[ "$member" != */ ]] || die "release archive regular member has an invalid layout"
+    fi
+    validate_release_member_name "$member"
+    member_path="${member%/}"
+    [[ -z "${seen_members[$member_path]+x}" ]] || \
+      die "release archive contains a duplicate member path"
+    seen_members["$member_path"]=1
+    IFS=/ read -r -a components <<< "$member_path"
+    if [[ -z "$top_level" ]]; then
+      top_level="${components[0]}"
+    fi
+    [[ "${components[0]}" == "$top_level" ]] || \
+      die "release archive contains multiple top-level entries"
+    if (( ${#components[@]} == 1 )); then
+      [[ "$type" == d ]] || die "release archive top-level entry is not a directory"
+      (( top_level_entry_seen == 0 )) || \
+        die "release archive contains duplicate top-level directories"
+      top_level_entry_seen=1
+    fi
+  done <<< "$listing"
+  [[ -n "$top_level" && "$top_level_entry_seen" == 1 ]] || \
+    die "release archive must contain exactly one top-level directory"
+}
+
+prepare_release() {
+  local actual_hash extracted_directory staged_archive staging_root
+  require_regular_file "$release_archive"
+  release_archive="$(readlink -f -- "$release_archive")"
+  reject_tar_environment
+  [[ "$expected_release_sha256" =~ ^[[:xdigit:]]{64}$ ]] || \
+    die "--expected-sha256 must be one SHA256 digest"
+  if (( dry_run == 1 )) && ! is_test_mode; then
+    release_stage="$(mktemp -d "${TMPDIR:-/tmp}/guard-upgrade.XXXXXXXX")"
+  else
+    ensure_release_staging_root
+    staging_root="$(release_staging_root_path)"
+    release_stage="$(mktemp -d "$staging_root/release.XXXXXXXX")"
+  fi
+  chmod 0700 "$release_stage"
+  staged_archive="$release_stage/release.tar.gz"
+  extracted_directory="$release_stage/extracted"
+  install -m 0600 "$release_archive" "$staged_archive"
+  actual_hash="$(sha256sum "$staged_archive" | cut -d ' ' -f 1)"
+  [[ "${actual_hash,,}" == "${expected_release_sha256,,}" ]] || \
+    die "release archive digest does not match --expected-sha256"
+  mkdir "$extracted_directory"
+  chmod 0700 "$extracted_directory"
+  validate_release_archive_members "$staged_archive"
+  tar --extract --gzip --file "$staged_archive" --directory "$extracted_directory" \
+    --one-top-level=release --strip-components=1 --no-same-owner \
+    --no-same-permissions --no-overwrite-dir --delay-directory-restore
+  release_directory="$(canonical_directory "$extracted_directory/release")"
+  chmod 0700 "$release_directory"
+  validate_protected_directory "$release_stage" "Guard release stage" 700
+  validate_protected_directory "$extracted_directory" "Guard extracted release root" 700
+  validate_protected_directory "$release_directory" "Guard extracted release" 700
+  [[ -z "$(find "$release_directory" -type l -print -quit)" ]] || \
+    die "release archive contains a symbolic link"
+  [[ -z "$(find "$release_directory" ! -type d ! -type f -print -quit)" ]] || \
+    die "release archive contains a non-regular entry"
+}
+
+verify_release() {
+  local binary_manifest install_manifest expected_entries actual_entries
+  binary_manifest="$release_directory/BINARY-SHA256"
+  install_manifest="$release_directory/INSTALL-SHA256"
+  require_regular_file "$binary_manifest"
+  require_regular_file "$install_manifest"
+  (cd "$release_directory" && sha256sum --check --strict BINARY-SHA256)
+  expected_entries=$'deployment/systemd/guard-exec-as-caller.service\ndeployment/systemd/guard-operator\ndeployment/systemd/guard.service\ndeployment/systemd/upgrade-guard\nguard'
+  actual_entries="$(awk '{ print $2 }' "$install_manifest" | LC_ALL=C sort)"
+  [[ "$actual_entries" == "$expected_entries" ]] || \
+    die "INSTALL-SHA256 does not cover the exact installed artifact set"
+  (cd "$release_directory" && sha256sum --check --strict INSTALL-SHA256)
+  require_regular_file "$release_directory/guard"
+  require_regular_file "$release_directory/deployment/systemd/guard-operator"
+  require_regular_file "$release_directory/deployment/systemd/guard.service"
+  require_regular_file "$release_directory/deployment/systemd/guard-exec-as-caller.service"
+  require_regular_file "$release_directory/deployment/systemd/upgrade-guard"
+}
+
+validate_release_execution_boundary() {
+  local artifact
+  ensure_transaction_root
+  validate_protected_directory "$(release_staging_root_path)" "Guard release staging root" 700
+  validate_protected_directory "$release_stage" "Guard release stage" 700
+  validate_protected_directory "$(dirname "$release_directory")" "Guard extracted release root" 700
+  validate_protected_directory "$release_directory" "Guard extracted release" 700
+  for artifact in \
+    guard \
+    deployment/systemd/guard-operator \
+    deployment/systemd/upgrade-guard \
+    deployment/systemd/guard.service \
+    deployment/systemd/guard-exec-as-caller.service; do
+    require_regular_file "$release_directory/$artifact"
+  done
+}
+
+verify_installed_release_artifacts() {
+  local source destination
+  while IFS=$'\t' read -r source destination; do
+    [[ "$(sha256sum "$release_directory/$source" | cut -d ' ' -f 1)" == \
+      "$(sha256sum "$(rooted_path "$destination")" | cut -d ' ' -f 1)" ]] || \
+      die "installed artifact digest does not match the release: $destination"
+  done <<'ARTIFACTS'
+guard	/usr/local/bin/guard
+deployment/systemd/guard-operator	/usr/local/sbin/guard-operator
+deployment/systemd/guard.service	/etc/systemd/system/guard.service
+deployment/systemd/guard-exec-as-caller.service	/etc/systemd/system/guard-exec-as-caller.service
+deployment/systemd/upgrade-guard	/usr/local/sbin/upgrade-guard
+ARTIFACTS
+}
+
+verify_candidate_state_database() {
+  local state_database="$1"
+  local database output
+  database="$(rooted_path "$state_database")"
+  require_regular_file "$database"
+  output="$("$release_directory/guard" state-db check --file "$database" --json)" || \
+    die "candidate Guard binary rejected the active state database"
+  jq -e '
+    .type == "state_db_compatibility" and
+    .compatible == true and
+    .simulated_open == true and
+    .simulated_startup.succeeded == true
+  ' >/dev/null <<<"$output" || \
+    die "candidate Guard binary reported an incompatible state database"
+}
+
+fault_boundary() {
+  local name="$1"
+  is_test_mode || return
+  if [[ "${GUARD_UPGRADE_TEST_KILL_AT:-}" == "$name" ]]; then
+    unset GUARD_UPGRADE_TEST_KILL_AT
+    kill -KILL "$$"
+  fi
+  if [[ "${GUARD_UPGRADE_TEST_FAIL_AT:-}" == "$name" ]]; then
+    unset GUARD_UPGRADE_TEST_FAIL_AT
+    die "fault injected at $name"
+  fi
+  if [[ "${GUARD_UPGRADE_TEST_SIGNAL_AT:-}" == "$name" ]]; then
+    unset GUARD_UPGRADE_TEST_SIGNAL_AT
+    kill -TERM "$$"
+  fi
+}
+
+recovery_fault_boundary() {
+  local name="$1"
+  is_test_mode || return
+  if [[ "${GUARD_UPGRADE_TEST_RECOVERY_FAIL_AT:-}" == "$name" ]]; then
+    unset GUARD_UPGRADE_TEST_RECOVERY_FAIL_AT
+    die "fault injected at $name"
+  fi
+}
+
+stage_file() {
+  local source="$1"
+  local destination="$2"
+  local mode="$3"
+  local owner="${4:-root}"
+  local group="${5:-root}"
+  local stage
+  stage="$(dirname "$destination")/.${PROGRAM_NAME}.stage.$$.${RANDOM}"
+  install_owned_file "$source" "$stage" "$mode" "$owner" "$group"
+  sync_path "$stage"
+  printf '%s\n' "$stage"
+}
+
+swap_file() {
+  local source="$1"
+  local destination="$2"
+  local mode="$3"
+  local boundary="$4"
+  local owner="${5:-root}"
+  local group="${6:-root}"
+  local stage
+  stage="$(stage_file "$source" "$destination" "$mode" "$owner" "$group")"
+  mv -f -- "$stage" "$destination"
+  sync_path "$(dirname "$destination")"
+  fault_boundary "$boundary"
+}
+
+remove_file_by_swap() {
+  local destination="$1"
+  local boundary="$2"
+  rm -f -- "$destination"
+  sync_path "$(dirname "$destination")"
+  fault_boundary "$boundary"
+}
+
+stage_tree() {
+  local source="$1"
+  local destination="$2"
+  local stage
+  stage="$(dirname "$destination")/.${PROGRAM_NAME}.stage.$$.${RANDOM}"
+  copy_tree "$source" "$stage"
+  sync_path "$stage"
+  printf '%s\n' "$stage"
+}
+
+swap_tree() {
+  local source="$1"
+  local destination="$2"
+  local boundary="$3"
+  local stage displaced
+  stage="$(stage_tree "$source" "$destination")"
+  displaced="$(dirname "$destination")/.${PROGRAM_NAME}.displaced.$$.${RANDOM}"
+  if [[ -e "$destination" ]]; then
+    mv -- "$destination" "$displaced"
+    sync_path "$(dirname "$destination")"
+    fault_boundary "$boundary-displaced"
+  fi
+  mv -- "$stage" "$destination"
+  sync_path "$(dirname "$destination")"
+  fault_boundary "$boundary"
+  if [[ -d "$displaced" ]]; then
+    rm -r -- "$displaced"
+    sync_path "$(dirname "$destination")"
+  fi
+}
+
+remove_tree_by_swap() {
+  local destination="$1"
+  local boundary="$2"
+  if [[ -e "$destination" ]]; then
+    rm -r -- "$destination"
+  fi
+  sync_path "$(dirname "$destination")"
+  fault_boundary "$boundary"
+}
+
+restore_file() {
+  local name="$1"
+  local destination="$2"
+  local mode="$3"
+  local boundary="$4"
+  local owner="${5:-root}"
+  local group="${6:-root}"
+  if [[ -f "$rollback_source/files/$name.absent" ]]; then
+    remove_file_by_swap "$destination" "$boundary"
+  else
+    swap_file "$rollback_source/files/$name" "$destination" "$mode" "$boundary" "$owner" "$group"
+  fi
+}
+
+restore_tree() {
+  local name="$1"
+  local destination="$2"
+  local boundary="$3"
+  if [[ -f "$rollback_source/trees/$name.absent" ]]; then
+    remove_tree_by_swap "$destination" "$boundary"
+  else
+    swap_tree "$rollback_source/trees/$name" "$destination" "$boundary"
+  fi
+}
+
+move_sqlite_sidecars() {
+  local database="$1"
+  local suffix sidecar
+  for suffix in -wal -shm -journal; do
+    sidecar="${database}${suffix}"
+    if [[ -e "$sidecar" ]]; then
+      rm -f -- "$sidecar"
+    fi
+  done
+  sync_path "$(dirname "$database")"
+}
+
+verify_effective_state_database() {
+  local expected_state_database="$1"
+  local effective_state_database
+  effective_state_database="$(state_database_from_unit "$active_unit")"
+  [[ "$effective_state_database" == "$expected_state_database" ]] || \
+    die "effective Guard service state database differs from the backup metadata"
+}
+
+verify_effective_service_settings() {
+  local expected_state_database="$1"
+  local expected_socket="$2"
+  verify_effective_state_database "$expected_state_database"
+  [[ "$(socket_from_unit "$active_unit")" == "$expected_socket" ]] || \
+    die "effective Guard service socket differs from the backup metadata"
+}
+
+server_status() {
+  local socket="$1" admin_token_file
+  local output
+  socket="$(rooted_path "$socket")"
+  admin_token_file="$(rooted_path /etc/guard/admin.token)"
+  [[ -f "$admin_token_file" && ! -L "$admin_token_file" ]] || \
+    die "Guard operator token file is unavailable"
+  output="$(GUARD_ADMIN_TOKEN_FILE="$admin_token_file" \
+    "$(rooted_path /usr/local/bin/guard)" status --socket "$socket" --json)" || \
+    die "Guard server status request failed"
+  jq -e '.server.reachable == true and (.server.full | type == "object")' >/dev/null <<<"$output" || \
+    die "Guard server status did not report a reachable full status"
+  printf '%s\n' "$output"
+}
+
+verify_running_deployment() {
+  local expected_binary="$1"
+  local expected_state_database="$2"
+  local expected_socket="$3"
+  local expected_hash daemon_pid status_output reported_state_database reported_socket
+  expected_hash="$(sha256sum "$expected_binary" | cut -d ' ' -f 1)"
+  [[ "$(sha256sum "$(rooted_path /usr/local/bin/guard)" | cut -d ' ' -f 1)" == "$expected_hash" ]] || \
+    die "installed binary digest does not match the expected deployment"
+  if is_test_mode; then
+    status_output="$(server_status "$expected_socket")"
+  else
+    daemon_pid="$(systemctl show "$active_unit" --property MainPID --value)"
+    [[ "$daemon_pid" =~ ^[1-9][0-9]*$ ]] || die "Guard service has no main process"
+    [[ "$(readlink -f "/proc/$daemon_pid/exe")" == "$(rooted_path /usr/local/bin/guard)" ]] || \
+      die "Guard service is not running the installed binary"
+    [[ "$(sha256sum "/proc/$daemon_pid/exe" | cut -d ' ' -f 1)" == "$expected_hash" ]] || \
+      die "Guard process digest does not match the installed binary"
+    status_output="$(server_status "$expected_socket")"
+  fi
+  reported_state_database="$(jq -er '.server.full.state_db_path | strings' <<<"$status_output")" || \
+    die "Guard server status did not report a state database path"
+  validate_state_database_setting "$reported_state_database"
+  reported_socket="$(jq -er '.server.full.socket_path | strings' <<<"$status_output")" || \
+    die "Guard server status did not report a socket path"
+  validate_socket_setting "$reported_socket"
+  [[ "$reported_state_database" == "$expected_state_database" ]] || \
+    die "Guard server state database differs from the backup metadata"
+  [[ "$reported_socket" == "$expected_socket" ]] || \
+    die "Guard server socket differs from the backup metadata"
+}
+
+set_service_enabled_state() {
+  local unit="$1"
+  local expected="$2"
+  local actual
+  [[ "$expected" != preserve ]] || return 0
+  validate_service_enabled_state "$expected"
+  actual="$(service_enabled_state "$unit")"
+  [[ "$actual" != "$expected" ]] || return 0
+  case "$expected" in
+    enabled)
+      systemctl unmask "$unit" >/dev/null 2>&1 || true
+      systemctl unmask --runtime "$unit" >/dev/null 2>&1 || true
+      systemctl enable "$unit" >/dev/null
+      ;;
+    enabled-runtime)
+      systemctl unmask "$unit" >/dev/null 2>&1 || true
+      systemctl unmask --runtime "$unit" >/dev/null 2>&1 || true
+      systemctl enable --runtime "$unit" >/dev/null
+      ;;
+    disabled)
+      systemctl unmask "$unit" >/dev/null 2>&1 || true
+      systemctl unmask --runtime "$unit" >/dev/null 2>&1 || true
+      systemctl disable "$unit" >/dev/null
+      systemctl disable --runtime "$unit" >/dev/null 2>&1 || true
+      ;;
+    masked)
+      systemctl disable "$unit" >/dev/null 2>&1 || true
+      systemctl disable --runtime "$unit" >/dev/null 2>&1 || true
+      systemctl mask "$unit" >/dev/null
+      ;;
+    masked-runtime)
+      systemctl disable "$unit" >/dev/null 2>&1 || true
+      systemctl disable --runtime "$unit" >/dev/null 2>&1 || true
+      systemctl mask --runtime "$unit" >/dev/null
+      ;;
+    static|indirect)
+      die "Guard service enabled state cannot be reconstructed: $expected"
+      ;;
+  esac
+  actual="$(service_enabled_state "$unit")"
+  [[ "$actual" == "$expected" ]] || \
+    die "Guard service enabled state is $actual; expected $expected"
+}
+
+restore_service_state() {
+  local unit="$1"
+  local expected_active="$2"
+  local expected_enabled="$3"
+  local actual_active actual_enabled
+  validate_service_active_state "$expected_active"
+  [[ "$expected_enabled" == preserve ]] || validate_service_enabled_state "$expected_enabled"
+
+  actual_enabled="$(service_enabled_state "$unit")"
+  if [[ "$expected_active" == active && "$expected_enabled" == masked* && \
+    "$actual_enabled" == masked* ]]; then
+    case "$actual_enabled" in
+      masked) systemctl unmask "$unit" >/dev/null ;;
+      masked-runtime) systemctl unmask --runtime "$unit" >/dev/null ;;
+    esac
+  elif [[ "$expected_enabled" != masked && "$expected_enabled" != masked-runtime ]]; then
+    set_service_enabled_state "$unit" "$expected_enabled"
+  fi
+
+  actual_active="$(systemctl_active "$unit")"
+  case "$expected_active:$actual_active" in
+    active:active|inactive:inactive) ;;
+    active:inactive|active:failed)
+      systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+      systemctl start "$unit"
+      ;;
+    inactive:active)
+      systemctl stop "$unit"
+      ;;
+    inactive:failed)
+      systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+      ;;
+    *) die "Guard service did not have a recoverable active state: $actual_active" ;;
+  esac
+  [[ "$(wait_for_service_state "$unit" "$expected_active")" == "$expected_active" ]] || \
+    die "Guard service active state did not recover to $expected_active: $unit"
+
+  if [[ "$expected_enabled" == masked || "$expected_enabled" == masked-runtime ]]; then
+    set_service_enabled_state "$unit" "$expected_enabled"
+  fi
+}
+
+verify_deployment_state() {
+  local expected_binary="$1"
+  local expected_state_database="$2"
+  local expected_socket="$3"
+  local expected_active="$4"
+  local expected_hash
+  if [[ "$expected_active" == active ]]; then
+    verify_running_deployment "$expected_binary" "$expected_state_database" "$expected_socket"
+    return 0
+  fi
+  expected_hash="$(sha256sum "$expected_binary" | cut -d ' ' -f 1)"
+  [[ "$(sha256sum "$(rooted_path /usr/local/bin/guard)" | cut -d ' ' -f 1)" == "$expected_hash" ]] || \
+    die "installed binary digest does not match the expected deployment"
+  [[ "$(systemctl_active "$active_unit")" == inactive ]] || \
+    die "Guard service is active after restoring an inactive deployment"
+}
+
+restore_backup() {
+  local database state_db_setting socket_setting authority_key api_directory
+  local expected_active expected_enabled
+  validate_backup_directory "$rollback_source"
+  active_unit="$(<"$rollback_source/metadata/service-unit")"
+  expected_active="$(backup_service_active_state "$rollback_source")"
+  expected_enabled="$(backup_service_enabled_state "$rollback_source")"
+  state_owner "$active_unit" >/dev/null
+  ensure_stopped
+  state_db_setting="$(state_database_from_backup "$rollback_source")"
+  socket_setting="$(socket_from_backup "$rollback_source")"
+  database="$(rooted_path "$state_db_setting")"
+  authority_key="$(dirname "$database")/authority.hmac"
+  api_directory="$(api_proxy_reverts_directory "$state_db_setting")"
+  restore_file guard "$(rooted_path /usr/local/bin/guard)" 0755 restore-binary
+  restore_file guard-operator "$(rooted_path /usr/local/sbin/guard-operator)" 0755 restore-operator
+  restore_file upgrade-guard "$(rooted_path /usr/local/sbin/upgrade-guard)" 0755 restore-upgrader
+  restore_file guard.service "$(rooted_path /etc/systemd/system/guard.service)" 0644 restore-standard-unit
+  restore_file guard-exec-as-caller.service "$(rooted_path /etc/systemd/system/guard-exec-as-caller.service)" 0644 restore-caller-unit
+  restore_file \
+    authority.hmac \
+    "$authority_key" \
+    0600 \
+    restore-authority-key \
+    "$(<"$rollback_source/metadata/state-owner")" \
+    "$(<"$rollback_source/metadata/state-group")"
+  move_sqlite_sidecars "$database"
+  swap_file \
+    "$rollback_source/database/state.db" \
+    "$database" \
+    0600 \
+    restore-database \
+    "$(<"$rollback_source/metadata/state-owner")" \
+    "$(<"$rollback_source/metadata/state-group")"
+  restore_tree config "$(rooted_path /etc/guard)" restore-config
+  restore_tree api-proxy-reverts "$api_directory" restore-api-proxy-reverts
+  systemctl daemon-reload
+  verify_effective_service_settings "$state_db_setting" "$socket_setting"
+  restore_service_state "$active_unit" "$expected_active" "$expected_enabled"
+  verify_deployment_state \
+    "$rollback_source/files/guard" \
+    "$state_db_setting" \
+    "$socket_setting" \
+    "$expected_active"
+}
+
+create_recovery_backup() {
+  local label="$1"
+  recovery_backup="$(new_backup_directory "$label")"
+  create_backup "$recovery_backup" "$active_unit"
+}
+
+recover_quiesced_service() {
+  local expected_state_database="$1"
+  local expected_socket="$2"
+  local expected_active="$3"
+  local expected_enabled="$4"
+  verify_effective_service_settings "$expected_state_database" "$expected_socket"
+  restore_service_state "$active_unit" "$expected_active" "$expected_enabled"
+  verify_deployment_state \
+    "$(rooted_path /usr/local/bin/guard)" \
+    "$expected_state_database" \
+    "$expected_socket" \
+    "$expected_active"
+}
+
+complete_recovery_or_retain_journal() {
+  local source="$1"
+  local phase
+  if [[ -n "$transaction_directory" ]]; then
+    validate_transaction_journal
+    phase="$(<"$transaction_directory/phase")"
+  else
+    phase=""
+  fi
+  case "$phase" in
+    quiescing)
+      if ! recover_quiesced_service \
+        "$(<"$transaction_directory/state-db")" \
+        "$(<"$transaction_directory/socket")" \
+        "$(transaction_service_active_state "$transaction_directory")" \
+        "$(transaction_service_enabled_state "$transaction_directory")"; then
+        return 1
+      fi
+      ;;
+    prepared)
+      if ! recover_service_without_mutation "$source"; then
+        return 1
+      fi
+      ;;
+    mutating)
+      recovery_fault_boundary recovery-before-restore
+      if ! restore_backup; then
+        return 1
+      fi
+      recovery_fault_boundary recovery-after-restore
+      ;;
+    *)
+      [[ -n "$source" ]] || die "Guard failure recovery has no transaction journal"
+      if ! restore_backup; then
+        return 1
+      fi
+      ;;
+  esac
+  if ! complete_transaction; then
+    printf '%s: recovery completed but its transaction journal was retained\n' "$PROGRAM_NAME" >&2
+    return 1
+  fi
+}
+
+recover_from_failure() {
+  local source="$1"
+  local failure_status="$2"
+  (( handling_failure == 0 )) || exit "$failure_status"
+  handling_failure=1
+  trap - ERR HUP INT TERM
+  set +e
+  if [[ -z "$source" ]]; then
+    if (( service_recovery_armed == 1 )) && [[ -n "$active_unit" ]]; then
+      if ! complete_recovery_or_retain_journal ""; then
+        printf '%s: recovery failed; retaining the transaction journal\n' "$PROGRAM_NAME" >&2
+      fi
+    fi
+    exit "$failure_status"
+  fi
+  if [[ -n "$source" ]] && [[ -d "$source" ]]; then
+    rollback_source="$source"
+    if ! complete_recovery_or_retain_journal "$rollback_source"; then
+      printf '%s: recovery failed; retaining the transaction journal\n' "$PROGRAM_NAME" >&2
+    fi
+  fi
+  exit "$failure_status"
+}
+
+recover_service_without_mutation() {
+  local source="$1"
+  local expected_active expected_enabled
+  validate_backup_directory "$source"
+  expected_active="$(backup_service_active_state "$source")"
+  expected_enabled="$(backup_service_enabled_state "$source")"
+  restore_service_state "$active_unit" "$expected_active" "$expected_enabled"
+  verify_deployment_state \
+    "$source/files/guard" \
+    "$(state_database_from_backup "$source")" \
+    "$(socket_from_backup "$source")" \
+    "$expected_active"
+}
+
+recover_incomplete_transaction() {
+  local journal_restore_source journal_unit phase
+  transaction_directory="$(transaction_path)"
+  if [[ ! -e "$(transaction_root_path)" ]]; then
+    transaction_directory=""
+    return
+  fi
+  ensure_transaction_root
+  [[ -e "$transaction_directory" ]] || { transaction_directory=""; return; }
+  validate_transaction_journal
+  journal_unit="$(<"$transaction_directory/service-unit")"
+  active_unit="$journal_unit"
+  service_recovery_armed=1
+  printf '%s: recovering an incomplete Guard transaction\n' "$PROGRAM_NAME" >&2
+  phase="$(<"$transaction_directory/phase")"
+  case "$phase" in
+    quiescing)
+      recover_quiesced_service \
+        "$(<"$transaction_directory/state-db")" \
+        "$(<"$transaction_directory/socket")" \
+        "$(transaction_service_active_state "$transaction_directory")" \
+        "$(transaction_service_enabled_state "$transaction_directory")"
+      ;;
+    prepared|mutating)
+      journal_restore_source="$(<"$transaction_directory/restore-source")"
+      validate_backup_directory "$journal_restore_source"
+      rollback_source="$journal_restore_source"
+      [[ "$journal_unit" == "$(<"$rollback_source/metadata/service-unit")" ]] || \
+        die "Guard transaction journal service metadata does not match its backup"
+      failure_restore_source="$rollback_source"
+      case "$phase" in
+        prepared) recover_service_without_mutation "$rollback_source" ;;
+        mutating) restore_backup ;;
+      esac
+      ;;
+    *) die "Guard transaction journal phase is invalid" ;;
+  esac
+  complete_transaction
+  rollback_source=""
+  backup_directory=""
+}
+
+on_error() {
+  local status="$1"
+  recover_from_failure "$failure_restore_source" "$status"
+}
+
+on_signal() {
+  local signal="$1"
+  local status="$2"
+  printf '%s: received %s, restoring the prior deployment\n' "$PROGRAM_NAME" "$signal" >&2
+  recover_from_failure "$failure_restore_source" "$status"
+}
+
+install_release() {
+  local state_db_setting socket_setting expected_active expected_enabled
+  verify_release
+  select_active_unit
+  state_db_setting="$(state_database_from_unit "$active_unit")"
+  socket_setting="$(socket_from_unit "$active_unit")"
+  verify_candidate_state_database "$state_db_setting"
+  validate_standard_execution_account
+  fault_boundary candidate-state-db-checked
+  ensure_guard_backup_root >/dev/null
+  if [[ -z "$backup_directory" ]]; then
+    backup_directory="$(new_backup_directory install)"
+  else
+    validate_new_backup_destination "$backup_directory"
+  fi
+  begin_quiesce_transaction "$active_unit" "$state_db_setting" "$socket_setting"
+  ensure_stopped
+  create_backup "$backup_directory" "$active_unit"
+  rollback_source="$backup_directory"
+  expected_active="$(backup_service_active_state "$rollback_source")"
+  expected_enabled="$(backup_service_enabled_state "$rollback_source")"
+  record_transaction_restore_source "$rollback_source"
+  mark_transaction_mutating
+  fault_boundary install-service-stopped
+  # The verified tree is nested under the root-only transaction directory.
+  # Revalidating every ancestor immediately before use makes its path stable:
+  # the daemon cannot traverse, replace, or rename any component.
+  validate_release_execution_boundary
+  swap_file "$release_directory/guard" "$(rooted_path /usr/local/bin/guard)" 0755 install-binary
+  swap_file "$release_directory/deployment/systemd/guard-operator" "$(rooted_path /usr/local/sbin/guard-operator)" 0755 install-operator
+  swap_file "$release_directory/deployment/systemd/upgrade-guard" "$(rooted_path /usr/local/sbin/upgrade-guard)" 0755 install-upgrader
+  swap_file "$release_directory/deployment/systemd/guard.service" "$(rooted_path /etc/systemd/system/guard.service)" 0644 install-standard-unit
+  swap_file "$release_directory/deployment/systemd/guard-exec-as-caller.service" "$(rooted_path /etc/systemd/system/guard-exec-as-caller.service)" 0644 install-caller-unit
+  verify_installed_release_artifacts
+  systemctl daemon-reload
+  verify_effective_service_settings \
+    "$(state_database_from_backup "$rollback_source")" \
+    "$(socket_from_backup "$rollback_source")"
+  restore_service_state "$active_unit" "$expected_active" "$expected_enabled"
+  verify_deployment_state \
+    "$release_directory/guard" \
+    "$(state_database_from_backup "$rollback_source")" \
+    "$(socket_from_backup "$rollback_source")" \
+    "$expected_active"
+  complete_transaction
+  printf 'Guard release installed; verified backup: %s\n' "$backup_directory"
+}
+
+rollback_deployment() {
+  local state_db_setting socket_setting
+  rollback_source="$backup_directory"
+  validate_backup_directory "$rollback_source"
+  active_unit="$(<"$rollback_source/metadata/service-unit")"
+  state_owner "$active_unit" >/dev/null
+  local other_unit
+  case "$active_unit" in
+    guard.service) other_unit=guard-exec-as-caller.service ;;
+    guard-exec-as-caller.service) other_unit=guard.service ;;
+  esac
+  [[ "$(systemctl_active "$other_unit")" != active ]] || \
+    die "the non-selected Guard service is active: $other_unit"
+  state_db_setting="$(state_database_from_unit "$active_unit")"
+  socket_setting="$(socket_from_unit "$active_unit")"
+  begin_quiesce_transaction "$active_unit" "$state_db_setting" "$socket_setting"
+  ensure_stopped
+  create_recovery_backup rollback-safety
+  record_transaction_restore_source "$recovery_backup"
+  mark_transaction_mutating
+  fault_boundary rollback-service-stopped
+  restore_backup
+  complete_transaction
+  printf 'Guard rollback restored; safety backup: %s\n' "$recovery_backup"
+}
+
+parse_arguments() {
+  [[ $# -gt 0 ]] || { usage; exit 2; }
+  case "$1" in
+    --help|-h)
+      usage
+      exit 0
+      ;;
+  esac
+  action="$1"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --release-archive)
+        [[ $# -ge 2 ]] || die "--release-archive requires a file"
+        release_archive="$2"
+        shift 2
+        ;;
+      --expected-sha256)
+        [[ $# -ge 2 ]] || die "--expected-sha256 requires a digest"
+        expected_release_sha256="$2"
+        shift 2
+        ;;
+      --backup-dir)
+        [[ $# -ge 2 ]] || die "--backup-dir requires a directory"
+        backup_directory="$2"
+        shift 2
+        ;;
+      --root)
+        [[ $# -ge 2 ]] || die "--root requires a directory"
+        root_prefix="$2"
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  case "$action" in
+    install)
+      [[ -n "$release_archive" ]] || die "install requires --release-archive"
+      [[ -n "$expected_release_sha256" ]] || die "install requires --expected-sha256"
+      [[ -z "$backup_directory" || "$backup_directory" == /* ]] || die "backup directory must be absolute"
+      ;;
+    rollback)
+      [[ -n "$backup_directory" ]] || die "rollback requires --backup-dir"
+      [[ -z "$release_archive" ]] || die "rollback does not accept --release-archive"
+      [[ -z "$expected_release_sha256" ]] || die "rollback does not accept --expected-sha256"
+      ;;
+    *) die "action must be install or rollback" ;;
+  esac
+}
+
+main() {
+  local requested_backup_directory state_db_setting
+  parse_arguments "$@"
+  validate_test_environment
+  validate_root_prefix
+  (( dry_run == 1 )) || require_root
+  require_status_json_parser
+  trap cleanup_release_stage EXIT
+  if (( dry_run == 1 )); then
+    [[ ! -e "$(transaction_path)" ]] || \
+      die "an incomplete Guard transaction requires recovery before a dry run"
+    case "$action" in
+      install)
+        prepare_release
+        verify_release
+        select_active_unit
+        validate_standard_execution_account
+        state_db_setting="$(state_database_from_unit "$active_unit")"
+        verify_candidate_state_database "$state_db_setting"
+        printf 'Guard install dry run validated %s for %s\n' "$release_archive" "$active_unit"
+        ;;
+      rollback)
+        validate_backup_directory "$backup_directory"
+        printf 'Guard rollback dry run validated %s\n' "$backup_directory"
+        ;;
+    esac
+    return
+  fi
+  acquire_upgrade_lock
+  trap 'on_error "$?"' ERR
+  trap 'on_signal HUP 129' HUP
+  trap 'on_signal INT 130' INT
+  trap 'on_signal TERM 143' TERM
+  requested_backup_directory="$backup_directory"
+  recover_incomplete_transaction
+  cleanup_stale_release_stages
+  backup_directory="$requested_backup_directory"
+  case "$action" in
+    install)
+      prepare_release
+      install_release
+      ;;
+    rollback) rollback_deployment ;;
+  esac
+  trap - ERR HUP INT TERM
+}
+
+main "$@"

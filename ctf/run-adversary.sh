@@ -255,6 +255,11 @@ EOF
         overall_rc=1
         continue
     fi
+    if ! podman exec "$cid" /bin/sh -c \
+        'pids=$(pgrep -u 900 -x guard); [ "$(printf "%s\\n" "$pids" | sed "/^$/d" | wc -l)" -eq 1 ] && ! pgrep -u 0 -x guard >/dev/null && cap_eff=$(awk "/^CapEff:/ { value = tolower(\$2); sub(/^0+/, \"\", value); print value == \"\" ? \"0\" : value }" /proc/$pids/status) && [ "$cap_eff" = c0 ]'; then
+        printf 'Scenario %s started Guard with the wrong identity or capability set.\n' "$scenario" >&2
+        overall_rc=1
+    fi
     set +e
     wait_status="$(podman wait "$cid")"
     wait_rc=$?

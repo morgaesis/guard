@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-minimal \
         python3-yaml \
         openssh-client \
+        util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # The attacker agent is the Codex CLI against a dedicated OpenRouter key with
@@ -21,6 +22,7 @@ RUN npm install -g @openai/codex && npm cache clean --force
 RUN userdel -r ubuntu 2>/dev/null || true
 
 RUN groupadd -g 900 guard && useradd -m -u 900 -g 900 -s /bin/bash guard \
+ && useradd -m -u 902 -s /usr/sbin/nologin guard-exec \
  && useradd -m -u 1000 -s /bin/bash victim \
  && useradd -m -u 1001 -s /bin/bash attacker \
  && groupadd guard-clients \

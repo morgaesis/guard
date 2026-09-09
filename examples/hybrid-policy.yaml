@@ -7,7 +7,7 @@
 # denylist fast-rejects known-bad patterns before any LLM call, and
 # everything else falls through to the LLM.
 #
-# Load with: guard server start --policy examples/hybrid-policy.yaml
+# Load with: guard server start --policy examples/hybrid-policy.yaml --exec-user guard-exec
 # Or place at: ~/.config/guard/policy.yaml
 #
 # EVALUATION ORDER (per src/policy.rs):
@@ -25,7 +25,7 @@
 # with a verb catalog instead:
 #
 #   guard server start --policy examples/hybrid-policy.yaml \
-#       --verbs examples/verbs-readonly.yaml
+#       --verbs examples/verbs-readonly.yaml --exec-user guard-exec
 #
 # A verb's parameters are structurally validated (anchored regex per
 # parameter, single-argv rendering, no shell), which is what makes a verb

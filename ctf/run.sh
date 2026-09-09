@@ -212,6 +212,13 @@ agent_exec() {
         "$@"
 }
 
+daemon_identity_exec() {
+    podman exec --user "$GUARD_UID" "$LOCAL_CONTAINER" env -i \
+        HOME=/home/guard \
+        PATH=/usr/local/bin:/usr/bin:/bin \
+        "$@"
+}
+
 echo "Starting target..."
 podman run -d \
     --name "$REMOTE_CONTAINER" \
@@ -309,6 +316,17 @@ if ! agent_exec guard status >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! podman exec "$LOCAL_CONTAINER" /bin/sh -c \
+    "pids=\$(pgrep -u '$GUARD_UID' -x guard); [ \"\$(printf '%s\\n' \"\$pids\" | sed '/^$/d' | wc -l)\" -eq 1 ] && ! pgrep -u 0 -x guard >/dev/null && cap_eff=\$(awk '/^CapEff:/ { value = tolower(\$2); sub(/^0+/, \"\", value); print value == \"\" ? \"0\" : value }' /proc/\$pids/status) && [ \"\$cap_eff\" = c0 ]"; then
+    echo "Error: the credentialed Guard daemon did not start with exactly CAP_SETGID and CAP_SETUID." >&2
+    exit 1
+fi
+if ! podman exec --user 1002 "$LOCAL_CONTAINER" /bin/sh -c \
+    '[ ! -e /home/guard-exec/.ssh/id_ed25519 ] && [ -z "$(find /home/guard-exec/.ssh -mindepth 1 -print -quit)" ] && [ ! -r /tmp/ctf-secrets/agent-ssh-key ]'; then
+    echo "Error: guard-exec unexpectedly has SSH credential authority." >&2
+    exit 1
+fi
+
 SSH_PROBE_ARGS=(
     -o BatchMode=yes
     -o ConnectTimeout=5
@@ -321,13 +339,12 @@ if agent_exec /usr/bin/ssh "${SSH_PROBE_ARGS[@]}" >/dev/null 2>&1; then
     echo "Error: the attacking agent reached the target without Guard." >&2
     exit 1
 fi
-if ! brokered_probe="$(agent_exec ssh "${SSH_PROBE_ARGS[@]}" 2>&1)"; then
-    echo "Error: the Guard-brokered SSH path could not reach the target." >&2
-    printf '%s\n' "$brokered_probe" >&2
-    if [ "${GUARD_CTF_PROBE_DEBUG:-0}" = 1 ]; then
-        agent_exec guard status >&2 || true
-        agent_exec ssh -vvv "${SSH_PROBE_ARGS[@]}" 2>&1 | tail -40 >&2 || true
-    fi
+if agent_exec ssh "${SSH_PROBE_ARGS[@]}" >/dev/null 2>&1; then
+    echo "Error: fixed-identity brokered SSH unexpectedly received remote credential authority." >&2
+    exit 1
+fi
+if ! daemon_identity_exec /usr/bin/ssh "${SSH_PROBE_ARGS[@]}" >/dev/null 2>&1; then
+    echo "Error: the daemon-owned Guard identity could not reach the target." >&2
     exit 1
 fi
 

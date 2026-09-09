@@ -20,12 +20,13 @@ cargo build --quiet --release
 ## Release archive
 
 ```bash
-GUARD_VERSION=v0.8.5
+GUARD_VERSION=v0.9.0
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
 tar -xzf "guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 archive_root="guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu"
+install -d ~/.local/bin
 install -m 0755 "$archive_root/guard" ~/.local/bin/guard
 ```
 
@@ -58,7 +59,11 @@ Set the evaluator key where the daemon starts:
 
 ```bash
 export GUARD_LLM_API_KEY="..."
-guard server start &
+sudo --preserve-env=GUARD_LLM_API_KEY guard server start \
+  --exec-as-caller \
+  --socket /run/guard/guard.sock \
+  --socket-group "$(id -gn)" &
+guard config set-server /run/guard/guard.sock
 guard status
 guard run uptime
 ```
@@ -66,12 +71,15 @@ guard run uptime
 `OPENROUTER_API_KEY` is also accepted. A durable service should load the key
 from its protected environment or from Guard's secret backend.
 
-On Windows, `--socket` selects a named pipe:
+On Windows, `--socket` selects a named pipe. Windows provides policy, access
+administration, and inspection only; local process execution and API proxying
+are unavailable because the platform has no distinct worker identity or secure
+client-authority handoff:
 
 ```powershell
 guard server start --socket guard
 guard config set-server guard
-guard run whoami
+guard status
 ```
 
 The named-pipe peer SID supplies caller identity. The dedicated service installer
@@ -86,7 +94,7 @@ and pass it explicitly. The installer copies the candidate into its protected
 maintenance tree, verifies that digest, and only then executes the staged copy:
 
 ```powershell
-$archive = Resolve-Path '.\guard-v0.8.5-x86_64-pc-windows-msvc.tar.gz'
+$archive = Resolve-Path '.\guard-v0.9.0-x86_64-pc-windows-msvc.tar.gz'
 $archiveHash = '<digest from the verified release SHA256SUMS>'
 $protectedRoot = 'C:\ProgramData\GuardInstall'
 New-Item -ItemType Directory -Force -Path $protectedRoot | Out-Null
@@ -95,7 +103,7 @@ $protectedArchive = Join-Path $protectedRoot (Split-Path -Leaf $archive)
 Copy-Item -LiteralPath $archive -Destination $protectedArchive
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $protectedArchive).Hash -ne $archiveHash) { throw 'Archive digest mismatch.' }
 & tar.exe -C $protectedRoot -xzf $protectedArchive
-$archiveRoot = 'C:\ProgramData\GuardInstall\guard-v0.8.5-x86_64-pc-windows-msvc'
+$archiveRoot = 'C:\ProgramData\GuardInstall\guard-v0.9.0-x86_64-pc-windows-msvc'
 $binaryHash = ((Get-Content -LiteralPath "$archiveRoot\BINARY-SHA256" -Raw).Trim() -split '\s+')[0]
 & "$archiveRoot\deployment\windows\install-guard.ps1" `
   -Action install `
@@ -110,11 +118,14 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for Unix and Windows principal separation.
 Loopback TCP uses bearer identity rather than a kernel-authenticated local
 principal. It requires an execution token and a separate admin token for admin
 RPCs. Consequence gating and per-principal secret injection are unavailable.
+On Unix, execution through `--exec-user` requires root or `CAP_SETUID` and
+`CAP_SETGID`; the packaged systemd service configures this identity boundary.
+The command below assumes those privileges are present.
 
 ```bash
 export GUARD_AUTH_TOKEN="..."
 export GUARD_ADMIN_TOKEN="..."
-guard server start --tcp-port 8123
+guard server start --tcp-port 8123 --exec-user guard-exec
 ```
 
 Configure the port with `guard config set-port 8123`. Pipe each bearer to

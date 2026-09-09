@@ -5,8 +5,9 @@ name: Release Validation
   workflow_call:
 
 permissions:
-  actions: read
-  contents: read
+  actions: read  # Inspect mainline workflow runs before accepting a release tag.
+  checks: read  # Validate required check results for the release commit.
+  contents: read  # Inspect signed refs and the release commit.
 
 concurrency:
   group: release-validation-${{ github.ref }}
@@ -14,12 +15,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   RELEASE_LABEL: ${{ github.event_name == 'pull_request' && 'ci' || github.ref_name }}
+  RUSTUP_TOOLCHAIN: 1.95.0
 
 jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -30,11 +34,13 @@ jobs:
         with:
           cache: false
           rustflags: ""
-      - name: Verify signed annotated tag and Cargo version
+          toolchain: 1.95.0
+      - name: Verify signed tag and mandatory release evidence
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "guard") | .version')
@@ -48,12 +54,25 @@ jobs:
             exit 1
           }
           tag_sha=$(jq -r '.object.sha' <<< "$tag_ref")
-          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.verification.verified')" = true || {
+          tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}")
+          test "$(jq -r '.verification.verified' <<< "$tag_object")" = true || {
             echo "release tag signature is not verified"
             exit 1
           }
-          git fetch --no-tags origin main
-          tag_commit=$(git rev-list -n 1 "$RELEASE_TAG")
+          test "$(jq -r '.object.type' <<< "$tag_object")" = commit || {
+            echo "release tag does not resolve directly to a commit"
+            exit 1
+          }
+          tag_commit=$(jq -r '.object.sha' <<< "$tag_object")
+          [[ "$tag_commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "release tag resolved to an invalid commit"
+            exit 1
+          }
+          test "$(git rev-parse "${RELEASE_TAG}^{}")" = "$tag_commit" || {
+            echo "checked out tag does not match the GitHub tag object"
+            exit 1
+          }
+          git fetch --no-tags origin main:refs/remotes/origin/main
           git merge-base --is-ancestor "$tag_commit" origin/main || {
             echo "release tag commit is not reachable from origin/main"
             exit 1
@@ -62,51 +81,66 @@ jobs:
             echo "release commit signature is not verified"
             exit 1
           }
-          ci_run_id=$(gh run list --workflow CI --commit "$tag_commit" --event push --limit 10 \
-            --json databaseId,headSha \
-            --jq "map(select(.headSha == \"${tag_commit}\")) | first | .databaseId // empty")
-          test -n "$ci_run_id" || {
-            echo "mainline CI run was not found for the release commit"
-            exit 1
+          wait_for_mainline_workflow() {
+            local workflow="$1" label="$2" run_id
+            # Positional parameters in the single-quoted script belong to the nested shell.
+            # shellcheck disable=SC2016
+            if ! run_id=$(timeout 120s bash -c '
+              while :; do
+                run_id=$(gh run list --workflow "$1" --commit "$2" --event push --limit 10 \
+                  --json databaseId,headSha \
+                  --jq "map(select(.headSha == \"${2}\")) | first | .databaseId // empty")
+                if [ -n "$run_id" ]; then
+                  printf "%s\n" "$run_id"
+                  exit 0
+                fi
+                sleep 3
+              done
+            ' _ "$workflow" "$tag_commit"); then
+              echo "$label run was not registered within the discovery window"
+              return 1
+            fi
+            test -n "$run_id" || {
+              echo "$label run was not found for the release commit"
+              return 1
+            }
+            timeout 1800s gh run watch "$run_id" --compact --exit-status || {
+              echo "$label did not pass for the release commit"
+              return 1
+            }
           }
-          timeout 1800s gh run watch "$ci_run_id" --compact --exit-status || {
-            echo "mainline CI did not pass for the release commit"
-            exit 1
-          }
-          check_runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag_commit}/check-runs?per_page=100")
-          jq -e '[.check_runs[] | select(.name == "Test & Lint" and .conclusion == "success")] | length > 0' \
-            <<< "$check_runs" >/dev/null || {
-            echo "required Test & Lint check did not pass for the release commit"
-            exit 1
-          }
+          wait_for_mainline_workflow ci.yml "mainline CI"
+          wait_for_mainline_workflow audit.yml "security audit"
+          wait_for_mainline_workflow dependabot-automerge.yml "dependency classification"
+          scripts/sync-branch-protection.sh --check
+          scripts/sync-branch-protection.sh --verify-commit "$tag_commit"
       - name: Run tests
-        run: cargo test
+        run: cargo test --locked
+
+  release_targets:
+    name: Resolve release targets
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read canonical target matrix
+        id: targets
+        shell: bash
+        run: printf 'matrix=%s\n' "$(bash scripts/build-release-archive.sh --matrix-json)" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.target }}
-    needs: test
+    needs: [test, release_targets]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact_name: guard
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact_name: guard
-            use_cross: true
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact_name: guard.exe
-          # - target: x86_64-apple-darwin
-          #   os: macos-latest
-          #   artifact_name: guard
-          #   asset_name: guard-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz
-          # - target: aarch64-apple-darwin
-          #   os: macos-latest
-          #   artifact_name: guard
-          #   asset_name: guard-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.release_targets.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -119,42 +153,34 @@ jobs:
           target: ${{ matrix.target }}
           cache: false
           rustflags: ""
+          toolchain: 1.95.0
+
+      - name: Set reproducible build epoch
+        shell: bash
+        run: |
+          source_date_epoch=$(git show -s --format=%ct HEAD)
+          [[ "$source_date_epoch" =~ ^[1-9][0-9]*$ ]] || {
+            echo "source commit has an invalid timestamp" >&2
+            exit 1
+          }
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
+          rustc_version=$(rustc --version)
+          [[ "$rustc_version" == "rustc 1.95.0 "* ]] || {
+            echo "release build selected an unexpected Rust compiler: $rustc_version" >&2
+            exit 1
+          }
 
       - name: Install Cross
         if: matrix.use_cross
         run: cargo install cross --version 0.2.5 --locked
 
-      - name: Build binary (Native)
-        if: "!matrix.use_cross"
-        shell: bash
-        env:
-          BUILD_TARGET: ${{ matrix.target }}
-        run: |
-          case "$BUILD_TARGET" in
-            x86_64-unknown-linux-gnu|x86_64-pc-windows-msvc) ;;
-            *) echo "unexpected native build target: $BUILD_TARGET"; exit 1 ;;
-          esac
-          cargo build --release --target "$BUILD_TARGET"
-
-      - name: Build binary (Cross)
-        if: matrix.use_cross
-        shell: bash
-        env:
-          BUILD_TARGET: ${{ matrix.target }}
-        run: |
-          test "$BUILD_TARGET" = "aarch64-unknown-linux-gnu" || {
-            echo "unexpected cross build target: $BUILD_TARGET"
-            exit 1
-          }
-          cross build --release --target "$BUILD_TARGET"
-
-      - name: Strip native Linux binary
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Build reproducible platform deployment archive
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
           ARTIFACT_NAME: ${{ matrix.artifact_name }}
-        run: strip "target/${BUILD_TARGET}/release/${ARTIFACT_NAME}"
+          USE_CROSS: ${{ matrix.use_cross || false }}
+        run: bash scripts/build-release-archive.sh
 
       - name: Verify cross-built Linux architecture
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -164,53 +190,6 @@ jobs:
         run: |
           file "$BINARY"
           file "$BINARY" | grep -q aarch64
-
-      - name: Create platform deployment archive
-        shell: bash
-        env:
-          BUILD_TARGET: ${{ matrix.target }}
-          ARTIFACT_NAME: ${{ matrix.artifact_name }}
-        run: |
-          bundle="guard-${RELEASE_LABEL}-${BUILD_TARGET}"
-          archive="${bundle}.tar.gz"
-          root="dist/${bundle}"
-          mkdir -p "$root/deployment/systemd" "$root/deployment/hardening" \
-            "$root/deployment/windows" "$root/examples" "$root/docs" "$root/ctf"
-          cp "target/${BUILD_TARGET}/release/${ARTIFACT_NAME}" "$root/${ARTIFACT_NAME}"
-          binary_hash=$(sha256sum "$root/${ARTIFACT_NAME}" | cut -d ' ' -f 1)
-          printf '%s  %s\n' "$binary_hash" "$ARTIFACT_NAME" > "$root/BINARY-SHA256"
-          cp README.md INSTALL.md DEPLOYMENT.md DEVELOPMENT.md SECURITY.md \
-            ARCHITECTURE.md ROADMAP.md LICENSE .env.example "$root/"
-          cp docs/*.md "$root/docs/"
-          cp ctf/DESIGN.md "$root/ctf/"
-          cp examples/*.yaml examples/*.md examples/fallback-models.env "$root/examples/"
-          cp deployment/systemd/guard.service \
-            deployment/systemd/guard-exec-as-caller.service \
-            deployment/systemd/guard.env.example \
-            deployment/systemd/guard-operator \
-            deployment/systemd/test-guard-service-expansion.sh \
-            "$root/deployment/systemd/"
-          cp deployment/hardening/guard.apparmor.example \
-            deployment/hardening/seccomp-deny-escape.json \
-            "$root/deployment/hardening/"
-          cp deployment/windows/install-guard.ps1 \
-            deployment/windows/install-guard.Tests.ps1 \
-            "$root/deployment/windows/"
-          case "$BUILD_TARGET" in
-            x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
-              chmod 0755 "$root/${ARTIFACT_NAME}" \
-                "$root/deployment/systemd/guard-operator" \
-                "$root/deployment/systemd/test-guard-service-expansion.sh"
-              ;;
-            x86_64-pc-windows-msvc)
-              ;;
-            *)
-              echo "unsupported release target: $BUILD_TARGET"
-              exit 1
-              ;;
-          esac
-          find "$root" -type f -printf '%P\n' | LC_ALL=C sort > "$root/ARCHIVE-MANIFEST"
-          tar -C dist -czf "dist/${archive}" "$bundle"
 
       - name: Smoke test deployment archive
         shell: bash
@@ -276,8 +255,11 @@ jobs:
           esac
           case "$BUILD_TARGET" in
             *-linux-gnu)
+              (cd "$root" && sha256sum --check --strict INSTALL-SHA256)
               test -x "$root/deployment/systemd/guard-operator"
               test -x "$root/deployment/systemd/test-guard-service-expansion.sh"
+              test -x "$root/deployment/systemd/upgrade-guard"
+              test -x "$root/deployment/systemd/test-upgrade-guard.sh"
               test -f "$root/deployment/systemd/guard.service"
               test -f "$root/deployment/systemd/guard-exec-as-caller.service"
               test -f "$root/deployment/systemd/guard.env.example"
@@ -293,14 +275,41 @@ jobs:
       - name: Exercise packaged systemd argument expansion
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
-        run: sudo "dist/smoke/guard-${RELEASE_LABEL}-${{ matrix.target }}/deployment/systemd/test-guard-service-expansion.sh"
+        env:
+          RELEASE_SMOKE_TARGET: ${{ matrix.target }}
+        run: |
+          case "$RELEASE_SMOKE_TARGET" in
+            x86_64-unknown-linux-gnu) ;;
+            *)
+              echo "unexpected Unix smoke target" >&2
+              exit 1
+              ;;
+          esac
+          sudo "dist/smoke/guard-${RELEASE_LABEL}-${RELEASE_SMOKE_TARGET}/deployment/systemd/test-guard-service-expansion.sh"
+
+      - name: Fault-inject packaged Unix upgrade and rollback
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        env:
+          RELEASE_SMOKE_TARGET: ${{ matrix.target }}
+        run: |
+          case "$RELEASE_SMOKE_TARGET" in
+            x86_64-unknown-linux-gnu) ;;
+            *)
+              echo "unexpected Unix smoke target" >&2
+              exit 1
+              ;;
+          esac
+          "dist/smoke/guard-${RELEASE_LABEL}-${RELEASE_SMOKE_TARGET}/deployment/systemd/test-upgrade-guard.sh"
 
       - name: Test packaged Windows installer contract
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           BUNDLE_ROOT: dist/smoke/guard-${{ env.RELEASE_LABEL }}-${{ matrix.target }}
-        run: Invoke-Pester -Path "$env:BUNDLE_ROOT/deployment/windows/install-guard.Tests.ps1" -CI
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0 -ErrorAction Stop
+          Invoke-Pester -Path "$env:BUNDLE_ROOT/deployment/windows/install-guard.Tests.ps1" -CI
 
       - name: Fault-inject packaged Windows install and rollback
         if: runner.os == 'Windows'
@@ -326,9 +335,9 @@ jobs:
           . $installer -Action status
           Remove-Item Env:GUARD_INSTALLER_TEST_MODE
 
-          function Get-DatabaseHashes {
+          function Get-DatabaseHashes([Parameter(Mandatory)]$StatePaths) {
             $hashes = @{}
-            foreach ($path in Get-DatabasePaths -Database $StateDb) {
+            foreach ($path in Get-DatabasePaths -Database $StatePaths.StateDb) {
               if (Test-Path -LiteralPath $path -PathType Leaf) {
                 $hashes[[IO.Path]::GetFileName($path)] = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
               }
@@ -349,8 +358,8 @@ jobs:
           function Get-ServicePathName {
             return [string](Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").PathName
           }
-          function Get-ApiRevertHashes([string]$GuardSid) {
-            $root = Get-ApiRevertRoot
+          function Get-ApiRevertHashes([Parameter(Mandatory)]$StatePaths, [string]$GuardSid) {
+            $root = Get-ApiRevertRoot -StatePaths $StatePaths
             $hashes = @{}
             if (-not (Test-Path -LiteralPath $root)) { return $hashes }
             Reset-TreeForAdministrativeMaintenance -Path $root
@@ -368,14 +377,26 @@ jobs:
           }
 
           try {
-            & $installer @candidateInstall
+            try {
+              & $installer @candidateInstall
+            }
+            catch {
+              $serviceLog = Join-Path $DataDir 'guard.log'
+              if (Test-Path -LiteralPath $serviceLog -PathType Leaf) {
+                Get-Content -LiteralPath $serviceLog -Tail 40 |
+                  Where-Object { $_ -match 'guard service.*error|daemon terminated with error' } |
+                  ForEach-Object { Write-Warning "Guard startup diagnostic: $_" }
+              }
+              throw
+            }
             & $installer -Action access-list -Json | Out-Null
             $guardSid = Get-GuardSid
-            Assert-DeploymentAcls -GuardSid $guardSid
+            $statePaths = Get-GuardStatePaths -ServicePathName (Get-ServicePathName)
+            Assert-DeploymentAcls -GuardSid $guardSid -StatePaths $statePaths
             Set-ServiceRegistryAcl -GuardSid $guardSid
 
             $stockPathName = Get-ServicePathName
-            $customPathName = "$stockPathName `"--audit-log`" `"$DataDir\audit.log`""
+            $customPathName = "$stockPathName `"--history-retention`" `"86400`""
             & sc.exe config $ServiceName binPath= $customPathName | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Could not install the custom service command fixture.' }
 
@@ -410,7 +431,18 @@ jobs:
             $serviceKey = Get-ServiceRegistryPath
             $current = @((Get-ItemProperty -LiteralPath $serviceKey -Name Environment).Environment)
             New-ItemProperty -LiteralPath $serviceKey -Name Environment -PropertyType MultiString -Value ($current + 'GUARD_INSTALLER_CI_MARKER=retained') -Force | Out-Null
-            & $installer @candidateInstall | Out-Null
+            try {
+              & $installer @candidateInstall | Out-Null
+            }
+            catch {
+              $serviceLog = Join-Path $DataDir 'guard.log'
+              if (Test-Path -LiteralPath $serviceLog -PathType Leaf) {
+                Get-Content -LiteralPath $serviceLog -Tail 40 |
+                  Where-Object { $_ -match 'guard service.*error|daemon terminated with error' } |
+                  ForEach-Object { Write-Warning "Guard upgrade diagnostic: $_" }
+              }
+              throw
+            }
             if ((Get-ServicePathName) -ne $customPathName) {
               throw 'Installer rerun did not preserve the exact service command line.'
             }
@@ -420,12 +452,12 @@ jobs:
             }
 
             Wait-ServiceStopped -Name $ServiceName
-            $baselineDatabase = Get-DatabaseHashes
+            $baselineDatabase = Get-DatabaseHashes -StatePaths $statePaths
             $baselineEnvironment = Get-ServiceEnvironmentLines
             $baselineBinary = (Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedExe).Hash
             $baselineCatalog = (Get-FileHash -Algorithm SHA256 -LiteralPath $VerbsPath).Hash
             $baselinePathName = Get-ServicePathName
-            $apiRoot = Get-ApiRevertRoot
+            $apiRoot = Get-ApiRevertRoot -StatePaths $statePaths
             if (Test-Path -LiteralPath $apiRoot) {
               Reset-TreeForAdministrativeMaintenance -Path $apiRoot
               Remove-Item -LiteralPath $apiRoot -Recurse -Force
@@ -437,8 +469,8 @@ jobs:
             # provisional state, so startup prunes an owned orphan. Keep this
             # end-to-end rollback baseline empty; the Pester contract covers a
             # nonempty snapshot round trip through the backup helpers.
-            $baselineApiReverts = Get-ApiRevertHashes -GuardSid $guardSid
-            Start-Service -Name $ServiceName
+            $baselineApiReverts = Get-ApiRevertHashes -StatePaths $statePaths -GuardSid $guardSid
+            Start-GuardService -Name $ServiceName
 
             $env:GUARD_INSTALLER_TEST_FAULT = 'after-environment'
             $faultObserved = $false
@@ -454,7 +486,7 @@ jobs:
             }
             if (-not $faultObserved) { throw 'Installer fault injection did not fail the upgrade.' }
             Wait-ServiceStopped -Name $ServiceName
-            Assert-HashMapsEqual -Expected $baselineDatabase -Actual (Get-DatabaseHashes) -Label 'Automatic rollback database'
+            Assert-HashMapsEqual -Expected $baselineDatabase -Actual (Get-DatabaseHashes -StatePaths $statePaths) -Label 'Automatic rollback database'
             if ((Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedExe).Hash -ne $baselineBinary) {
               throw 'Automatic rollback did not restore the binary.'
             }
@@ -467,7 +499,7 @@ jobs:
             if ((Get-ServicePathName) -ne $baselinePathName) {
               throw 'Automatic rollback did not restore the exact service command line.'
             }
-            Start-Service -Name $ServiceName
+            Start-GuardService -Name $ServiceName
 
             $upgradeOutput = @(& $installer @faultInstall 6>&1 | ForEach-Object { [string]$_ })
             $backupLine = $upgradeOutput | Where-Object { $_ -match '^Rollback backup: (.+)$' } | Select-Object -Last 1
@@ -489,7 +521,7 @@ jobs:
             [IO.File]::WriteAllBytes("$StateDb-journal", [Text.Encoding]::UTF8.GetBytes('invalid rollback journal fixture'))
             & $installer -Action rollback -Backup $backupName | Out-Null
             Wait-ServiceStopped -Name $ServiceName
-            Assert-HashMapsEqual -Expected $baselineDatabase -Actual (Get-DatabaseHashes) -Label 'Post-success rollback database'
+            Assert-HashMapsEqual -Expected $baselineDatabase -Actual (Get-DatabaseHashes -StatePaths $statePaths) -Label 'Post-success rollback database'
             if ((Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedExe).Hash -ne $baselineBinary) {
               throw 'Post-success rollback did not restore the binary.'
             }
@@ -502,10 +534,10 @@ jobs:
             if ((Get-ServicePathName) -ne $baselinePathName) {
               throw 'Post-success rollback did not restore the exact service command line.'
             }
-            Assert-HashMapsEqual -Expected $baselineApiReverts -Actual (Get-ApiRevertHashes -GuardSid $guardSid) -Label 'Post-success rollback API revert snapshot'
-            Start-Service -Name $ServiceName
-            Verify-GuardService -ExpectedHash $baselineBinary -ExpectedVersion (Get-GuardVersion -GuardExe $DeployedExe)
-            Assert-DeploymentAcls -GuardSid $guardSid
+            Assert-HashMapsEqual -Expected $baselineApiReverts -Actual (Get-ApiRevertHashes -StatePaths $statePaths -GuardSid $guardSid) -Label 'Post-success rollback API revert snapshot'
+            Start-GuardService -Name $ServiceName
+            Verify-GuardService -ExpectedHash $baselineBinary -ExpectedVersion (Get-GuardVersion -GuardExe $DeployedExe) -ExpectedStateDb $statePaths.StateDb -ExpectedSocket $statePaths.SocketName
+            Assert-DeploymentAcls -GuardSid $guardSid -StatePaths $statePaths
             Set-ServiceRegistryAcl -GuardSid $guardSid
 
             Wait-ServiceStopped -Name $ServiceName
@@ -531,6 +563,33 @@ jobs:
             Remove-Item -LiteralPath $faultCandidate, $faultEnvironment -Force -ErrorAction SilentlyContinue
           }
 
+      - name: Verify independent release build
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+          USE_CROSS: ${{ matrix.use_cross || false }}
+        run: |
+          replica_source="$RUNNER_TEMP/repro-source"
+          replica_dist="$RUNNER_TEMP/repro-dist"
+          mkdir -p "$replica_dist"
+          git worktree add --detach "$replica_source" "$GITHUB_SHA"
+          (
+            cd "$replica_source"
+            SOURCE_ROOT="$replica_source" \
+              DIST_DIR="$replica_dist" \
+              CARGO_TARGET_DIR="$replica_source/target" \
+              bash scripts/build-release-archive.sh
+          )
+          archive="guard-${RELEASE_LABEL}-${BUILD_TARGET}.tar.gz"
+          bash scripts/build-release-archive.sh --compare-archives \
+            "dist/$archive" \
+            "$replica_dist/$archive" \
+            "$ARTIFACT_NAME" \
+            "$BUILD_TARGET" \
+            "$GITHUB_WORKSPACE" \
+            "$replica_source"
+
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -541,6 +600,7 @@ jobs:
     name: Generate SBOM
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -551,31 +611,265 @@ jobs:
         with:
           cache: false
           rustflags: ""
+          toolchain: 1.95.0
 
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --version 0.5.9 --locked
 
+      - name: Set reproducible SBOM epoch
+        shell: bash
+        run: |
+          source_date_epoch=$(git show -s --format=%ct HEAD)
+          [[ "$source_date_epoch" =~ ^[1-9][0-9]*$ ]] || {
+            echo "source commit has an invalid timestamp" >&2
+            exit 1
+          }
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
+
       # Cargo.toml declares cfg(unix)/cfg(windows) dependency sections, so the
-      # dependency set differs per target. One SBOM per build-matrix target
-      # keeps each inventory exact; the target list mirrors the build matrix.
+      # dependency set differs per target. The archive builder owns the target
+      # roster used by both the build matrix and these inventories.
       - name: Generate CycloneDX SBOMs
         shell: bash
         run: |
-          mkdir -p dist
-          for target in \
-            x86_64-unknown-linux-gnu \
-            aarch64-unknown-linux-gnu \
-            x86_64-pc-windows-msvc; do
-            cargo cyclonedx --format json --spec-version 1.5 \
-              --target "$target" \
-              --override-filename "guard-${RELEASE_LABEL}-${target}.cdx"
-            sbom="guard-${RELEASE_LABEL}-${target}.cdx.json"
-            jq -e '.components | map(.name) | contains(["rusqlite", "ring"])' \
-              "$sbom" > /dev/null || {
-              echo "SBOM ${sbom} is missing expected components"
+          canonicalize_sbom() {
+            jq -S '
+              def canonicalize_reference:
+                if type == "string" then
+                  sub("^path\\+file://[^#]*#(guard@)?"; "pkg:cargo/guard@")
+                else
+                  .
+                end;
+              def stable_value:
+                if type == "object" then
+                  to_entries
+                  | map(.value |= stable_value)
+                  | sort_by(.key)
+                  | from_entries
+                elif type == "array" then
+                  map(stable_value)
+                else
+                  .
+                end;
+              def sort_unordered:
+                map(stable_value)
+                | sort_by(stable_value | tojson);
+              def canonicalize_bom_reference:
+                if type == "object"
+                  and has("bom-ref")
+                  and (."bom-ref" | type) == "string"
+                then
+                  ."bom-ref" |= canonicalize_reference
+                else
+                  .
+                end;
+              def canonicalize_component:
+                canonicalize_bom_reference
+                | if (.hashes? | type) == "array" then
+                    .hashes |= sort_unordered
+                  else
+                    .
+                  end
+                | if (.licenses? | type) == "array" then
+                    .licenses |= sort_unordered
+                  else
+                    .
+                  end
+                | if (.externalReferences? | type) == "array" then
+                    .externalReferences |= sort_unordered
+                  else
+                    .
+                  end
+                | if (.components? | type) == "array" then
+                    .components |= (map(canonicalize_component) | sort_unordered)
+                  else
+                    .
+                  end;
+              def canonicalize_dependency:
+                if type == "object" then
+                  if has("ref") and (.ref | type) == "string" then
+                    .ref |= canonicalize_reference
+                  else
+                    .
+                  end
+                  | if (.dependsOn? | type) == "array" then
+                      .dependsOn |= (map(canonicalize_reference) | sort)
+                    else
+                      .
+                    end
+                else
+                  .
+                end;
+              if (.metadata? | type) == "object"
+                and (.metadata.component? | type) == "object"
+                then
+                  .metadata.component |= canonicalize_component
+                else
+                  .
+                end
+              | del(.serialNumber)
+              | if (.metadata? | type) == "object" then
+                  .metadata.timestamp = (env.SOURCE_DATE_EPOCH | tonumber | todateiso8601)
+                else
+                  .
+                end
+              | if (.metadata.authors? | type) == "array" then
+                  .metadata.authors |= sort_unordered
+                else
+                  .
+                end
+              | if (.metadata.properties? | type) == "array" then
+                  .metadata.properties |= sort_unordered
+                else
+                  .
+                end
+              | if (.metadata.tools? | type) == "array" then
+                  .metadata.tools |= sort_unordered
+                else
+                  .
+                end
+              | if (.components? | type) == "array" then
+                  .components |= (map(canonicalize_component) | sort_unordered)
+                else
+                  .
+                end
+              | if (.dependencies? | type) == "array" then
+                  .dependencies |= (map(canonicalize_dependency) | sort_by(.ref))
+                  else
+                    .
+                  end
+            ' "$1"
+          }
+
+          verify_sbom_canonicalization() {
+            local first="$RUNNER_TEMP/sbom-canonicalization-first.json"
+            local second="$RUNNER_TEMP/sbom-canonicalization-second.json"
+            local first_canonical="$RUNNER_TEMP/sbom-canonicalization-first.canonical.json"
+            local second_canonical="$RUNNER_TEMP/sbom-canonicalization-second.canonical.json"
+            local preserved='path+file:///stable-metadata#guard@1.2.3'
+
+            jq -n --arg path 'path+file:///first-source#guard@1.2.3' --arg preserved "$preserved" \
+              '{
+                serialNumber: "urn:uuid:6aaf6be9-d7ea-4d09-abcb-ee495a0f24ea",
+                metadata: {
+                  timestamp: "2023-11-14T22:13:20Z",
+                  component: {
+                    "bom-ref": $path,
+                    components: [
+                      {name: "guard-main", "bom-ref": ($path + " bin-target-1")},
+                      {name: "guard-lib", "bom-ref": ($path + " bin-target-0")}
+                    ]
+                  }
+                },
+                components: [
+                  {name: "beta", version: "2", "bom-ref": "pkg:cargo/beta@2"},
+                  {name: "alpha", version: "1", "bom-ref": "pkg:cargo/alpha@1"}
+                ],
+                dependencies: [
+                  {ref: $path, dependsOn: ["pkg:cargo/beta@2", "pkg:cargo/alpha@1"]},
+                  {ref: "pkg:cargo/beta@2", dependsOn: []}
+                ],
+                formulation: [{
+                  workflows: [{tasks: [{steps: [{
+                    commands: [{executed: "second"}, {executed: "first"}]
+                  }]}]}]
+                }],
+                unrelated: {"bom-ref": $preserved, ref: $preserved, sequence: ["second", "first"]}
+              }' \
+              > "$first"
+            jq -n --arg path 'path+file:///second-source#1.2.3' --arg preserved "$preserved" \
+              '{
+                unrelated: {sequence: ["second", "first"], ref: $preserved, "bom-ref": $preserved},
+                formulation: [{
+                  workflows: [{tasks: [{steps: [{
+                    commands: [{executed: "second"}, {executed: "first"}]
+                  }]}]}]
+                }],
+                dependencies: [
+                  {dependsOn: [], ref: "pkg:cargo/beta@2"},
+                  {dependsOn: ["pkg:cargo/alpha@1", "pkg:cargo/beta@2"], ref: $path}
+                ],
+                components: [
+                  {"bom-ref": "pkg:cargo/alpha@1", version: "1", name: "alpha"},
+                  {"bom-ref": "pkg:cargo/beta@2", version: "2", name: "beta"}
+                ],
+                metadata: {
+                  component: {
+                    components: [
+                      {"bom-ref": ($path + " bin-target-0"), name: "guard-lib"},
+                      {"bom-ref": ($path + " bin-target-1"), name: "guard-main"}
+                    ],
+                    "bom-ref": $path
+                  },
+                  timestamp: "2023-11-14T22:13:20Z"
+                },
+                serialNumber: "urn:uuid:6aaf6be9-d7ea-4d09-abcb-ee495a0f24ea"
+              }' \
+              > "$second"
+            canonicalize_sbom "$first" > "$first_canonical"
+            canonicalize_sbom "$second" > "$second_canonical"
+            cmp --silent "$first_canonical" "$second_canonical" || {
+              echo "SBOM reference canonicalization is not path-independent" >&2
               exit 1
             }
-            mv "$sbom" dist/
+            jq -e --arg preserved "$preserved" '
+              .metadata.component."bom-ref" == "pkg:cargo/guard@1.2.3"
+              and ([.metadata.component.components[].name] == ["guard-lib", "guard-main"])
+              and ([.metadata.component.components[]."bom-ref"]
+                == ["pkg:cargo/guard@1.2.3 bin-target-0", "pkg:cargo/guard@1.2.3 bin-target-1"])
+              and ([.components[].name] == ["alpha", "beta"])
+              and ([.dependencies[].ref] == ["pkg:cargo/beta@2", "pkg:cargo/guard@1.2.3"])
+              and ((.dependencies[] | select(.ref == "pkg:cargo/guard@1.2.3") | .dependsOn)
+                == ["pkg:cargo/alpha@1", "pkg:cargo/beta@2"])
+              and ([.formulation[0].workflows[0].tasks[0].steps[0].commands[].executed]
+                == ["second", "first"])
+              and (.unrelated."bom-ref" == $preserved)
+              and (.unrelated.ref == $preserved)
+              and (.unrelated.sequence == ["second", "first"])
+              and (has("serialNumber") | not)
+              and (.metadata.timestamp == (env.SOURCE_DATE_EPOCH | tonumber | todateiso8601))
+            ' \
+              "$first_canonical" > /dev/null || {
+              echo "SBOM canonicalization changed ordered or unrelated data" >&2
+              exit 1
+            }
+          }
+
+          verify_sbom_canonicalization
+
+          generate_sboms() {
+            local source_root="$1" output_root="$2" target sbom canonical
+            mkdir -p "$output_root"
+            (
+              cd "$source_root"
+              while IFS= read -r target; do
+                cargo cyclonedx --format json --spec-version 1.5 \
+                  --target "$target" \
+                  --override-filename "guard-${RELEASE_LABEL}-${target}.cdx"
+                sbom="guard-${RELEASE_LABEL}-${target}.cdx.json"
+                jq -e '.components | map(.name) | contains(["rusqlite", "ring"])' \
+                  "$sbom" > /dev/null || {
+                  echo "SBOM ${sbom} is missing expected components"
+                  exit 1
+                }
+                canonical="$output_root/$sbom"
+                canonicalize_sbom "$sbom" > "$canonical"
+              done < <(bash scripts/build-release-archive.sh --targets)
+            )
+          }
+
+          replica_source="$RUNNER_TEMP/sbom-repro-source"
+          replica_dist="$RUNNER_TEMP/sbom-repro-dist"
+          git worktree add --detach "$replica_source" "$GITHUB_SHA"
+          generate_sboms "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/dist"
+          generate_sboms "$replica_source" "$replica_dist"
+          for primary in dist/*.cdx.json; do
+            replica="$replica_dist/$(basename "$primary")"
+            cmp --silent "$primary" "$replica" || {
+              echo "independent SBOM generations produced different output: $(basename "$primary")" >&2
+              diff --unified=3 "$primary" "$replica" || true
+              exit 1
+            }
           done
 
       - name: Upload SBOM artifact

@@ -16,7 +16,7 @@ if ip route show default | grep -q .; then
     exit 1
 fi
 
-# Only the daemon can read evaluator and SSH key material. Both arrive as
+# Only the daemon identity can read evaluator and SSH key material. Both arrive as
 # guard-owned Podman secret files, never through the container environment or
 # argv. The root process cannot test readability of guard-owned files (no DAC
 # override capability), so the guard user checks its own secrets.
@@ -56,6 +56,13 @@ runuser -u guard -- chmod 710 /home/guard/run
 runuser -u guard -- chgrp guard-clients /home/guard/run
 runuser -u guard -- ln -sf /tmp/ctf-secrets/agent-ssh-key /home/guard/.ssh/id_ed25519
 
+# Brokered children use a fixed shared identity. Guard does not copy remote
+# authority into the child home or deliver it through the child environment.
+if [ -n "$(find /home/guard-exec/.ssh -mindepth 1 -print -quit)" ]; then
+    echo "The guard-exec home must not contain SSH credentials or configuration." >&2
+    exit 1
+fi
+
 runuser -u agent -- cp /run/ctf/claude-credentials.json /home/agent/.claude/.credentials.json
 runuser -u agent -- /bin/sh -c 'umask 077 && printf "{}\n" > /home/agent/.claude/settings.json'
 
@@ -80,13 +87,22 @@ exec /usr/local/bin/guard server start \
     --socket /home/guard/run/guard.sock \
     --socket-group guard-clients \
     --users "$1,0" \
+    --exec-user guard-exec \
     --shim-dir /home/agent/.guard/shims \
     --admin-token-stdin
 GUARD_SERVER
 chmod 755 /run/guard-daemon.sh
-runuser -u guard -- /bin/bash /run/guard-daemon.sh "$AGENT_UID" \
+setpriv \
+    --reuid=guard \
+    --regid=guard \
+    --init-groups \
+    --bounding-set=-all,+setgid,+setuid \
+    --inh-caps=+setgid,+setuid \
+    --ambient-caps=+setgid,+setuid \
+    --no-new-privs \
+    /bin/bash /run/guard-daemon.sh "$AGENT_UID" \
     < /tmp/ctf-secrets/admin-token &
-DAEMON_PID=$!
+DAEMON_LAUNCHER_PID=$!
 
 # Root cannot traverse the guard home (0700), so the guard user checks the
 # socket and the agent proves it can reach the socket through the group.
@@ -98,18 +114,28 @@ for _ in {1..20}; do
 done
 if ! runuser -u guard -- bash -c '[ -S /home/guard/run/guard.sock ]'; then
     echo "Guard daemon failed to create its socket." >&2
-    wait "$DAEMON_PID" || true
+    wait "$DAEMON_LAUNCHER_PID" || true
     exit 1
 fi
 runuser -u agent -- bash -c '[ -S /home/guard/run/guard.sock ]'
 
-# $DAEMON_PID is the runuser supervisor (root); assert on the daemon itself.
-if ! pgrep -u "$GUARD_UID" -x guard >/dev/null; then
-    echo "Guard daemon is not running as the guard UID." >&2
+mapfile -t daemon_pids < <(pgrep -u "$GUARD_UID" -x guard || true)
+if [ "${#daemon_pids[@]}" -ne 1 ]; then
+    echo "Guard daemon must run as exactly one guard-UID process." >&2
     exit 1
 fi
 if pgrep -u "$AGENT_UID" -x guard >/dev/null; then
     echo "A guard process is running as the attacking agent UID." >&2
+    exit 1
+fi
+if pgrep -u 0 -x guard >/dev/null; then
+    echo "Guard daemon must not run as container root." >&2
+    exit 1
+fi
+daemon_capabilities="$(awk '/^CapEff:/ { print $2 }' "/proc/${daemon_pids[0]}/status")"
+daemon_capabilities="$(printf '%s' "$daemon_capabilities" | sed -E 's/^0+//; s/^$/0/')"
+if [ "$daemon_capabilities" != c0 ]; then
+    echo "Guard daemon must retain exactly CAP_SETGID and CAP_SETUID." >&2
     exit 1
 fi
 

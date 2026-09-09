@@ -52,6 +52,13 @@ pub struct VerbContext {
     /// Canonical digest of the complete composed matcher result, including
     /// every applicable coverage cell and every selected verb definition.
     pub composition_digest: Option<String>,
+    /// True only when every caller-controlled environment binding is covered
+    /// by the selected typed cells. Execution must not infer this capability
+    /// merely from the presence of a verb context.
+    pub environment_authority: bool,
+    /// True only when the composed matcher includes exact constraints that
+    /// bind every statically validated local file path.
+    pub local_file_authority: bool,
     /// Set to `TypedVerbPreempts` only after this exact typed authority has
     /// preauthorized the command. Evaluator-reviewed contexts remain
     /// `Enforce` so a newly learned deny can close the process-start race.
@@ -82,6 +89,14 @@ pub struct VerbMatchInfo {
     pub selected: bool,
     #[serde(default)]
     pub overridden: bool,
+    /// Typed execution authority from an exact `cwd` constraint. This field,
+    /// rather than the human-readable feature list, controls carrier routing.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exact_cwd_authorized: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -214,6 +229,7 @@ pub fn resolve_scoped_matches(
             features: matched.matched.features.iter().cloned().collect(),
             selected: maximal.contains(&index),
             overridden: matched.overridden,
+            exact_cwd_authorized: matched.matched.exact_cwd_authorized,
         })
         .collect::<Vec<_>>();
 
@@ -283,6 +299,12 @@ pub fn resolve_scoped_matches(
 
     let (context, revert) = if !plan_conflict {
         let first = selected[0];
+        let environment_authority = selected
+            .iter()
+            .all(|matched| matched.matched.environment_authorized);
+        let local_file_authority = selected
+            .iter()
+            .any(|matched| matched.matched.local_file_authorized);
         let access_evaluation_override_eligible = decision == VerbDecision::Evaluate
             && selected.iter().all(|matched| {
                 matched.scope == VerbMatchScope::Session
@@ -317,6 +339,8 @@ pub fn resolve_scoped_matches(
                 catalog_version,
                 verb_digest: None,
                 composition_digest: None,
+                environment_authority,
+                local_file_authority,
                 learned_deny_match_policy: LearnedDenyMatchPolicy::Enforce,
                 access_evaluation_override_eligible,
             }),
@@ -542,6 +566,8 @@ mod verb_resolution_tests {
                     ..CoverageSpecificity::default()
                 },
                 environment_authorized: true,
+                local_file_authorized: true,
+                exact_cwd_authorized: false,
             },
             scope,
             effective_action: action,
@@ -585,6 +611,28 @@ mod verb_resolution_tests {
         assert_eq!(resolution.context.unwrap().name, "session-apply");
         assert!(!resolution.matches[0].selected);
         assert!(resolution.matches[1].selected);
+    }
+
+    #[test]
+    fn verb_context_carries_secondary_authority_as_explicit_capabilities() {
+        let mut matched = scoped(
+            "typed-check",
+            "bounded",
+            VerbMatchScope::Baseline,
+            CoverageAction::Evaluate,
+            &["required:--check"],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        matched.matched.environment_authorized = false;
+        matched.matched.local_file_authorized = false;
+        let resolution = resolve_scoped_matches(vec![matched], 1);
+        let context = resolution.context.unwrap();
+        assert!(!context.environment_authority);
+        assert!(!context.local_file_authority);
     }
 
     #[test]
@@ -1050,6 +1098,8 @@ mod verb_resolution_properties {
                     ..CoverageSpecificity::default()
                 },
                 environment_authorized: true,
+                local_file_authorized: true,
+                exact_cwd_authorized: false,
             },
             scope,
             effective_action: action,

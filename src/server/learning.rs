@@ -249,7 +249,7 @@ pub(super) async fn maybe_promote_deny_shape(
     };
     let hint = (outcome.denials >= outcome.required_denials).then(|| {
         format!(
-            "guard has denied {} similar {} commands; if this access is needed, use the escalation handle to request a saved-grant or verb amendment",
+            "this denial came from evaluator judgment; no learned deny shape decided this command. Guard has recorded {} similar {} denials; if this access is needed, use the escalation handle to request a saved-grant or verb amendment",
             outcome.denials, binary
         )
     });

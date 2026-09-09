@@ -324,24 +324,26 @@ mod tests {
 
     #[test]
     fn test_llm_config_builder() {
+        let credential = format!("fixture-{:032x}", rand::random::<u128>());
         let config = LlmConfig {
             enabled: false,
-            api_key: Some("test-key".to_string()),
+            api_key: Some(credential.clone()),
             model: Some("test-model".to_string()),
             ..Default::default()
         };
 
         assert!(!config.enabled);
-        assert_eq!(config.api_key.as_deref(), Some("test-key"));
+        assert_eq!(config.api_key.as_deref(), Some(credential.as_str()));
         assert_eq!(config.model(), "test-model");
     }
 
     #[test]
     fn test_eval_config_builder() {
+        let credential = format!("fixture-{:032x}", rand::random::<u128>());
         let config = EvalConfig::default()
             .policy_path(PathBuf::from("/test/policy.yaml"))
             .llm_enabled(false)
-            .llm_api_key("key".to_string())
+            .llm_api_key(credential.clone())
             .llm_timeout_secs(30)
             .llm_retries(1)
             .llm_models(vec!["m1".into(), "m2".into()]);
@@ -351,7 +353,7 @@ mod tests {
             Some("/test/policy.yaml")
         );
         assert!(!config.llm.enabled);
-        assert_eq!(config.llm.api_key.as_deref(), Some("key"));
+        assert_eq!(config.llm.api_key.as_deref(), Some(credential.as_str()));
         assert_eq!(config.llm.timeout_secs, 30);
         assert_eq!(config.llm.retries, 1);
         assert_eq!(config.llm.models.len(), 2);

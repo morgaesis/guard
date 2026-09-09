@@ -23,13 +23,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN userdel -r ubuntu 2>/dev/null || true && \
     useradd -m -u "$AGENT_UID" -s /bin/bash agent && \
     useradd -m -u "$GUARD_UID" -s /usr/sbin/nologin guard && \
+    useradd -m -u 1002 -s /usr/sbin/nologin guard-exec && \
     groupadd guard-clients && \
     usermod -aG guard-clients agent && \
     usermod -aG guard-clients guard && \
-    mkdir -p /home/agent/.config/guard /home/agent/.ssh /home/agent/.claude /home/agent/work /home/guard/.ssh /home/guard/.local && \
+    mkdir -p /home/agent/.config/guard /home/agent/.ssh /home/agent/.claude /home/agent/work /home/guard/.ssh /home/guard/.local /home/guard-exec/.ssh && \
     chown -R agent:agent /home/agent && \
     chown -R guard:guard /home/guard && \
-    chmod 700 /home/agent/.ssh /home/agent/.claude /home/guard/.ssh
+    chown -R guard-exec:guard-exec /home/guard-exec && \
+    chmod 700 /home/agent/.ssh /home/agent/.claude /home/guard/.ssh /home/guard-exec/.ssh
 
 COPY guard /usr/local/bin/guard
 COPY .claude-bin /usr/local/bin/claude

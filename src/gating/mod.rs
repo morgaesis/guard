@@ -35,6 +35,48 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+/// Canonical executable identity used by every authority classifier.
+///
+/// On Windows, executable lookup is case-insensitive and an extensionless
+/// native program name resolves to its `.exe` spelling. The non-native
+/// executable suffixes `.com`, `.cmd`, and `.bat` remain distinct because they
+/// select different execution semantics. Unix executable names are
+/// case-sensitive and retain every suffix.
+pub fn executable_match_key(binary: &str) -> String {
+    let base = binary.rsplit(['/', '\\']).next().unwrap_or(binary);
+
+    executable_match_key_for_platform(base)
+}
+
+/// Cross-platform executable family used only for command semantics.
+///
+/// Policy grammar must recognize Windows spellings while tests or catalog
+/// tooling run on Unix, and must not confuse that recognition with the host's
+/// actual path-lookup rules. Process identity continues to use
+/// [`executable_match_key`].
+pub fn semantic_executable_key(binary: &str) -> String {
+    let base = binary.rsplit(['/', '\\']).next().unwrap_or(binary);
+    let normalized = base.to_ascii_lowercase();
+    normalized
+        .strip_suffix(".exe")
+        .map(str::to_owned)
+        .unwrap_or(normalized)
+}
+
+#[cfg(windows)]
+fn executable_match_key_for_platform(base: &str) -> String {
+    let normalized = base.to_ascii_lowercase();
+    normalized
+        .strip_suffix(".exe")
+        .map(str::to_owned)
+        .unwrap_or(normalized)
+}
+
+#[cfg(not(windows))]
+fn executable_match_key_for_platform(base: &str) -> String {
+    base.to_owned()
+}
+
 /// Versioned explanation of one admission decision. This is deliberately
 /// transport-neutral so the same immutable record can be attached to command
 /// responses, session history, holds, and containment snapshots.
@@ -180,7 +222,7 @@ pub enum Reversibility {
     /// git status, kubectl get).
     Reversible,
     /// A mutation with a known inverse and bounded blast radius that a rollback
-    /// can restore (systemctl restart, kubectl scale, a config edit with a
+    /// can restore (kubectl scale, a config edit with a
     /// backup, a firewall change behind an auto-revert).
     Recoverable,
     /// Destruction or a change with no clean inverse (rm -rf, mkfs, DROP TABLE,
@@ -343,20 +385,20 @@ pub fn decide_gate(
 /// plan, Makefile, or plugin tree discovered from the caller working
 /// directory), so the safe-mode prompt's carrier boundary is backed by this
 /// code path rather than model compliance alone: an evaluator allow for such
-/// a binary never executes by itself and is clamped to an operator hold. An
-/// operator-authored typed verb (which can pin an exact `cwd`) expresses the
-/// trust the floor demands and bypasses it per verb; a session grant skips
-/// the evaluator entirely and is likewise untouched. Readonly and paranoid
-/// modes already deny these operations outright and are unchanged, and an
-/// evaluator deny is never softened.
+/// a binary cannot enter an approval hold because raw approval cannot bind its
+/// executable authority. Selected operator-authored typed coverage bypasses
+/// the floor only when it pins an exact `cwd`; a session grant skips the
+/// evaluator entirely and is likewise untouched. Readonly and paranoid modes
+/// already deny these operations
+/// outright and are unchanged, and an evaluator deny is never softened.
 ///
-/// Returns the hold reason when the floor applies.
+/// Returns the denial reason when the floor applies.
 pub fn opaque_carrier_floor_reason(
     mode: Option<PolicyMode>,
     binary: &str,
-    verb_authorized: bool,
+    exact_cwd_verb_authority: bool,
 ) -> Option<String> {
-    if verb_authorized
+    if exact_cwd_verb_authority
         || mode != Some(PolicyMode::Safe)
         || !allow_promotion::is_cwd_dependent_opaque_carrier(binary)
     {
@@ -364,8 +406,9 @@ pub fn opaque_carrier_floor_reason(
     }
     Some(format!(
         "opaque-carrier floor: '{binary}' executes effects defined outside the command text, \
-         so an evaluator allow alone cannot execute it in safe mode; held for operator \
-         approval (an operator-authored typed verb authorizes it deterministically)"
+         so an evaluator allow alone cannot execute it in safe mode. Raw approval cannot \
+         bind executable authority for this carrier; use operator-authored typed coverage \
+         with an exact working-directory binding."
     ))
 }
 
@@ -440,6 +483,43 @@ impl Coverage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_match_key_folds_case_and_matches_extensionless_native_programs() {
+        assert_eq!(executable_match_key("kubectl"), "kubectl");
+        assert_eq!(executable_match_key("KUBECTL.EXE"), "kubectl");
+        assert_eq!(executable_match_key(r"C:\\Tools\\KuBeCtL.eXe"), "kubectl");
+        assert_eq!(executable_match_key("kubectl-wrapper"), "kubectl-wrapper");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_match_key_keeps_explicit_windows_program_types_distinct() {
+        let native = executable_match_key("kubectl.exe");
+        for binary in ["kubectl.com", "KUBECTL.CMD", "kubectl.BAT"] {
+            assert_ne!(native, executable_match_key(binary));
+        }
+
+        assert_eq!(executable_match_key("KUBECTL.CMD"), "kubectl.cmd");
+        assert_eq!(executable_match_key(r"C:/Tools/kubectl.BAT"), "kubectl.bat");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn executable_match_key_preserves_unix_case_and_suffixes() {
+        assert_eq!(executable_match_key("kubectl"), "kubectl");
+        assert_eq!(executable_match_key("KUBECTL.EXE"), "KUBECTL.EXE");
+        assert_eq!(executable_match_key("kubectl.exe"), "kubectl.exe");
+        assert_ne!(
+            executable_match_key("kubectl"),
+            executable_match_key("KUBECTL")
+        );
+        assert_ne!(
+            executable_match_key("kubectl"),
+            executable_match_key("kubectl.exe")
+        );
+    }
 
     #[test]
     fn reversible_low_risk_executes_now() {
@@ -554,14 +634,17 @@ mod tests {
         // Every classifier member is floored the same way.
         assert!(opaque_carrier_floor_reason(Some(PolicyMode::Safe), "terraform", false).is_some());
         assert!(opaque_carrier_floor_reason(Some(PolicyMode::Safe), "make", false).is_some());
+        assert!(
+            opaque_carrier_floor_reason(Some(PolicyMode::Safe), "Ansible.ExE", false).is_some()
+        );
     }
 
     #[test]
-    fn opaque_carrier_floor_is_bypassed_by_typed_verb_authority() {
+    fn opaque_carrier_floor_is_bypassed_by_exact_cwd_typed_authority() {
         assert_eq!(
             opaque_carrier_floor_reason(Some(PolicyMode::Safe), "ansible-playbook", true),
             None,
-            "an operator-authored typed verb expresses the trust the floor demands"
+            "exact cwd typed authority expresses the trust the floor demands"
         );
     }
 

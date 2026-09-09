@@ -1,60 +1,88 @@
 version: 2
 updates:
-  - package-ecosystem: "cargo"
+  - package-ecosystem: "cargo" # zizmor: ignore[dependabot-cooldown] Security updates have no configured cooldown.
     directory: "/"
     schedule:
       interval: "daily"
-    cooldown:
-      default-days: 7
     labels:
       - "dependencies"
       - "rust"
     commit-message:
       prefix: "chore(deps)"
     groups:
-      rust-safe-dependencies:
+      root-cargo-patch-minor:
         patterns:
           - "*"
         update-types:
           - "minor"
           - "patch"
-      rust-major-dependencies:
+      root-cargo-major:
         patterns:
           - "*"
         update-types:
           - "major"
 
-  - package-ecosystem: "github-actions"
+  - package-ecosystem: "github-actions" # zizmor: ignore[dependabot-cooldown] Security updates have no configured cooldown.
     directory: "/"
     schedule:
       interval: "weekly"
-    cooldown:
-      default-days: 7
     labels:
       - "dependencies"
       - "github-actions"
     commit-message:
       prefix: "chore(ci)"
+    groups:
+      github-actions-patch-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      github-actions-major:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
 
-  - package-ecosystem: "cargo"
+  - package-ecosystem: "cargo" # zizmor: ignore[dependabot-cooldown] Security updates have no configured cooldown.
     directory: "/fuzz"
     schedule:
       interval: "weekly"
-    cooldown:
-      default-days: 7
     labels:
       - "dependencies"
       - "rust"
     commit-message:
       prefix: "chore(deps)"
+    groups:
+      fuzz-cargo-patch-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      fuzz-cargo-major:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
 
-  - package-ecosystem: "docker"
+  - package-ecosystem: "docker" # zizmor: ignore[dependabot-cooldown] Security updates have no configured cooldown.
     directory: "/.clusterfuzzlite"
     schedule:
       interval: "weekly"
-    cooldown:
-      default-days: 7
     labels:
       - "dependencies"
     commit-message:
       prefix: "chore(deps)"
+    groups:
+      docker-patch-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      docker-major:
+        patterns:
+          - "*"
+        update-types:
+          - "major"

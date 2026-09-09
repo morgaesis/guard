@@ -61,10 +61,23 @@ fn configure_windows_stack() {
 }
 
 fn main() {
-    let commit =
-        git_stdout(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
-    let tag = git_stdout(&["tag", "--points-at", "HEAD"]);
-    let branch = git_stdout(&["branch", "--show-current"]).unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rerun-if-env-changed=CARGO_GUARD_GIT_COMMIT");
+    println!("cargo:rerun-if-env-changed=CARGO_GUARD_GIT_BRANCH");
+    println!("cargo:rerun-if-env-changed=CARGO_GUARD_GIT_TAG");
+    let commit = std::env::var("CARGO_GUARD_GIT_COMMIT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| git_stdout(&["rev-parse", "--short", "HEAD"]))
+        .unwrap_or_else(|| "unknown".to_string());
+    let tag = std::env::var("CARGO_GUARD_GIT_TAG")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| git_stdout(&["tag", "--points-at", "HEAD"]));
+    let branch = std::env::var("CARGO_GUARD_GIT_BRANCH")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| git_stdout(&["branch", "--show-current"]))
+        .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=GUARD_GIT_COMMIT={}", commit);
     println!("cargo:rustc-env=GUARD_GIT_BRANCH={}", branch);

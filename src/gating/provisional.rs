@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
+use super::approval::{ProcessAuthorityBinding, SecretBinding};
 use super::{sanitize_gate_text, DecisionTrace, GateError};
 use crate::principal::{scope_eq, PrincipalKey};
 
@@ -76,6 +77,17 @@ pub enum ProvisionalStatus {
     NeedsOperatorDecision,
 }
 
+/// Process-start authority for one command that may execute from a durable
+/// containment row. Secret values stay out of this structure: replay resolves
+/// each named reference once, compares its installation-keyed HMAC, and carries that same
+/// in-memory value snapshot through spawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedCommandAuthorization {
+    pub process_authority: ProcessAuthorityBinding,
+    pub secret_binding: SecretBinding,
+    pub exec_timeout_secs: u64,
+}
+
 impl ProvisionalStatus {
     /// Whether this status still occupies an outstanding/“stuck” slot for cap
     /// accounting. Terminal-good (`Confirmed`, `Reverted`) do not; everything
@@ -122,9 +134,10 @@ pub struct Provisional {
     pub handle: String,
     /// Principal of the caller that created this, used to reconstruct the exec
     /// identity for the revert (so under `--exec-as-caller` the revert runs as
-    /// the original caller). `None` means the daemon executes as its own
-    /// identity. Deserializes from the legacy numeric `caller_uid` form so rows
-    /// written by an older daemon survive an upgrade.
+    /// the original caller). `None` carries no caller-bound attribution; fixed
+    /// mode still uses its dedicated child identity, while caller mode fails
+    /// closed without a principal. Deserializes from the legacy numeric
+    /// `caller_uid` form so rows written by an older daemon survive an upgrade.
     #[serde(
         default,
         alias = "caller_uid",
@@ -156,12 +169,20 @@ pub struct Provisional {
     /// agent-supplied `--revert` that was itself evaluated to APPROVE at arm time.
     pub revert_binary: String,
     pub revert_args: Vec<String>,
+    /// Exact process and secret authority captured for command-shaped rollback.
+    /// Missing authority marks a legacy row and prevents replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert_authorization: Option<PersistedCommandAuthorization>,
     /// Independent command run at the deadline before rollback. Older rows
     /// omit it and retain the unconditional auto-revert behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_check_binary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub confirm_check_args: Vec<String>,
+    /// Exact process and secret authority captured for the independent check.
+    /// Missing authority on a row with a check prevents replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_check_authorization: Option<PersistedCommandAuthorization>,
     /// Evaluator-reviewed authority and transport required by the check and
     /// rollback. Stored for audit and operator inspection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -846,8 +867,10 @@ mod tests {
             secret_file_keys: BTreeMap::new(),
             revert_binary: "systemctl".into(),
             revert_args: vec!["stop".into(), "app".into()],
+            revert_authorization: None,
             confirm_check_binary: None,
             confirm_check_args: Vec::new(),
+            confirm_check_authorization: None,
             control_path: None,
             session_fingerprint: None,
             session_revision: None,
@@ -1234,5 +1257,7 @@ mod tests {
         let p: Provisional = serde_json::from_str(json).expect("legacy provisional row");
         assert_eq!(p.principal, Some(PrincipalKey::from_uid(1001)));
         assert!(p.secret_keys.is_empty());
+        assert!(p.revert_authorization.is_none());
+        assert!(p.confirm_check_authorization.is_none());
     }
 }

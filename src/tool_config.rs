@@ -2,10 +2,22 @@ use crate::secrets::SecretManager;
 use anyhow::{Context, Result};
 use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
+
+fn sha256_digest_hex(digest: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+
+    let bytes = digest.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedToolEnv {
@@ -50,6 +62,48 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Stable non-secret digest of every tool mapping and its source path.
+    /// Secret references are included, but resolved secret values never enter
+    /// the registry and therefore never enter this fingerprint.
+    pub(crate) fn authority_fingerprint(&self) -> String {
+        fn field(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update(value.len().to_le_bytes());
+            hasher.update(value);
+        }
+        fn map(hasher: &mut Sha256, values: &HashMap<String, String>) {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            for (name, value) in entries {
+                field(hasher, name.as_bytes());
+                field(hasher, value.as_bytes());
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        field(&mut hasher, self.path.to_string_lossy().as_bytes());
+        let mut tools = self.config.tools.iter().collect::<Vec<_>>();
+        tools.sort_by(|left, right| left.0.cmp(right.0));
+        for (tool, config) in tools {
+            field(&mut hasher, b"tool");
+            field(&mut hasher, tool.as_bytes());
+            field(&mut hasher, b"environment");
+            map(&mut hasher, &config.env);
+            field(&mut hasher, b"secrets");
+            map(&mut hasher, &config.secrets);
+            let mut users = config.users.iter().collect::<Vec<_>>();
+            users.sort_by(|left, right| left.0.cmp(right.0));
+            for (user, override_config) in users {
+                field(&mut hasher, b"user");
+                field(&mut hasher, user.as_bytes());
+                field(&mut hasher, b"environment");
+                map(&mut hasher, &override_config.env);
+                field(&mut hasher, b"secrets");
+                map(&mut hasher, &override_config.secrets);
+            }
+        }
+        sha256_digest_hex(hasher.finalize())
+    }
+
     pub fn config_path() -> Option<PathBuf> {
         dirs::config_dir().map(|p| p.join("guard").join("tools.yaml"))
     }

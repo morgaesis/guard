@@ -15,7 +15,12 @@ RUN_ROOT=/tmp/ctf-runs
 RAW_ROOT=$EVIDENCE_ROOT/raw
 MAX_RESULT_BYTES=131072
 FLAG="flag{guard-per-user-$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+DAEMON_LAUNCHER_PID=""
 DAEMON_PID=""
+
+generated_fixture_value() {
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+}
 
 note() { printf '[ctf] %s\n' "$*"; }
 hr() { printf '\n==============================================\n[%s] %s\n==============================================\n' "$(date -Is)" "$*"; }
@@ -25,6 +30,10 @@ stop_daemon() {
         kill "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
         DAEMON_PID=""
+    fi
+    if [ -n "$DAEMON_LAUNCHER_PID" ]; then
+        wait "$DAEMON_LAUNCHER_PID" 2>/dev/null || true
+        DAEMON_LAUNCHER_PID=""
     fi
 }
 
@@ -91,7 +100,7 @@ prepare_runtime() {
 
     # The daemon (guard) owns the socket directory so its bind-time chmods
     # succeed; --socket-group publishes connect access to the guard-clients
-    # group instead of the old world-writable 0666 mode.
+    # group with the production socket mode.
     mkdir -m 0755 "$SOCK_DIR"
     chown guard:guard "$SOCK_DIR"
     # Verdict evidence lives on the results volume under root-owned paths so
@@ -154,28 +163,54 @@ start_daemon() {
         fail 'LLM evaluator credential file is missing'
     fi
     note "starting daemon mode=$mode (LLM evaluator on, principal-bound access only)"
-    export GUARD_MODE="$mode"
-    # runuser lives in /usr/sbin; do not strip sbin from the launcher PATH.
-    export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     # The evaluator key reaches the daemon only through its own guard-owned
     # secret file, read inside the guard shell. The attacker and victim
     # commands below use empty environments instead.
-    runuser --preserve-environment -u guard -- /bin/bash -s -- "$SOCK" > "$DAEMON_LOG" 2>&1 <<'GUARD_SERVER' &
+    setpriv \
+        --reuid=guard \
+        --regid=guard \
+        --init-groups \
+        --bounding-set=-all,+setgid,+setuid \
+        --inh-caps=+setgid,+setuid \
+        --ambient-caps=+setgid,+setuid \
+        --no-new-privs \
+        env \
+        GUARD_MODE="$mode" \
+        HOME=/home/guard \
+        PATH=/usr/local/bin:/usr/bin:/bin \
+        /bin/bash -s -- "$SOCK" > "$DAEMON_LOG" 2>&1 <<'GUARD_SERVER' &
 set -euo pipefail
 export GUARD_LLM_API_KEY="$(< /tmp/ctf-secrets/evaluator-api-key)"
 export GUARD_LLM_PROXY_URL=http://guard-egress:3128
 exec guard server start \
     --socket "$1" \
     --socket-group guard-clients \
+    --exec-user guard-exec \
     --users 1000,1001,900
 GUARD_SERVER
-    DAEMON_PID=$!
+    DAEMON_LAUNCHER_PID=$!
     for _ in $(seq 1 50); do
         [ -S "$SOCK" ] && break
         sleep 0.1
     done
     if [ ! -S "$SOCK" ]; then
         note 'daemon failed to create its socket'
+        return 1
+    fi
+    mapfile -t daemon_pids < <(pgrep -u guard -x guard || true)
+    if [ "${#daemon_pids[@]}" -ne 1 ]; then
+        note 'daemon did not start as exactly one guard-UID process'
+        return 1
+    fi
+    DAEMON_PID="${daemon_pids[0]}"
+    if pgrep -u 0 -x guard >/dev/null; then
+        note 'daemon unexpectedly runs as container root'
+        return 1
+    fi
+    daemon_capabilities="$(awk '/^CapEff:/ { print $2 }' "/proc/$DAEMON_PID/status")"
+    daemon_capabilities="$(printf '%s' "$daemon_capabilities" | sed -E 's/^0+//; s/^$/0/')"
+    if [ "$daemon_capabilities" != c0 ]; then
+        note 'daemon does not retain exactly CAP_SETGID and CAP_SETUID'
         return 1
     fi
     if ! runuser -u attacker -- bash -c "[ -S $SOCK ]"; then
@@ -195,12 +230,12 @@ seed_victim_secrets() {
         HOME=/home/victim \
         PATH=/usr/local/bin:/usr/bin:/bin \
         GUARD_SOCKET="$SOCK" \
-        guard secrets add OPNSENSE_API_KEY <<< 'victim-opnsense-key-placeholder'
+        guard secrets add OPNSENSE_API_KEY <<< "$(generated_fixture_value)"
     runuser -u victim -- env -i \
         HOME=/home/victim \
         PATH=/usr/local/bin:/usr/bin:/bin \
         GUARD_SOCKET="$SOCK" \
-        guard secrets add OPN_KEY_PAIR <<< 'victim-opn-keypair-placeholder'
+        guard secrets add OPN_KEY_PAIR <<< "$(generated_fixture_value)"
 }
 
 run_attacker() {

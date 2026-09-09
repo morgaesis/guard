@@ -80,7 +80,7 @@ An operator extends a specific active target by stable session reference or
 agent label:
 
 ```bash
-guard access extend session:0123456789abcdef 'Inspect host-a logs.'
+guard access extend <session-reference> 'Inspect host-a logs.'
 guard access extend agent:1001 'Restart the bounded fixture service.' --once
 ```
 

@@ -39,9 +39,10 @@ use crate::learned_rules::{
 };
 use crate::policy::{PolicyEngine, PolicyMode};
 use anyhow::{bail, Context, Result};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder, Url};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -99,6 +100,7 @@ pub struct Evaluator {
     policy_engine: Option<PolicyEngine>,
     llm_config: LlmConfig,
     http_client: Client,
+    loopback_http_client: Client,
     system_prompt: String,
     cache: Option<RwLock<EvalCache>>,
     mode: Option<PolicyMode>,
@@ -113,6 +115,39 @@ pub struct Evaluator {
     /// a fresh stamp and `server::execute_command_inner` stops trusting
     /// verbs promoted under the old one. See `gating::allow_promotion`.
     verb_promotion_stamp: String,
+}
+
+enum ProviderEndpoint {
+    AuthenticatedHttps(Url),
+    UnauthenticatedLoopback(Url),
+}
+
+impl ProviderEndpoint {
+    fn parse(value: &str) -> Result<Self> {
+        let url = Url::parse(value).context("invalid LLM API URL")?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            bail!("LLM API URL cannot contain credentials, a query, or a fragment");
+        }
+        match url.scheme() {
+            "https" => Ok(Self::AuthenticatedHttps(url)),
+            "http" if endpoint_host_is_loopback(&url) => Ok(Self::UnauthenticatedLoopback(url)),
+            _ => bail!("LLM API URL must use HTTPS or unauthenticated HTTP loopback"),
+        }
+    }
+}
+
+fn endpoint_host_is_loopback(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// A fresh learned-deny snapshot held through one command-start handoff.
@@ -224,7 +259,13 @@ impl Evaluator {
             system_prompt
         };
 
-        let mut http_client = Client::builder().timeout(config.llm.timeout());
+        if config.llm.enabled {
+            ProviderEndpoint::parse(&config.llm.api_url())?;
+        }
+        let mut http_client = Client::builder()
+            .timeout(config.llm.timeout())
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none());
         if let Some(proxy_url) = config.llm.proxy_url.as_deref() {
             http_client =
                 http_client.proxy(reqwest::Proxy::all(proxy_url).context("invalid LLM proxy URL")?);
@@ -232,6 +273,12 @@ impl Evaluator {
         let http_client = http_client
             .build()
             .context("failed to create HTTP client")?;
+        let loopback_http_client = Client::builder()
+            .timeout(config.llm.timeout())
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to create loopback HTTP client")?;
 
         let cache = if config.cache_enabled {
             tracing::info!(
@@ -264,6 +311,7 @@ impl Evaluator {
             policy_engine,
             llm_config: config.llm,
             http_client,
+            loopback_http_client,
             system_prompt,
             cache,
             mode: config.mode,
@@ -273,6 +321,28 @@ impl Evaluator {
             allow_promotion: config.allow_promotion,
             verb_promotion_stamp,
         })
+    }
+
+    fn provider_post(&self, api_url: &str, api_key: &str) -> Result<RequestBuilder> {
+        match ProviderEndpoint::parse(api_url)? {
+            ProviderEndpoint::AuthenticatedHttps(url) => {
+                Ok(self.http_client.post(url).bearer_auth(api_key))
+            }
+            ProviderEndpoint::UnauthenticatedLoopback(url) => {
+                Ok(self.loopback_http_client.post(url))
+            }
+        }
+    }
+
+    fn provider_get(&self, api_url: &str, api_key: &str) -> Result<RequestBuilder> {
+        match ProviderEndpoint::parse(api_url)? {
+            ProviderEndpoint::AuthenticatedHttps(url) => {
+                Ok(self.http_client.get(url).bearer_auth(api_key))
+            }
+            ProviderEndpoint::UnauthenticatedLoopback(url) => {
+                Ok(self.loopback_http_client.get(url))
+            }
+        }
     }
 
     /// Refresh and lease learned-deny authority for a finite process-start
@@ -766,11 +836,25 @@ async fn refresh_deny_shapes_once(store: &Arc<RwLock<DenyShapeStore>>) -> anyhow
 
 #[cfg(test)]
 mod tests {
-    use super::{EvalConfig, EvalResult, EvalSource, Evaluator};
+    use super::{EvalConfig, EvalResult, EvalSource, Evaluator, ProviderEndpoint};
     use crate::gating::deny_shape::{canonical_argv, DenyShapeStore};
     use crate::learned_rules::{AutoShimMode, LearnedRuleStore};
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[test]
+    fn provider_endpoints_require_authenticated_transport() {
+        assert!(matches!(
+            ProviderEndpoint::parse("https://provider.example/v1/chat").unwrap(),
+            ProviderEndpoint::AuthenticatedHttps(_)
+        ));
+        assert!(matches!(
+            ProviderEndpoint::parse("http://127.0.0.1:8080/v1/chat").unwrap(),
+            ProviderEndpoint::UnauthenticatedLoopback(_)
+        ));
+        assert!(ProviderEndpoint::parse("http://provider.example/v1/chat").is_err());
+        assert!(ProviderEndpoint::parse("https://provider.example/v1/chat?key=value").is_err());
+    }
 
     #[tokio::test]
     async fn structured_cache_identity_preserves_every_argv_boundary() {

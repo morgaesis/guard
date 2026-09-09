@@ -2,9 +2,12 @@
 #
 # When the daemon fronts the Vercel API (`guard server start
 # --api-proxy 127.0.0.1:8445 --api-protocol vercel --api-upstream
-# https://api.vercel.com --api-token-file /etc/guard/vercel-token`), every
-# request is parsed into a typed operation and matched against this policy.
-# The daemon holds the real token; the brokered client talks only to the proxy.
+# https://api.vercel.com --api-token-file /etc/guard/vercel-token
+# --api-client-config-out /run/guard/vercel-client.json --exec-user guard-exec`),
+# the generated client has policy-filtered read-only access. Declare the same
+# listener through `--api-endpoints` with `mode: policy` to enable this file's
+# scoped write rules. The daemon holds the real token; the brokered client talks
+# only to the proxy.
 #
 # The Vercel mapping: a project is the namespace
 # (`/v{n}/projects/{project}/{resource}`), so rules scope per project the way

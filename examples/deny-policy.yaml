@@ -5,7 +5,7 @@
 # opt-in feature for deployments that want to fast-reject known-bad patterns
 # without paying for an LLM round-trip on obvious rejections.
 #
-# Load with: guard server start --policy examples/deny-policy.yaml
+# Validate with: guard server start --dry-run --exec-user guard-exec --policy examples/deny-policy.yaml
 # Or place at: ~/.config/guard/policy.yaml
 #
 # RECOMMENDED USAGE: keep this as a pre-LLM fast-reject layer. Commands that

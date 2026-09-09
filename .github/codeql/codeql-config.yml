@@ -1,0 +1,4 @@
+name: Guard complete source
+
+# Scan tests as first-class code. Credential fixtures are generated at runtime,
+# so test coverage does not rely on suppressing secret-shaped source literals.

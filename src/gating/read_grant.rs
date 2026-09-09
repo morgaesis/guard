@@ -84,9 +84,8 @@ pub struct ReadGrant {
     pub granting_session: Option<String>,
     /// The single caller-named file the grant is for (absolute).
     pub target_path: String,
-    /// setfacl user qualifier the grant was issued to: the numeric uid of the
-    /// identity that runs brokered children (guard's own uid, or the caller's
-    /// uid under `--exec-as-caller`).
+    /// setfacl user qualifier the grant was issued to: the authenticated
+    /// caller uid that runs the child under `--exec-as-caller`.
     pub grantee_uid: u32,
     /// Every ACL entry added: the leaf read grant plus each ancestor traverse
     /// grant. Revocation removes exactly these.

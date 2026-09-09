@@ -3,10 +3,22 @@
 Consequence gating converts an evaluator approval into one of three execution
 routes. Enable it on a local authenticated listener:
 
+Provision the dedicated accounts first, using the
+[Unix service setup](../DEPLOYMENT.md#unix-service).
+
 ```bash
-guard server start --gate consequence \
+sudo install -d -o root -g root -m 0755 /run/guard
+sudo install -o root -g guard-exec -m 0640 /dev/null /run/guard/kubeconfig
+sudo env KUBECONFIG=/run/guard/kubeconfig \
+  guard server start --gate consequence \
   --socket /run/guard/guard.sock \
-  --verbs /etc/guard/verbs.yaml
+  --exec-user guard-exec \
+  --verbs /etc/guard/verbs.yaml \
+  --child-env KUBECONFIG \
+  --kube-proxy 127.0.0.1:8443 \
+  --kubeconfig /etc/guard/upstream.kubeconfig \
+  --brokered-kubeconfig-out /run/guard/kubeconfig \
+  --api-policy /etc/guard/api-policy.yaml
 ```
 
 | Class | Route |
@@ -19,13 +31,13 @@ Classification can raise the gate but cannot lower it. Missing or conflicting
 classification holds. Trusted verbs skip evaluator approval, not consequence
 routing.
 
-In safe mode, an evaluator allow of a cwd-dependent opaque carrier
-(`ansible-playbook`, `terraform`, `helm`, `make`, and the rest of the fixed
-classifier list) is deterministically routed to a hold regardless of its
-reversibility class and risk score: these tools execute effects defined
-outside the command text, so a model verdict alone never reaches execute-now
-for them. Coverage by an operator-authored typed verb, which can pin an exact
-`cwd`, authorizes the command past the floor; an evaluator deny stays a deny.
+In safe mode, an evaluator allow of a profile-dependent carrier is denied when
+its runtime identity cannot reproduce an immutable authority snapshot. Fixed
+identity admits kubectl only through the generated kubeconfig for an active
+Guard proxy and denies Ansible and Helm. Caller identity denies all three typed
+profile tools. Prompt supplements, catalog entries, access approval, and replay
+cannot bypass these process-admission rules. Unprofiled carriers such as
+Terraform and Make remain denied. An evaluator deny stays a deny.
 
 Unix and foreground Windows operators hold the explicitly configured admin
 bearer. The packaged Windows service rejects that bearer and accepts
@@ -37,15 +49,17 @@ kernel-authenticated local peer identity and cannot host consequence gating.
 
 ## Recoverable commands
 
-The caller can propose a complete containment envelope:
+The caller can propose a complete containment envelope. The following is a
+schematic command shape; every forward, rollback, and check executable must have
+a closed mode-compatible profile:
 
 ```bash
 guard run \
-  --revert 'systemctl stop app' \
-  --confirm-check 'systemctl is-active app' \
-  --revert-control-path 'local systemd control socket' \
+  --revert "$CLOSED_ROLLBACK_COMMAND" \
+  --confirm-check "$CLOSED_CONFIRMATION_COMMAND" \
+  --revert-control-path "$CONTROL_PATH_DESCRIPTION" \
   --confirm-within 900 \
-  systemctl restart app
+  "$CLOSED_FORWARD_EXECUTABLE" "${FORWARD_ARGUMENTS[@]}"
 ```
 
 The evaluator considers the forward command, rollback, confirmation check,
@@ -90,8 +104,8 @@ change remains visible for operator handling instead of using another endpoint.
 
 A held operation has not executed. Guard stores the exact command or API
 request, caller working directory, effective grant revision, applicable verb
-coverage, secret-name bindings with salted value hashes, and consequence
-decision. This frozen snapshot prevents a later grant edit, verb reload, secret
+coverage, secret-name bindings with installation-keyed value HMACs, and
+consequence decision. This frozen snapshot prevents a later grant edit, verb reload, secret
 swap, or caller environment change from rewriting what the operator reviews.
 
 ```bash
@@ -165,8 +179,9 @@ back on an `appeal:` line. `static-policy` is a matched operator-authored deny
 rule and is absolute; `static-default-deny` is missing coverage that `guard
 access request` supplies; `learned-deny` is a generated fast path that
 `--reevaluate` skips; `evaluator` and `evaluator-cache` are model judgments
-that `guard access request` escalates. The underlying source also appears in
-structured output as `decision_source`.
+that `guard access request` escalates. A similar-command counter is evidence
+recorded after an evaluator denial, not a matched learned shape. The underlying
+source also appears in structured output as `decision_source`.
 
 ## Autonomous operation
 

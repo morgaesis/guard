@@ -1,0 +1,478 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Build one release target and package its canonical deployment archive. The
+# workflow runs this script twice from independent clean source and target
+# directories, then requires byte-identical archives before publication.
+
+release_target_rows() {
+  printf '%s\t%s\t%s\t%s\n' \
+    x86_64-unknown-linux-gnu ubuntu-latest guard false \
+    aarch64-unknown-linux-gnu ubuntu-latest guard true \
+    x86_64-pc-windows-msvc windows-latest guard.exe false
+}
+
+write_archive_evidence() {
+  local archive="$1" artifact="$2" manifest="$3" binary="$4"
+  python3 - "$archive" "$artifact" "$binary" > "$manifest" <<'PY'
+import hashlib
+import pathlib
+import sys
+import tarfile
+
+archive_path = pathlib.Path(sys.argv[1])
+artifact_name = sys.argv[2]
+binary_path = pathlib.Path(sys.argv[3])
+binary_count = 0
+file_count = 0
+
+try:
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        for member in sorted(archive.getmembers(), key=lambda entry: entry.name):
+            path = pathlib.PurePosixPath(member.name)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("archive contains an unsafe member name")
+            if not member.isfile():
+                continue
+            file_count += 1
+            if file_count > 200:
+                raise ValueError("archive contains more than 200 files")
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError("archive file member is unreadable")
+            is_binary = len(path.parts) == 2 and path.name == artifact_name
+            if is_binary:
+                binary_count += 1
+                output = binary_path.open("wb")
+            else:
+                output = None
+            digest = hashlib.sha256()
+            try:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+                    if output is not None:
+                        output.write(chunk)
+            finally:
+                source.close()
+                if output is not None:
+                    output.close()
+            print(f"{digest.hexdigest()}  {member.name}")
+except (OSError, tarfile.TarError, ValueError) as error:
+    raise SystemExit(f"release archive diagnostics failed: {error}") from None
+
+if binary_count != 1:
+    raise SystemExit("release archive diagnostics require exactly one packaged binary")
+PY
+}
+
+binary_contains_literal() {
+  local binary="$1" literal="$2"
+  if strings -a "$binary" | grep -F -- "$literal" >/dev/null; then
+    printf 'yes'
+  else
+    printf 'no'
+  fi
+}
+
+describe_binary() {
+  local label="$1" binary="$2" source_root="$3" format build_id
+  format=$(file -b "$binary")
+  printf '%s binary format: %s\n' "$label" "$format" >&2
+  printf '%s binary contains its source root: %s\n' \
+    "$label" "$(binary_contains_literal "$binary" "$source_root")" >&2
+  if [[ "$format" == ELF* ]]; then
+    build_id=$(readelf -n "$binary" | sed -n 's/^[[:space:]]*Build ID: /Build ID: /p' | sed -n '1p')
+    printf '%s %s\n' "$label" "${build_id:-Build ID: unavailable}" >&2
+    printf '%s ELF sections (first 80 lines):\n' "$label" >&2
+    readelf -SW "$binary" | sed -n '1,80p' | sed "s/^/${label} /" >&2
+  fi
+}
+
+report_differing_binary_offsets() {
+  local primary="$1" replica="$2"
+  timeout 5s python3 - "$primary" "$replica" <<'PY'
+import sys
+
+limit = 32
+emitted = 0
+offset = 0
+
+with open(sys.argv[1], "rb") as primary, open(sys.argv[2], "rb") as replica:
+    while emitted < limit:
+        primary_chunk = primary.read(1024 * 1024)
+        replica_chunk = replica.read(1024 * 1024)
+        shared_length = min(len(primary_chunk), len(replica_chunk))
+
+        for index in range(shared_length):
+            if primary_chunk[index] != replica_chunk[index]:
+                print(offset + index + 1)
+                emitted += 1
+                if emitted == limit:
+                    break
+
+        if emitted == limit or len(primary_chunk) == len(replica_chunk):
+            if not primary_chunk:
+                break
+            offset += shared_length
+            continue
+
+        for index in range(shared_length, min(max(len(primary_chunk), len(replica_chunk)), shared_length + limit - emitted)):
+            print(offset + index + 1)
+            emitted += 1
+        break
+PY
+}
+
+verify_linux_release_binary_stripped() {
+  local target="$1" binary="$2" sections
+  case "$target" in
+    *-unknown-linux-gnu) ;;
+    *) return 0 ;;
+  esac
+  command -v readelf >/dev/null 2>&1 || {
+    echo "Linux release symbol verification requires readelf" >&2
+    return 1
+  }
+  sections=$(LC_ALL=C readelf -SW "$binary") || {
+    echo "Linux release symbol verification could not inspect the binary" >&2
+    return 1
+  }
+  if grep -Eq '^[[:space:]]*\[[[:space:]]*[0-9]+\][[:space:]]+\.symtab[[:space:]]' <<< "$sections"; then
+    echo "Linux release binary retains a .symtab section" >&2
+    return 1
+  fi
+}
+
+compare_release_archives() {
+  local primary="$1" replica="$2" artifact="$3" target="$4"
+  local primary_source="$5" replica_source="$6" diagnostic_root
+  local primary_manifest replica_manifest primary_binary replica_binary
+  if [ ! -f "$primary" ] || [ ! -f "$replica" ]; then
+    echo "release archive comparison requires two regular files" >&2
+    return 2
+  fi
+  case "$artifact" in
+    guard|guard.exe) ;;
+    *)
+      echo "release archive comparison received an unexpected artifact name" >&2
+      return 2
+      ;;
+  esac
+  if [ -z "$primary_source" ] || [ -z "$replica_source" ]; then
+    echo "release archive comparison requires both source roots" >&2
+    return 2
+  fi
+  if cmp --silent "$primary" "$replica"; then
+    return 0
+  fi
+
+  diagnostic_root=$(mktemp -d "${TMPDIR:-/tmp}/guard-release-compare.XXXXXX")
+  primary_manifest="$diagnostic_root/primary.manifest"
+  replica_manifest="$diagnostic_root/replica.manifest"
+  primary_binary="$diagnostic_root/primary.binary"
+  replica_binary="$diagnostic_root/replica.binary"
+  write_archive_evidence "$primary" "$artifact" "$primary_manifest" "$primary_binary"
+  write_archive_evidence "$replica" "$artifact" "$replica_manifest" "$replica_binary"
+
+  echo "independent release builds produced different archives for $target" >&2
+  echo "archive member digest differences (first 200 lines):" >&2
+  diff -u --label primary-members --label replica-members \
+    "$primary_manifest" "$replica_manifest" | sed -n '1,200p' >&2 || true
+  describe_binary primary "$primary_binary" "$primary_source"
+  describe_binary replica "$replica_binary" "$replica_source"
+  echo "first differing packaged-binary offsets (first 32 lines):" >&2
+  report_differing_binary_offsets "$primary_binary" "$replica_binary" >&2 || \
+    echo "packaged-binary offset reporting did not complete" >&2
+  rm -rf -- "$diagnostic_root"
+  return 1
+}
+
+test_archive_comparison() {
+  local test_root bundle shell_binary diagnostic primary_source replica_source
+  local primary_payload replica_payload unstripped_binary symbol_diagnostic
+  test_root=$(mktemp -d "${TMPDIR:-/tmp}/guard-release-test.XXXXXX")
+  bundle="$test_root/guard-fixture-aarch64-unknown-linux-gnu"
+  shell_binary=$(readlink -f "/proc/$$/exe")
+  diagnostic="$test_root/diagnostic.txt"
+  primary_source="$test_root/source-primary"
+  replica_source="$test_root/source-replica"
+  primary_payload="$primary_source/src/release-diagnostic-primary.bin"
+  replica_payload="$replica_source/src/release-diagnostic-replica.bin"
+  unstripped_binary="$test_root/unstripped-elf"
+  symbol_diagnostic="$test_root/symbol-diagnostic.txt"
+  command -v cc >/dev/null 2>&1 || {
+    echo "release symbol verification fixture requires a C compiler" >&2
+    rm -rf -- "$test_root"
+    return 1
+  }
+  printf 'int main(void) { return 0; }\n' | cc -x c -o "$unstripped_binary" -
+  if verify_linux_release_binary_stripped \
+    x86_64-unknown-linux-gnu "$unstripped_binary" \
+    > "$symbol_diagnostic" 2>&1; then
+    echo "release symbol verification accepted an unstripped ELF binary" >&2
+    rm -rf -- "$test_root"
+    return 1
+  fi
+  grep -Fq 'Linux release binary retains a .symtab section' "$symbol_diagnostic"
+  verify_linux_release_binary_stripped x86_64-pc-windows-msvc "$unstripped_binary"
+  mkdir -p "$bundle"
+  cp "$shell_binary" "$bundle/guard"
+  printf '%s\0\x01\xfe\x02' "$primary_payload" >> "$bundle/guard"
+  printf 'binary diagnostic fixture\n' > "$bundle/README.md"
+  tar -C "$test_root" -czf "$test_root/primary.tar.gz" "$(basename "$bundle")"
+  compare_release_archives \
+    "$test_root/primary.tar.gz" "$test_root/primary.tar.gz" guard fixture-target \
+    "$primary_source" "$replica_source"
+  cp "$shell_binary" "$bundle/guard"
+  printf '%s\0\x03\xfd\x04' "$replica_payload" >> "$bundle/guard"
+  tar -C "$test_root" -czf "$test_root/replica.tar.gz" "$(basename "$bundle")"
+  if compare_release_archives \
+    "$test_root/primary.tar.gz" "$test_root/replica.tar.gz" guard fixture-target \
+    "$primary_source" "$replica_source" \
+    > "$diagnostic" 2>&1; then
+    echo "release archive comparison accepted different archives" >&2
+    rm -rf -- "$test_root"
+    return 1
+  fi
+  grep -Fq 'archive member digest differences' "$diagnostic"
+  grep -Fq 'primary ELF sections' "$diagnostic"
+  grep -Fq 'first differing packaged-binary offsets' "$diagnostic"
+  awk '
+    /^first differing packaged-binary offsets \(first 32 lines\):$/ { in_offsets = 1; next }
+    in_offsets && /^[0-9]+$/ { count += 1; next }
+    in_offsets { invalid = 1 }
+    END { exit !in_offsets || !count || invalid }
+  ' "$diagnostic"
+  if grep -Fq "$primary_payload" "$diagnostic" || grep -Fq "$replica_payload" "$diagnostic"; then
+    echo "release archive diagnostics exposed fixture payload content" >&2
+    rm -rf -- "$test_root"
+    return 1
+  fi
+  rm -rf -- "$test_root"
+  echo "release archive comparison tests passed"
+}
+
+case "${1:-}" in
+  --matrix-json)
+    release_target_rows | python3 -c '
+import json
+import sys
+
+rows = []
+for line in sys.stdin:
+    target, operating_system, artifact_name, use_cross = line.rstrip("\n").split("\t")
+    rows.append({
+        "target": target,
+        "os": operating_system,
+        "artifact_name": artifact_name,
+        "use_cross": use_cross == "true",
+    })
+print(json.dumps({"include": rows}, separators=(",", ":")))
+'
+    exit 0
+    ;;
+  --targets)
+    release_target_rows | cut -f1
+    exit 0
+    ;;
+  --compare-archives)
+    [ "$#" -eq 7 ] || {
+      echo "usage: $0 --compare-archives PRIMARY REPLICA ARTIFACT TARGET PRIMARY_SOURCE REPLICA_SOURCE" >&2
+      exit 2
+    }
+    compare_release_archives "$2" "$3" "$4" "$5" "$6" "$7"
+    exit $?
+    ;;
+  --test-archive-comparison)
+    [ "$#" -eq 1 ] || {
+      echo "usage: $0 --test-archive-comparison" >&2
+      exit 2
+    }
+    test_archive_comparison
+    exit 0
+    ;;
+  "") ;;
+  *)
+    echo "usage: $0 [--matrix-json|--targets|--test-archive-comparison]" >&2
+    exit 2
+    ;;
+esac
+
+: "${BUILD_TARGET:?BUILD_TARGET is required}"
+: "${ARTIFACT_NAME:?ARTIFACT_NAME is required}"
+: "${RELEASE_LABEL:?RELEASE_LABEL is required}"
+: "${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH is required}"
+
+expected_artifact=""
+expected_cross=""
+while IFS=$'\t' read -r target _ artifact use_cross; do
+  if [ "$target" = "$BUILD_TARGET" ]; then
+    expected_artifact="$artifact"
+    expected_cross="$use_cross"
+  fi
+done < <(release_target_rows)
+[ -n "$expected_artifact" ] || {
+  echo "unsupported release target: $BUILD_TARGET" >&2
+  exit 1
+}
+[ "$ARTIFACT_NAME" = "$expected_artifact" ] || {
+  echo "release artifact does not match target $BUILD_TARGET" >&2
+  exit 1
+}
+[ "${USE_CROSS:-false}" = "$expected_cross" ] || {
+  echo "release compiler selection does not match target $BUILD_TARGET" >&2
+  exit 1
+}
+[[ "$SOURCE_DATE_EPOCH" =~ ^[1-9][0-9]*$ ]] || {
+  echo "source commit has an invalid timestamp" >&2
+  exit 1
+}
+
+source_root="${SOURCE_ROOT:-$PWD}"
+dist_dir="${DIST_DIR:-$source_root/dist}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$source_root/target}"
+export CARGO_INCREMENTAL=0
+# Source paths affect compiler output even when symbols are stripped.
+compiler_source_root="$source_root"
+if [ "${USE_CROSS:-false}" = true ]; then
+  compiler_source_root=/project
+fi
+export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$compiler_source_root=/guard-source"
+bundle="guard-${RELEASE_LABEL}-${BUILD_TARGET}"
+archive="$dist_dir/${bundle}.tar.gz"
+root="$dist_dir/$bundle"
+if [ -e "$root" ] || [ -e "$archive" ]; then
+  echo "release output already exists for $BUILD_TARGET" >&2
+  exit 1
+fi
+
+cd "$source_root"
+# A linked worktree's `.git` indirection is outside Cross's `/project` mount.
+# Resolve release identity on the host and pass it through Cross using the
+# automatically forwarded `CARGO_` namespace so both builds embed one value.
+export CARGO_GUARD_GIT_COMMIT
+CARGO_GUARD_GIT_COMMIT=$(git rev-parse --short HEAD)
+export CARGO_GUARD_GIT_BRANCH=detached
+release_tag=$(git tag --points-at HEAD | LC_ALL=C sort | sed -n '1p')
+if [ -n "$release_tag" ]; then
+  export CARGO_GUARD_GIT_TAG="$release_tag"
+else
+  unset CARGO_GUARD_GIT_TAG
+fi
+release_build=()
+if [ "${USE_CROSS:-false}" = true ]; then
+  [ "$BUILD_TARGET" = aarch64-unknown-linux-gnu ] || {
+    echo "cross compilation selected for an unexpected target" >&2
+    exit 1
+  }
+  # Cross 0.2.5 falls back to host Cargo when passed Cargo's global
+  # --config option. Supply release profile overrides through Cargo env.
+  release_build=(
+    cross build --locked --release --target "$BUILD_TARGET" --jobs 1
+  )
+else
+  [ "$BUILD_TARGET" != aarch64-unknown-linux-gnu ] || {
+    echo "aarch64 Linux release requires cross compilation" >&2
+    exit 1
+  }
+  release_build=(
+    cargo --config 'build.rustc-wrapper=""'
+    --config 'env.SCCACHE_CLIENT_SIDE=""'
+    build --locked --release --target "$BUILD_TARGET"
+    --config profile.release.codegen-units=1
+  )
+fi
+(
+  export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+  case "$BUILD_TARGET" in
+    *-unknown-linux-gnu) export CARGO_PROFILE_RELEASE_STRIP=symbols ;;
+    *) unset CARGO_PROFILE_RELEASE_STRIP ;;
+  esac
+  "${release_build[@]}"
+)
+
+binary="$CARGO_TARGET_DIR/$BUILD_TARGET/release/$ARTIFACT_NAME"
+verify_linux_release_binary_stripped "$BUILD_TARGET" "$binary"
+
+mkdir -p "$root/deployment/systemd" "$root/deployment/hardening" \
+  "$root/deployment/windows" "$root/examples" "$root/docs" "$root/ctf"
+cp "$binary" "$root/$ARTIFACT_NAME"
+binary_hash=$(sha256sum "$root/$ARTIFACT_NAME" | cut -d ' ' -f 1)
+printf '%s  %s\n' "$binary_hash" "$ARTIFACT_NAME" > "$root/BINARY-SHA256"
+cp README.md INSTALL.md DEPLOYMENT.md DEVELOPMENT.md SECURITY.md \
+  ARCHITECTURE.md ROADMAP.md LICENSE .env.example "$root/"
+cp docs/*.md "$root/docs/"
+cp ctf/DESIGN.md "$root/ctf/"
+cp examples/*.yaml examples/*.md examples/fallback-models.env "$root/examples/"
+cp deployment/systemd/guard.service \
+  deployment/systemd/guard-exec-as-caller.service \
+  deployment/systemd/guard.env.example \
+  deployment/systemd/guard-operator \
+  deployment/systemd/test-guard-service-expansion.sh \
+  deployment/systemd/upgrade-guard \
+  deployment/systemd/test-upgrade-guard.sh \
+  "$root/deployment/systemd/"
+cp deployment/hardening/guard.apparmor.example \
+  deployment/hardening/seccomp-deny-escape.json \
+  "$root/deployment/hardening/"
+cp deployment/windows/install-guard.ps1 \
+  deployment/windows/install-guard.Tests.ps1 \
+  "$root/deployment/windows/"
+
+case "$BUILD_TARGET" in
+  *-linux-gnu)
+    chmod 0755 "$root/$ARTIFACT_NAME" \
+      "$root/deployment/systemd/guard-operator" \
+      "$root/deployment/systemd/test-guard-service-expansion.sh" \
+      "$root/deployment/systemd/upgrade-guard" \
+      "$root/deployment/systemd/test-upgrade-guard.sh"
+    (
+      cd "$root"
+      sha256sum \
+        "$ARTIFACT_NAME" \
+        deployment/systemd/guard-operator \
+        deployment/systemd/guard.service \
+        deployment/systemd/guard-exec-as-caller.service \
+        deployment/systemd/upgrade-guard \
+        > INSTALL-SHA256
+    )
+    ;;
+  x86_64-pc-windows-msvc) ;;
+esac
+
+find "$root" -type f -printf '%P\n' | LC_ALL=C sort > "$root/ARCHIVE-MANIFEST"
+ROOT="$root" BUNDLE="$bundle" ARCHIVE="$archive" python3 <<'PY'
+import gzip
+import os
+import pathlib
+import tarfile
+
+bundle = os.environ["BUNDLE"]
+source_date_epoch = int(os.environ["SOURCE_DATE_EPOCH"])
+root = pathlib.Path(os.environ["ROOT"])
+output = pathlib.Path(os.environ["ARCHIVE"])
+
+paths = [root, *sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())]
+with output.open("wb") as raw:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=9) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for path in paths:
+                arcname = bundle if path == root else f"{bundle}/{path.relative_to(root).as_posix()}"
+                info = archive.gettarinfo(str(path), arcname=arcname)
+                info.uid = 0
+                info.gid = 0
+                info.uname = ""
+                info.gname = ""
+                info.mtime = source_date_epoch
+                if info.isdir():
+                    info.mode = 0o755
+                elif info.isfile():
+                    info.mode = 0o755 if info.mode & 0o111 else 0o644
+                elif info.issym():
+                    info.mode = 0o777
+                if info.isfile():
+                    with path.open("rb") as source:
+                        archive.addfile(info, source)
+                else:
+                    archive.addfile(info)
+PY

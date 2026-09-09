@@ -267,9 +267,7 @@ impl Evaluator {
         body: &serde_json::Value,
     ) -> Result<Option<(String, String, Option<VerbCommand>, String)>> {
         let response = self
-            .http_client
-            .post(api_url)
-            .header("Authorization", format!("Bearer {}", api_key))
+            .provider_post(api_url, api_key)?
             .header("Content-Type", "application/json")
             .json(body)
             .send()
@@ -693,7 +691,7 @@ mod tests {
 
         let evaluator = Evaluator::new(
             EvalConfig::default()
-                .llm_api_key("test-key".to_string())
+                .llm_api_key(format!("fixture-{:032x}", rand::random::<u128>()))
                 .llm_api_url(format!("http://{address}"))
                 .llm_retries(0),
         )

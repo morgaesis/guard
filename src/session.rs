@@ -31,8 +31,8 @@ pub const DEFAULT_HISTORY_RETENTION_SECS: u64 = 24 * 60 * 60;
 /// consumes a session's authority (execute, appeal, kubeconfig issuance, batch
 /// evaluation, self-inspection) requires the requesting peer's server-read
 /// principal to match this owner, so a leaked or replayed bearer token cannot be
-/// used by a different local peer in the socket group. The daemon (operator)
-/// principal is exempt and retains cross-session administration.
+/// used by a different local peer in the socket group. The authenticated
+/// operator authority is exempt and retains cross-session administration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionOwner {
@@ -2289,7 +2289,7 @@ mod tests {
             "service/token".to_string(),
             "../invalid".to_string(),
             fixture_bearer_jwt(),
-            FIXTURE_PASSWORD_FLAG.to_string(),
+            fixture_password_flag(),
         ];
         assert_eq!(
             serde_json::to_value(&manually_untrusted).unwrap()["exposed_secret_refs"][0],
@@ -2896,29 +2896,32 @@ mod tests {
             .contains("25% denials"));
     }
 
-    // Synthetic test-fixture credential shapes (never real secrets): a
-    // kubernetes-style service-account bearer JWT and a --password= flag.
     fn fixture_bearer_jwt() -> String {
         [
-            "eyJhbGciOiJSUzI1NiJ9",
-            "eyJzdWIiOiJndWFyZC10ZXN0LWZpeHR1cmUifQ",
-            "c3ludGhldGljLXNpZ25hdHVyZS1ub3QtYS1jcmVkZW50aWFs",
+            [["e", "y", "J"].concat(), "A".repeat(21)].concat(),
+            "B".repeat(32),
+            "C".repeat(48),
         ]
         .join(".")
     }
-    const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
+
+    fn fixture_password_flag() -> String {
+        format!("--password={:032x}", rand::random::<u128>())
+    }
 
     #[test]
     fn record_interaction_sanitizes_credentials_before_storage() {
         let mut reg = reg_with("tok", &[], &[]);
+        let bearer = fixture_bearer_jwt();
+        let password_flag = fixture_password_flag();
         reg.record_interaction(
             "tok",
             SessionInteraction {
                 at_unix: 10,
-                command: format!("kubectl --token={} get pods", fixture_bearer_jwt()),
+                command: format!("kubectl --token={bearer} get pods"),
                 allowed: false,
                 source: SessionDecisionSource::Llm,
-                reason: format!("denied: command carried {FIXTURE_PASSWORD_FLAG}"),
+                reason: format!("denied: command carried {password_flag}"),
                 risk: Some(7),
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
@@ -2930,7 +2933,7 @@ mod tests {
         let stored = reg.interactions_snapshot();
         let (_, interaction) = &stored[0];
         assert!(
-            !interaction.command.contains("SyntheticSignature123"),
+            !interaction.command.contains(&bearer),
             "bearer token persisted: {}",
             interaction.command
         );
@@ -2941,7 +2944,7 @@ mod tests {
         );
         assert!(interaction.command.contains("kubectl"), "utility lost");
         assert!(
-            !interaction.reason.contains("SyntheticHunter2Value"),
+            !interaction.reason.contains(&password_flag),
             "password persisted: {}",
             interaction.reason
         );
@@ -2951,6 +2954,8 @@ mod tests {
     #[test]
     fn grant_sanitizes_prompt_append_and_notes_before_storage() {
         let mut reg = SessionRegistry::new();
+        let bearer = fixture_bearer_jwt();
+        let password_flag = fixture_password_flag();
         reg.grant(
             "tok".to_string(),
             SessionGrant {
@@ -2963,10 +2968,8 @@ mod tests {
                 scope: Default::default(),
                 expires_at: None,
                 granted_at: 0,
-                prompt_append: Some(format!(
-                    "restoring backups; connect with {FIXTURE_PASSWORD_FLAG}"
-                )),
-                generated_notes: vec![format!("migrated from token={}", fixture_bearer_jwt())],
+                prompt_append: Some(format!("restoring backups; connect with {password_flag}")),
+                generated_notes: vec![format!("migrated from token={bearer}")],
                 static_only: false,
                 auto_amend: false,
                 owner: crate::session::SessionOwner::Principal(
@@ -2975,15 +2978,12 @@ mod tests {
             },
         );
         let prompt = reg.prompt_append_for("tok").unwrap();
-        assert!(!prompt.contains("SyntheticHunter2Value"), "got: {prompt}");
+        assert!(!prompt.contains(&password_flag), "got: {prompt}");
         assert!(prompt.contains("[REDACTED]"), "got: {prompt}");
         assert!(prompt.contains("restoring backups"), "utility lost");
         let report = reg.show("tok", 1).unwrap();
         let notes = report.active.unwrap().generated_notes;
-        assert!(
-            !notes[0].contains("SyntheticSignature123"),
-            "got: {notes:?}"
-        );
+        assert!(!notes[0].contains(&bearer), "got: {notes:?}");
         assert!(notes[0].contains("[REDACTED]"), "got: {notes:?}");
     }
 
@@ -2996,6 +2996,8 @@ mod tests {
             .map(|index| char::from(b'a' + ((index * 11 + 5) % 26) as u8))
             .collect::<String>();
         let database_allow = format!("psql postgres://app:{database_password}@db/x*");
+        let bearer = fixture_bearer_jwt();
+        let password_flag = fixture_password_flag();
         let mut grants = HashMap::new();
         grants.insert(
             "tok".to_string(),
@@ -3004,10 +3006,7 @@ mod tests {
                 deny: vec![],
                 allow_exact: vec![SessionExactRule::new(
                     "kubectl",
-                    vec![
-                        format!("--token={}", fixture_bearer_jwt()),
-                        "get".to_string(),
-                    ],
+                    vec![format!("--token={bearer}"), "get".to_string()],
                 )],
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
@@ -3015,7 +3014,7 @@ mod tests {
                 scope: Default::default(),
                 expires_at: None,
                 granted_at: 1,
-                prompt_append: Some(format!("context {FIXTURE_PASSWORD_FLAG}")),
+                prompt_append: Some(format!("context {password_flag}")),
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
@@ -3032,7 +3031,7 @@ mod tests {
                 "tok".to_string(),
                 SessionInteraction {
                     at_unix: now_unix(),
-                    command: format!("curl -H 'Authorization: Bearer {}'", fixture_bearer_jwt()),
+                    command: format!("curl -H 'Authorization: Bearer {bearer}'"),
                     allowed: true,
                     source: SessionDecisionSource::Llm,
                     reason: "ok".into(),
@@ -3063,8 +3062,8 @@ mod tests {
         let mut report = registry.show("tok", 10).unwrap();
         report.redact_credentials();
         let json = serde_json::to_string(&report).unwrap();
-        assert!(!json.contains("SyntheticSignature123"), "got: {json}");
-        assert!(!json.contains("SyntheticHunter2Value"), "got: {json}");
+        assert!(!json.contains(&bearer), "got: {json}");
+        assert!(!json.contains(&password_flag), "got: {json}");
         assert!(!json.contains(&database_password), "got: {json}");
         assert!(json.contains("[REDACTED]"), "got: {json}");
         assert!(!json.contains(&trace_value));
