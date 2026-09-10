@@ -2739,7 +2739,7 @@ async fn launch_failures_are_typed_in_buffered_and_streaming_execution() {
             ));
             let failure = result.execution_failure().expect("typed launch failure");
             assert_eq!(failure.started, Some(false));
-            assert_eq!(failure.stage, stage, "{failure:?}");
+            assert_eq!(failure.stage, stage);
             assert_eq!(failure.errno, Some(errno));
             assert!(!failure.message.contains(cwd.to_str().unwrap()));
             assert!(!failure.message.contains("unexpected"));
@@ -2793,7 +2793,7 @@ async fn launch_preserves_relative_file_access_in_both_output_modes() {
                     assert_eq!(stdout.as_deref(), Some("cwd-content"));
                 }
             }
-            other => panic!("expected completed relative-file execution: {other:?}"),
+            _ => panic!("expected completed relative-file execution"),
         }
     }
 }
