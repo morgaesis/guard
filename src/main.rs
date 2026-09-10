@@ -694,7 +694,7 @@ enum VerbCommands {
     },
     /// Add one operator-authored verb from a YAML file.
     Add {
-        /// YAML file containing exactly one verb definition.
+        /// YAML file with one top-level verb mapping; no leading '-' list marker or 'verbs:' wrapper.
         #[arg(long, value_name = "PATH")]
         file: PathBuf,
         #[arg(long)]
@@ -712,7 +712,7 @@ enum VerbCommands {
     /// Replace one operator-authored verb without clobbering concurrent edits.
     Amend {
         name: String,
-        /// YAML file containing exactly one verb definition.
+        /// YAML file with one top-level verb mapping; no leading '-' list marker or 'verbs:' wrapper.
         #[arg(long, value_name = "PATH")]
         file: PathBuf,
         #[arg(long)]

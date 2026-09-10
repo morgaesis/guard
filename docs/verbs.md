@@ -18,10 +18,23 @@ coverage-cell examples. A catalog may declare `platform: unix` or
 linting and startup.
 
 On file-backed deployments, operators add one catalog entry from a YAML file
-containing exactly one verb definition:
+containing exactly one verb definition as a top-level YAML mapping:
 
 ```bash
 guard verb add --file inspect-service.yaml
+```
+
+For both `verb add --file` and `verb amend --file`, start the file with
+`name:`. Omit the leading `-` list marker and the catalog's `verbs:` wrapper.
+For example, a single-verb file for inspecting a systemd service contains:
+
+```yaml
+name: inspect-service
+binary: systemctl
+args: [status, "{unit}", --no-pager]
+params:
+  unit: { pattern: "^[a-zA-Z0-9@._-]+$", required: true }
+consequence: reversible
 ```
 
 The daemon validates the candidate and the complete catalog before atomically

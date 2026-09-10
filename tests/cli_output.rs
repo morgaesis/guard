@@ -234,3 +234,113 @@ async fn execution_result_consumers_share_failure_denial_and_child_exits() {
         }
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verb_file_diagnostics_preserve_mapping_parser_and_connection_order() {
+    let mapping = "name: fixture\nbinary: echo\nconsequence: reversible\n";
+    let sequence = "- name: fixture\n  binary: echo\n  consequence: reversible\n";
+    let malformed = "name: fixture\nbinary: echo\nargs: [\n";
+    for verb in ["add", "amend"] {
+        for json in [false, true] {
+            for (yaml, diagnostic) in [
+                (mapping, None),
+                (
+                    sequence,
+                    Some("invalid type: sequence, expected struct Verb"),
+                ),
+                (
+                    malformed,
+                    Some("did not find expected node content at line 4 column 1"),
+                ),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let file = directory.path().join("verb.yaml");
+                std::fs::write(&file, yaml).unwrap();
+                let listening_socket = directory.path().join("parse-probe.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&listening_socket).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let socket = if diagnostic.is_some() {
+                    listening_socket
+                } else {
+                    directory.path().join("missing.sock")
+                };
+                let mut command = tokio::process::Command::new(GUARD_BIN);
+                command
+                    .env_clear()
+                    .env("XDG_CONFIG_HOME", directory.path())
+                    .current_dir(directory.path())
+                    .kill_on_drop(true)
+                    .args(["verb", verb]);
+                if verb == "amend" {
+                    command.arg("fixture");
+                }
+                command
+                    .arg("--file")
+                    .arg(&file)
+                    .arg("--socket")
+                    .arg(&socket);
+                if json {
+                    command.arg("--json");
+                }
+                let output =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
+                        .await
+                        .expect("verb file handling must not wait for a daemon")
+                        .unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(output.status.code(), Some(125), "{verb}: {stderr}");
+                assert!(
+                    output.stdout.is_empty(),
+                    "parse and connection errors stay on stderr, including --json"
+                );
+                if let Some(diagnostic) = diagnostic {
+                    assert!(stderr.contains("top-level YAML mapping"), "{stderr}");
+                    assert!(stderr.contains("starting with 'name:'"), "{stderr}");
+                    assert!(
+                        stderr.contains("without a leading '-' list marker"),
+                        "{stderr}"
+                    );
+                    assert!(stderr.contains("'verbs:' wrapper"), "{stderr}");
+                    assert!(
+                        stderr.contains(diagnostic),
+                        "underlying YAML error must survive: {stderr}"
+                    );
+                    assert!(!stderr.contains("cannot reach guard server"));
+                } else {
+                    assert!(stderr.contains("cannot reach guard server"), "{stderr}");
+                    assert!(stderr.contains(socket.to_str().unwrap()), "{stderr}");
+                    assert!(!stderr.contains("failed to parse"), "{stderr}");
+                }
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "invalid YAML must not contact the daemon"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn verb_file_help_names_the_single_mapping_format() {
+    for verb in ["add", "amend"] {
+        let output = Command::new(GUARD_BIN)
+            .args(["verb", verb, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let help = String::from_utf8(output.stdout)
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(help.contains("--file <PATH>"), "{help}");
+        assert!(help.contains("one top-level verb mapping"), "{help}");
+        assert!(
+            help.contains("no leading '-' list marker or 'verbs:' wrapper"),
+            "{help}"
+        );
+    }
+}

@@ -1408,7 +1408,10 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 .with_context(|| format!("failed to read verb file {}", file.display()))?;
             let verb: guard::gating::verb::Verb =
                 serde_yaml_ng::from_str(&yaml).with_context(|| {
-                    format!("failed to parse {} as one verb definition", file.display())
+                    format!(
+                        "failed to parse {} as one verb definition; use a top-level YAML mapping starting with 'name:', without a leading '-' list marker or a 'verbs:' wrapper",
+                        file.display()
+                    )
                 })?;
             let (client, source) = gate_client(socket, json)?;
             let response = client
@@ -1465,7 +1468,10 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 .with_context(|| format!("failed to read verb file {}", file.display()))?;
             let replacement: guard::gating::verb::Verb = serde_yaml_ng::from_str(&yaml)
                 .with_context(|| {
-                    format!("failed to parse {} as one verb definition", file.display())
+                    format!(
+                        "failed to parse {} as one verb definition; use a top-level YAML mapping starting with 'name:', without a leading '-' list marker or a 'verbs:' wrapper",
+                        file.display()
+                    )
                 })?;
             if replacement.name != name {
                 anyhow::bail!(
