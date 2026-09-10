@@ -3260,6 +3260,9 @@ fn spawn_owned_command(
     identity: Option<&PreparedExecIdentity>,
     secret_files: Option<super::secure_fs::SecretFileLease>,
 ) -> std::result::Result<ManagedChild, LaunchError> {
+    // Install the drop guard before fallible setup or spawn. Drop cancels an
+    // unstarted launch and releases its lease; after adoption, the cleanup
+    // worker retains the lease until reaping succeeds.
     let child = ManagedChild {
         ownership: ChildOwnership::prepare(secret_files).map_err(|error| {
             LaunchError::from_io(

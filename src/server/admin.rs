@@ -3119,23 +3119,14 @@ async fn approve_held_access(
         return match handle_approve_claimed(server, caller, handle, snapshot).await {
             AdminResponse::GateAction {
                 message,
-                policy,
-                execution_failure,
-                exit_code,
+                policy: None,
+                execution_failure: None,
+                exit_code: None,
                 ..
             } => AccessDecisionResult {
                 request: handle.to_string(),
-                success: policy.as_ref().is_none_or(|p| p.allowed)
-                    && execution_failure.is_none()
-                    && exit_code.is_none_or(|code| code == 0),
-                state: if policy.as_ref().is_some_and(|p| !p.allowed) {
-                    "denied"
-                } else if execution_failure.is_some() {
-                    "exec_failed"
-                } else {
-                    "approved"
-                }
-                .to_string(),
+                success: true,
+                state: "approved".to_string(),
                 target: None,
                 remaining_uses: None,
                 use_policy: "unavailable".to_string(),
