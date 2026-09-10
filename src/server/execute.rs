@@ -3220,7 +3220,7 @@ impl ManagedChild {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
         let stdout = self.stdout.take();
         let stderr = self.stderr.take();

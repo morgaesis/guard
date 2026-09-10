@@ -489,6 +489,7 @@ impl std::fmt::Debug for ChildOwnership {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CleanupOperation {
+    #[cfg(unix)]
     GroupSignal,
     ChildSignal,
     Reap,
