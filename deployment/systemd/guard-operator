@@ -1,21 +1,134 @@
 #!/bin/sh
 set -eu
 
-# Administrative RPCs require the admin bearer token. The operator wrapper
-# runs as root (via sudo), reads the root-held token file, and presents it.
-# Brokered children never see the token: it lives only in this root context
-# and in the daemon's memory, fed from stdin at daemon startup.
-standard_state=$(systemctl is-active guard.service 2>/dev/null || true)
-caller_state=$(systemctl is-active guard-exec-as-caller.service 2>/dev/null || true)
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+umask 077
+
+fail() {
+    printf 'guard-operator: %s\n' "$1" >&2
+    exit 125
+}
+
+usage_error() {
+    printf 'guard-operator: %s; use sudo guard-operator --help\n' "$1" >&2
+    exit 2
+}
+
+[ "$(id -u)" = 0 ] || fail 'run this command through sudo guard-operator'
+
+# The installation and token are protected against replacement by non-root users.
+protected_directory() {
+    if [ ! -d "$1" ] || [ -L "$1" ]; then
+        fail "expected a real directory: $1"
+    fi
+    directory_owner=$(stat -c %u -- "$1") || fail "cannot inspect directory: $1"
+    directory_mode=$(stat -c %a -- "$1") || fail "cannot inspect directory: $1"
+    if [ "$directory_owner" != 0 ] || [ "$((0$directory_mode & 022))" != 0 ]; then
+        fail "directory must be root-owned and not group/other writable: $1"
+    fi
+}
+
+protected_file() {
+    if [ ! -f "$1" ] || [ -L "$1" ]; then
+        fail "expected a regular file without symlinks: $1"
+    fi
+    file_metadata=$(stat -c '%u:%g:%a:%h' -- "$1") || fail "cannot inspect file: $1"
+    [ "$file_metadata" = "0:0:$2:1" ] ||
+        fail "file must be root:root mode $2 with one link: $1"
+}
+
+for directory in / /usr /usr/local /usr/local/bin /usr/local/sbin /etc /etc/guard; do
+    protected_directory "$directory"
+done
+[ "$0" = /usr/local/sbin/guard-operator ] || fail 'use the installed /usr/local/sbin/guard-operator'
+protected_file /usr/local/sbin/guard-operator 700
+protected_file /usr/local/bin/guard 755
+
+# Older clients discover cwd configuration before parsing --version. Probe from
+# a protected directory without a dotenv file, without credentials or caller stdin.
+if [ -e /.env ] || [ -L /.env ]; then
+    fail 'the compatibility probe requires /.env to be absent'
+fi
+client_version=$(
+    cd /
+    exec env -i PATH="$PATH" HOME=/etc/guard XDG_CONFIG_HOME=/etc/guard \
+        GUARD_NO_AUTO_CONFIG=1 timeout 10 /usr/local/bin/guard --version </dev/null 2>/dev/null
+) || fail 'cannot check the installed Guard version; install a stable Guard 0.8.8 or newer'
+if ! printf '%s\n' "$client_version" | LC_ALL=C awk '
+    /^guard v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*) \(([0-9a-f]+|unknown)\)$/ {
+        version = substr($2, 2)
+        split(version, parts, ".")
+        supported = parts[1] > 0 || (parts[1] == 0 && (parts[2] > 8 || (parts[2] == 8 && parts[3] >= 8)))
+    }
+    END { exit !(NR == 1 && supported) }
+'; then
+    fail 'the operator launcher requires stable Guard 0.8.8 or newer; install the matching release binary'
+fi
+protected_file /etc/guard/admin.token 400
+[ -s /etc/guard/admin.token ] || fail 'the operator token file is empty; provision it before starting Guard'
+
+case "${1:-}" in
+    ''|-h|--help)
+        printf '%s\n' \
+            'Usage: sudo guard-operator COMMAND [ARGUMENTS]' \
+            'Operator commands: status, access {list,show,status,approve,deny,extend,revoke},' \
+            '  approval {list,show,note}, provisionals [show], confirm, revert,' \
+            '  audit {tail,verify}, verb {list,show,add,amend,delete,create,coverage {list,clear}},' \
+            '  secrets {add,list,remove}.' \
+            'Use COMMAND --help for its options. The packaged socket is fixed.' \
+            'Verb --file paths are relative to your original directory; stdin is preserved.'
+        exit 0
+        ;;
+    status|confirm|revert) ;;
+    provisionals)
+        case "${2:-}" in
+            ''|show|-h|--help) ;;
+            --json) case "${3:-}" in ''|show|-h|--help) ;; *) usage_error 'unsupported provisional command' ;; esac ;;
+            *) usage_error 'unsupported provisional command' ;;
+        esac
+        ;;
+    access)
+        case "${2:-}" in list|show|status|approve|deny|extend|revoke) ;; *) usage_error 'unsupported operator access command' ;; esac
+        ;;
+    approval)
+        case "${2:-}" in list|show|note) ;; *) usage_error 'unsupported operator approval command' ;; esac
+        ;;
+    audit)
+        case "${2:-}" in tail|verify) ;; *) usage_error 'unsupported operator audit command' ;; esac
+        ;;
+    secrets|secret)
+        case "${2:-}" in add|list|remove) ;; *) usage_error 'unsupported operator secret command' ;; esac
+        ;;
+    verb)
+        case "${2:-}" in
+            list|show|add|amend|delete|create) ;;
+            coverage) case "${3:-}" in list|clear) ;; *) usage_error 'unsupported operator coverage command' ;; esac ;;
+            *) usage_error 'unsupported operator verb command' ;;
+        esac
+        ;;
+    *) usage_error 'only operator RPC commands are supported' ;;
+esac
+
+# Clap owns operand and option validation; the packaged endpoint is not overridable.
+for argument do
+    case "$argument" in
+        --socket|--socket=*) usage_error 'socket overrides are not supported' ;;
+    esac
+done
+
+standard_state=$(env -i PATH="$PATH" systemctl is-active guard.service </dev/null 2>/dev/null || true)
+caller_state=$(env -i PATH="$PATH" systemctl is-active guard-exec-as-caller.service </dev/null 2>/dev/null || true)
 if [ "$standard_state" = active ] && [ "$caller_state" != active ]; then
   :
 elif [ "$caller_state" = active ] && [ "$standard_state" != active ]; then
   :
 else
-  echo 'guard-operator requires exactly one active packaged Guard service' >&2
-  exit 1
+    fail 'exactly one packaged Guard service must be active; inspect guard.service and guard-exec-as-caller.service'
 fi
 
-GUARD_ADMIN_TOKEN="$(cat /etc/guard/admin.token)"
-export GUARD_ADMIN_TOKEN
-exec /usr/local/bin/guard "$@" --socket /run/guard/guard.sock
+exec env -i PATH="$PATH" HOME=/etc/guard XDG_CONFIG_HOME=/etc/guard \
+    LANG=C.UTF-8 GUARD_NO_AUTO_CONFIG=1 GUARD_ADMIN_TOKEN_FILE=/etc/guard/admin.token \
+    GUARD_SOCKET=/run/guard/guard.sock \
+    /usr/local/bin/guard "$@"
