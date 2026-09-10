@@ -2,7 +2,7 @@
 """Exercise the installed launcher and real client in a disposable Linux container.
 
 Requires Python 3, coreutils, util-linux, and Guard binaries built for the container.
-OLD_GUARD_BINARY points to a verified stable release older than 0.8.8.
+OLD_GUARD_BINARY points to a verified 0.8.7 release that runs in the container.
 Mount this repository read-only and run with an explicit disposable container root:
   podman run --rm --network none --entrypoint python3 \
     -e GUARD_OPERATOR_TEST_CONTAINER=1 -v "$PWD:/source:ro" \
@@ -179,13 +179,20 @@ fi
         self.rpc(["verb", "delete", "--", "-fixture"], [deleted])
 
     def test_old_client_and_unknown_versions_fail_before_authenticated_rpc(self):
+        old_version = subprocess.run([str(OLD_BINARY_SOURCE), "--version"], cwd="/",
+                                     env={"PATH": "/usr/bin:/bin", "HOME": "/", "XDG_CONFIG_HOME": "/"},
+                                     stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+        self.assertEqual(old_version.returncode, 0, "old binary fixture must run with compatible system libraries")
+        self.assertEqual(old_version.stdout.split()[:2], ["guard", "v0.8.7"])
         shutil.copyfile(OLD_BINARY_SOURCE, BINARY)
         BINARY.chmod(0o755)
         with socket.socket(socket.AF_UNIX) as listener:
             listener.bind(SOCKET)
             listener.listen()
             listener.settimeout(0.1)
-            self.expect_failure(125, "secrets", "list")
+            rejected = self.invoke("secrets", "list")
+            self.assertEqual(rejected.returncode, 125)
+            self.assertIn("requires stable Guard 0.8.8", rejected.stderr)
             with self.assertRaises(TimeoutError):
                 listener.accept()
         Path(SOCKET).unlink()
