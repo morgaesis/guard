@@ -2868,6 +2868,83 @@ async fn launch_failure_is_recorded_as_an_allowed_session_interaction_after_rest
     assert_eq!(interaction.execution_failure.as_ref(), Some(&failure));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cleanup_pending_preserves_execution_failure_policy_and_correlated_audit() {
+    if std::env::var_os("GUARD_TEST_EXEC_CLEANUP_DENIED").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "server::tests::exec_policy::cleanup_pending_preserves_execution_failure_policy_and_correlated_audit", "--nocapture"])
+            .env("GUARD_TEST_EXEC_CLEANUP_DENIED", "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains("pending cleanup verified in both output modes"));
+        return;
+    }
+    crate::server::runtime::deny_cleanup_signals_for_test();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for streaming in [false, true] {
+            let (mut cfg, _) = make_test_config();
+            cfg.config.exec_timeout_secs = 1;
+            let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+            let caller = CallerIdentity::Unix {
+                uid: unsafe { libc::geteuid() },
+            };
+            let request = basic_request("sleep", vec!["6".into()]);
+            let mut stream = Vec::new();
+            let result = exec_after_approval_with_secret_authority(
+                &mut RequestContext {
+                    server: &cfg,
+                    caller: &caller,
+                    depth: 0,
+                    stream_output: streaming,
+                    stream_writer: &mut stream,
+                },
+                request.clone(),
+                "fixture policy approval".into(),
+                None,
+            )
+            .await;
+            assert!(result.policy_allowed());
+            assert_eq!(result.policy_reason(), "fixture policy approval");
+            let failure = result.execution_failure().unwrap();
+            assert_eq!(failure.started, Some(true));
+            assert_eq!(failure.stage, guard::wire::ExecutionStage::Unknown);
+            assert!(failure.message.starts_with("exec_timeout:"));
+            assert!(failure
+                .message
+                .contains("cleanup incomplete; the command may still be running"));
+            assert!(failure.message.contains("cleanup_id="));
+            assert!(failure.message.contains("errno: Some(1)"));
+            cfg.log_audit_exec_failed(&caller, None, &request.binary, &request.args, &result);
+            let audit =
+                std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+            let event = audit
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<guard::audit::AuditRecord>(line)
+                        .unwrap()
+                        .event
+                })
+                .find(|event| event.kind == guard::audit::AuditKind::ExecFailed)
+                .unwrap();
+            assert_eq!(event.execution_failure.as_ref(), Some(failure));
+            assert!(event.policy.unwrap().allowed);
+            // The denied signal leaves this bounded fixture to exit naturally.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
+    println!("pending cleanup verified in both output modes");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn default_service_execution_does_not_forward_ssh_auth_sock() {

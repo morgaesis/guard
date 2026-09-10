@@ -478,12 +478,65 @@ fn bounded_notify_event(mut event: NotifyEvent) -> NotifyEvent {
 #[derive(Clone)]
 pub(super) struct ChildOwnership(Arc<Mutex<OwnedChildState>>);
 
+impl std::fmt::Debug for ChildOwnership {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChildOwnership")
+            .field("id", &self.id())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CleanupOperation {
+    GroupSignal,
+    ChildSignal,
+    Reap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CleanupError {
+    pub operation: CleanupOperation,
+    pub errno: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CleanupOutcome {
+    Reaped,
+    Pending { errors: Vec<CleanupError> },
+}
+
+impl CleanupOutcome {
+    pub(super) fn diagnostic(&self, cleanup_id: u128) -> Option<String> {
+        match self {
+            Self::Reaped => None,
+            Self::Pending { errors } => Some(format!(
+                "cleanup incomplete; the command may still be running; cleanup_id={cleanup_id:032x}; cleanup_errors={errors:?}"
+            )),
+        }
+    }
+}
+
+fn retry_interrupted<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
 struct OwnedChildState {
     child: Option<std::process::Child>,
     status: Option<std::process::ExitStatus>,
     pending_launch: bool,
     cleanup: ChildCleanup,
     secret_files: Option<super::secure_fs::SecretFileLease>,
+    cleanup_id: u128,
+    errors: Vec<CleanupError>,
+    cleanup_started: Option<Instant>,
+    reported_errors: usize,
+    reported_pending: bool,
     #[cfg(test)]
     signals: usize,
 }
@@ -492,31 +545,72 @@ struct OwnedChildState {
 enum ChildCleanup {
     Running,
     Graceful(Instant),
-    Forced,
+    AwaitingExit,
 }
 
 impl OwnedChildState {
+    fn record_error(&mut self, operation: CleanupOperation, error: &std::io::Error) {
+        let error = CleanupError {
+            operation,
+            errno: error.raw_os_error(),
+        };
+        if !self.errors.contains(&error) {
+            self.errors.push(error);
+        }
+    }
+
+    fn may_signal(&self, operation: CleanupOperation) -> bool {
+        // A failed wait cannot establish that the PID still belongs to us.
+        // Permanent signal failures require intervention, not repeated kills.
+        !self
+            .errors
+            .iter()
+            .any(|error| error.operation == CleanupOperation::Reap || error.operation == operation)
+    }
+
     fn signal(&mut self, graceful: bool) {
-        if let Some(child) = self.child.as_mut() {
-            #[cfg(test)]
-            {
-                self.signals += 1;
-            }
+        if let Some(pid) = self.child.as_ref().map(std::process::Child::id) {
             #[cfg(unix)]
-            unsafe {
-                libc::kill(
-                    -(child.id() as i32),
-                    if graceful {
-                        libc::SIGTERM
+            if self.may_signal(CleanupOperation::GroupSignal) {
+                #[cfg(test)]
+                {
+                    self.signals += 1;
+                }
+                let result = retry_interrupted(|| {
+                    if unsafe {
+                        libc::kill(
+                            -(pid as i32),
+                            if graceful {
+                                libc::SIGTERM
+                            } else {
+                                libc::SIGKILL
+                            },
+                        )
+                    } == 0
+                    {
+                        Ok(())
                     } else {
-                        libc::SIGKILL
-                    },
-                );
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+                if let Err(error) = result {
+                    self.record_error(CleanupOperation::GroupSignal, &error);
+                }
             }
+            #[cfg(not(unix))]
+            let _ = pid;
             // Windows uses the retained process handle. On Unix this also
             // covers a leader that moved itself out of its original group.
-            if !graceful || !cfg!(unix) {
-                let _ = child.kill();
+            if (!graceful || !cfg!(unix)) && self.may_signal(CleanupOperation::ChildSignal) {
+                #[cfg(test)]
+                {
+                    self.signals += 1;
+                }
+                if let Err(error) =
+                    retry_interrupted(|| self.child.as_mut().expect("owned child").kill())
+                {
+                    self.record_error(CleanupOperation::ChildSignal, &error);
+                }
             }
         }
     }
@@ -524,6 +618,16 @@ impl OwnedChildState {
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         if let Some(status) = self.status {
             return Ok(Some(status));
+        }
+        if let Some(error) = self
+            .errors
+            .iter()
+            .find(|error| error.operation == CleanupOperation::Reap)
+        {
+            return Err(error
+                .errno
+                .map(std::io::Error::from_raw_os_error)
+                .unwrap_or_else(|| std::io::Error::other("child reaping failed")));
         }
         // Keep the leader unreaped until the final group signal. Its PID
         // cannot be reused while the grace deadline is outstanding.
@@ -533,7 +637,13 @@ impl OwnedChildState {
         let Some(child) = self.child.as_mut() else {
             return Ok(None);
         };
-        let status = child.try_wait()?;
+        let status = match retry_interrupted(|| child.try_wait()) {
+            Ok(status) => status,
+            Err(error) => {
+                self.record_error(CleanupOperation::Reap, &error);
+                return Err(error);
+            }
+        };
         if let Some(status) = status {
             self.status = Some(status);
             self.child = None;
@@ -546,15 +656,39 @@ impl OwnedChildState {
         if let ChildCleanup::Graceful(deadline) = self.cleanup {
             if Instant::now() >= deadline {
                 self.signal(false);
-                self.cleanup = ChildCleanup::Forced;
+                self.cleanup = ChildCleanup::AwaitingExit;
             }
         }
-        if matches!(self.cleanup, ChildCleanup::Forced) {
-            // Errors retain ownership for a later attempt; a foreground
-            // timeout never discards an unreaped child or its secret lease.
+        if matches!(self.cleanup, ChildCleanup::AwaitingExit) {
+            // try_wait records failures and retains ownership and the lease.
             let _ = self.try_wait();
         }
         !self.pending_launch && self.child.is_none()
+    }
+
+    fn outcome(&self) -> CleanupOutcome {
+        if !self.pending_launch && self.child.is_none() {
+            CleanupOutcome::Reaped
+        } else {
+            CleanupOutcome::Pending {
+                errors: self.errors.clone(),
+            }
+        }
+    }
+
+    fn take_diagnostic(&mut self) -> Option<(u128, CleanupOutcome)> {
+        let new_errors = self.errors.len() > self.reported_errors;
+        let overdue = !self.reported_pending
+            && self.child.is_some()
+            && self
+                .cleanup_started
+                .is_some_and(|started| started.elapsed() >= Duration::from_secs(3));
+        if !new_errors && !overdue {
+            return None;
+        }
+        self.reported_errors = self.errors.len();
+        self.reported_pending |= overdue;
+        Some((self.cleanup_id, self.outcome()))
     }
 }
 
@@ -589,10 +723,24 @@ fn register_child_cleanup(state: Arc<Mutex<OwnedChildState>>) -> std::io::Result
                     }
                     children.extend(rx.try_iter());
                     children.retain(|child| {
-                        !child
+                        let mut state = child
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .cleanup_tick()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let complete = state.cleanup_tick();
+                        let diagnostic = state.take_diagnostic();
+                        drop(state);
+                        if let Some((cleanup_id, outcome)) = diagnostic {
+                            if let Some(message) = outcome.diagnostic(cleanup_id) {
+                                tracing::error!(cleanup_id = %format_args!("{cleanup_id:032x}"), "{message}");
+                                let _ = guard::audit::emit_global(
+                                    &guard::audit::AuditEvent::new(guard::audit::AuditKind::ExecFailed)
+                                        .field("phase", "cleanup")
+                                        .field("cleanup_id", format!("{cleanup_id:032x}"))
+                                        .reason(message)
+                                );
+                            }
+                        }
+                        !complete
                     });
                 }
             })?;
@@ -620,6 +768,11 @@ impl ChildOwnership {
             pending_launch: true,
             cleanup: ChildCleanup::Running,
             secret_files,
+            cleanup_id: rand::random(),
+            errors: Vec::new(),
+            cleanup_started: None,
+            reported_errors: 0,
+            reported_pending: false,
             #[cfg(test)]
             signals: 0,
         }));
@@ -643,6 +796,20 @@ impl ChildOwnership {
             .child
             .as_ref()
             .map(std::process::Child::id)
+    }
+
+    pub(super) fn cleanup_id(&self) -> u128 {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cleanup_id
+    }
+
+    pub(super) fn cleanup_outcome(&self) -> CleanupOutcome {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcome()
     }
 
     pub(super) fn take_stdout(&self) -> Option<std::process::ChildStdout> {
@@ -682,24 +849,26 @@ impl ChildOwnership {
             state.secret_files = None;
             return;
         }
+        state.cleanup_started.get_or_insert_with(Instant::now);
         if graceful && matches!(state.cleanup, ChildCleanup::Running) {
             state.signal(true);
             state.cleanup = if cfg!(unix) {
                 ChildCleanup::Graceful(Instant::now() + Duration::from_secs(2))
             } else {
-                ChildCleanup::Forced
+                ChildCleanup::AwaitingExit
             };
-        } else if !graceful {
+        } else if !graceful && !matches!(state.cleanup, ChildCleanup::AwaitingExit) {
             state.signal(false);
-            state.cleanup = ChildCleanup::Forced;
+            state.cleanup = ChildCleanup::AwaitingExit;
         }
     }
 
-    pub(super) async fn wait_for_cleanup(&self) {
+    pub(super) async fn wait_for_cleanup(&self) -> CleanupOutcome {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while self.id().is_some() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        self.cleanup_outcome()
     }
 }
 
@@ -715,8 +884,9 @@ impl ProcessTracker {
         self.active
             .lock()
             .expect("process tracker poisoned")
-            .insert(generation, child);
+            .insert(generation, child.clone());
         ProcessGuard {
+            child,
             generation,
             tracker: self.clone(),
             armed: true,
@@ -754,6 +924,7 @@ impl Drop for ShutdownGuard {
 }
 
 pub(super) struct ProcessGuard {
+    child: ChildOwnership,
     generation: u64,
     tracker: ProcessTracker,
     armed: bool,
@@ -765,12 +936,12 @@ impl ProcessGuard {
         self.armed = false;
     }
 
-    pub(super) async fn terminate_gracefully(mut self) {
+    pub(super) async fn terminate_gracefully(mut self) -> CleanupOutcome {
         if let Some(child) = self.tracker.take(self.generation) {
             child.terminate(true);
-            self.armed = false;
-            child.wait_for_cleanup().await;
         }
+        self.armed = false;
+        self.child.wait_for_cleanup().await
     }
 }
 
@@ -782,6 +953,68 @@ impl Drop for ProcessGuard {
             }
         }
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn deny_cleanup_signals_for_test() {
+    // Install only in a fresh fixture subprocess, before its cleanup worker.
+    let deny = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+    let instructions = [
+        libc::sock_filter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 3,
+            jf: 0,
+            k: libc::SYS_kill as u32,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 2,
+            jf: 0,
+            k: libc::SYS_tkill as u32,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 1,
+            jf: 0,
+            k: libc::SYS_tgkill as u32,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_pidfd_send_signal as u32,
+        },
+        libc::sock_filter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: deny,
+        },
+        libc::sock_filter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: instructions.len() as u16,
+        filter: instructions.as_ptr() as *mut _,
+    };
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) },
+        0
+    );
 }
 
 #[cfg(test)]
@@ -940,7 +1173,7 @@ mod tests {
         .await
         .expect("shell installed its SIGTERM trap");
 
-        guard.terminate_gracefully().await;
+        assert_eq!(guard.terminate_gracefully().await, CleanupOutcome::Reaped);
         assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "term");
     }
@@ -994,13 +1227,14 @@ mod tests {
         child.terminate(true);
         child.0.lock().unwrap().cleanup =
             ChildCleanup::Graceful(Instant::now() + Duration::from_secs(60));
-        tokio::time::timeout(Duration::from_secs(4), child.wait_for_cleanup())
+        let outcome = tokio::time::timeout(Duration::from_secs(4), child.wait_for_cleanup())
             .await
             .unwrap();
+        assert_eq!(outcome, CleanupOutcome::Pending { errors: Vec::new() });
         let retained_child = child.id().is_some();
         let retained_lease = bindings[0].1.exists();
         child.terminate(false);
-        child.wait_for_cleanup().await;
+        assert_eq!(child.wait_for_cleanup().await, CleanupOutcome::Reaped);
         assert!(retained_child, "foreground timeout must retain ownership");
         assert!(
             retained_lease,
@@ -1046,6 +1280,137 @@ mod tests {
             .contains_key(&second.generation));
         second.complete();
         child.terminate(false);
+    }
+
+    #[test]
+    fn cleanup_retries_only_interrupted_operations() {
+        let mut calls = 0;
+        let result = retry_interrupted(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 2);
+        calls = 0;
+        let result: std::io::Result<()> = retry_interrupted(|| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_denied_signals_report_pending_and_reap_natural_exit() {
+        if std::env::var_os("GUARD_TEST_CLEANUP_DENIED").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "server::runtime::tests::cleanup_denied_signals_report_pending_and_reap_natural_exit", "--nocapture"])
+                .env("GUARD_TEST_CLEANUP_DENIED", "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("cleanup incomplete; the command may still be running"));
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        deny_cleanup_signals_for_test();
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .with_max_level(tracing::Level::ERROR)
+            .try_init()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (lease, bindings) = super::super::secure_fs::SecretFileLease::create(
+            directory.path(),
+            &[("FIXTURE_FILE".into(), "fixture-value".into())],
+        )
+        .unwrap();
+        let child = ChildOwnership::prepare(Some(lease)).unwrap();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("5").process_group(0);
+        child.adopt(command.spawn().unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        child.terminate(false);
+        let outcome = runtime.block_on(child.wait_for_cleanup());
+        let CleanupOutcome::Pending { errors } = outcome else {
+            panic!("termination was denied");
+        };
+        assert!(errors.contains(&CleanupError {
+            operation: CleanupOperation::GroupSignal,
+            errno: Some(libc::EPERM)
+        }));
+        assert!(errors.contains(&CleanupError {
+            operation: CleanupOperation::ChildSignal,
+            errno: Some(libc::EPERM)
+        }));
+        assert!(child.id().is_some());
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(bindings[0].1.exists());
+        let attempts = child.0.lock().unwrap().signals;
+        child.terminate(false);
+        assert_eq!(child.0.lock().unwrap().signals, attempts);
+        assert_eq!(
+            runtime.block_on(child.wait_for_cleanup()),
+            CleanupOutcome::Reaped
+        );
+        assert!(!bindings[0].1.exists());
+        child.terminate(false);
+        child.terminate(true);
+        assert_eq!(child.0.lock().unwrap().signals, attempts);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_reap_error_is_retained_and_prevents_later_signals() {
+        use std::os::unix::process::CommandExt;
+        let directory = tempfile::tempdir().unwrap();
+        let (lease, bindings) = super::super::secure_fs::SecretFileLease::create(
+            directory.path(),
+            &[("FIXTURE_FILE".into(), "fixture-value".into())],
+        )
+        .unwrap();
+        let child = ChildOwnership::prepare(Some(lease)).unwrap();
+        let mut command = std::process::Command::new("true");
+        command.process_group(0);
+        child.adopt(command.spawn().unwrap());
+        let pid = child.id().unwrap();
+        // The fixture acts as a competing reaper for this one owned child.
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, 0) },
+            pid as i32
+        );
+        assert_eq!(
+            child.try_wait().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        child.terminate(false);
+        let CleanupOutcome::Pending { errors } = child.cleanup_outcome() else {
+            panic!("reaping ownership is unknown");
+        };
+        assert!(errors.contains(&CleanupError {
+            operation: CleanupOperation::Reap,
+            errno: Some(libc::ECHILD)
+        }));
+        assert_eq!(child.0.lock().unwrap().signals, 0);
+        assert!(bindings[0].1.exists());
+        // The fixture's waitpid above establishes exit; release its test state.
+        let mut state = child.0.lock().unwrap();
+        state.child = None;
+        state.secret_files = None;
     }
 
     #[test]

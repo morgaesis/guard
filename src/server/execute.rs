@@ -53,7 +53,7 @@ use super::learning::{
 };
 #[cfg(unix)]
 use super::path_with_shim_dir;
-use super::runtime::{ChildOwnership, NotifyEvent, ProcessGuard};
+use super::runtime::{ChildOwnership, CleanupOutcome, NotifyEvent, ProcessGuard};
 use super::transport::{write_policy_decision, write_stream_message};
 #[cfg(unix)]
 use super::wire::ExecOutcome;
@@ -500,6 +500,7 @@ async fn revalidate_exec_cwd(cwd: &Path) -> std::result::Result<(), LaunchError>
     })?;
     if canonical != cwd {
         return Err(LaunchError {
+            cleanup: None,
             started: false,
             stage: ExecutionStage::Cwd,
             errno: None,
@@ -515,6 +516,7 @@ async fn revalidate_exec_cwd(cwd: &Path) -> std::result::Result<(), LaunchError>
     })?;
     if !meta.is_dir() {
         return Err(LaunchError {
+            cleanup: None,
             started: false,
             stage: ExecutionStage::Cwd,
             errno: None,
@@ -2916,6 +2918,7 @@ fn drop_brokered_child_capabilities() -> std::io::Result<()> {
 
 #[derive(Debug)]
 struct LaunchError {
+    cleanup: Option<ChildOwnership>,
     started: bool,
     stage: ExecutionStage,
     errno: Option<i32>,
@@ -2925,6 +2928,7 @@ struct LaunchError {
 impl LaunchError {
     fn from_io(stage: ExecutionStage, message: &'static str, error: &std::io::Error) -> Self {
         Self {
+            cleanup: None,
             started: false,
             stage,
             errno: error.raw_os_error(),
@@ -3014,6 +3018,7 @@ fn prepare_child_setup(
         .map(|path| CString::new(path.as_os_str().as_bytes()))
         .transpose()
         .map_err(|_| LaunchError {
+            cleanup: None,
             started: false,
             stage: ExecutionStage::Cwd,
             errno: Some(libc::EINVAL),
@@ -3146,6 +3151,7 @@ fn read_child_setup_error(
         _ => return None,
     };
     (errno > 0 && spawn_error.raw_os_error() == Some(errno)).then_some(LaunchError {
+        cleanup: None,
         started: false,
         stage,
         errno: Some(errno),
@@ -3180,6 +3186,7 @@ impl ManagedChild {
             .map(ChildStdout::from_std)
             .transpose()
             .map_err(|error| LaunchError {
+                cleanup: None,
                 started: true,
                 stage: ExecutionStage::Unknown,
                 errno: error.raw_os_error(),
@@ -3195,6 +3202,7 @@ impl ManagedChild {
             .map(ChildStderr::from_std)
             .transpose()
             .map_err(|error| LaunchError {
+                cleanup: None,
                 started: true,
                 stage: ExecutionStage::Unknown,
                 errno: error.raw_os_error(),
@@ -3300,8 +3308,11 @@ fn spawn_brokered_command(
     secret_files: Option<super::secure_fs::SecretFileLease>,
 ) -> std::result::Result<ManagedChild, LaunchError> {
     let mut child = spawn_owned_command(cmd, cwd, identity, secret_files)?;
-    child.attach_stdout()?;
-    child.attach_stderr()?;
+    if let Err(mut error) = child.attach_stdout().and_then(|()| child.attach_stderr()) {
+        child.ownership.terminate(false);
+        error.cleanup = Some(child.ownership.clone());
+        return Err(error);
+    }
     Ok(child)
 }
 
@@ -4070,180 +4081,218 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         Err(error) => {
             if error.started {
                 audit_credential_access(server, caller, &request, &credential_references);
-                return error
+                let cleanup = match &error.cleanup {
+                    Some(owner) => Some((owner.cleanup_id(), owner.wait_for_cleanup().await)),
+                    None => None,
+                };
+                let result = error
                     .into_result(allow_reason)
                     .with_credential_references(credential_references);
+                return match cleanup {
+                    Some((cleanup_id, outcome)) => {
+                        with_cleanup_outcome(result, cleanup_id, outcome)
+                    }
+                    None => result,
+                };
             }
             return error.into_result(allow_reason);
         }
     };
-    drop(tool_mapping_lease);
-    drop(initiation_lease);
-    #[cfg(all(test, unix))]
-    signal_command_started_for_test(server);
+    let cleanup_owner = child.ownership.clone();
+    let result = async {
+        drop(tool_mapping_lease);
+        drop(initiation_lease);
+        #[cfg(all(test, unix))]
+        signal_command_started_for_test(server);
 
-    if context.stream_output {
-        let result = execute_streaming_child(
-            child,
-            allow_reason,
-            exec_timeout_secs,
-            server,
-            OutputRedactionContext {
-                environment: &redaction_env,
-                exact_secrets: &exact_output_secrets,
-            },
-            SpawnAuditContext {
-                caller,
-                request: &request,
-                credential_references,
-            },
-            &mut *context.stream_writer,
-        )
-        .await;
-        return result;
-    }
-
-    let mut process_guard = Some(server.state.process_tracker.track(child.ownership.clone()));
-    audit_credential_access(server, caller, &request, &credential_references);
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let exact_secrets = server
-        .config
-        .redact_secrets
-        .iter()
-        .chain(exact_output_secrets.iter())
-        .map(|secret| secret.as_bytes().to_vec())
-        .collect::<Vec<_>>();
-    let raw_total = Arc::new(AtomicUsize::new(0));
-    let stdout_secrets = exact_secrets.clone();
-    let stdout_total = raw_total.clone();
-    let stdout_reader = async move {
-        match stdout_pipe {
-            Some(pipe) => read_bounded_redacted_output(pipe, stdout_secrets, stdout_total).await,
-            None => Ok(Vec::new()),
-        }
-    };
-    let stderr_reader = async move {
-        match stderr_pipe {
-            Some(pipe) => read_bounded_redacted_output(pipe, exact_secrets, raw_total).await,
-            None => Ok(Vec::new()),
-        }
-    };
-    let execution_deadline =
-        tokio::time::sleep(std::time::Duration::from_secs(exec_timeout_secs.max(1)));
-    tokio::pin!(execution_deadline);
-    let buffered_output = if exec_timeout_secs == 0 {
-        Ok(collect_bounded_output_pair(stdout_reader, stderr_reader).await)
-    } else {
-        tokio::select! {
-            result = collect_bounded_output_pair(stdout_reader, stderr_reader) => Ok(result),
-            _ = &mut execution_deadline => Err(()),
-        }
-    };
-    let buffered_output = match buffered_output {
-        Err(()) => {
-            terminate_spawned_child(&mut child, &mut process_guard).await;
-            return ExecuteResult::exec_failed_after_start(
+        if context.stream_output {
+            let result = execute_streaming_child(
+                child,
                 allow_reason,
-                exec_timeout_reason(exec_timeout_secs),
+                exec_timeout_secs,
+                server,
+                OutputRedactionContext {
+                    environment: &redaction_env,
+                    exact_secrets: &exact_output_secrets,
+                },
+                SpawnAuditContext {
+                    caller,
+                    request: &request,
+                    credential_references,
+                },
+                &mut *context.stream_writer,
             )
-            .with_credential_references(credential_references);
+            .await;
+            return result;
         }
-        Ok(Err(error)) => {
-            terminate_spawned_child(&mut child, &mut process_guard).await;
-            return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+
+        let mut process_guard = Some(server.state.process_tracker.track(child.ownership.clone()));
+        audit_credential_access(server, caller, &request, &credential_references);
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let exact_secrets = server
+            .config
+            .redact_secrets
+            .iter()
+            .chain(exact_output_secrets.iter())
+            .map(|secret| secret.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let raw_total = Arc::new(AtomicUsize::new(0));
+        let stdout_secrets = exact_secrets.clone();
+        let stdout_total = raw_total.clone();
+        let stdout_reader = async move {
+            match stdout_pipe {
+                Some(pipe) => {
+                    read_bounded_redacted_output(pipe, stdout_secrets, stdout_total).await
+                }
+                None => Ok(Vec::new()),
+            }
+        };
+        let stderr_reader = async move {
+            match stderr_pipe {
+                Some(pipe) => read_bounded_redacted_output(pipe, exact_secrets, raw_total).await,
+                None => Ok(Vec::new()),
+            }
+        };
+        let execution_deadline =
+            tokio::time::sleep(std::time::Duration::from_secs(exec_timeout_secs.max(1)));
+        tokio::pin!(execution_deadline);
+        let buffered_output = if exec_timeout_secs == 0 {
+            Ok(collect_bounded_output_pair(stdout_reader, stderr_reader).await)
+        } else {
+            tokio::select! {
+                result = collect_bounded_output_pair(stdout_reader, stderr_reader) => Ok(result),
+                _ = &mut execution_deadline => Err(()),
+            }
+        };
+        let buffered_output = match buffered_output {
+            Err(()) => {
+                terminate_spawned_child(&mut child, &mut process_guard).await;
+                return ExecuteResult::exec_failed_after_start(
+                    allow_reason,
+                    exec_timeout_reason(exec_timeout_secs),
+                )
                 .with_credential_references(credential_references);
-        }
-        Ok(Ok(output)) => output,
-    };
-    let wait_result = if exec_timeout_secs == 0 {
-        Ok(child.wait().await)
-    } else {
-        tokio::select! {
-            result = child.wait() => Ok(result),
-            _ = &mut execution_deadline => Err(()),
-        }
-    };
-    let status = match wait_result {
-        Err(()) => {
-            terminate_spawned_child(&mut child, &mut process_guard).await;
-            return ExecuteResult::exec_failed_after_start(
-                allow_reason,
-                exec_timeout_reason(exec_timeout_secs),
-            )
-            .with_credential_references(credential_references);
-        }
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => {
-            return ExecuteResult::exec_failed_after_start(
-                allow_reason,
-                format!("failed to wait for '{}': {}", request.binary, e),
-            )
-            .with_credential_references(credential_references);
-        }
-    };
-    if let Some(guard) = process_guard {
-        guard.complete();
-    }
-
-    let (stdout_bytes, stderr_bytes) = buffered_output;
-    let retained_total = Arc::new(AtomicUsize::new(0));
-    let stdout = if stdout_bytes.is_empty() {
-        None
-    } else {
-        let redacted = match redact_bounded_buffered_output(
-            server,
-            &redaction_env,
-            &exact_output_secrets,
-            String::from_utf8_lossy(&stdout_bytes).to_string(),
-            &retained_total,
-        ) {
-            Ok(redacted) => redacted,
-            Err(error) => {
+            }
+            Ok(Err(error)) => {
+                terminate_spawned_child(&mut child, &mut process_guard).await;
                 return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
                     .with_credential_references(credential_references);
             }
+            Ok(Ok(output)) => output,
         };
-        Some(redacted)
-    };
-
-    let mut stderr = if stderr_bytes.is_empty() {
-        None
-    } else {
-        let redacted = match redact_bounded_buffered_output(
-            server,
-            &redaction_env,
-            &exact_output_secrets,
-            String::from_utf8_lossy(&stderr_bytes).to_string(),
-            &retained_total,
-        ) {
-            Ok(redacted) => redacted,
-            Err(error) => {
-                return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
-                    .with_credential_references(credential_references);
+        let wait_result = if exec_timeout_secs == 0 {
+            Ok(child.wait().await)
+        } else {
+            tokio::select! {
+                result = child.wait() => Ok(result),
+                _ = &mut execution_deadline => Err(()),
             }
         };
-        Some(redacted)
-    };
+        let status = match wait_result {
+            Err(()) => {
+                terminate_spawned_child(&mut child, &mut process_guard).await;
+                return ExecuteResult::exec_failed_after_start(
+                    allow_reason,
+                    exec_timeout_reason(exec_timeout_secs),
+                )
+                .with_credential_references(credential_references);
+            }
+            Ok(Ok(status)) => status,
+            Ok(Err(e)) => {
+                terminate_spawned_child(&mut child, &mut process_guard).await;
+                return ExecuteResult::exec_failed_after_start(
+                    allow_reason,
+                    format!("failed to wait for '{}': {}", request.binary, e),
+                )
+                .with_credential_references(credential_references);
+            }
+        };
+        if let Some(guard) = process_guard {
+            guard.complete();
+        }
 
-    let mut exit_code = status.code();
-    if let Some(mut diagnostics) =
-        AnsibleInventoryDiagnostics::for_command(&request.binary, &request.args)
-    {
-        diagnostics.observe(&String::from_utf8_lossy(&stdout_bytes));
-        diagnostics.observe(&String::from_utf8_lossy(&stderr_bytes));
-        if diagnostics.normalizes_success_to_failure(exit_code) {
-            exit_code = Some(1);
-            stderr = append_accounted_diagnostic(
-                stderr,
-                ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC,
+        let (stdout_bytes, stderr_bytes) = buffered_output;
+        let retained_total = Arc::new(AtomicUsize::new(0));
+        let stdout = if stdout_bytes.is_empty() {
+            None
+        } else {
+            let redacted = match redact_bounded_buffered_output(
+                server,
+                &redaction_env,
+                &exact_output_secrets,
+                String::from_utf8_lossy(&stdout_bytes).to_string(),
                 &retained_total,
-            );
-        }
-    }
+            ) {
+                Ok(redacted) => redacted,
+                Err(error) => {
+                    return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+                        .with_credential_references(credential_references);
+                }
+            };
+            Some(redacted)
+        };
 
-    ExecuteResult::completed(allow_reason, exit_code, stdout, stderr)
-        .with_credential_references(credential_references)
+        let mut stderr = if stderr_bytes.is_empty() {
+            None
+        } else {
+            let redacted = match redact_bounded_buffered_output(
+                server,
+                &redaction_env,
+                &exact_output_secrets,
+                String::from_utf8_lossy(&stderr_bytes).to_string(),
+                &retained_total,
+            ) {
+                Ok(redacted) => redacted,
+                Err(error) => {
+                    return ExecuteResult::exec_failed_after_start(allow_reason, error.to_string())
+                        .with_credential_references(credential_references);
+                }
+            };
+            Some(redacted)
+        };
+
+        let mut exit_code = status.code();
+        if let Some(mut diagnostics) =
+            AnsibleInventoryDiagnostics::for_command(&request.binary, &request.args)
+        {
+            diagnostics.observe(&String::from_utf8_lossy(&stdout_bytes));
+            diagnostics.observe(&String::from_utf8_lossy(&stderr_bytes));
+            if diagnostics.normalizes_success_to_failure(exit_code) {
+                exit_code = Some(1);
+                stderr = append_accounted_diagnostic(
+                    stderr,
+                    ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC,
+                    &retained_total,
+                );
+            }
+        }
+
+        ExecuteResult::completed(allow_reason, exit_code, stdout, stderr)
+            .with_credential_references(credential_references)
+    }
+    .await;
+    with_cleanup_outcome(
+        result,
+        cleanup_owner.cleanup_id(),
+        cleanup_owner.cleanup_outcome(),
+    )
+}
+
+fn with_cleanup_outcome(
+    result: ExecuteResult,
+    cleanup_id: u128,
+    outcome: CleanupOutcome,
+) -> ExecuteResult {
+    let Some(mut failure) = result.execution_failure().cloned() else {
+        return result;
+    };
+    if let Some(diagnostic) = outcome.diagnostic(cleanup_id) {
+        failure.message.push_str("; ");
+        failure.message.push_str(&diagnostic);
+        return result.with_execution_failure(Some(failure));
+    }
+    result
 }
 
 fn truncate_utf8_bytes(value: &mut String, limit: usize) {
@@ -4437,20 +4486,20 @@ async fn cleanup_streaming_failure(
     child: &mut ManagedChild,
     process_guard: &mut Option<ProcessGuard>,
     stream_tasks: &mut StreamTaskCleanup,
-) {
+) -> CleanupOutcome {
     stream_tasks.abort_and_join().await;
-    terminate_spawned_child(child, process_guard).await;
+    terminate_spawned_child(child, process_guard).await
 }
 
 async fn terminate_spawned_child(
     child: &mut ManagedChild,
     process_guard: &mut Option<ProcessGuard>,
-) {
+) -> CleanupOutcome {
     if let Some(guard) = process_guard.take() {
-        guard.terminate_gracefully().await;
+        guard.terminate_gracefully().await
     } else {
         child.ownership.terminate(false);
-        child.ownership.wait_for_cleanup().await;
+        child.ownership.wait_for_cleanup().await
     }
 }
 
@@ -4862,6 +4911,7 @@ async fn execute_streaming_child<W: AsyncWrite + Unpin>(
         }
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
+            terminate_spawned_child(&mut child, &mut process_guard).await;
             return ExecuteResult::exec_failed_after_start(
                 allow_reason,
                 format!("failed to wait for '{}': {}", audit.request.binary, e),
