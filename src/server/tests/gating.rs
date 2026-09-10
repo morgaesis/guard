@@ -2334,12 +2334,16 @@ async fn failed_revert_is_durable_queryable_and_notifies_operator() {
     let (mut cfg, _operator, agent) = gating_config(7_015, 1_000);
     cfg.state.session_store = Some(store.clone());
     let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
-    let event_path = state.path().join("notify-event.json");
+    let events_directory = state.path().join("notifications");
+    std::fs::create_dir(&events_directory).expect("create notification directory");
     cfg.state.notify_hook = crate::server::runtime::NotifyHook::new(
         vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!("cat > '{}'", event_path.display()),
+            "capture=\"$1/notify-$$\"; cat > \"$capture.pending\" && mv \"$capture.pending\" \"$capture.json\""
+                .to_string(),
+            "sh".to_string(),
+            events_directory.display().to_string(),
         ],
         5,
     );
@@ -2430,23 +2434,28 @@ async fn failed_revert_is_durable_queryable_and_notifies_operator() {
     assert!(audit.contains("REVERT_FAILED"), "audit: {audit}");
 
     let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if event_path.exists() {
-                break std::fs::read_to_string(&event_path).expect("read notification event");
+        'notification: loop {
+            for entry in std::fs::read_dir(&events_directory).expect("read notifications") {
+                let path = entry.expect("notification entry").path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    let event: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(path).expect("read completed notification"),
+                    )
+                    .expect("complete notification JSON");
+                    if event["event"] == "decision_made" && event["status"] == "revert_failed" {
+                        break 'notification event;
+                    }
+                }
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("revert notification event timed out");
-    assert!(
-        event.contains("\"event\":\"decision_made\""),
-        "event: {event}"
-    );
-    assert!(
-        event.contains("\"status\":\"revert_failed\""),
-        "event: {event}"
-    );
+    assert_eq!(event["handle"], handle);
 }
 
 /// The sweeper executes a due API revert as an HTTP request through the
