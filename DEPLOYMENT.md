@@ -44,6 +44,8 @@ deployment/systemd/guard.service
 deployment/systemd/guard-exec-as-caller.service
 deployment/systemd/guard.env.example
 deployment/systemd/guard-operator
+deployment/systemd/install-guard
+deployment/systemd/PACKAGE-VERSION
 deployment/hardening/guard.apparmor.example
 deployment/hardening/seccomp-deny-escape.json
 ```
@@ -52,33 +54,82 @@ The standard unprivileged model runs `guard` as a dedicated account and exposes
 `/run/guard/guard.sock` to the permitted agent group. Protect the state directory,
 environment file, catalogs, SSH material, and secret backend from that group.
 
-Create the dedicated socket group and add only agent accounts that may submit
-requests. The daemon creates the socket as `0600`, or `0660` after it
-successfully assigns the configured group. It never makes the socket
-world-accessible.
+The Bash installer uses the same GNU/Linux and systemd tools as the packaged
+units. It installs `/usr/local/bin/guard`, a root-owned mode `0700`
+`/usr/local/sbin/guard-operator`, both service units, and missing initial
+configuration. It creates the dedicated `guard` identity and `guard-clients`
+group only when absent. Existing account IDs, group memberships, configuration,
+admin token and state stay unchanged. It creates `/etc/guard` as root:root `0700`
+and the admin token once as root:root `0400`; an empty or insecure existing
+token causes refusal rather than replacement.
+
+Use a verified release expanded into a root-controlled directory. Read its
+binary digest from the verified archive's `BINARY-SHA256`, not from an
+unverified download. In a root shell, set the archive path and package version:
 
 ```bash
-getent group guard >/dev/null || groupadd --system guard
-getent group guard-clients >/dev/null || groupadd --system guard-clients
-id guard >/dev/null 2>&1 || useradd --system --gid guard --home-dir /var/lib/guard --shell /usr/sbin/nologin guard
-usermod --append --groups guard-clients guard-agent
-install -m 0755 guard /usr/local/bin/guard
-install -o root -g root -m 0755 deployment/systemd/guard-operator /usr/local/sbin/guard-operator
-install -m 0644 deployment/systemd/guard.service /etc/systemd/system/
-install -m 0600 deployment/systemd/guard.env.example /etc/default/guard
-# Provision the admin token (root-held, root:root 0400) before the first start.
-install -m 0400 -o root -g root /dev/null /etc/guard/admin.token
-openssl rand -hex 32 > /etc/guard/admin.token
-# Edit /etc/default/guard before the first start.
-systemctl daemon-reload
-systemctl enable --now guard.service
-guard status
+set -euo pipefail
+archive_root=/path/to/verified/archive
+release_version=0.8.8
+expected_binary_hash="$(awk '$2 == "guard" {print $1}' "$archive_root/BINARY-SHA256")"
+"$archive_root/deployment/systemd/install-guard" --check \
+  --binary "$archive_root/guard" --version "$release_version" --sha256 "$expected_binary_hash"
+"$archive_root/deployment/systemd/install-guard" --apply \
+  --binary "$archive_root/guard" --version "$release_version" --sha256 "$expected_binary_hash"
 ```
 
-Replace `guard-agent` with each local agent account that may connect. Edit
-`/etc/default/guard` before starting the service. Keep API keys and bearer
-tokens out of unit command lines. `systemctl cat guard.service` shows the exact
-merged hardening and environment configuration.
+`--check` reports paths, ownership/mode changes and preserved objects without
+creating files, users or tokens, reading token contents, or executing the
+candidate. Exit 0 means the check succeeded, including when it reports changes;
+exit 1 is a refusal or operational failure and exit 2 is invalid usage.
+`--apply` verifies the digest again after protected staging, then probes the
+actual stable binary version from a protected cwd with an empty inherited
+environment. The candidate must match the installer package version and be at
+least 0.8.8, which provides the operator's automatic-configuration opt-out.
+The version probe is an apply-only check. Prerelease binaries are unsupported.
+
+Both packaged services must be inactive. The installer refuses custom units,
+drop-ins, nonstandard unit locations and incompatible account or state layouts.
+It leaves those deployments intact for manual review; it does not replace a
+custom socket group or hardening configuration with packaged defaults. Managed
+unit updates require unchanged recorded file digests. File replacements use a
+staged file and rename in the destination directory. The group of file updates
+is not one transaction: after an interrupted apply, inspect `--check` and keep
+the service stopped until every file is reconciled with the reviewed package.
+
+Use `--service guard-exec-as-caller.service` for initial caller-identity mode.
+It selects root-owned state and does not convert existing daemon-owned state.
+The installer never changes sudoers, adds clients to groups, runs database
+migrations, reloads systemd, enables a service or restarts one.
+
+After reviewing the initial configuration, add only authorized agent accounts
+to the socket group and set their numeric UIDs in `/etc/default/guard`:
+
+```bash
+usermod --append --groups guard-clients guard-agent
+# Edit /etc/default/guard through the configuration owner; retain existing keys.
+systemctl daemon-reload
+systemctl enable --now guard.service
+```
+
+Replace `guard-agent` with an authorized local account. Group membership changes
+require a new login. The daemon creates the socket as `0600`, or `0660` after
+assigning the socket group. Activation is an explicit deployment step and may
+migrate the database; use the stopped snapshot procedure below for an existing
+service. The installer only updates `/usr/local/bin/guard`. A package-manager,
+tool-manager or user-local `guard` elsewhere on PATH remains a separate client
+installation. Update it through its existing owner and verify the actual command
+from the normal client shell before accepting a coordinated deployment:
+
+```bash
+type -a guard
+guard --version
+/usr/local/bin/guard --version
+guard status --json
+```
+
+Compare the invoked client's version and the daemon version in the status
+response. A replaced file does not prove that the running daemon uses it.
 
 Use `--users` to restrict submitting Unix uids when the socket group is broader
 than the intended agent account. Set `GUARD_ALLOWED_UIDS=1000,1001` in
@@ -133,16 +184,18 @@ only through stdin at startup (`StandardInput=file:` opens the root-held file
 as root and hands over the descriptor), so it never enters the daemon's
 environment, argv, or any file its children can read.
 
-Provision the token file once, as `root:root` mode `0400`:
+The installer provisions the admin token only when absent. Preserve an existing
+token across updates. The operator launcher requires effective UID 0, normally
+through `sudo guard-operator`; an existing root shell can invoke it directly.
+Ordinary `sudo guard` still needs the admin bearer and gains no implicit operator
+authority from UID 0. No automatic passwordless sudoers entry is installed.
 
-```bash
-install -m 0400 -o root -g root /dev/null /etc/guard/admin.token
-openssl rand -hex 32 > /etc/guard/admin.token
-```
-
-Run operator RPCs through the root-owned wrapper, which reads the token and
-presents it, and refuses to run when both or neither packaged service is
-active:
+The launcher keeps the caller's working directory, so relative and spaced paths
+such as `sudo guard-operator verb add --file 'definitions/service status.yaml'`
+remain valid. It uses a clean environment, protected HOME/XDG paths under
+`/etc/guard`, and `GUARD_NO_AUTO_CONFIG=1` to prevent dotenv or saved client
+configuration from supplying authority. Its fixed socket and root-held token
+select the local endpoint; only supported operator leaves are accepted.
 
 ```bash
 sudo guard-operator access list
@@ -268,117 +321,159 @@ them with its current operator interface and verify that no active sessions
 remain. Keep the stopped binary and consistent database backup together for
 rollback.
 
-On Unix, the packaged paths use this upgrade sequence:
+On Unix, inspect the effective service before changing a deployment. Existing
+drop-ins, identity, socket-group selection and credential configuration belong
+to that deployment and must survive the update. Run these inspections locally;
+configuration can contain secrets and must not be pasted into diagnostics:
 
 ```bash
-release_version=0.8.1
+systemctl show guard.service guard-exec-as-caller.service \
+  --property=ActiveState,FragmentPath,DropInPaths,User,Group,MainPID
+sudo guard-operator access list
+type -a guard
+guard --version
+guard status --json
+```
+
+Keep an independent root session available. For a running deployment, arm a
+host-local delayed rollback with a success sentinel before replacing files or
+restarting. Its restore action must use the verified matching snapshot below,
+preserve displaced state, and work without Guard. Keep that timer armed until
+the actual client, daemon, operator and allowed-command checks succeed.
+
+In a root shell, select the one active packaged unit. Resolve holds and stop
+all writers before taking the snapshot. A stopped snapshot includes the entire
+state directory and every SQLite sidecar; it is not a copy of one live database
+file. The independent SQLite backup provides an additional consistent database
+image:
+
+```bash
+backup_dir="$(bash <<'GUARD_SNAPSHOT'
+set -euo pipefail
+umask 077
 standard_state="$(systemctl is-active guard.service || true)"
 caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
 case "$standard_state:$caller_state" in
-  active:active) echo 'both packaged Guard services are active' >&2; exit 1 ;;
-  active:*) guard_unit=guard.service ;;
-  *:active) guard_unit=guard-exec-as-caller.service ;;
-  *) echo 'no packaged Guard service is active' >&2; exit 1 ;;
+  active:inactive|active:unknown) guard_unit=guard.service ;;
+  inactive:active|unknown:active) guard_unit=guard-exec-as-caller.service ;;
+  *) echo 'select exactly one active packaged service before proceeding' >&2; exit 1 ;;
 esac
-sha256sum --check BINARY-SHA256
-expected_binary_hash="$(awk '$2 == "guard" {print $1}' BINARY-SHA256)"
-test "${#expected_binary_hash}" -eq 64
-test ! -f /var/lib/guard/verbs.yaml || ./guard verb lint --file /var/lib/guard/verbs.yaml
-backup_dir="$(mktemp -d "/var/backups/guard-before-v${release_version}-XXXXXXXX")"
-printf 'GUARD_ROLLBACK_BACKUP_DIR=%q\n' "$backup_dir"
-install -d -o root -g root -m 0700 "$backup_dir"
+backup_dir="$(mktemp -d /var/backups/guard-before-upgrade.XXXXXXXX)"
 systemctl stop "$guard_unit"
 test "$(systemctl is-active "$guard_unit" || true)" = inactive
-install -o root -g root -m 0755 /usr/local/bin/guard "$backup_dir/guard"
-for deployed_file in \
-  /usr/local/sbin/guard-operator \
-  /etc/systemd/system/guard.service \
-  /etc/systemd/system/guard-exec-as-caller.service; do
-  backup_name="$(basename "$deployed_file")"
-  if test -f "$deployed_file"; then
-    cp -a "$deployed_file" "$backup_dir/$backup_name"
-  else
-    : > "$backup_dir/$backup_name.absent"
-  fi
-done
+cp -a /var/lib/guard "$backup_dir/state"
 sqlite3 /var/lib/guard/state.db ".backup '$backup_dir/state.db'"
-test -s "$backup_dir/state.db"
-if test -d /etc/guard; then
-  cp -a /etc/guard "$backup_dir/config"
-else
-  : > "$backup_dir/config.absent"
-fi
-if test -d /var/lib/guard/api-proxy-reverts; then
-  cp -a /var/lib/guard/api-proxy-reverts "$backup_dir/api-proxy-reverts"
-fi
-(cd "$backup_dir" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
-(cd "$backup_dir" && sha256sum --check SHA256SUMS)
-install -m 0755 guard /usr/local/bin/guard
-install -o root -g root -m 0755 deployment/systemd/guard-operator /usr/local/sbin/guard-operator
-install -o root -g root -m 0644 deployment/systemd/guard.service /etc/systemd/system/guard.service
-install -o root -g root -m 0644 deployment/systemd/guard-exec-as-caller.service /etc/systemd/system/guard-exec-as-caller.service
-systemctl daemon-reload
-systemctl start "$guard_unit"
-daemon_pid="$(systemctl show "$guard_unit" --property MainPID --value)"
-test "$daemon_pid" -gt 0
-test "$(readlink -f "/proc/$daemon_pid/exe")" = /usr/local/bin/guard
-test "$(sha256sum "/proc/$daemon_pid/exe" | cut -d ' ' -f 1)" = "$expected_binary_hash"
-guard status --json
+cp -a /usr/local/bin/guard "$backup_dir/guard"
+cp -a /usr/local/sbin/guard-operator "$backup_dir/guard-operator"
+cp -a /etc/guard "$backup_dir/config"
+cp -a /etc/default/guard "$backup_dir/environment"
+printf '%s\n' "$guard_unit" > "$backup_dir/service-unit"
+mkdir "$backup_dir/units"
+for unit in guard.service guard-exec-as-caller.service; do
+  for suffix in '' .d; do
+    source="/etc/systemd/system/$unit$suffix"
+    if test -e "$source" || test -L "$source"; then
+      cp -a "$source" "$backup_dir/units/"
+    fi
+  done
+done
+(cd "$backup_dir"
+checksum_manifest="$(find . -type f -print0 | sort -z | xargs -0 sha256sum)"
+printf '%s\n' "$checksum_manifest" > SHA256SUMS)
+(cd "$backup_dir" && sha256sum --check --status SHA256SUMS)
+printf '%s\n' "$backup_dir"
+GUARD_SNAPSHOT
+)" || exit 1
+guard_unit="$(cat "$backup_dir/service-unit")" || exit 1
+printf 'Snapshot: %s\n' "$backup_dir"
 ```
 
-Rollback stops the service again, verifies the backup manifest, and restores
-the matching binary, database, configuration, and API-revert bodies. Remove the
-database and every WAL, SHM, or rollback-journal sidecar before installing the
-backup so SQLite cannot combine files from different snapshots:
+Preserve this path for the rollback action. For an unmodified packaged deployment,
+run the installer's `--check` and `--apply` commands with the verified new archive.
+For custom units or drop-ins, review the differences manually and update only
+approved packaged files by installing a temporary file beside each destination
+and renaming it into place. Keep the existing environment, token, state,
+identities, socket group and drop-ins. Never overwrite them with examples.
+
+After the coordinated client update, reload and start explicitly, then verify
+the running executable digest against the verified release manifest:
 
 ```bash
-: "${GUARD_ROLLBACK_BACKUP_DIR:?set it to the value printed by the upgrade sequence}"
-backup_dir="$GUARD_ROLLBACK_BACKUP_DIR"
-standard_state="$(systemctl is-active guard.service || true)"
-caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
-case "$standard_state:$caller_state" in
-  active:active) echo 'both packaged Guard services are active' >&2; exit 1 ;;
-  active:*) guard_unit=guard.service; state_owner=guard; state_group=guard ;;
-  *:active) guard_unit=guard-exec-as-caller.service; state_owner=root; state_group=root ;;
-  *) echo 'no packaged Guard service is active' >&2; exit 1 ;;
-esac
-systemctl stop "$guard_unit"
-test "$(systemctl is-active "$guard_unit" || true)" = inactive
-(cd "$backup_dir" && sha256sum --check SHA256SUMS)
-for database_file in /var/lib/guard/state.db /var/lib/guard/state.db-wal /var/lib/guard/state.db-shm /var/lib/guard/state.db-journal; do
-  test ! -e "$database_file" || rm -- "$database_file"
-done
-install -o root -g root -m 0755 "$backup_dir/guard" /usr/local/bin/guard
-restore_packaged_file() {
-  backup_name="$1"
-  destination="$2"
-  mode="$3"
-  if test -f "$backup_dir/$backup_name.absent"; then
-    rm -f -- "$destination"
-  else
-    install -o root -g root -m "$mode" "$backup_dir/$backup_name" "$destination"
-  fi
-}
-restore_packaged_file guard-operator /usr/local/sbin/guard-operator 0755
-restore_packaged_file guard.service /etc/systemd/system/guard.service 0644
-restore_packaged_file guard-exec-as-caller.service /etc/systemd/system/guard-exec-as-caller.service 0644
-install -o "$state_owner" -g "$state_group" -m 0600 "$backup_dir/state.db" /var/lib/guard/state.db
-rm -rf /etc/guard /var/lib/guard/api-proxy-reverts
-if test ! -f "$backup_dir/config.absent"; then
-  cp -a "$backup_dir/config" /etc/guard
-fi
-if test -d "$backup_dir/api-proxy-reverts"; then
-  cp -a "$backup_dir/api-proxy-reverts" /var/lib/guard/api-proxy-reverts
-  chown -R "$state_owner:$state_group" /var/lib/guard/api-proxy-reverts
-fi
 systemctl daemon-reload
 systemctl start "$guard_unit"
 daemon_pid="$(systemctl show "$guard_unit" --property MainPID --value)"
 test "$daemon_pid" -gt 0
-test "$(readlink -f "/proc/$daemon_pid/exe")" = /usr/local/bin/guard
-test "$(sha256sum "/proc/$daemon_pid/exe" | cut -d ' ' -f 1)" = "$(sha256sum "$backup_dir/guard" | cut -d ' ' -f 1)"
+test "$(sha256sum "/proc/$daemon_pid/exe" | cut -d ' ' -f 1)" = "$expected_binary_hash"
+guard --version
 guard status --json
+sudo guard-operator access list
+guard run id
 ```
+
+Also exercise an approved representative verb and a genuine denial under the
+intended agent identity. Verify token and launcher permissions and require an
+installer `--check` with zero planned changes for a managed layout. A custom
+layout retains its documented manual checks. Only then mark the rollback action
+successful and disarm its timer.
+
+Rollback requires another stop and a verified matching snapshot. Preserve the
+entire displaced migrated state, including WAL, SHM and rollback-journal files,
+by renaming the directory into a fresh archive on the same filesystem. Preserve
+configuration and packaged files separately before restoration. No unique state
+is deleted or overwritten. Each block runs in its own fail-fast Bash process;
+a failed prerequisite stops that process even when its caller tests the exit
+status in a conditional. A failed archive step leaves the service stopped and
+retains any files already moved for recovery:
+
+```bash
+bash -s -- "$backup_dir" "$guard_unit" <<'GUARD_ROLLBACK'
+set -euo pipefail
+backup_dir=${1:?verified matching snapshot path required}
+guard_unit=${2:?recorded service required}
+case "$guard_unit" in guard.service|guard-exec-as-caller.service) ;; *) exit 1 ;; esac
+systemctl stop "$guard_unit"
+test "$(systemctl is-active "$guard_unit" || true)" = inactive
+(cd "$backup_dir" && sha256sum --check --status SHA256SUMS)
+test "$(cat "$backup_dir/service-unit")" = "$guard_unit"
+archive_path() {
+  [[ ! -e "$2" && ! -L "$2" ]]
+  test "$(stat -c %d "$1")" = "$(stat -c %d "$(dirname "$2")")"
+  mv -nT -- "$1" "$2"
+  [[ ! -e "$1" && ! -L "$1" ]]
+}
+state_archive="$(mktemp -d /var/lib/guard-displaced.XXXXXXXX)"
+config_archive="$(mktemp -d /etc/guard-displaced.XXXXXXXX)"
+binary_archive="$(mktemp -d /usr/local/guard-displaced.XXXXXXXX)"
+archive_path /var/lib/guard "$state_archive/state"
+archive_path /etc/guard "$config_archive/config"
+archive_path /etc/default/guard "$config_archive/environment"
+archive_path /usr/local/bin/guard "$binary_archive/guard"
+archive_path /usr/local/sbin/guard-operator "$binary_archive/guard-operator"
+mkdir "$config_archive/units"
+for unit in guard.service guard-exec-as-caller.service; do
+  for suffix in '' .d; do
+    source="/etc/systemd/system/$unit$suffix"
+    if test -e "$source" || test -L "$source"; then
+      archive_path "$source" "$config_archive/units/$(basename "$source")"
+    fi
+  done
+done
+cp -a "$backup_dir/state" /var/lib/guard
+cp -a "$backup_dir/config" /etc/guard
+cp -a "$backup_dir/environment" /etc/default/guard
+cp -a "$backup_dir/guard" /usr/local/bin/guard
+cp -a "$backup_dir/guard-operator" /usr/local/sbin/guard-operator
+cp -a "$backup_dir/units/." /etc/systemd/system/
+systemctl daemon-reload
+systemctl start "$guard_unit"
+GUARD_ROLLBACK
+```
+
+A mount-point rename or failed snapshot verification requires a filesystem-aware
+restore plan; leave the service stopped instead of copying over live state.
+Restore separately managed clients to the same binary version, repeat the
+process-digest and endpoint checks against the snapshot, and retain the displaced
+archives. Do not point an older binary at the schema-15 database.
 
 On Windows, verify the release archive checksum, extract it into an
 Administrators-and-SYSTEM only directory, and rerun `install-guard.ps1` from an

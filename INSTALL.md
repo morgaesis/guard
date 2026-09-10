@@ -20,7 +20,7 @@ cargo build --quiet --release
 ## Release archive
 
 ```bash
-GUARD_VERSION=v0.8.5
+GUARD_VERSION=v0.8.8
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
@@ -31,7 +31,16 @@ install -m 0755 "$archive_root/guard" ~/.local/bin/guard
 
 Each archive expands beneath its release-and-target directory. Linux archives
 include the binary, systemd units, operator wrapper, hardening examples, and
-generic verb examples. The Windows archive includes `guard.exe`, the PowerShell
+generic verb examples. Linux service installation uses
+`deployment/systemd/install-guard --check` followed by an explicit `--apply`.
+Supply the verified binary path, package version and SHA-256. The installer
+requires a matching stable package version of at least 0.8.8 and installs the
+operator launcher root-owned with mode `0700`; it does not configure sudoers or
+activate a service. Existing custom units and drop-ins require manual review
+and remain untouched. See the [Unix deployment guide](DEPLOYMENT.md#unix-service)
+for exact commands, state preservation and separate service activation.
+
+The Windows archive includes `guard.exe`, the PowerShell
 installer and tests, an inner binary digest manifest, and the same examples.
 Every archive includes the platform-marked examples. Guard rejects one at lint
 or startup when its declared platform does not match the binary.

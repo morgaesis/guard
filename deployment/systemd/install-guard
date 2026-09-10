@@ -1,0 +1,242 @@
+#!/bin/bash
+# Bash matches the packaged systemd tooling and preserves argument boundaries.
+set -euo pipefail
+umask 077
+
+usage() {
+  cat <<'HELP'
+Usage: install-guard --check|--apply --binary PATH --version VERSION --sha256 DIGEST
+                     [--service guard.service|guard-exec-as-caller.service]
+
+Install a verified local Guard binary and the adjacent packaged systemd assets.
+--check reports planned changes without writing files or executing the candidate.
+--apply installs files; it never enables, starts, stops, or reloads a service.
+VERSION is the package version without the leading v. DIGEST is the binary's
+SHA-256 from the independently verified archive. The default is guard.service.
+Existing configurations, tokens, state, accounts and group memberships are kept.
+Custom units, drop-ins and incompatible identities require manual deployment.
+Run as root. No arguments prints help. Exit 0 means success, 1 means refusal or
+an operational failure, and 2 means invalid arguments. Check may report changes
+with exit 0; it does not verify the candidate's executable version.
+HELP
+}
+fail() { printf 'install-guard: %s\n' "$*" >&2; exit 1; }
+invalid() { printf 'install-guard: %s\n' "$*" >&2; exit 2; }
+[[ $# -gt 0 ]] || { usage; exit 0; }
+action='' binary='' version='' digest='' service=guard.service
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h) usage; exit 0 ;;
+    --check|--apply)
+      [[ -z "$action" ]] || invalid 'choose exactly one of --check and --apply'
+      action=${1#--}; shift ;;
+    --binary|--version|--sha256|--service)
+      [[ $# -ge 2 && -n "$2" ]] || invalid "missing value for $1"
+      case "$1" in
+        --binary) binary=$2 ;;
+        --version) version=$2 ;;
+        --sha256) digest=$2 ;;
+        --service) service=$2 ;;
+      esac
+      shift 2 ;;
+    *) invalid "unknown argument: $1" ;;
+  esac
+done
+[[ -n "$action" && -n "$binary" ]] || invalid '--check or --apply and --binary are required'
+[[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || invalid '--version must be stable MAJOR.MINOR.PATCH without leading zeroes'
+[[ "$digest" =~ ^[a-fA-F0-9]{64}$ ]] || invalid '--sha256 must contain 64 hexadecimal digits'
+digest=${digest,,}
+case "$service" in guard.service|guard-exec-as-caller.service) ;; *) invalid 'unsupported --service' ;; esac
+[[ $EUID -eq 0 && $(uname -s) == Linux ]] || fail 'Linux root privileges are required'
+for tool in cmp stat sha256sum install mktemp mv ln rm rmdir chmod od tr getent groupadd useradd flock systemctl timeout cut awk dirname basename id grep env sort head; do
+  command -v "$tool" >/dev/null || fail "required command is unavailable: $tool"
+done
+[[ ! -e /etc/guard || $(stat -c '%u:%g:%a' /etc/guard) == 0:0:700 ]] || fail 'protected configuration directory must be root:root mode 0700: /etc/guard'
+assets=$(cd -- "$(dirname -- "$0")" && pwd -P)
+if [[ -f "$assets/PACKAGE-VERSION" && ! -L "$assets/PACKAGE-VERSION" ]]; then
+  package_version=$(cat "$assets/PACKAGE-VERSION")
+elif [[ -f "$assets/../../Cargo.toml" ]]; then
+  package_version=$(awk '/^version = / {gsub(/"/, "", $3); print $3; exit}' "$assets/../../Cargo.toml")
+else
+  fail 'package version metadata is missing'
+fi
+[[ "$package_version" == "$version" ]] || fail 'candidate version must match the installer package version'
+# The operator isolation contract requires the auto-config opt-out in 0.8.8.
+[[ $(printf '%s\n' 0.8.8 "$version" | sort -V | head -n 1) == 0.8.8 ]] || fail 'operator isolation requires Guard 0.8.8 or newer'
+[[ -f "$binary" && ! -L "$binary" ]] || fail 'candidate must be a regular file, not a symlink'
+[[ $(sha256sum -- "$binary" | cut -d ' ' -f 1) == "$digest" ]] || fail 'candidate SHA-256 mismatch'
+for asset in guard.service guard-exec-as-caller.service guard.env.example guard-operator; do
+  [[ -f "$assets/$asset" && ! -L "$assets/$asset" ]] || fail "missing regular packaged asset: $asset"
+done
+
+# Lock an existing root-owned directory so --check creates no lock file.
+exec 9</etc
+flock -n 9 || fail 'another installer is inspecting or updating this host'
+root_path() {
+  local path=$1 parent
+  [[ "$path" != / ]] || return 0
+  parent=$(dirname -- "$path")
+  root_path "$parent"
+  [[ ! -L "$path" ]] || fail "symlink is unsupported: $path"
+  if [[ -e "$path" ]]; then
+    [[ $(stat -c %u -- "$path") == 0 ]] || fail "root ownership required: $path"
+    (( (8#$(stat -c %a -- "$path") & 8#022) == 0 )) || fail "group/world-writable path: $path"
+  fi
+}
+regular_file() {
+  local path=$1
+  root_path "$path"
+  if [[ -e "$path" ]]; then
+    [[ -f "$path" && $(stat -c %h -- "$path") == 1 ]] || fail "regular single-link file required: $path"
+  fi
+}
+for directory in /usr/local/bin /usr/local/sbin /etc/systemd/system /etc/default /etc/guard /var/lib; do
+  root_path "$directory"
+  [[ ! -e "$directory" || -d "$directory" ]] || fail "directory required: $directory"
+done
+for path in /usr/local/bin/guard /usr/local/sbin/guard-operator /etc/default/guard \
+  /etc/guard/admin.token /etc/guard/packaged-units.sha256 \
+  /etc/systemd/system/guard.service /etc/systemd/system/guard-exec-as-caller.service; do
+  regular_file "$path"
+done
+for protected in /etc/default/guard /etc/guard/packaged-units.sha256; do
+  [[ ! -e "$protected" || $(stat -c '%u:%g:%a' -- "$protected") == 0:0:600 ]] || fail "root:root mode 0600 required: $protected"
+done
+if [[ -e /etc/guard/admin.token ]]; then
+  [[ -s /etc/guard/admin.token && $(stat -c '%u:%g:%a' /etc/guard/admin.token) == 0:0:400 ]] || fail 'existing admin token must be nonempty, root:root mode 0400; it is never replaced'
+fi
+if [[ -f /etc/default/guard ]] && grep -Eq '^[[:space:]]*GUARD_ADMIN_TOKEN[[:space:]]*=' /etc/default/guard; then
+  fail 'remove the development-only admin-token environment setting through a reviewed configuration change; the packaged service uses stdin'
+fi
+
+units=(guard.service guard-exec-as-caller.service)
+manifest=/etc/guard/packaged-units.sha256
+for unit in "${units[@]}"; do
+  for parent in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+    [[ ! -e "$parent/$unit.d" && ! -L "$parent/$unit.d" ]] || fail "custom service drop-ins require manual deployment: $parent/$unit.d"
+    if [[ "$parent" != /etc/systemd/system ]]; then
+      [[ ! -e "$parent/$unit" && ! -L "$parent/$unit" ]] || fail "non-packaged service location requires manual deployment: $parent/$unit"
+    fi
+  done
+  destination=/etc/systemd/system/$unit
+  if [[ -f "$destination" ]] && ! cmp -s -- "$assets/$unit" "$destination"; then
+    [[ -f "$manifest" ]] || fail "unrecognized existing unit requires manual deployment: $unit"
+    recorded=$(awk -v unit="$unit" '$2 == unit { print $1 }' "$manifest")
+    [[ "$recorded" =~ ^[a-f0-9]{64}$ && $(sha256sum "$destination" | cut -d ' ' -f 1) == "$recorded" ]] || fail "modified unit requires manual deployment: $unit"
+  fi
+  state=$(systemctl is-active "$unit" 2>/dev/null || true)
+  case "$state" in inactive|unknown) ;; *) fail "stop and inspect $unit before installation (service is not inactive)" ;; esac
+done
+
+guard_group=$(getent group guard || true)
+clients_group=$(getent group guard-clients || true)
+guard_account=$(getent passwd guard || true)
+for existing_group in "$guard_group" "$clients_group"; do
+  [[ -z "$existing_group" || $(cut -d: -f3 <<< "$existing_group") != 0 ]] || fail 'Guard groups must not use gid 0'
+done
+[[ -n "$guard_account" || -x /usr/sbin/nologin ]] || fail '/usr/sbin/nologin is required to create the guard account'
+if [[ -n "$guard_account" ]]; then
+  IFS=: read -r _ _ guard_uid guard_gid _ guard_home guard_shell <<< "$guard_account"
+  [[ -n "$guard_group" && "$guard_uid" != 0 && "$guard_gid" == "$(cut -d: -f3 <<< "$guard_group")" && "$guard_home" == /var/lib/guard ]] || fail 'existing guard account has an unsupported uid, primary group or home'
+  case "$guard_shell" in /usr/sbin/nologin|/sbin/nologin|/bin/false) ;; *) fail 'existing guard account must have a non-login shell' ;; esac
+fi
+state_owner=0 state_group=0
+if [[ "$service" == guard.service ]]; then
+  state_owner=${guard_uid:-missing}; state_group=${guard_gid:-missing}
+fi
+[[ ! -L /var/lib/guard ]] || fail 'state directory must not be a symlink'
+if [[ -e /var/lib/guard ]]; then
+  [[ -d /var/lib/guard && $(stat -c '%u:%g:%a' /var/lib/guard) == "$state_owner:$state_group:700" ]] || fail 'existing state ownership or mode does not match --service; state is never rewritten'
+fi
+
+changes=0
+plan() { printf '%s %s\n' "$1" "$2"; [[ "$1" == KEEP ]] || changes=$((changes + 1)); }
+for group in guard guard-clients; do
+  if getent group "$group" >/dev/null; then plan KEEP "group $group"; else plan CREATE "group $group"; fi
+done
+if [[ -n "$guard_account" ]]; then plan KEEP 'account guard'; else plan CREATE 'account guard'; fi
+for path in /etc/default/guard /etc/guard/admin.token /var/lib/guard; do
+  if [[ -e "$path" ]]; then plan KEEP "$path"; else plan CREATE "$path"; fi
+done
+sources=("$binary" "$assets/guard-operator" "$assets/guard.service" "$assets/guard-exec-as-caller.service")
+destinations=(/usr/local/bin/guard /usr/local/sbin/guard-operator /etc/systemd/system/guard.service /etc/systemd/system/guard-exec-as-caller.service)
+modes=(755 700 644 644)
+for index in "${!sources[@]}"; do
+  destination=${destinations[$index]}
+  if [[ -f "$destination" ]] && cmp -s -- "${sources[$index]}" "$destination" && [[ $(stat -c '%u:%g:%a' "$destination") == "0:0:${modes[$index]}" ]]; then
+    plan KEEP "$destination"
+  else
+    plan INSTALL "$destination (root:root ${modes[$index]})"
+  fi
+done
+manifest_content=$(for unit in "${units[@]}"; do
+  printf '%s  %s\n' "$(sha256sum "$assets/$unit" | cut -d ' ' -f 1)" "$unit"
+done)
+if [[ -f "$manifest" ]] && cmp -s "$manifest" <(printf '%s\n' "$manifest_content"); then
+  plan KEEP "$manifest"
+else
+  plan INSTALL "$manifest (root:root 600)"
+fi
+printf 'Planned changes: %s\n' "$changes"
+[[ "$action" == apply ]] || exit 0
+
+# Copy the entire candidate set into protected staging before executing it.
+stage=$(mktemp -d /etc/.guard-install.XXXXXXXX)
+temporary=
+cleanup() {
+  [[ -z "$temporary" ]] || rm -f -- "$temporary"
+  rm -f -- "$stage/guard" "$stage/guard-operator" "$stage/guard.service" "$stage/guard-exec-as-caller.service" "$stage/guard.env.example" "$stage/packaged-units.sha256"
+  rmdir -- "$stage"
+}
+trap cleanup EXIT
+for index in "${!sources[@]}"; do
+  install -o root -g root -m "${modes[$index]}" -- "${sources[$index]}" "$stage/$(basename -- "${destinations[$index]}")"
+done
+install -o root -g root -m 600 "$assets/guard.env.example" "$stage/guard.env.example"
+[[ $(sha256sum "$stage/guard" | cut -d ' ' -f 1) == "$digest" ]] || fail 'staged binary SHA-256 mismatch'
+candidate_version=$(cd "$stage" && env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$stage" XDG_CONFIG_HOME="$stage" GUARD_NO_AUTO_CONFIG=1 timeout 10 ./guard --version 2>/dev/null) || fail 'staged binary version check failed'
+[[ "$candidate_version" =~ ^guard\ v([0-9]+\.[0-9]+\.[0-9]+)(\ \([[:alnum:].+-]+\))?$ ]] || fail 'staged binary must report a stable package version'
+actual_version=${BASH_REMATCH[1]}
+[[ $(printf '%s\n' 0.8.8 "$actual_version" | sort -V | head -n 1) == 0.8.8 ]] || fail 'staged binary lacks the required 0.8.8 operator isolation contract'
+[[ "$actual_version" == "$version" ]] || fail 'staged binary version does not match --version'
+for unit in "${units[@]}"; do
+  printf '%s  %s\n' "$(sha256sum "$stage/$unit" | cut -d ' ' -f 1)" "$unit"
+done > "$stage/packaged-units.sha256"
+
+[[ -n "$guard_group" ]] || groupadd --system guard
+[[ -n "$clients_group" ]] || groupadd --system guard-clients
+if [[ -z "$guard_account" ]]; then
+  [[ -x /usr/sbin/nologin ]] || fail '/usr/sbin/nologin is required to create the guard account'
+  useradd --system --gid guard --home-dir /var/lib/guard --shell /usr/sbin/nologin --no-create-home guard
+fi
+for directory in /usr/local/bin /usr/local/sbin /etc/systemd/system /etc/default; do
+  [[ -d "$directory" ]] || install -d -o root -g root -m 755 "$directory"
+done
+[[ -d /etc/guard ]] || install -d -o root -g root -m 700 /etc/guard
+if [[ ! -d /var/lib/guard ]]; then
+  if [[ "$service" == guard.service ]]; then state_owner=$(id -u guard); state_group=$(id -g guard); fi
+  install -d -o "$state_owner" -g "$state_group" -m 700 /var/lib/guard
+fi
+atomic_install() {
+  local source=$1 destination=$2 mode=$3
+  if [[ -f "$destination" ]] && cmp -s -- "$source" "$destination" && [[ $(stat -c '%u:%g:%a' "$destination") == "0:0:$mode" ]]; then return; fi
+  temporary=$(mktemp "$(dirname -- "$destination")/.guard-install.XXXXXXXX")
+  install -o root -g root -m "$mode" -- "$source" "$temporary"
+  mv -fT -- "$temporary" "$destination"
+  temporary=
+}
+[[ -e /etc/default/guard ]] || atomic_install "$stage/guard.env.example" /etc/default/guard 600
+if [[ ! -e /etc/guard/admin.token ]]; then
+  temporary=$(mktemp /etc/guard/.admin-token.XXXXXXXX)
+  od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$temporary"
+  [[ $(stat -c %s "$temporary") == 64 ]] || fail 'admin token generation failed'
+  chmod 400 "$temporary"
+  ln -- "$temporary" /etc/guard/admin.token
+  rm -f -- "$temporary"
+  temporary=
+fi
+for index in "${!sources[@]}"; do
+  atomic_install "$stage/$(basename -- "${destinations[$index]}")" "${destinations[$index]}" "${modes[$index]}"
+done
+atomic_install "$stage/packaged-units.sha256" "$manifest" 600
+printf 'Installed Guard %s. Configure /etc/default/guard and review service activation separately.\n' "$version"
