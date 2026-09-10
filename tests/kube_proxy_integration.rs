@@ -777,6 +777,17 @@ async fn spawn_transport_error_upstream() -> String {
 }
 
 async fn spawn_replaceable_create_upstream() -> (String, Arc<AtomicBool>, Arc<AtomicUsize>) {
+    spawn_replaceable_create_upstream_with_delete_barrier(None).await
+}
+
+struct ResponseHeaderBarrier {
+    reached: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+async fn spawn_replaceable_create_upstream_with_delete_barrier(
+    delete_barrier: Option<Arc<ResponseHeaderBarrier>>,
+) -> (String, Arc<AtomicBool>, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let replacement = Arc::new(AtomicBool::new(false));
@@ -790,15 +801,21 @@ async fn spawn_replaceable_create_upstream() -> (String, Arc<AtomicBool>, Arc<At
             let replacement = state.clone();
             let deletes = observed_deletes.clone();
             let provenance = provenance.clone();
+            let delete_barrier = delete_barrier.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |request: Request<Incoming>| {
                     let replacement = replacement.clone();
                     let deletes = deletes.clone();
                     let provenance = provenance.clone();
+                    let delete_barrier = delete_barrier.clone();
                     async move {
                         let (method, path) = observe_create_provenance(request, &provenance).await;
                         if method == hyper::Method::DELETE {
                             deletes.fetch_add(1, Ordering::SeqCst);
+                            if let Some(barrier) = delete_barrier {
+                                barrier.reached.add_permits(1);
+                                barrier.release.acquire().await.unwrap().forget();
+                            }
                         }
                         let mut object = created_pod_object();
                         if let Some(name) = path.rsplit('/').next() {
@@ -3079,68 +3096,108 @@ async fn cleanup_revocation_linearizes_at_the_final_header_handoff() {
         (CleanupLeasePause::BeforeLease, 403, 0),
         (CleanupLeasePause::AfterLease, 200, 1),
     ] {
-        let (upstream, _, deletes) = spawn_replaceable_create_upstream().await;
-        let sink = Arc::new(CleanupLeaseSink::new(pause));
-        let (base, client) = start_proxy_with(
-            upstream,
-            "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
-            None,
-            Some(sink.clone()),
-            0,
-        )
-        .await;
-        let created = client
-            .post(format!("{base}/api/v1/namespaces/dev/pods"))
-            .body(r#"{"metadata":{"name":"lease-linearized"}}"#)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(created.status(), 201);
-        created
-            .bytes()
-            .await
-            .expect("create response completes before cleanup handoff");
-
-        let cleanup = tokio::spawn(async move {
-            client
-                .delete(format!(
-                    "{base}/api/v1/namespaces/dev/pods/lease-linearized"
-                ))
-                .send()
-                .await
-                .unwrap()
+        let response_headers = Arc::new(ResponseHeaderBarrier {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
         });
-        tokio::time::timeout(PROXY_INTEGRATION_TIMEOUT, sink.reached.acquire())
-            .await
-            .expect("cleanup reaches the final authority handoff")
-            .unwrap()
-            .forget();
+        let (upstream, _, deletes) =
+            spawn_replaceable_create_upstream_with_delete_barrier(Some(response_headers.clone()))
+                .await;
+        let sink = Arc::new(CleanupLeaseSink::new(pause));
+        let upstream = Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream), None).unwrap();
+        let tls = ProxyTls::generate().unwrap();
+        let ca_pem = tls.ca_pem().to_string();
+        let policy = ApiPolicy::from_yaml(
+            "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+        )
+        .unwrap();
+        let (listener, listen) = reserve_listener().await;
+        let proxy = Arc::new(
+            ApiProxy::new(listen, tls, upstream, policy, None)
+                .with_listener_mode(ApiListenerMode::Policy),
+        );
+        proxy.attach_gate(sink.clone());
+        proxy.attach_session_sink(Arc::new(LiveSessionSink));
+        tokio::spawn(proxy.serve_on(listener));
+        // Cleanup provenance is connection-scoped. Own one TLS connection so
+        // pool scheduling cannot route the delete outside that authority.
+        let mut client = SingleConnectionClient::connect(listen, &ca_pem).await;
+        let created = client
+            .request(
+                hyper::Method::POST,
+                "/api/v1/namespaces/dev/pods",
+                Some("live-session"),
+                Some(r#"{"metadata":{"name":"lease-linearized"}}"#),
+            )
+            .await;
+        assert_eq!(created, 201);
+
+        let mut cleanup = tokio::spawn(async move {
+            client
+                .request(
+                    hyper::Method::DELETE,
+                    "/api/v1/namespaces/dev/pods/lease-linearized",
+                    Some("live-session"),
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(PROXY_INTEGRATION_TIMEOUT, async {
+            tokio::select! {
+                reached = sink.reached.acquire() => reached.unwrap().forget(),
+                result = &mut cleanup => {
+                    let status = result.unwrap_or_else(|_| panic!("cleanup task failed before {pause:?}"));
+                    panic!(
+                        "cleanup completed before {pause:?}: status={status}, forwarded_deletes={}",
+                        deletes.load(Ordering::SeqCst),
+                    );
+                },
+            }
+        })
+        .await
+        .unwrap_or_else(|error| panic!("cleanup did not reach {pause:?}: {error}"));
         let coordination = sink.coordination.clone();
-        let mut revoke = tokio::spawn(async move {
+        let mut revoke = Box::pin(async move {
             *coordination.write().await = false;
         });
         if matches!(pause, CleanupLeasePause::AfterLease) {
-            assert!(sink.coordination.try_write().is_err());
+            assert!(futures::poll!(&mut revoke).is_pending());
         } else {
             tokio::time::timeout(Duration::from_secs(2), &mut revoke)
                 .await
-                .expect("pre-handoff revocation completes before cleanup send")
-                .unwrap();
+                .expect("pre-handoff revocation completes before cleanup send");
         }
         sink.release.add_permits(1);
+        if matches!(pause, CleanupLeasePause::AfterLease) {
+            tokio::time::timeout(PROXY_INTEGRATION_TIMEOUT, async {
+                tokio::select! {
+                    reached = response_headers.reached.acquire() => reached.unwrap().forget(),
+                    result = &mut cleanup => {
+                        let status = result.unwrap_or_else(|_| panic!("cleanup task failed before upstream response headers"));
+                        panic!("cleanup completed before upstream response headers: status={status}");
+                    },
+                }
+            })
+            .await
+            .expect("cleanup reaches upstream before response headers are released");
+            assert_eq!(deletes.load(Ordering::SeqCst), 1);
+            assert!(
+                futures::poll!(&mut revoke).is_pending(),
+                "revocation waits while upstream response headers are withheld"
+            );
+            response_headers.release.add_permits(1);
+        }
         assert_eq!(
             tokio::time::timeout(PROXY_INTEGRATION_TIMEOUT, cleanup)
                 .await
                 .expect("cleanup completes after final authority handoff")
-                .unwrap()
-                .status(),
+                .unwrap(),
             expected_status
         );
         if matches!(pause, CleanupLeasePause::AfterLease) {
             tokio::time::timeout(Duration::from_secs(2), &mut revoke)
                 .await
-                .expect("post-handoff revocation completes after cleanup send")
-                .unwrap();
+                .expect("post-handoff revocation completes after cleanup send");
         }
         assert_eq!(deletes.load(Ordering::SeqCst), expected_deletes);
     }
@@ -3860,7 +3917,7 @@ impl Default for BlockingUidTransitionSink {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum CleanupLeasePause {
     BeforeLease,
     AfterLease,
