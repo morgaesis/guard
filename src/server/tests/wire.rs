@@ -415,3 +415,126 @@ fn containment_failure_is_parseable_by_origin_main_clients_in_both_response_shap
 }
 
 // ---- Audit emission end-to-end tests ------------------------------------
+
+#[test]
+fn execution_failure_preserves_policy_in_buffered_and_streamed_results() {
+    use guard::wire::ExecutionStage;
+    for stage in [
+        ExecutionStage::Identity,
+        ExecutionStage::Capabilities,
+        ExecutionStage::Cwd,
+        ExecutionStage::Exec,
+        ExecutionStage::Unknown,
+    ] {
+        let result = ExecuteResult::launch_failed(
+            "permitted by policy",
+            stage,
+            Some(13),
+            "permission denied",
+        )
+        .with_decision_source(crate::session::SessionDecisionSource::StaticPolicy);
+        let response = result.into_response();
+        assert!(!response.allowed);
+        assert!(response.policy.as_ref().unwrap().allowed);
+        assert_eq!(
+            response.policy.as_ref().unwrap().reason,
+            "permitted by policy"
+        );
+        assert_eq!(response.decision_source, "static_policy");
+        let failure = response.execution_failure.as_ref().unwrap();
+        assert_eq!(failure.started, Some(false));
+        assert_eq!(failure.stage, stage);
+        assert_eq!(failure.errno, Some(13));
+        let encoded = serde_json::to_value(&response).unwrap();
+        let decoded: crate::server::ExecuteResponse =
+            serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.execution_failure, response.execution_failure);
+        let stream = serde_json::to_value(ExecuteStreamMessage::Result { response }).unwrap();
+        assert_eq!(stream["response"], encoded);
+    }
+}
+
+#[test]
+fn execution_failure_unknown_preserves_started_and_legacy_deserialization() {
+    use guard::wire::ExecutionStage;
+    for result in [
+        ExecuteResult::exec_failed("allow", "setup failed"),
+        ExecuteResult::exec_failed_after_start("allow", "stream lost"),
+    ] {
+        let started = matches!(result.exec, ExecOutcome::Failed { started: true, .. });
+        let response = result.into_response();
+        let failure = response.execution_failure.as_ref().unwrap();
+        assert_eq!(failure.started, Some(started));
+        assert_eq!(failure.stage, ExecutionStage::Unknown);
+        assert_eq!(failure.errno, None);
+    }
+    let legacy: crate::server::ExecuteResponse =
+        serde_json::from_value(serde_json::json!({"allowed":false,"reason":"denied"})).unwrap();
+    assert!(legacy.policy.is_none());
+    assert!(legacy.execution_failure.is_none());
+    let unknown: guard::wire::ExecutionFailure = serde_json::from_value(
+        serde_json::json!({"started":false,"stage":"future_stage","errno":null,"message":"failed"}),
+    )
+    .unwrap();
+    assert_eq!(unknown.stage, ExecutionStage::Unknown);
+    let unknown_start: guard::wire::ExecutionFailure = serde_json::from_value(
+        serde_json::json!({"stage":"future_stage","errno":null,"message":"outcome unknown"}),
+    )
+    .unwrap();
+    assert_eq!(unknown_start.started, None);
+    assert_eq!(
+        serde_json::to_value(unknown_start).unwrap()["started"],
+        serde_json::Value::Null
+    );
+    let denied = ExecuteResult::denied("policy rejects this").into_response();
+    assert!(!denied.policy.unwrap().allowed);
+    assert!(denied.execution_failure.is_none());
+}
+
+#[test]
+fn execution_failure_audit_preserves_typed_details_and_redacts_prose() {
+    let result = ExecuteResult::launch_failed(
+        "password=fixture-private",
+        guard::wire::ExecutionStage::Cwd,
+        Some(13),
+        "password=fixture-private",
+    )
+    .with_decision_source(crate::session::SessionDecisionSource::StaticPolicy);
+    let event = guard::audit::AuditEvent::new(guard::audit::AuditKind::ExecFailed)
+        .execution(
+            result.policy_decision(),
+            result.execution_failure().cloned(),
+        )
+        .decision_source(result.decision_source());
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["policy"]["allowed"], true);
+    assert_eq!(json["execution_failure"]["stage"], "cwd");
+    assert_eq!(json["execution_failure"]["errno"], 13);
+    assert!(!json.to_string().contains("fixture-private"));
+    assert!(!event.render_line().contains("fixture-private"));
+}
+
+#[test]
+fn execution_failure_held_projection_retains_admission_and_started_state() {
+    for started in [false, true] {
+        let approval: guard::gating::approval::Approval = serde_json::from_value(serde_json::json!({
+            "handle": "ap-failure", "snapshot": { "binary": "true", "args": [], "env": {}, "secret_keys": {}, "verb_params": {} },
+            "reason": "policy permits command", "created_unix": 1, "ttl_secs": 3600, "status": "exec_failed",
+            "decision_trace": guard::gating::DecisionTrace::source("static_policy"),
+            "execution_failure": {"started": started, "stage": "unknown", "errno": null, "message": "execution failed"}
+        })).unwrap();
+        let summary = crate::server::wire::ApprovalSummary::from_row(&approval);
+        assert_eq!(summary.execution_failure, approval.execution_failure);
+        let response = crate::server::gate_runtime::approval_to_result(&approval).into_response();
+        assert_eq!(response.execution_failure.unwrap().started, Some(started));
+        assert_eq!(response.decision_source, "static_policy");
+        assert_eq!(
+            response.policy.unwrap(),
+            guard::wire::PolicyDecision {
+                allowed: true,
+                reason: "policy permits command".into()
+            }
+        );
+        assert!(!response.allowed);
+    }
+}

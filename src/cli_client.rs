@@ -530,96 +530,19 @@ pub(crate) async fn run_exec(
         exit_for_execute_response(&resp);
     }
 
-    // Consequence-gate outcomes: a held command did not run; a provisional ran
-    // behind an auto-revert timer.
-    if resp.containment_failure.is_some() {
-        print_containment_failure(&resp, streamed_output);
-    }
-    match resp.status {
-        Some(server::GateStatus::Held) => {
-            print_held_banner(&resp);
-            print_coverage(&resp.coverage);
-            // Not executed; exit non-zero so callers do not treat it as success.
-            std::process::exit(EXIT_GUARD_HELD);
-        }
-        Some(server::GateStatus::Provisional) => {
-            let color = color_enabled_for_stderr();
-            if !streamed_output {
-                if let Some(stdout) = &resp.stdout {
-                    cli_print!("{}", stdout);
-                }
-                if let Some(stderr) = &resp.stderr {
-                    eprint!("{}", stderr);
-                }
-            }
-            let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!(
-                "{} containment envelope: {}",
-                paint("PROVISIONAL", AnsiColor::Yellow, color),
-                resp.reason
-            );
-            eprintln!("  handle:  {}", handle);
-            eprintln!("  confirm: {}", operator_confirm_command(&handle));
-            eprintln!("  inspect: guard provisionals");
-            print_provisional_window(&resp);
-            print_coverage(&resp.coverage);
-            if let Some(code) = resp.exit_code {
-                std::process::exit(code);
-            }
-            return Ok(());
-        }
-        Some(server::GateStatus::DryRun) => {
-            let color = color_enabled_for_stdout();
-            cli_println!(
-                "{} {}",
-                paint("[DRY-RUN]", AnsiColor::Cyan, color),
-                resp.reason
-            );
-            print_coverage(&resp.coverage);
-            return Ok(());
-        }
-        _ => {}
-    }
+    render_gated_response(&resp, streamed_output, &binary, explain)
+}
 
-    if resp.allowed {
-        tracing::info!(
-            binary = %binary,
-            reason = %resp.reason,
-            "ALLOWED"
-        );
-        if !streamed_output {
-            if let Some(stdout) = &resp.stdout {
-                cli_print!("{}", stdout);
-            }
-            if let Some(stderr) = &resp.stderr {
-                eprint!("{}", stderr);
-            }
-        }
-        if explain {
-            print_verb_guidance(&resp);
-            eprintln!("  decision source: {}", resp.decision_source);
-        }
-        if let Some(code) = resp.exit_code {
-            std::process::exit(code);
-        }
-        Ok(())
-    } else {
-        let color = color_enabled_for_stderr();
-        tracing::warn!(
-            binary = %binary,
-            reason = %resp.reason,
-            "DENIED"
-        );
-        eprintln!(
-            "{}: {}",
-            paint("DENIED", AnsiColor::Red, color),
-            resp.reason
-        );
-        print_deny_source(&resp);
-        print_access_request_guidance(&resp);
-        print_verb_guidance(&resp);
-        std::process::exit(EXIT_GUARD_DENIED);
-    }
+fn execution_failure_text(failure: &guard::wire::ExecutionFailure) -> String {
+    let errno = failure
+        .errno
+        .map(|errno| format!(", OS error {errno}"))
+        .unwrap_or_default();
+    format!(
+        "EXECUTION FAILED [{}{errno}]: {}",
+        failure.stage.as_str(),
+        guard::gating::sanitize_gate_text(&failure.message)
+    )
 }
 
 fn print_execute_response_json(
@@ -654,6 +577,9 @@ fn exit_for_execute_response(response: &server::ExecuteResponse) -> ! {
     }
     if let Some(failure) = response.containment_failure.as_ref() {
         std::process::exit(containment_failure_exit_code(failure));
+    }
+    if response.execution_failure.is_some() {
+        std::process::exit(EXIT_GUARD_ERROR);
     }
     if !response.allowed {
         std::process::exit(EXIT_GUARD_DENIED);
@@ -846,6 +772,9 @@ pub(crate) fn provisional_detail_human(item: &server::ProvisionalSummary) -> Str
 }
 
 fn render_approval(item: &server::ApprovalSummary, include_transcript: bool) {
+    if let Some(failure) = &item.execution_failure {
+        eprintln!("{}", execution_failure_text(failure));
+    }
     cli_println!(
         "[{}] handle={} cmd={:?} deadline={} reason={:?}",
         item.status,
@@ -1116,19 +1045,26 @@ pub(crate) async fn handle_resume(
         .map_err(|error| describe_connect_failure(error, &client, source))?;
     match response {
         server::AdminResponse::GateAction {
+            policy,
+            execution_failure,
+            decision_source,
             message,
             exit_code,
             stdout,
             stderr,
         } => {
             if json {
-                print_json(&resume_json_response(
+                let mut document = resume_json_response(
                     &handle,
                     &message,
                     exit_code,
                     stdout.as_deref(),
                     stderr.as_deref(),
-                ))?;
+                );
+                document["policy"] = serde_json::to_value(&policy)?;
+                document["execution_failure"] = serde_json::to_value(&execution_failure)?;
+                document["decision_source"] = serde_json::to_value(decision_source)?;
+                print_json(&document)?;
             } else {
                 if let Some(stdout) = stdout.as_deref() {
                     cli_print!("{stdout}");
@@ -1144,6 +1080,18 @@ pub(crate) async fn handle_resume(
                     Some(code) => eprintln!("exit status: {code}"),
                     None => eprintln!("exit status: unavailable"),
                 }
+            }
+            if let Some(failure) = execution_failure {
+                if !json {
+                    eprintln!("{}", execution_failure_text(&failure));
+                }
+                std::process::exit(EXIT_GUARD_ERROR);
+            }
+            if let Some(policy) = policy.filter(|policy| !policy.allowed) {
+                if !json {
+                    eprintln!("DENIED: {}", card_text(&policy.reason));
+                }
+                std::process::exit(EXIT_GUARD_DENIED);
             }
             if let Some(code) = exit_code.filter(|code| *code != 0) {
                 std::process::exit(code);
@@ -3343,7 +3291,7 @@ fn grant_class_wait_refusal(item: &server::AccessItem) -> String {
     ))
 }
 
-fn render_gated_response(
+pub(crate) fn render_gated_response(
     resp: &server::ExecuteResponse,
     streamed: bool,
     label: &str,
@@ -3351,6 +3299,18 @@ fn render_gated_response(
 ) -> Result<()> {
     if resp.containment_failure.is_some() {
         print_containment_failure(resp, streamed);
+    }
+    if let Some(failure) = &resp.execution_failure {
+        eprintln!("{}", execution_failure_text(failure));
+        if explain {
+            if let Some(policy) = &resp.policy {
+                eprintln!(
+                    "  policy allowed: {}; source: {}; reason: {}",
+                    policy.allowed, resp.decision_source, policy.reason
+                );
+            }
+        }
+        std::process::exit(EXIT_GUARD_ERROR);
     }
     match resp.status {
         Some(server::GateStatus::Held) => {
@@ -3446,11 +3406,23 @@ pub(crate) async fn handle_gate_action(
         .map_err(|e| describe_connect_failure(e, &client, source))?
     {
         server::AdminResponse::GateAction {
+            policy,
+            execution_failure,
+            decision_source,
             message,
             exit_code,
             stdout,
             stderr,
         } => {
+            let _ = decision_source;
+            if let Some(failure) = execution_failure {
+                eprintln!("{}", execution_failure_text(&failure));
+                std::process::exit(EXIT_GUARD_ERROR);
+            }
+            if let Some(policy) = policy.filter(|policy| !policy.allowed) {
+                eprintln!("DENIED: {}", card_text(&policy.reason));
+                std::process::exit(EXIT_GUARD_DENIED);
+            }
             cli_println!("{}", message);
             if let Some(out) = &stdout {
                 cli_print!("{}", out);
@@ -4245,6 +4217,8 @@ mod tests {
     #[test]
     fn denied_guidance_lists_every_durable_request_exactly() {
         let response = server::ExecuteResponse {
+            policy: None,
+            execution_failure: None,
             allowed: false,
             reason: "access required".to_string(),
             exit_code: None,
@@ -4321,6 +4295,8 @@ mod tests {
         confirm_window_secs: Option<u64>,
     ) -> server::ExecuteResponse {
         server::ExecuteResponse {
+            policy: None,
+            execution_failure: None,
             allowed: true,
             reason: "recoverable change".to_string(),
             exit_code: Some(0),
@@ -4553,6 +4529,8 @@ mod tests {
 
     fn denied_response(decision_source: &str) -> server::ExecuteResponse {
         server::ExecuteResponse {
+            policy: None,
+            execution_failure: None,
             allowed: false,
             reason: "rejected".to_string(),
             exit_code: None,
@@ -5381,6 +5359,8 @@ mod tests {
     #[test]
     fn execute_json_envelope_keeps_decision_output_and_child_status() {
         let response = server::ExecuteResponse {
+            policy: None,
+            execution_failure: None,
             allowed: true,
             reason: "trusted verb".to_string(),
             exit_code: Some(75),

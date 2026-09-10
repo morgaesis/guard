@@ -3132,6 +3132,7 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
         )
     };
     let held = |handle: &str| Approval {
+        execution_failure: None,
         handle: handle.to_string(),
         snapshot: ApprovalSnapshot {
             binary: "true".to_string(),
@@ -4925,6 +4926,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
         vec![crate::session::StoredSessionInteraction::from_typed_parts(
             token.clone(),
             SessionInteraction {
+                execution_failure: None,
                 at_unix: guard::env::now_unix(),
                 command: format!("kubectl --token={} get pods", fixture_bearer_jwt()),
                 allowed: true,
@@ -5384,6 +5386,7 @@ async fn session_show_reports_recent_stats() {
         reg.record_interaction_with_credential_references(
             &token,
             SessionInteraction {
+                execution_failure: None,
                 at_unix: now.saturating_sub(1),
                 command: "echo hi".into(),
                 allowed: true,
@@ -5403,6 +5406,7 @@ async fn session_show_reports_recent_stats() {
         reg.record_interaction(
             &token,
             SessionInteraction {
+                execution_failure: None,
                 at_unix: now,
                 command: "rm -rf /tmp/x".into(),
                 allowed: false,
@@ -5521,6 +5525,7 @@ async fn session_status_self_view_redacts_bearer_and_keeps_decision_trace() {
     cfg.state.sessions.write().await.record_interaction(
         &token,
         SessionInteraction {
+            execution_failure: None,
             at_unix: guard::env::now_unix(),
             command: "uptime".to_string(),
             allowed: true,
@@ -5932,6 +5937,7 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
     cfg.state.sessions.write().await.record_interaction(
         "suspended-request",
         SessionInteraction {
+            execution_failure: None,
             command: "denied".to_string(),
             allowed: false,
             source: SessionDecisionSource::Llm,
@@ -6812,6 +6818,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
     cfg.state.sessions.write().await.record_interaction(
         "batch-owner",
         SessionInteraction {
+            execution_failure: None,
             command: "denied".to_string(),
             allowed: false,
             source: SessionDecisionSource::Llm,

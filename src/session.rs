@@ -317,6 +317,9 @@ impl SessionInteraction {
     /// state database) and again on every inspection surface (so historical
     /// rows written before sanitization existed cannot leak either).
     pub fn redact_credentials(&mut self) {
+        if let Some(failure) = self.execution_failure.as_mut() {
+            failure.message = guard::gating::sanitize_gate_text(&failure.message);
+        }
         sanitize_credentials(&mut self.command);
         sanitize_credentials(&mut self.reason);
         sanitize_credentials_vec(&mut self.exposed_secret_refs);
@@ -647,6 +650,8 @@ impl<'de> Deserialize<'de> for CredentialReference {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInteraction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_failure: Option<guard::wire::ExecutionFailure>,
     pub at_unix: u64,
     pub command: String,
     pub allowed: bool,
@@ -2257,6 +2262,7 @@ mod tests {
         );
 
         let interaction = SessionInteraction {
+            execution_failure: None,
             at_unix: 1,
             command: "true".to_string(),
             allowed: true,
@@ -2750,6 +2756,7 @@ mod tests {
         reg.record_interaction(
             "tok",
             SessionInteraction {
+                execution_failure: None,
                 at_unix: 10,
                 command: "cat /tmp/a".into(),
                 allowed: true,
@@ -2765,6 +2772,7 @@ mod tests {
         reg.record_interaction(
             "tok",
             SessionInteraction {
+                execution_failure: None,
                 at_unix: 11,
                 command: "rm -rf /tmp/a".into(),
                 allowed: false,
@@ -2780,6 +2788,7 @@ mod tests {
         reg.record_interaction(
             "tok",
             SessionInteraction {
+                execution_failure: None,
                 at_unix: 12,
                 command: "echo hi".into(),
                 allowed: true,
@@ -2846,6 +2855,7 @@ mod tests {
             reg.record_interaction(
                 "tok",
                 SessionInteraction {
+                    execution_failure: None,
                     at_unix: now,
                     command: command.into(),
                     allowed,
@@ -2914,6 +2924,7 @@ mod tests {
         reg.record_interaction(
             "tok",
             SessionInteraction {
+                execution_failure: None,
                 at_unix: 10,
                 command: format!("kubectl --token={} get pods", fixture_bearer_jwt()),
                 allowed: false,
@@ -3031,6 +3042,7 @@ mod tests {
             vec![StoredSessionInteraction::from_typed_parts(
                 "tok".to_string(),
                 SessionInteraction {
+                    execution_failure: None,
                     at_unix: now_unix(),
                     command: format!("curl -H 'Authorization: Bearer {}'", fixture_bearer_jwt()),
                     allowed: true,

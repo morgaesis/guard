@@ -147,6 +147,8 @@ use guard::wire::mcp::{
 
 #[derive(Debug, Clone)]
 struct GuardToolResponse {
+    policy: Option<guard::wire::PolicyDecision>,
+    execution_failure: Option<guard::wire::ExecutionFailure>,
     allowed: bool,
     reason: String,
     exit_code: Option<i32>,
@@ -177,6 +179,8 @@ struct AccessRequestArgs {
 impl From<server::ExecuteResponse> for GuardToolResponse {
     fn from(response: server::ExecuteResponse) -> Self {
         Self {
+            policy: response.policy,
+            execution_failure: response.execution_failure,
             allowed: response.allowed,
             reason: response.reason,
             exit_code: response.exit_code,
@@ -1780,6 +1784,20 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
             "containment_failure".to_string(),
             containment_failure_schema,
         );
+        properties.insert(
+            "policy".to_string(),
+            json!({
+                "type": ["object", "null"], "properties": {
+                    "allowed": {"type": "boolean"}, "reason": {"type": "string"}
+                }, "required": ["allowed", "reason"], "additionalProperties": false
+            }),
+        );
+        properties.insert("execution_failure".to_string(), json!({
+            "type": ["object", "null"], "properties": {
+                "started": {"type": ["boolean", "null"]}, "stage": {"type": "string"},
+                "errno": {"type": ["integer", "null"]}, "message": {"type": "string"}
+            }, "required": ["started", "stage", "errno", "message"], "additionalProperties": false
+        }));
         output["required"]
             .as_array_mut()
             .expect("execution output required fields")
@@ -2022,28 +2040,47 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
             .await
         {
             Ok(server::AdminResponse::GateAction {
+                policy,
+                execution_failure,
+                decision_source,
                 message,
                 exit_code,
                 stdout,
                 stderr,
             }) => {
+                let denied = policy.as_ref().is_some_and(|policy| !policy.allowed);
+                let label = if execution_failure.is_some() {
+                    "EXECUTION FAILED: "
+                } else if denied {
+                    "DENIED: "
+                } else {
+                    ""
+                };
                 let text = format!(
-                    "{message}\n{}{}",
+                    "{label}{message}\n{}{}",
                     stdout.as_deref().unwrap_or_default(),
                     stderr.as_deref().unwrap_or_default()
                 );
-                admin_tool_result(
+                let is_error = execution_failure.is_some()
+                    || denied
+                    || exit_code.is_some_and(|code| code != 0);
+                let mut response = admin_tool_result(
                     "approval_resume",
                     text,
                     json!({
                         "result": {
+                            "policy": policy,
+                            "execution_failure": execution_failure,
+                            "decision_source": decision_source,
                             "message": message,
                             "exit_code": exit_code,
                             "stdout": stdout,
                             "stderr": stderr,
                         }
                     }),
-                )
+                );
+                response["isError"] = json!(is_error);
+                response
             }
             Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
             Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
@@ -2172,6 +2209,13 @@ fn render_approval_text(item: &server::ApprovalSummary) -> String {
         "{} status={} command={} deadline={}",
         item.handle, item.status, item.command, item.deadline_unix
     );
+    if let Some(failure) = &item.execution_failure {
+        line.push_str(&format!(
+            "\nEXECUTION FAILED [{}]: {}",
+            failure.stage.as_str(),
+            guard::gating::sanitize_gate_text(&failure.message)
+        ));
+    }
     if let Some(reason) = item.decided_reason.as_deref() {
         line.push_str(&format!("\nreason: {reason}"));
     }
@@ -2373,7 +2417,8 @@ fn jsonrpc_error_response(id: Value, code: i64, message: String, data: Option<Va
 }
 
 fn tool_result(result: GuardToolResponse) -> Value {
-    let is_error = result.containment_failure.is_some()
+    let is_error = result.execution_failure.is_some()
+        || result.containment_failure.is_some()
         || (result.auto_revert_durable == Some(false) && result.containment_failure.is_none());
     let structured = json!({
         "schema_version": TOOL_SCHEMA_VERSION,
@@ -2389,6 +2434,8 @@ fn tool_result(result: GuardToolResponse) -> Value {
         "confirm_window_secs": result.confirm_window_secs,
         "auto_revert_durable": result.auto_revert_durable,
         "containment_failure": result.containment_failure,
+        "policy": result.policy,
+        "execution_failure": result.execution_failure,
         "approval_options": result.approval_options,
         "access_requests": result.access_requests,
         "coverage": result.coverage,
@@ -2424,6 +2471,8 @@ fn tool_error_result(message: String) -> Value {
         "confirm_window_secs": Value::Null,
         "auto_revert_durable": Value::Null,
         "containment_failure": Value::Null,
+        "policy": Value::Null,
+        "execution_failure": Value::Null,
         "approval_options": [],
         "access_requests": [],
         "coverage": Value::Null,
@@ -2536,6 +2585,24 @@ fn render_tool_text(result: &Value) -> String {
             coverage_text(result)
         ));
         return out;
+    }
+
+    if let Some(failure) = result
+        .get("execution_failure")
+        .filter(|failure| failure.is_object())
+    {
+        let stage = failure
+            .get("stage")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let message = failure
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(reason);
+        return format!(
+            "EXECUTION FAILED [{stage}]: {}{decision}",
+            guard::gating::sanitize_gate_text(message)
+        );
     }
 
     // Consequence-gate outcomes are not denials: surface the handle, the next
@@ -2927,6 +2994,7 @@ mod tests {
 
     fn approval_summary(status: &str) -> server::ApprovalSummary {
         server::ApprovalSummary {
+            execution_failure: None,
             handle: "approval-example".to_string(),
             status: status.to_string(),
             command: "approved-command".to_string(),
@@ -3304,6 +3372,8 @@ mod tests {
     async fn initialize_advertises_tools_capability() {
         let executor = Arc::new(FakeExecutor {
             response: Ok(GuardToolResponse {
+                policy: None,
+                execution_failure: None,
                 allowed: true,
                 reason: "ok".to_string(),
                 exit_code: Some(0),
@@ -3524,6 +3594,8 @@ mod tests {
     async fn tools_list_returns_guard_tool() {
         let executor = Arc::new(FakeExecutor {
             response: Ok(GuardToolResponse {
+                policy: None,
+                execution_failure: None,
                 allowed: true,
                 reason: "ok".to_string(),
                 exit_code: Some(0),
@@ -3889,6 +3961,8 @@ mod tests {
     async fn tool_call_returns_structured_output() {
         let executor = Arc::new(FakeExecutor {
             response: Ok(GuardToolResponse {
+                policy: None,
+                execution_failure: None,
                 allowed: true,
                 reason: "allowed by policy".to_string(),
                 exit_code: Some(0),
@@ -4008,6 +4082,8 @@ mod tests {
     #[test]
     fn denied_tool_results_are_not_transport_errors() {
         let value = tool_result(GuardToolResponse {
+            policy: None,
+            execution_failure: None,
             allowed: false,
             reason: "policy denied".to_string(),
             exit_code: None,
@@ -4044,6 +4120,8 @@ mod tests {
             (true, Some("executed"), None),
         ] {
             let value = tool_result(GuardToolResponse {
+                policy: None,
+                execution_failure: None,
                 allowed,
                 reason: "fixture result".to_string(),
                 exit_code: Some(0),
@@ -4082,6 +4160,8 @@ mod tests {
 
     fn execute_response_fixture() -> server::ExecuteResponse {
         server::ExecuteResponse {
+            policy: None,
+            execution_failure: None,
             allowed: true,
             reason: "recoverable change".to_string(),
             exit_code: Some(0),
@@ -4101,6 +4181,28 @@ mod tests {
             decision_source: "static_policy".to_string(),
             decision_trace: None,
         }
+    }
+
+    #[test]
+    fn execution_failure_mcp_is_an_error_without_denial_guidance() {
+        let response: server::ExecuteResponse = serde_json::from_value(json!({
+            "allowed": false, "reason": "working directory permission denied",
+            "policy": {"allowed": true, "reason": "policy permits command"},
+            "execution_failure": {"started": false, "stage": "cwd", "errno": 13, "message": "working directory permission denied"},
+            "decision_source": "static_policy", "verb_guidance": "ask for approval"
+        })).unwrap();
+        let value = tool_result(response.into());
+        assert_eq!(value["isError"], true);
+        assert_eq!(value["structuredContent"]["allowed"], false);
+        assert_eq!(value["structuredContent"]["policy"]["allowed"], true);
+        assert_eq!(
+            value["structuredContent"]["execution_failure"]["stage"],
+            "cwd"
+        );
+        let text = value["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("EXECUTION FAILED"));
+        assert!(!text.contains("DENIED"));
+        assert!(!text.contains("ask for approval"));
     }
 
     #[test]
@@ -4254,6 +4356,8 @@ mod tests {
     async fn request_missing_method_gets_invalid_request_error() {
         let executor = Arc::new(FakeExecutor {
             response: Ok(GuardToolResponse {
+                policy: None,
+                execution_failure: None,
                 allowed: true,
                 reason: "ok".to_string(),
                 exit_code: Some(0),
@@ -4292,6 +4396,8 @@ mod tests {
     async fn tools_list_has_stable_order_and_access_request_schema() {
         let executor = Arc::new(FakeExecutor {
             response: Ok(GuardToolResponse {
+                policy: None,
+                execution_failure: None,
                 allowed: true,
                 reason: "ok".to_string(),
                 exit_code: Some(0),
@@ -4391,6 +4497,8 @@ mod tests {
     async fn verb_list_tool_proxies_daemon_catalog() {
         let executor = Arc::new(FakeExecutor {
             response: Ok(GuardToolResponse {
+                policy: None,
+                execution_failure: None,
                 allowed: true,
                 reason: "ok".to_string(),
                 exit_code: Some(0),
@@ -4461,6 +4569,8 @@ mod tests {
     async fn access_list_tool_proxies_non_mutating_access_state() {
         let executor = Arc::new(FakeExecutor {
             response: Ok(GuardToolResponse {
+                policy: None,
+                execution_failure: None,
                 allowed: true,
                 reason: "ok".to_string(),
                 exit_code: Some(0),
@@ -4595,6 +4705,8 @@ mod tests {
     fn http_test_server() -> McpServer<FakeExecutor, FakeAdmin> {
         let executor = Arc::new(FakeExecutor {
             response: Ok(GuardToolResponse {
+                policy: None,
+                execution_failure: None,
                 allowed: true,
                 reason: "ok".to_string(),
                 exit_code: Some(0),

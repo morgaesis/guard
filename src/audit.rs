@@ -179,6 +179,10 @@ impl std::fmt::Display for AuditKind {
 /// which preserves insertion order for the stderr projection.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::wire::PolicyDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_failure: Option<crate::wire::ExecutionFailure>,
     pub kind: AuditKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
@@ -200,6 +204,10 @@ pub struct AuditEvent {
 
 #[derive(Serialize)]
 struct AuditEventSerializationView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<crate::wire::PolicyDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_failure: Option<crate::wire::ExecutionFailure>,
     kind: AuditKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     handle: Option<String>,
@@ -223,6 +231,8 @@ impl AuditEvent {
     fn serialization_view(&self) -> AuditEventSerializationView {
         let projected = redact_secret_exposure(self);
         AuditEventSerializationView {
+            policy: projected.policy,
+            execution_failure: projected.execution_failure,
             kind: projected.kind,
             handle: projected.handle,
             caller: projected.caller,
@@ -252,6 +262,14 @@ impl AuditEvent {
                 *value = crate::redact::redact_exact_and_registered_secrets(value, secrets);
             }
         }
+        if let Some(policy) = self.policy.as_mut() {
+            policy.reason =
+                crate::redact::redact_exact_and_registered_secrets(&policy.reason, secrets);
+        }
+        if let Some(failure) = self.execution_failure.as_mut() {
+            failure.message =
+                crate::redact::redact_exact_and_registered_secrets(&failure.message, secrets);
+        }
         redact(&mut self.handle, secrets);
         redact(&mut self.caller, secrets);
         redact(&mut self.session_fingerprint, secrets);
@@ -268,6 +286,8 @@ impl AuditEvent {
 
     pub fn new(kind: AuditKind) -> Self {
         Self {
+            policy: None,
+            execution_failure: None,
             kind,
             handle: None,
             caller: None,
@@ -278,6 +298,16 @@ impl AuditEvent {
             decision_source: None,
             fields: Vec::new(),
         }
+    }
+
+    pub fn execution(
+        mut self,
+        policy: crate::wire::PolicyDecision,
+        failure: Option<crate::wire::ExecutionFailure>,
+    ) -> Self {
+        self.policy = Some(policy);
+        self.execution_failure = failure.map(crate::wire::ExecutionFailure::sanitized);
+        self
     }
 
     pub fn handle(mut self, handle: impl Into<String>) -> Self {
@@ -354,6 +384,23 @@ impl AuditEvent {
         if let Some(source) = &self.decision_source {
             push_field(&mut line, "decision_source", source, false);
         }
+        if let Some(policy) = &self.policy {
+            push_field(
+                &mut line,
+                "policy_allowed",
+                &policy.allowed.to_string(),
+                false,
+            );
+            push_field(&mut line, "policy_reason", &policy.reason, true);
+        }
+        if let Some(failure) = &self.execution_failure {
+            push_field(
+                &mut line,
+                "execution_failure",
+                &serde_json::to_string(failure).expect("execution failure serializes"),
+                true,
+            );
+        }
         for (key, value) in &self.fields {
             push_field(&mut line, key, value, value_needs_quoting(value));
         }
@@ -363,7 +410,15 @@ impl AuditEvent {
 
 fn redact_secret_exposure(event: &AuditEvent) -> AuditEvent {
     let mut redacted = event.clone();
+    if let Some(policy) = redacted.policy.as_mut() {
+        policy.reason = crate::gating::sanitize_gate_text(&policy.reason);
+    }
+    redacted.execution_failure = redacted
+        .execution_failure
+        .map(crate::wire::ExecutionFailure::sanitized);
     if event.kind == AuditKind::SecretExposed {
+        redacted.policy = None;
+        redacted.execution_failure = None;
         redacted.cmd = redacted.cmd.map(|_| "[redacted]".to_string());
         redacted.reason = redacted.reason.map(|_| "[redacted]".to_string());
         redacted.fields = redacted

@@ -1,6 +1,5 @@
 use super::{
-    color_enabled_for_stderr, env_pairs_to_map, paint, parse_env_bool, resolve_bool_flag,
-    secret_pairs_to_map, AnsiColor, ServerCommands,
+    env_pairs_to_map, parse_env_bool, resolve_bool_flag, secret_pairs_to_map, ServerCommands,
 };
 use crate::cli_client::handle_status;
 use crate::injection::{collect_unique_pairs, is_valid_env_name};
@@ -1809,28 +1808,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 )
                 .await?;
 
-            if resp.allowed {
-                if !streamed_output {
-                    if let Some(stdout) = &resp.stdout {
-                        cli_print!("{}", stdout);
-                    }
-                    if let Some(stderr) = &resp.stderr {
-                        eprint!("{}", stderr);
-                    }
-                }
-                if let Some(code) = resp.exit_code {
-                    std::process::exit(code);
-                }
-                Ok(())
-            } else {
-                let color = color_enabled_for_stderr();
-                eprintln!(
-                    "{}: {}",
-                    paint("DENIED", AnsiColor::Red, color),
-                    resp.reason
-                );
-                std::process::exit(1);
-            }
+            crate::cli_client::render_gated_response(&resp, streamed_output, &binary, false)
         }
         ServerCommands::Status { socket, json } => handle_status(socket, json).await,
     }

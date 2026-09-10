@@ -9,6 +9,7 @@ use guard::gating::approval::{bound_approval_transcript, Approval, WaiterLease};
 use guard::gating::provisional::{Provisional, ProvisionalStatus};
 use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch};
 use guard::principal::PrincipalKey;
+use guard::wire::{ExecutionFailure, ExecutionStage, PolicyDecision};
 use serde::{Deserialize, Serialize};
 
 use super::execute::audit_session_fingerprint;
@@ -751,6 +752,12 @@ pub enum AdminResponse {
     /// A gate action ran (confirm/revert/approve/deny). Carries a human message
     /// and, for approve/revert, the resulting exit/output.
     GateAction {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<PolicyDecision>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_failure: Option<ExecutionFailure>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision_source: Option<String>,
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
@@ -1073,6 +1080,8 @@ pub struct ProvisionalSummary {
 /// Operator-facing view of a held/decided approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_failure: Option<ExecutionFailure>,
     pub handle: String,
     pub status: String,
     pub command: String,
@@ -1170,6 +1179,7 @@ impl ApprovalSummary {
         let (stdout, stdout_truncated) = exposed_transcript(a.result_stdout.as_deref());
         let (stderr, stderr_truncated) = exposed_transcript(a.result_stderr.as_deref());
         Self {
+            execution_failure: a.execution_failure.clone(),
             handle: a.handle.clone(),
             status: if approval_is_armed(&a) {
                 "armed".to_string()
@@ -1311,6 +1321,10 @@ pub(crate) const EXECUTE_FEATURE_TCP_NO_CWD: &str = "tcp-no-cwd-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_failure: Option<ExecutionFailure>,
     pub allowed: bool,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1563,12 +1577,11 @@ pub(super) enum ExecOutcome {
         stdout: Option<String>,
         stderr: Option<String>,
     },
-    /// Policy approved, but the child failed. `started` distinguishes a
-    /// spawn/setup failure where the child never ran (e.g. ENOENT on the binary)
-    /// from a failure after it was launched (e.g. the client stream dropped
-    /// mid-run). A contained forward command that fails with `started: true` may
-    /// already have applied its mutation, so the containment envelope keeps the
-    /// auto-revert armed rather than dropping it.
+    /// Policy approved, but execution failed. `started: false` establishes
+    /// that the command never started. `true` includes both a known start and
+    /// an unknown start state, distinguished by the public `ExecutionFailure`.
+    /// Interrupted containment requires operator judgment because the command
+    /// may already have applied its mutation.
     Failed { reason: String, started: bool },
     /// Policy approved, but the server intentionally did not spawn the child.
     /// Carries gate coverage when the dry-run was routed by the consequence gate.
@@ -1609,6 +1622,7 @@ struct ExecutionAuditMetadata {
 }
 
 pub(super) struct ExecuteResult {
+    execution_failure: Option<ExecutionFailure>,
     policy: PolicyOutcome,
     pub(super) exec: ExecOutcome,
     request_handle: Option<String>,
@@ -1640,6 +1654,7 @@ impl ExecuteResult {
             access_requests: Vec::new(),
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
+            execution_failure: None,
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1666,6 +1681,7 @@ impl ExecuteResult {
             access_requests: Vec::new(),
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
+            execution_failure: None,
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1678,18 +1694,25 @@ impl ExecuteResult {
         policy_reason: impl Into<String>,
         exec_reason: impl Into<String>,
     ) -> Self {
+        let exec_reason = Self::sanitize_prose(exec_reason);
         Self {
             policy: PolicyOutcome::Allowed {
                 reason: Self::sanitize_prose(policy_reason),
             },
             exec: ExecOutcome::Failed {
-                reason: Self::sanitize_prose(exec_reason),
+                reason: exec_reason.clone(),
                 started: false,
             },
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
+            execution_failure: Some(ExecutionFailure {
+                started: Some(false),
+                stage: ExecutionStage::Unknown,
+                errno: None,
+                message: exec_reason,
+            }),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1703,22 +1726,89 @@ impl ExecuteResult {
         policy_reason: impl Into<String>,
         exec_reason: impl Into<String>,
     ) -> Self {
+        let exec_reason = Self::sanitize_prose(exec_reason);
         Self {
             policy: PolicyOutcome::Allowed {
                 reason: Self::sanitize_prose(policy_reason),
             },
             exec: ExecOutcome::Failed {
-                reason: Self::sanitize_prose(exec_reason),
+                reason: exec_reason.clone(),
                 started: true,
             },
             request_handle: None,
             access_requests: Vec::new(),
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
+            execution_failure: Some(ExecutionFailure {
+                started: Some(true),
+                stage: ExecutionStage::Unknown,
+                errno: None,
+                message: exec_reason,
+            }),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn launch_failed(
+        policy_reason: impl Into<String>,
+        stage: ExecutionStage,
+        errno: Option<i32>,
+        message: impl Into<String>,
+    ) -> Self {
+        let message = Self::sanitize_prose(message);
+        Self::exec_failed(policy_reason, message.clone()).with_execution_failure(Some(
+            ExecutionFailure {
+                started: Some(false),
+                stage,
+                errno,
+                message,
+            },
+        ))
+    }
+
+    pub(super) fn with_execution_failure(mut self, failure: Option<ExecutionFailure>) -> Self {
+        if let (ExecOutcome::Failed { reason, started }, Some(failure)) = (&mut self.exec, failure)
+        {
+            let failure = failure.sanitized();
+            *reason = failure.message.clone();
+            // The internal containment flag is conservative when start is unknown.
+            *started = failure.started.unwrap_or(true);
+            self.execution_failure = Some(failure);
+        }
+        self
+    }
+
+    pub(super) fn exec_failed_unknown_start(
+        policy_reason: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        let message = Self::sanitize_prose(message);
+        Self::exec_failed_after_start(policy_reason, message.clone()).with_execution_failure(Some(
+            ExecutionFailure {
+                started: None,
+                stage: ExecutionStage::Unknown,
+                errno: None,
+                message,
+            },
+        ))
+    }
+
+    pub(super) fn execution_failure(&self) -> Option<&ExecutionFailure> {
+        self.execution_failure.as_ref()
+    }
+
+    pub(super) fn policy_decision(&self) -> PolicyDecision {
+        PolicyDecision {
+            allowed: self.policy_allowed(),
+            reason: self.policy_reason().to_string(),
+        }
+    }
+
+    pub(super) fn decision_source(&self) -> &str {
+        self.decision_source.as_str()
     }
 
     pub(super) fn dry_run(reason: impl Into<String>) -> Self {
@@ -1727,6 +1817,7 @@ impl ExecuteResult {
                 reason: Self::sanitize_prose(reason),
             },
             audit_metadata: ExecutionAuditMetadata::default(),
+            execution_failure: None,
             exec: ExecOutcome::DryRun { coverage: None },
             request_handle: None,
             access_requests: Vec::new(),
@@ -1751,6 +1842,7 @@ impl ExecuteResult {
             access_requests: Vec::new(),
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
+            execution_failure: None,
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1769,6 +1861,7 @@ impl ExecuteResult {
             access_requests: Vec::new(),
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
+            execution_failure: None,
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1804,6 +1897,7 @@ impl ExecuteResult {
             access_requests: Vec::new(),
             operator_guidance: false,
             audit_metadata: ExecutionAuditMetadata::default(),
+            execution_failure: None,
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1945,6 +2039,18 @@ impl ExecuteResult {
         self
     }
 
+    pub(super) fn with_admission_trace(mut self, trace: Option<&DecisionTrace>) -> Self {
+        if !self.policy_allowed() {
+            return self;
+        }
+        if let Some(trace) = trace {
+            self.decision_source =
+                serde_json::from_value(serde_json::Value::String(trace.decision_source.clone()))
+                    .unwrap_or(SessionDecisionSource::Validation);
+        }
+        self
+    }
+
     pub(super) fn with_decision_source(mut self, source: SessionDecisionSource) -> Self {
         self.decision_source = source;
         self
@@ -1968,6 +2074,11 @@ impl ExecuteResult {
     /// Build the `ExecuteResponse` wire payload. Callers that need to emit
     /// audit events first should do so before consuming the result.
     pub(super) fn into_response(self) -> ExecuteResponse {
+        let policy = Some(self.policy_decision());
+        let execution_failure = self
+            .execution_failure
+            .clone()
+            .map(ExecutionFailure::sanitized);
         let allowed = self.policy_allowed();
         let request_handle = self.request_handle;
         let access_requests = self.access_requests;
@@ -2010,13 +2121,14 @@ impl ExecuteResult {
         };
         let policy_reason = guard::gating::sanitize_gate_text(&policy_reason);
         match self.exec {
-            // Legacy arms keep status/handle/coverage = None so a gating-off
-            // response is byte-identical to today's wire format.
+            // Ungated execution leaves the consequence-gate fields absent.
             ExecOutcome::Completed {
                 exit_code,
                 stdout,
                 stderr,
             } => ExecuteResponse {
+                policy,
+                execution_failure,
                 allowed: true,
                 reason: policy_reason,
                 exit_code,
@@ -2039,11 +2151,10 @@ impl ExecuteResult {
             ExecOutcome::Failed {
                 reason: exec_msg, ..
             } => ExecuteResponse {
-                // Even though the policy allowed it, the command could not
-                // actually run. Surface this to the client as `allowed=false`
-                // with the exec error as the reason, because from the
-                // client's perspective nothing ran successfully. The audit
-                // stream still records both POLICY=ALLOWED and EXEC_FAILED.
+                policy,
+                execution_failure,
+                // Legacy clients fail closed. Typed fields retain admission
+                // separately from the failure and whether the command started.
                 allowed: false,
                 reason: format!(
                     "execution error: {}",
@@ -2067,13 +2178,14 @@ impl ExecuteResult {
                 decision_trace,
             },
             ExecOutcome::DryRun { coverage } => ExecuteResponse {
+                policy,
+                execution_failure,
                 allowed: true,
                 reason: policy_reason,
                 exit_code: Some(0),
                 stdout: Some("[DRY-RUN] policy allowed; command was not executed\n".to_string()),
                 stderr: None,
-                // A gated dry-run carries its coverage and a DryRun status; a
-                // plain dry-run stays byte-identical to the pre-gating wire.
+                // A gated dry-run carries its coverage and a DryRun status.
                 status: coverage.as_ref().map(|_| GateStatus::DryRun),
                 handle: None,
                 approval_options: Vec::new(),
@@ -2089,6 +2201,8 @@ impl ExecuteResult {
                 decision_trace,
             },
             ExecOutcome::NotAttempted => ExecuteResponse {
+                policy,
+                execution_failure,
                 allowed,
                 reason: policy_reason,
                 exit_code: None,
@@ -2114,6 +2228,8 @@ impl ExecuteResult {
                 let approval_options = access_request.approval_options.clone();
                 let access_requests = vec![access_request];
                 ExecuteResponse {
+                    policy,
+                    execution_failure,
                     // Approved but held: allowed=true (not a denial), no exit code.
                     allowed: true,
                     reason: policy_reason,
@@ -2144,6 +2260,8 @@ impl ExecuteResult {
                 deadline_unix,
                 window_secs,
             } => ExecuteResponse {
+                policy,
+                execution_failure,
                 allowed: true,
                 reason: policy_reason,
                 exit_code,
@@ -2188,6 +2306,8 @@ impl ExecuteResult {
                     ),
                 };
                 ExecuteResponse {
+                    policy,
+                    execution_failure,
                     allowed: false,
                     reason,
                     exit_code,

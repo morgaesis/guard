@@ -245,14 +245,14 @@ enum MainArgs {
         disable_help_flag = true,
         after_help = "Use `guard run <binary> --help` to pass --help to the child command.\n\n\
             Exit codes:\n  \
-            125    guard operational error (daemon unreachable, protocol failure)\n  \
+            125    guard operational error (connection, protocol, or execution failure)\n  \
             126    denied by policy\n  \
             127    held for operator approval\n  \
             2      invalid guard CLI usage\n  \
             other  the child's own exit status, propagated untranslated\n\n\
             A child can itself exit 125-127 (`sh -c` exits 127 for a missing command;\n\
             `git bisect skip` uses 125), so the exit code alone cannot prove a\n\
-            guard-origin outcome. Use --json and read `allowed`/`status` for certainty."
+            guard-origin outcome. Use --json and read `policy`/`execution_failure`/`allowed`/`status` for certainty."
     )]
     Run {
         /// Override the daemon socket or Windows named pipe.
