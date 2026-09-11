@@ -42,6 +42,9 @@ impl ClientConfig {
     }
 
     pub fn load() -> Result<Self> {
+        if guard::env::guard_env("NO_AUTO_CONFIG").as_deref() == Some("1") {
+            return Ok(Self::default());
+        }
         let path = Self::config_path()?
             .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?;
 

@@ -188,8 +188,11 @@ jobs:
             deployment/systemd/guard-exec-as-caller.service \
             deployment/systemd/guard.env.example \
             deployment/systemd/guard-operator \
+            deployment/systemd/install-guard \
+            deployment/systemd/test-install-guard.sh \
             deployment/systemd/test-guard-service-expansion.sh \
             "$root/deployment/systemd/"
+          printf '%s\n' "${RELEASE_LABEL#v}" > "$root/deployment/systemd/PACKAGE-VERSION"
           cp deployment/hardening/guard.apparmor.example \
             deployment/hardening/seccomp-deny-escape.json \
             "$root/deployment/hardening/"
@@ -200,6 +203,8 @@ jobs:
             x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
               chmod 0755 "$root/${ARTIFACT_NAME}" \
                 "$root/deployment/systemd/guard-operator" \
+                "$root/deployment/systemd/install-guard" \
+                "$root/deployment/systemd/test-install-guard.sh" \
                 "$root/deployment/systemd/test-guard-service-expansion.sh"
               ;;
             x86_64-pc-windows-msvc)
@@ -277,6 +282,10 @@ jobs:
           case "$BUILD_TARGET" in
             *-linux-gnu)
               test -x "$root/deployment/systemd/guard-operator"
+              test -x "$root/deployment/systemd/install-guard"
+              test -x "$root/deployment/systemd/test-install-guard.sh"
+              test "$(cat "$root/deployment/systemd/PACKAGE-VERSION")" = "${RELEASE_LABEL#v}"
+              "$root/deployment/systemd/test-install-guard.sh" --verify-only
               test -x "$root/deployment/systemd/test-guard-service-expansion.sh"
               test -f "$root/deployment/systemd/guard.service"
               test -f "$root/deployment/systemd/guard-exec-as-caller.service"

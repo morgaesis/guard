@@ -66,6 +66,57 @@ fn missing_subcommand_remains_invalid_usage() {
 }
 
 #[cfg(unix)]
+#[test]
+fn explicit_no_auto_config_isolates_startup_without_changing_normal_loading() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config");
+    std::fs::create_dir_all(config_root.join("guard")).unwrap();
+    std::fs::write(
+        config_root.join("guard/client.yaml"),
+        "server_socket: configured.sock\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join(".env"),
+        "XDG_CONFIG_HOME=relative-invalid-config\n",
+    )
+    .unwrap();
+
+    let run = |disable: Option<&str>, config: Option<&Path>| {
+        let mut command = Command::new(GUARD_BIN);
+        command
+            .args(["config", "show", "--json"])
+            .current_dir(directory.path())
+            .env_remove("GUARD_NO_AUTO_CONFIG")
+            .env_remove("XDG_CONFIG_HOME");
+        if let Some(value) = disable {
+            command.env("GUARD_NO_AUTO_CONFIG", value);
+        }
+        if let Some(path) = config {
+            command.env("XDG_CONFIG_HOME", path);
+        }
+        command.output().unwrap()
+    };
+
+    // A normal client loads its stored configuration and discovers cwd .env.
+    for disable in [None, Some("0")] {
+        let configured = run(disable, Some(&config_root));
+        assert!(configured.status.success());
+        let config: serde_json::Value = serde_json::from_slice(&configured.stdout).unwrap();
+        assert_eq!(config["server_socket"], "configured.sock");
+        assert!(!run(disable, None).status.success());
+    }
+
+    for config in [Some(config_root.as_path()), None] {
+        let isolated = run(Some("1"), config);
+        assert!(isolated.status.success());
+        let config: serde_json::Value = serde_json::from_slice(&isolated.stdout).unwrap();
+        assert!(config["server_socket"].is_null());
+        assert_eq!(config["admin_token_configured"], false);
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn execution_failure_cli_distinguishes_policy_in_text_and_json() {
     use serde_json::json;

@@ -1570,7 +1570,9 @@ async fn main() {
 }
 
 async fn run_main() -> Result<()> {
-    let _ = dotenvy::dotenv();
+    if guard_env("NO_AUTO_CONFIG").as_deref() != Some("1") {
+        let _ = dotenvy::dotenv();
+    }
 
     // Windows service entry. The installer registers the daemon with
     // `server start ... --service`; when the Service Control Manager launches
