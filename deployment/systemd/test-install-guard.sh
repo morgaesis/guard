@@ -18,6 +18,11 @@ fixture=$(mktemp -d /tmp/guard-installer-fixture.XXXXXXXX)
 printf 'Fixture retained at %s\n' "$fixture"
 cat > /usr/bin/systemctl <<'MOCK'
 #!/bin/sh
+if test "$1" = show; then
+  test "$2" = --all && test "$4" = guard.service || exit 91
+  cat /tmp/guard-fixture-unit.properties
+  exit 0
+fi
 test "$1" = is-active || { echo 'unexpected service mutation' >&2; exit 90; }
 if test -f /tmp/guard-fixture-service-active; then echo active; exit 0; fi
 echo inactive
@@ -177,6 +182,142 @@ if [[ -f /fixtures/guard-new && -f /fixtures/guard-operator ]]; then
   cmp -s /var/lib/guard/state.db "$fixture/original-state"
   printf 'Actual 0.8.8 package installation and mixed-version refusal passed\n'
 fi
+
+# A compatible existing deployment keeps its unit/drop-in and identity contract.
+mkdir /etc/systemd/system/guard.service.d
+cat > /etc/systemd/system/guard.service.d/10-socket-group.conf <<'DROPIN'
+[Service]
+Group=guard
+SupplementaryGroups=guard
+ExecStart=
+ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --socket-group guard --state-db /var/lib/guard/state.db --users ${GUARD_ALLOWED_UIDS} --admin-token-stdin
+DROPIN
+printf '[Service]\nPrivateTmp=false\n' > /etc/systemd/system/guard.service.d/50-host-tmp.conf
+cat > /tmp/guard-fixture-unit.properties <<'PROPERTIES'
+LoadState=loaded
+NeedDaemonReload=no
+FragmentPath=/etc/systemd/system/guard.service
+DropInPaths=/etc/systemd/system/guard.service.d/10-socket-group.conf /etc/systemd/system/guard.service.d/50-host-tmp.conf
+ExecStart={ path=/usr/local/bin/guard ; argv[]=/usr/local/bin/guard server start --socket /run/guard/guard.sock --socket-group guard --state-db /var/lib/guard/state.db --users ${GUARD_ALLOWED_UIDS} --admin-token-stdin ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Type=simple
+User=guard
+Group=guard
+SupplementaryGroups=guard
+DynamicUser=no
+WorkingDirectory=/var/lib/guard
+StandardInput=file
+EnvironmentFiles=/etc/default/guard (ignore_errors=yes)
+RootDirectory=
+RootImage=
+RootDirectoryStartOnly=no
+PrivateUsers=no
+PrivateNetwork=no
+PrivateTmp=no
+BindPaths=
+BindReadOnlyPaths=
+TemporaryFileSystem=
+InaccessiblePaths=
+MountImages=
+ExtensionImages=
+JoinsNamespaceOf=
+StateDirectory=guard guard/.ssh
+RuntimeDirectory=guard
+PROPERTIES
+cp /tmp/guard-fixture-unit.properties "$fixture/original-unit.properties"
+if [[ -f /fixtures/guard-new && -f /fixtures/guard-old ]]; then
+  # Replace only a derived fixture binary to exercise an actual version update.
+  mv /usr/local/bin/guard "$fixture/before-existing-update"
+  cp /fixtures/guard-old /usr/local/bin/guard
+  chmod 755 /usr/local/bin/guard
+  arguments=(--binary /fixtures/guard-new --version 0.8.8 --sha256 "$(sha256sum /fixtures/guard-new | cut -d ' ' -f 1)")
+else
+  make_binary 1.2.5
+  arguments=(--binary "$fixture/candidate binary" --version 1.2.5 --sha256 "$(sha256sum "$fixture/candidate binary" | cut -d ' ' -f 1)")
+fi
+preserved_snapshot() {
+  # Hashes and metadata stay inside the private fixture; contents are not logged.
+  find /etc/guard /etc/default/guard /var/lib/guard /etc/systemd/system /etc/passwd /etc/group -print0 |
+    sort -z | xargs -0 stat -c '%n:%d:%i:%u:%g:%a:%Y'
+  find /etc/guard /etc/default/guard /var/lib/guard /etc/systemd/system /etc/passwd /etc/group -type f -print0 |
+    sort -z | xargs -0 sha256sum
+}
+preserved_snapshot > "$fixture/preserved-before-update"
+cp /usr/local/bin/guard "$fixture/binary-before-update"
+cp /usr/local/sbin/guard-operator "$fixture/operator-before-update"
+cp /tmp/guard-fixture-candidate-executed "$fixture/executions-before-check"
+touch /tmp/guard-fixture-service-active
+"$installer" --check --update-binaries --service guard.service "${arguments[@]}" > "$fixture/check-existing-active.log"
+grep -q '^PREREQUISITE stop guard.service before --apply' "$fixture/check-existing-active.log"
+cmp -s /tmp/guard-fixture-candidate-executed "$fixture/executions-before-check"
+preserved_snapshot > "$fixture/preserved-after-check"
+cmp -s "$fixture/preserved-before-update" "$fixture/preserved-after-check"
+if "$installer" --apply --update-binaries --service guard.service "${arguments[@]}" > "$fixture/refuse-existing-active.log" 2>&1; then exit 1; fi
+grep -q 'stop and inspect' "$fixture/refuse-existing-active.log"
+if "$installer" --check --update-binaries "${arguments[@]}" > "$fixture/refuse-implicit-service.log" 2>&1; then exit 1; else test "$?" = 2; fi
+mv /tmp/guard-fixture-service-active "$fixture/existing-active.control"
+"$installer" --apply --update-binaries --service guard.service "${arguments[@]}" > "$fixture/update-existing.log"
+cmp -s /usr/local/bin/guard "${arguments[1]}"
+cmp -s /usr/local/sbin/guard-operator "$fixture/package/guard-operator"
+test "$(stat -c '%u:%g:%a' /usr/local/sbin/guard-operator)" = 0:0:700
+preserved_snapshot > "$fixture/preserved-after-update"
+cmp -s "$fixture/preserved-before-update" "$fixture/preserved-after-update"
+inode=$(stat -c '%i' /usr/local/bin/guard)
+"$installer" --apply --update-binaries --service guard.service "${arguments[@]}" > "$fixture/update-existing-repeat.log"
+test "$(stat -c '%i' /usr/local/bin/guard)" = "$inode"
+"$installer" --check --update-binaries --service guard.service "${arguments[@]}" > "$fixture/check-existing-repeat.log"
+grep -q 'Planned changes: 0' "$fixture/check-existing-repeat.log"
+preserved_snapshot > "$fixture/preserved-after-repeat"
+cmp -s "$fixture/preserved-before-update" "$fixture/preserved-after-repeat"
+
+reject_existing() {
+  preserved_snapshot > "$fixture/before-refuse-existing-$1"
+  if "$installer" --apply --update-binaries --service guard.service "${arguments[@]}" > "$fixture/refuse-existing-$1.log" 2>&1; then
+    echo "unexpected existing-unit acceptance: $1" >&2; exit 1
+  fi
+  grep -q "$2" "$fixture/refuse-existing-$1.log"
+  preserved_snapshot > "$fixture/after-refuse-existing-$1"
+  cmp -s "$fixture/before-refuse-existing-$1" "$fixture/after-refuse-existing-$1"
+  cmp -s /usr/local/bin/guard "${arguments[1]}"
+  cmp -s /usr/local/sbin/guard-operator "$fixture/package/guard-operator"
+}
+for failure in endpoint state-path credential-mode stdin-mode binary unit-path identity namespace pending-reload missing-property; do
+  cp "$fixture/original-unit.properties" /tmp/guard-fixture-unit.properties
+  case "$failure" in
+    endpoint) sed -i 's|--socket /run/guard/guard.sock|--socket /run/other.sock|' /tmp/guard-fixture-unit.properties; expected='socket must match' ;;
+    state-path) sed -i 's|--state-db /var/lib/guard/state.db|--state-db /var/lib/other/state.db|' /tmp/guard-fixture-unit.properties; expected='database path' ;;
+    credential-mode) sed -i 's/--admin-token-stdin/--admin-token-file other/' /tmp/guard-fixture-unit.properties; expected='credential mode' ;;
+    stdin-mode) sed -i 's/^StandardInput=file$/StandardInput=socket/' /tmp/guard-fixture-unit.properties; expected='protected stdin file' ;;
+    binary) sed -i 's|path=/usr/local/bin/guard|path=/usr/local/bin/other|' /tmp/guard-fixture-unit.properties; expected='directly execute' ;;
+    unit-path) sed -i 's|^FragmentPath=.*|FragmentPath=/run/systemd/system/guard.service|' /tmp/guard-fixture-unit.properties; expected='installed unit path' ;;
+    identity) sed -i 's/^User=guard$/User=root/' /tmp/guard-fixture-unit.properties; expected='guard identity' ;;
+    namespace) sed -i 's|^RootDirectory=$|RootDirectory=/other|' /tmp/guard-fixture-unit.properties; expected='namespace or lifecycle' ;;
+    pending-reload) sed -i 's/^NeedDaemonReload=no$/NeedDaemonReload=yes/' /tmp/guard-fixture-unit.properties; expected='pending unit-file changes' ;;
+    missing-property) sed -i '/^RootImage=/d' /tmp/guard-fixture-unit.properties; expected='property unavailable' ;;
+  esac
+  reject_existing "$failure" "$expected"
+done
+cp "$fixture/original-unit.properties" /tmp/guard-fixture-unit.properties
+cp /etc/systemd/system/guard.service.d/50-host-tmp.conf "$fixture/original-tmp-drop-in"
+printf 'StandardInput=file:/etc/guard/other.token\n' >> /etc/systemd/system/guard.service.d/50-host-tmp.conf
+reject_existing stdin-path 'stdin must use'
+mv /etc/systemd/system/guard.service.d/50-host-tmp.conf "$fixture/rejected-stdin-drop-in"
+cp "$fixture/original-tmp-drop-in" /etc/systemd/system/guard.service.d/50-host-tmp.conf
+chmod 666 /etc/systemd/system/guard.service.d/50-host-tmp.conf
+reject_existing untrusted-unit 'writable path'
+chmod 600 /etc/systemd/system/guard.service.d/50-host-tmp.conf
+printf 'ExecStart=+/usr/local/bin/guard server start --admin-token-stdin\n' >> /etc/systemd/system/guard.service.d/50-host-tmp.conf
+reject_existing privilege-prefix 'executable prefix'
+mv /etc/systemd/system/guard.service.d/50-host-tmp.conf "$fixture/rejected-privilege-drop-in"
+cp "$fixture/original-tmp-drop-in" /etc/systemd/system/guard.service.d/50-host-tmp.conf
+chmod 600 /etc/guard/admin.token
+reject_existing token-mode 'mode 0400'
+chmod 400 /etc/guard/admin.token
+printf 'ExecStartPre=/bin/true\n' >> /etc/systemd/system/guard.service.d/50-host-tmp.conf
+reject_existing lifecycle 'lifecycle commands'
+mv /etc/systemd/system/guard.service.d/50-host-tmp.conf "$fixture/rejected-lifecycle-drop-in"
+cp "$fixture/original-tmp-drop-in" /etc/systemd/system/guard.service.d/50-host-tmp.conf
+if grep -Fq -f "$fixture/original-token" "$fixture/"*.log; then echo 'token leaked to diagnostics' >&2; exit 1; fi
+printf 'Existing-unit update, active dry-run, preservation, convergence and compatibility refusals passed\n'
 
 # Execute the documented Bash bodies, changing only absolute fixture paths.
 documentation=$assets/../../DEPLOYMENT.md

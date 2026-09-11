@@ -88,12 +88,11 @@ environment. The candidate must match the installer package version and be at
 least 0.8.8, which provides the operator's automatic-configuration opt-out.
 The version probe is an apply-only check. Prerelease binaries are unsupported.
 
-Both packaged services must be inactive. The installer refuses custom units,
-drop-ins, nonstandard unit locations and incompatible account or state layouts.
-It leaves those deployments intact for manual review; it does not replace a
-custom socket group or hardening configuration with packaged defaults. Managed
-unit updates require unchanged recorded file digests. File replacements use a
-staged file and rename in the destination directory. The group of file updates
+Initial installation and packaged-unit updates require both services inactive
+and refuse custom units or drop-ins. Existing deployments use the explicit
+`--update-binaries` mode below. Managed unit updates require unchanged recorded
+file digests. File replacements use a staged file and rename in the destination
+directory. The group of file updates
 is not one transaction: after an interrupted apply, inspect `--check` and keep
 the service stopped until every file is reconciled with the reviewed package.
 
@@ -130,6 +129,53 @@ guard status --json
 
 Compare the invoked client's version and the daemon version in the status
 response. A replaced file does not prove that the running daemon uses it.
+
+### Existing service updates
+
+Use `--update-binaries --service NAME` to update an existing deployment while
+preserving its service contract. The installer replaces only
+`/usr/local/bin/guard` and `/usr/local/sbin/guard-operator` from the same verified
+package. Units, drop-ins, configuration, tokens, state, identities, group
+memberships and ownership records remain unchanged. It creates no missing
+installation objects. `packaged-units.sha256` records only unit-file hashes;
+it contains no installed binary version or digest and remains unchanged.
+
+The selected unit must be loaded from `/etc/systemd/system` with no pending
+unit-file changes. Its effective command must directly start the installed
+binary with the canonical socket, database, submitting-UID restriction and
+`--admin-token-stdin`. Stdin must reference `/etc/guard/admin.token`, and the
+service identity and state ownership must match the selected service model.
+Existing service and socket groups and `PrivateTmp=yes/no` are supported.
+The installer checks root ownership and safe permissions on the selected unit
+and its `/etc/systemd/system` drop-ins. Unit-file continuations and includes,
+additional lifecycle commands, alternative credentials or endpoints, dynamic
+identities, root images/directories and filesystem remapping are unsupported.
+An unsupported configuration is refused before installed files change.
+
+The read-only check may run while services are active. It reports the stop
+prerequisite and never runs the candidate. Use the verified archive variables
+above and select the deployed unit explicitly:
+
+```bash
+"$archive_root/deployment/systemd/install-guard" --check --update-binaries \
+  --service guard.service --binary "$archive_root/guard" \
+  --version "$release_version" --sha256 "$expected_binary_hash"
+```
+
+Complete the [stopped snapshot procedure](#upgrades) and retain independent
+recovery access before applying. Both services must be inactive; configuration
+and service state are checked again after candidate staging:
+
+```bash
+"$archive_root/deployment/systemd/install-guard" --apply --update-binaries \
+  --service "$guard_unit" --binary "$archive_root/guard" \
+  --version "$release_version" --sha256 "$expected_binary_hash"
+```
+
+The installer does not stop, start or reload systemd. Follow the activation and
+verification steps below, reconcile separately managed clients, and repeat the
+same check to require zero planned changes. A binary-only update preserves
+existing unit semantics; it does not apply changes from the packaged unit files.
 
 Use `--users` to restrict submitting Unix uids when the socket group is broader
 than the intended agent account. Set `GUARD_ALLOWED_UIDS=1000,1001` in
@@ -388,12 +434,12 @@ guard_unit="$(cat "$backup_dir/service-unit")" || exit 1
 printf 'Snapshot: %s\n' "$backup_dir"
 ```
 
-Preserve this path for the rollback action. For an unmodified packaged deployment,
-run the installer's `--check` and `--apply` commands with the verified new archive.
-For custom units or drop-ins, review the differences manually and update only
-approved packaged files by installing a temporary file beside each destination
-and renaming it into place. Keep the existing environment, token, state,
-identities, socket group and drop-ins. Never overwrite them with examples.
+Preserve this path for the rollback action. Run the existing-service
+`--check --update-binaries --service "$guard_unit"` and
+`--apply --update-binaries --service "$guard_unit"` commands with the verified
+new archive. This keeps the existing environment, token, state, identities,
+socket group and drop-ins. An incompatible configuration requires a separate
+reviewed deployment procedure; do not remove overrides to pass the check.
 
 After the coordinated client update, reload and start explicitly, then verify
 the running executable digest against the verified release manifest:
@@ -412,8 +458,8 @@ guard run id
 
 Also exercise an approved representative verb and a genuine denial under the
 intended agent identity. Verify token and launcher permissions and require an
-installer `--check` with zero planned changes for a managed layout. A custom
-layout retains its documented manual checks. Only then mark the rollback action
+installer `--check --update-binaries --service "$guard_unit"` with zero planned
+changes for the existing deployment. Only then mark the rollback action
 successful and disarm its timer.
 
 Rollback requires another stop and a verified matching snapshot. Preserve the
