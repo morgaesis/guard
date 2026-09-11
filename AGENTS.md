@@ -27,6 +27,10 @@ Follow [DEPLOYMENT.md](DEPLOYMENT.md#unix-service) for local installation and
 [the upgrade procedure](DEPLOYMENT.md#upgrades) for an existing daemon. Read the
 effective unit, drop-ins, identity and socket-group configuration before applying
 changes. Preserve existing tokens, configuration, state and account memberships.
+Use `--check --update-binaries --service NAME` for an existing deployment;
+it may inspect an active service. Apply the same mode only after the stopped
+snapshot. It replaces only the binary and operator launcher, preserves the
+unit-hash receipt, and revalidates the effective unit before replacement.
 Do not install examples over a custom deployment or add passwordless sudoers.
 
 The operator launcher and Guard binary form one versioned package. They require

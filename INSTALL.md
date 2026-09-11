@@ -36,8 +36,10 @@ generic verb examples. Linux service installation uses
 Supply the verified binary path, package version and SHA-256. The installer
 requires a matching stable package version of at least 0.8.8 and installs the
 operator launcher root-owned with mode `0700`; it does not configure sudoers or
-activate a service. Existing custom units and drop-ins require manual review
-and remain untouched. See the [Unix deployment guide](DEPLOYMENT.md#unix-service)
+activate a service. Existing deployments use explicit
+`--update-binaries --service NAME` to retain compatible units, drop-ins and group
+settings while updating the binary pair. See the
+[Unix deployment guide](DEPLOYMENT.md#unix-service)
 for exact commands, state preservation and separate service activation.
 
 The Windows archive includes `guard.exe`, the PowerShell
