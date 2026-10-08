@@ -205,6 +205,14 @@ Resolution follows these constraints:
 6. If evaluation cannot produce one safe plan, the request holds. Authorization
    ambiguity fails closed with an escalation handle.
 
+A raw command matches a template only at the same arity, with every literal
+character of each template element present verbatim. An element may hold
+several placeholders, and a name may repeat within or across elements with one
+value. Each candidate value must pass its parameter's declared validation, and
+template text is never compiled as a pattern. When more than one parameter
+binding renders the same argv, or the split search exceeds its internal bound,
+that template contributes no match.
+
 Catalog name order never chooses credentials or rollback. Global generated
 coverage cannot defeat an explicit operator deny. A live session can evaluate
 past matching global generated coverage under its own intent, while protocol
