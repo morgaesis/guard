@@ -1,0 +1,68 @@
+name: Dependabot reconcile
+
+# Merges eligible Dependabot pull requests and keeps mainline workflow runs
+# present for the commits those merges create.
+#
+# Write permission is isolated here. This workflow has no pull request
+# trigger, runs only the default-branch copy of scripts/dependabot-automerge.sh,
+# and decides from GitHub API metadata without checking out or executing pull
+# request content. A pull request merges only when the policy classifies it as
+# eligible and every required status check succeeded for its exact head
+# commit; the branch ruleset still applies to the merge.
+#
+# The schedule covers every open Dependabot pull request, including ones that
+# were opened before this workflow existed.
+
+"on":
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: dependabot-reconcile
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Merge eligible dependency updates
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      checks: read  # Reads required check results for pull request head commits.
+      contents: write  # Merges eligible pull requests.
+      pull-requests: write  # Merges eligible pull requests.
+    steps:
+      - name: Check out the default-branch policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Merge eligible pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/dependabot-automerge.sh reconcile
+
+  mainline-runs:
+    name: Ensure mainline workflow runs
+    needs: merge
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write  # Lists workflow runs and dispatches missing mainline runs.
+      contents: read
+    steps:
+      - name: Check out the default-branch policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Dispatch missing mainline runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/dependabot-automerge.sh ensure-mainline-runs
