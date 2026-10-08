@@ -297,10 +297,12 @@ fn redact_bare_long_tokens(text: &str) -> String {
 /// `key:` and `pass:` fields are pervasive structural metadata (Kubernetes
 /// selector/toleration `key:` entries, Docker JSON `"Key"` members, test
 /// reports' `pass:`) and are never credentials by themselves. Bare `token:`,
-/// `secret:`, `auth:`, and `cred(s):` DO match: an inline scalar under those
-/// names is a credential often enough (docker `config.json` `"auth"`,
-/// `token:` in kubeconfigs) that redaction wins the trade.
-const SECRET_NAME_SUBPATTERN: &str = r"(?:[A-Za-z0-9_.-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|CREDS?|AUTHORIZATION|AUTH|BEARER)|[A-Za-z0-9_.-]+(?:KEY|PASS))";
+/// `secret:`, `auth:`, `cred(s):` and `psk:` DO match: an inline scalar under
+/// those names is a credential often enough (docker `config.json` `"auth"`,
+/// `token:` in kubeconfigs) that redaction wins the trade. `PSK` covers IPsec
+/// pre-shared keys, which CloudStack returns as a short operator-chosen
+/// `ipsecpsk` that no value-shape pass recognizes.
+const SECRET_NAME_SUBPATTERN: &str = r"(?:[A-Za-z0-9_.-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|CREDS?|AUTHORIZATION|AUTH|BEARER|PSK)|[A-Za-z0-9_.-]+(?:KEY|PASS))";
 
 fn secret_name_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
@@ -578,7 +580,7 @@ fn yaml_secret_name_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)^\s*[+-]?\s*-\s*name\s*:\s*["']?[^"'\n]*(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[^"'\n]*["']?\s*$"#,
+            r#"(?i)^\s*[+-]?\s*-\s*name\s*:\s*["']?[^"'\n]*(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|PSK)[^"'\n]*["']?\s*$"#,
         )
         .unwrap()
     })
@@ -2467,6 +2469,132 @@ mod tests {
         let output = redact_output_text(input);
         assert!(!output.contains("0Xw9kQrf"), "got: {output}");
         assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    /// A short, low-entropy value generated per run, so no fixture carries a
+    /// credential-shaped literal and only the field name can trigger redaction.
+    fn short_generated_value(label: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or_default();
+        format!("{label}{:x}", nanos ^ std::process::id())
+    }
+
+    #[test]
+    fn test_redact_short_values_under_secret_field_names() {
+        for name in [
+            "psk",
+            "ipsecpsk",
+            "IPSEC_PSK",
+            "vpn-psk",
+            "secretkey",
+            "password",
+            "privatekey",
+            "private_key",
+            "presharedkey",
+            "passphrase",
+        ] {
+            let value = short_generated_value("v");
+            for input in [
+                format!(r#"{{"{name}": "{value}"}}"#),
+                format!("{name}: {value}"),
+                format!("{name}={value}"),
+            ] {
+                let output = redact_output_text(&input);
+                assert!(!output.contains(&value), "{name}: got {output}");
+                assert!(output.contains(name), "{name}: got {output}");
+                assert!(output.contains("[REDACTED]"), "{name}: got {output}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_redact_keeps_values_under_lookalike_field_names() {
+        for input in [
+            r#""passive": false,"#,
+            r#""pskmode": "ikev2","#,
+            r#""ikepolicy": "aes256-sha256;modp2048","#,
+            r#""keyword": "vpn","#,
+        ] {
+            assert_eq!(redact_output_text(input), input);
+        }
+    }
+
+    #[test]
+    fn test_redact_cmk_list_vpnconnections_ipsecpsk() {
+        let psk = short_generated_value("p");
+        let input = format!(
+            r#"{{
+  "count": 1,
+  "vpnconnection": [
+    {{
+      "account": "admin",
+      "cidrlist": "10.10.0.0/24",
+      "domain": "ROOT",
+      "dpd": false,
+      "esplifetime": 3600,
+      "esppolicy": "aes256-sha256",
+      "forceencap": false,
+      "gateway": "192.0.2.10",
+      "id": "00000000-0000-4000-8000-000000000001",
+      "ikelifetime": 86400,
+      "ikepolicy": "aes256-sha256;modp2048",
+      "ikeversion": "ike",
+      "ipsecpsk": "{psk}",
+      "passive": false,
+      "publicip": "198.51.100.20",
+      "s2scustomergatewayid": "00000000-0000-4000-8000-000000000002",
+      "s2svpngatewayid": "00000000-0000-4000-8000-000000000003",
+      "splitconnections": false,
+      "state": "Connected"
+    }}
+  ]
+}}
+"#
+        );
+        let output = redact_output_text(&input);
+        assert!(!output.contains(&psk), "got: {output}");
+        assert!(
+            output.contains(r#""ipsecpsk": "[REDACTED]","#),
+            "got: {output}"
+        );
+        assert_eq!(output.matches("[REDACTED]").count(), 1, "got: {output}");
+        for kept in [
+            r#""passive": false,"#,
+            r#""gateway": "192.0.2.10","#,
+            r#""ikepolicy": "aes256-sha256;modp2048","#,
+            r#""id": "00000000-0000-4000-8000-000000000001","#,
+        ] {
+            assert!(output.contains(kept), "{kept} lost: {output}");
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["vpnconnection"][0]["ipsecpsk"], "[REDACTED]");
+    }
+
+    #[test]
+    fn test_redact_stateful_yaml_env_psk_value() {
+        let value = short_generated_value("v");
+        let input = format!("        - name: VPN_PSK\n          value: {value}\n");
+        let output = redact_output_text(&input);
+        assert!(!output.contains(&value), "got: {output}");
+        assert!(output.contains("value: [REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_command_argv_ipsecpsk_is_a_sensitive_literal() {
+        let psk = short_generated_value("p");
+        let args = vec![
+            "create".to_string(),
+            "vpncustomergateway".to_string(),
+            format!("ipsecpsk={psk}"),
+            "gateway=192.0.2.10".to_string(),
+        ];
+        assert!(command_contains_sensitive_literals("cmk", &args));
+        let line = redact_command_line("cmk", &args);
+        assert!(!line.contains(&psk), "got: {line}");
+        assert!(line.contains("ipsecpsk=[REDACTED]"), "got: {line}");
+        assert!(line.contains("gateway=192.0.2.10"), "got: {line}");
     }
 
     #[test]
