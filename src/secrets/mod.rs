@@ -45,6 +45,10 @@ pub fn legacy_sentinel() -> PrincipalKey {
 /// Trait for secret storage backends.
 ///
 /// Implementors must be safe to share across threads (Send + Sync).
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait marks boxed futures as must_use"
+)]
 #[async_trait]
 pub trait SecretBackend: Send + Sync {
     /// Returns the backend name for logging/debugging.

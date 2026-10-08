@@ -70,6 +70,10 @@ pub enum HoldDecision {
 
 /// Implemented by the daemon to arm the proxy's synthesized reverts in its
 /// consequence machinery.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait marks boxed futures as must_use"
+)]
 #[async_trait]
 pub trait GateSink: Send + Sync {
     /// Durably stage an auto-revert before a mutation is sent upstream.
@@ -331,6 +335,10 @@ pub struct ApiSessionEvent {
     pub credential_ref: String,
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait marks boxed futures as must_use"
+)]
 #[async_trait]
 pub trait ApiSessionSink: Send + Sync {
     async fn resolve(&self, token: &str) -> Option<ApiSessionContext>;
@@ -348,6 +356,10 @@ pub trait ApiSessionSink: Send + Sync {
 /// One-shot proxy-owned upstream handoff. Authority providers can invoke this
 /// only while their retained lease is in lexical scope; they cannot construct
 /// or return a stand-in capability.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait marks boxed futures as must_use"
+)]
 #[async_trait]
 pub trait ApiForwardHandoff: Send {
     async fn forward(&mut self) -> Result<(), String>;
@@ -397,6 +409,10 @@ pub enum ApiCoverageVerdict {
     },
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait marks boxed futures as must_use"
+)]
 #[async_trait]
 pub trait ApiJudge: Send + Sync {
     /// Whether this resolver can invoke an evaluator. A coverage-only resolver

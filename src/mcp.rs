@@ -211,6 +211,10 @@ impl From<server::ExecuteResponse> for GuardToolResponse {
     }
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait marks boxed futures as must_use"
+)]
 #[async_trait]
 trait GuardExecutor: Send + Sync {
     async fn execute(&self, args: GuardToolArgs) -> Result<GuardToolResponse>;
@@ -220,6 +224,10 @@ trait GuardExecutor: Send + Sync {
 /// tools surface. These map one-to-one onto existing `AdminRequest` variants;
 /// they self-scope inside the daemon by caller uid/handle ownership and never
 /// bypass the gate (no command runs through this path).
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait marks boxed futures as must_use"
+)]
 #[async_trait]
 trait GuardAdmin: Send + Sync {
     async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse>;
