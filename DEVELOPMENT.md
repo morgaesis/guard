@@ -11,10 +11,48 @@ focused on one coherent change, add behavioral tests for changed behavior, and
 update the existing documentation when a public contract changes. Run the
 pre-commit gate below over the complete diff before requesting review. A
 maintainer review and passing required checks are required before merge.
+Routine Dependabot updates are the exception described under
+[Dependency updates](#dependency-updates).
 
 Contributions are accepted under the repository's MIT license. By submitting a
 contribution, the contributor confirms they have the right to provide it under
 that license.
+
+## Dependency updates
+
+`scripts/dependabot-automerge.sh` holds the policy for Dependabot pull requests,
+and the scheduled `Dependabot reconcile` workflow applies it from `main`. It
+never checks out or runs pull request content with a repository token.
+
+- A Cargo patch or minor update, or a GitHub Actions update pinned to a full
+  commit SHA, merges without a maintainer review once every required check
+  succeeded for its exact head commit and every review thread is resolved.
+- A major Cargo update, an unclassified update, or any other ecosystem fails
+  the required `Classify dependency update` check until a repository owner,
+  member, or collaborator approves the exact head commit.
+- One update merges per run. Further merges wait until the required checks
+  completed for the new `main` commit.
+
+A Cargo update whose required checks fail, or whose branch conflicts with
+`main`, is repaired by `scripts/dependency-repair.sh`. A language model reads
+the failure logs and edits files without the ability to run commands; Cargo
+then applies the requested lockfile updates in a job that holds neither the
+model credential nor a repository token. A separate job commits the result to
+the pull request branch as a signed commit, limited to the Cargo manifests,
+lockfiles, and Rust source of that update. A repair confined to the lockfile
+keeps the update routine. A repair that changes a manifest or source needs an
+approving review before it merges. Workflow updates are not repaired.
+
+The same repair runs locally against the current checkout and leaves its result
+uncommitted. The context file holds the failing check output:
+
+```bash
+scripts/dependency-repair.sh candidate context.md
+```
+
+The model credential is read from `OPENROUTER_API_KEY` and reaches only the
+model process. The repository variable `DEPENDENCY_REPAIR_MODEL` selects the
+model in CI.
 
 ## Building
 

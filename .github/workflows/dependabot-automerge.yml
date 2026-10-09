@@ -6,9 +6,15 @@ name: Dependabot review gate
 # metadata only; it does not execute pull request code, post comments, approve
 # reviews, or merge changes.
 #
-# The job succeeds for updates that need manual review, so a reviewed major
-# update can merge. Merging eligible updates is the separate, privileged
-# dependabot-reconcile.yml workflow, which repeats the classification itself.
+# The job succeeds for a routine update, and for any update that a repository
+# owner, member, or collaborator approved at its exact head commit. It fails
+# for a major or unclassified update without that review, so the required
+# check blocks the merge. A submitted or dismissed review runs the job again.
+#
+# Merging is the separate, privileged dependabot-reconcile.yml workflow, which
+# repeats the classification itself. That workflow dispatches this one on a
+# repaired branch, because a branch update made with the Actions token leaves
+# pull request workflows waiting for approval.
 
 "on":
   pull_request:
@@ -16,22 +22,34 @@ name: Dependabot review gate
       - opened
       - reopened
       - synchronize
+  pull_request_review:
+    types:
+      - submitted
+      - dismissed
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Number of the Dependabot pull request whose head is the dispatched commit.
+        required: true
+        type: string
 
 permissions: {}
 
 concurrency:
-  group: dependabot-review-${{ github.event.pull_request.number }}
+  group: dependabot-review-${{ github.event.pull_request.number || inputs.pull_request }}
   cancel-in-progress: true
 
 jobs:
   review-gate:
     name: Classify dependency update
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
-      pull-requests: read  # Reads pull request, commit, and changed-file metadata.
+      pull-requests: read  # Reads pull request, commit, review, and changed-file metadata.
     steps:
       - name: Check out the default-branch policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -43,9 +61,6 @@ jobs:
       - name: Classify pull request
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          result=$(scripts/dependabot-automerge.sh classify "$PR_NUMBER")
-          jq -r '"Decision: \(.decision). Reason: \(.reason)."' <<< "$result" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pull_request }}
+          EXPECTED_HEAD: ${{ github.event_name == 'workflow_dispatch' && github.sha || '' }}
+        run: scripts/dependabot-automerge.sh gate "$PR_NUMBER"
