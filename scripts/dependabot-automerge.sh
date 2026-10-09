@@ -63,19 +63,27 @@ set -euo pipefail
 # is unchanged immediately before the merge. A head that contains main has the
 # tree that the squash merge produces, so its checks are the integration
 # evidence. reconcile refreshes at most one branch per run that lacks the main
-# commit and does not conflict with it, through the branch merge API. The
-# refresh commit carries the marker that lets Dependabot keep rebasing the
-# branch. A conflicting Cargo update is left to repair-plan; a conflicting
-# workflow update is left to the rebase that Dependabot performs on a conflict.
+# commit and does not conflict with it, through the branch merge API. The merge
+# is made on a scratch branch under dependency-refresh/ that the run creates at
+# the pull request head and removes afterwards; the pull request branch
+# advances only after the merge commit meets everything classify requires of a
+# repair, as a fast-forward. A refresh that is refused, unverified, or
+# overtaken leaves the pull request branch unchanged and the next stale branch
+# is tried. The refresh commit carries the marker that lets Dependabot keep
+# rebasing the branch. A conflicting Cargo update is left to repair-plan; a
+# conflicting workflow update is left to the rebase that Dependabot performs
+# on a conflict.
 #
 # repair-plan selects at most one Cargo update whose required checks failed or
 # whose branch conflicts with main, and writes plan.json and context.md. A
-# failed check counts once a rerun reproduced it. Each plan has a record name
+# failed check counts once a rerun reproduced it: the same job failed in two
+# consecutive attempts of its workflow run. Each plan has a record name
 # derived from the Dependabot commit, the main commit, and the failing checks.
 # The workflow stores a record under that name when a repair was published or
 # cannot proceed, and repair-plan skips a plan whose record exists, so the
-# model runs again only after one of the three changed. An operational failure
-# leaves no record and is tried again on the next run.
+# model runs again only after one of the three changed. An operational failure,
+# such as a model run that timed out, leaves no record and is tried again on
+# the next run.
 #
 # publish-repair commits validated repair files to the pull request branch
 # through the Git database API. GitHub signs a commit created this way without
@@ -91,7 +99,8 @@ set -euo pipefail
 # supported event that the same token can raise. Dispatch is refused unless
 # the branch workflows equal the main workflows, or differ from them only by
 # an eligible workflow update on a head that contains main. It also reruns a
-# workflow run that was cancelled, or that failed and has not been rerun yet.
+# workflow run that was cancelled, or that holds a failure that no rerun
+# reproduced yet.
 #
 # ensure-mainline-runs dispatches the push-triggered mainline workflows for the
 # current main commit when no run exists for it, and reruns them the same way.
@@ -133,7 +142,10 @@ if ! [[ "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; t
 fi
 
 work_dir=$(mktemp -d)
-trap 'rm -rf "$work_dir"' EXIT
+# The scratch branch that this invocation created and has not removed, without
+# its dependency-refresh/ prefix.
+scratch_name=""
+trap 'remove_scratch_branch || true; rm -rf "$work_dir"' EXIT
 
 api() {
   gh api --method GET "$@"
@@ -527,36 +539,103 @@ repair_commit_verified() {
     and ([.parents[]?.sha] == $parents)' > /dev/null
 }
 
+# Removes the scratch branch that this invocation created, if one remains. A
+# branch that cannot be removed is reported by name and left in place.
+remove_scratch_branch() {
+  local name="$scratch_name"
+  [ -n "$name" ] || return 0
+  scratch_name=""
+  if gh api --method DELETE "repos/${REPO}/git/refs/heads/dependency-refresh/${name}" > /dev/null; then
+    return 0
+  fi
+  report "error, the scratch branch dependency-refresh/${name} could not be removed and is left in place"
+  return 1
+}
+
 # Merges the main commit into a pull request branch. GitHub computes the merge
-# and creates the commit; nothing is checked out.
+# and creates the commit; nothing is checked out. The merge is made on a
+# scratch branch that this invocation creates at the pull request head, so the
+# pull request branch advances only to a commit that already met everything
+# classify requires of a repair, and only as a fast-forward from that head.
+#
+# Returns 0 when the branch was refreshed, 1 when it was not and the run
+# failed, 2 when it was not and nothing failed, and 3 when it was refreshed
+# and the scratch branch could not be removed.
 refresh_branch() {
-  local number="$1" ref="$2" sha="$3" main="$4" response commit
+  local number="$1" ref="$2" sha="$3" main="$4" scratch response commit
   if ! [[ "$ref" =~ ^dependabot/[A-Za-z0-9._/+-]+$ ]]; then
     report "#${number}: error, the head branch name is malformed"
     return 1
   fi
-  if ! response=$(jq -n --arg base "$ref" --arg head "$main" --arg message "$REFRESH_MESSAGE" \
-      '{base: $base, head: $head, commit_message: $message}' \
+  scratch=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+  if ! [[ "$scratch" =~ ^[0-9a-f]{16}$ ]] || ! [[ "${GITHUB_RUN_ID:-0}" =~ ^[0-9]+$ ]]; then
+    report "#${number}: error, no scratch branch name could be made"
+    return 1
+  fi
+  scratch="${number}-${GITHUB_RUN_ID:-0}-${scratch}"
+
+  # Creation fails when the name is taken, so an existing branch is never
+  # reused, moved, or removed.
+  if ! response=$(jq -n --arg ref "refs/heads/dependency-refresh/${scratch}" --arg sha "$sha" \
+      '{ref: $ref, sha: $sha}' | api_write POST "repos/${REPO}/git/refs"); then
+    report "#${number}: error, the scratch branch for the refresh of ${ref} could not be created; the branch is unchanged"
+    return 1
+  fi
+  scratch_name="$scratch"
+  if ! jq -e --arg ref "refs/heads/dependency-refresh/${scratch}" --arg sha "$sha" \
+      '.ref == $ref and .object.sha == $sha' <<< "$response" > /dev/null; then
+    report "#${number}: error, the scratch branch for the refresh of ${ref} is not at ${sha}; the branch is unchanged"
+    remove_scratch_branch || true
+    return 1
+  fi
+
+  if ! response=$(jq -n --arg base "dependency-refresh/${scratch}" --arg head "$main" \
+      --arg message "$REFRESH_MESSAGE" '{base: $base, head: $head, commit_message: $message}' \
       | api_write POST "repos/${REPO}/merges"); then
-    report "#${number}: error, the refresh of ${ref} with ${main} was refused"
+    report "#${number}: error, the merge of ${main} into ${sha} was refused; the branch is unchanged"
+    remove_scratch_branch || true
     return 1
   fi
   commit=$(jq -r '.sha // ""' <<< "$response")
   if ! is_sha "$commit"; then
-    report "#${number}: the branch already contains ${main}, or moved during the refresh"
-    return 0
+    report "#${number}: nothing to refresh, ${sha} already contains ${main}"
+    remove_scratch_branch || return 1
+    return 2
   fi
   if ! api "repos/${REPO}/commits/${commit}" \
       | repair_commit_verified "$(jq -n --arg head "$sha" --arg main "$main" '[$head, $main]')"; then
-    report "#${number}: error, the refresh commit ${commit} is not a verified ${REPAIR_LOGIN} merge of ${main} into ${sha}"
+    report "#${number}: error, the refresh commit ${commit} is not a verified ${REPAIR_LOGIN} merge of ${main} into ${sha}; the branch is unchanged"
+    remove_scratch_branch || true
+    return 1
+  fi
+
+  if ! response=$(api "repos/${REPO}/pulls/${number}"); then
+    report "#${number}: error, the pull request is unreadable after the merge; the branch is unchanged"
+    remove_scratch_branch || true
+    return 1
+  fi
+  if ! jq -e --arg ref "$ref" --arg sha "$sha" --arg repo "$REPO" '
+      .state == "open" and .head.ref == $ref and .head.sha == $sha
+      and .head.repo.full_name == $repo' <<< "$response" > /dev/null; then
+    report "#${number}: waiting, the pull request changed during the refresh; the branch is unchanged"
+    remove_scratch_branch || return 1
+    return 2
+  fi
+
+  # A fast-forward only: the update fails if the branch moved.
+  if ! jq -n --arg sha "$commit" '{sha: $sha, force: false}' \
+      | api_write PATCH "repos/${REPO}/git/refs/heads/${ref}" > /dev/null; then
+    report "#${number}: error, the branch refused the refresh commit ${commit}"
+    remove_scratch_branch || true
     return 1
   fi
   report "#${number}: refreshed with ${main} as ${commit}; it merges once its checks pass"
+  remove_scratch_branch || return 3
 }
 
 reconcile() {
   local numbers number result decision approved reason sha state states unmet main ecosystem
-  local problem again refreshed=0 failures=0
+  local problem again outcome refreshed=0 failures=0
 
   main=$(main_head) || {
     report "error, the ${BRANCH} head commit is unreadable"
@@ -611,9 +690,19 @@ reconcile() {
       elif [ "$refreshed" -eq 1 ]; then
         report "#${number}: waiting, the branch lacks ${main}; one branch is refreshed per run"
       else
-        refreshed=1
-        refresh_branch "$number" "$(jq -r '.head_ref' <<< "$result")" "$sha" "$main" \
-          || failures=$((failures + 1))
+        # Only a refresh that advanced the branch uses the one refresh of this
+        # run; after any other outcome the next stale branch is tried.
+        outcome=0
+        refresh_branch "$number" "$(jq -r '.head_ref' <<< "$result")" "$sha" "$main" || outcome=$?
+        case "$outcome" in
+          0) refreshed=1 ;;
+          2) ;;
+          3)
+            refreshed=1
+            failures=$((failures + 1))
+            ;;
+          *) failures=$((failures + 1)) ;;
+        esac
       fi
       continue
     fi
@@ -696,10 +785,32 @@ verified_job_for_context() {
   ' <<< "$job"
 }
 
+# attempt_jobs <run id> <attempt> <file>: writes the jobs of one attempt of a
+# workflow run as one JSON array.
+attempt_jobs() {
+  api_pages "repos/${REPO}/actions/runs/${1}/attempts/${2}/jobs?per_page=100" \
+    | jq -se '[.[].jobs[]]' > "$3"
+}
+
+# Succeeds when a job of the given name failed or timed out in the attempt
+# before the given one. A rerun reproduced a failure only then: an attempt that
+# follows a cancelled one, or a job that fails for the first time on a rerun,
+# has failed once. Returns 1 when no such job exists and 2 when the earlier
+# attempt is unreadable.
+failed_in_previous_attempt() {
+  local run_id="$1" attempt="$2" name="$3"
+  [ "$attempt" -ge 2 ] || return 1
+  attempt_jobs "$run_id" "$((attempt - 1))" "$work_dir/previous-jobs.json" || return 2
+  jq -e --arg name "$name" 'any(.[]; .name == $name
+    and (.conclusion == "failure" or .conclusion == "timed_out"))' \
+    "$work_dir/previous-jobs.json" > /dev/null || return 1
+}
+
 # Succeeds when every failed check belongs to the latest attempt of its run,
-# the attempt is at least two, and at least one job failed or timed out.
+# at least one job failed or timed out, and each such job also failed or timed
+# out in the attempt before.
 failures_reproduced() {
-  local context job run jobs run_id attempt own=1
+  local context job run run_id attempt own=1
   for context in "$@"; do
     job=$(verified_job_for_context "$context") || return 1
     run_id=$(jq -er '.run_id' <<< "$job") || return 1
@@ -709,13 +820,14 @@ failures_reproduced() {
         and .status == "completed")
       | .run_attempt | numbers | select(. >= 2 and floor == .)
     ' <<< "$run") || return 1
-    jobs=$(api_pages "repos/${REPO}/actions/runs/${run_id}/attempts/${attempt}/jobs?per_page=100") || return 1
-    jq -se --argjson job "$job" '
-      [.[].jobs[] | select(.id == $job.id and .run_id == $job.run_id
+    attempt_jobs "$run_id" "$attempt" "$work_dir/jobs.json" || return 1
+    jq -e --argjson job "$job" '
+      [.[] | select(.id == $job.id and .run_id == $job.run_id
         and .head_sha == $job.head_sha and .conclusion == $job.conclusion)]
       | length == 1
-    ' <<< "$jobs" > /dev/null || return 1
+    ' "$work_dir/jobs.json" > /dev/null || return 1
     if jq -e '.conclusion == "failure" or .conclusion == "timed_out"' <<< "$job" > /dev/null; then
+      failed_in_previous_attempt "$run_id" "$attempt" "$(jq -r '.name' <<< "$job")" || return 1
       own=0
     fi
   done
@@ -952,20 +1064,49 @@ publish_repair() {
 #   missing  no such run exists;
 #   active   the run has not completed;
 #   passed   the run succeeded;
-#   failed   the run failed again after a rerun, which makes it a finding;
-#   retry    the run was cancelled, or failed and has not been rerun.
+#   failed   the run failed, and every job that failed or timed out in its
+#            latest attempt did so in the attempt before, which makes it a
+#            finding;
+#   retry    the run was cancelled, or holds a failure that no rerun
+#            reproduced yet.
+# Fails when the runs, or the jobs of a failed run that was rerun, are
+# unreadable.
 run_state() {
-  api "repos/${REPO}/actions/workflows/${1}/runs?head_sha=${2}&per_page=100" \
-    | jq -er --arg head "$2" --arg branch "$3" --argjson events "$4" '
+  local run state id attempt name status
+  run=$(api "repos/${REPO}/actions/workflows/${1}/runs?head_sha=${2}&per_page=100" \
+    | jq -ce --arg head "$2" --arg branch "$3" --argjson events "$4" '
         [.workflow_runs[] | select(.head_sha == $head and .head_branch == $branch
           and (.event as $event | $events | index($event) != null))]
         | sort_by(.run_started_at // "", .id) | last
-        | if . == null then "missing 0"
-          elif .status != "completed" then "active \(.id)"
-          elif .conclusion == "success" then "passed \(.id)"
-          elif .conclusion == "failure" and (.run_attempt // 1) >= 2 then "failed \(.id)"
-          else "retry \(.id)"
-          end'
+        | if . == null then {state: "missing", id: 0}
+          else {id, attempt: (.run_attempt // 1), state: (
+            if .status != "completed" then "active"
+            elif .conclusion == "success" then "passed"
+            elif .conclusion == "failure" and (.run_attempt // 1) >= 2 then "failed"
+            else "retry"
+            end)}
+          end') || return 1
+  state=$(jq -r '.state' <<< "$run")
+  id=$(jq -r '.id' <<< "$run")
+  if [ "$state" = "failed" ]; then
+    attempt=$(jq -er '.attempt | numbers | select(floor == .)' <<< "$run") || return 1
+    [[ "$id" =~ ^[1-9][0-9]*$ ]] || return 1
+    attempt_jobs "$id" "$attempt" "$work_dir/run-jobs.json" || return 1
+    while IFS= read -r name; do
+      status=0
+      failed_in_previous_attempt "$id" "$attempt" "$name" || status=$?
+      case "$status" in
+        0) ;;
+        1)
+          state="retry"
+          break
+          ;;
+        *) return 1 ;;
+      esac
+    done < <(jq -r '.[] | select(.conclusion == "failure" or .conclusion == "timed_out") | .name' \
+      "$work_dir/run-jobs.json")
+  fi
+  echo "${state} ${id}"
 }
 
 # Reruns the jobs of a run that did not succeed.

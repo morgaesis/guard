@@ -70,6 +70,8 @@ set -euo pipefail
 
 MODEL_KEY="${OPENROUTER_API_KEY:-}"
 unset OPENROUTER_API_KEY
+# A caller that exports a variable of this name does not make it inherited.
+declare +x MODEL_KEY
 
 MODEL="openrouter/anthropic/claude-sonnet-5.5"
 OPENCODE_VERSION="1.18.33"
@@ -389,7 +391,7 @@ EOF
 }
 
 # Runs the model. The credential reaches only this process, through its
-# environment, with every other variable removed.
+# environment, with every other variable but PATH, HOME, and TMPDIR removed.
 run_agent() {
   local repo="$1" ecosystem="$2" manifest="$3" agent_state config prompt version status=0
   [ -n "$MODEL_KEY" ] || die "OPENROUTER_API_KEY is not set"
@@ -403,7 +405,7 @@ run_agent() {
   config=$(agent_configuration "$ecosystem")
   prompt=$(agent_prompt "$manifest")
   (
-    keep_environment PATH HOME
+    keep_environment PATH HOME TMPDIR
     export XDG_CONFIG_HOME="$agent_state/config" XDG_DATA_HOME="$agent_state/data" \
       XDG_CACHE_HOME="$agent_state/cache" XDG_STATE_HOME="$agent_state/state" TERM=dumb \
       OPENCODE_CONFIG_CONTENT="$config" OPENCODE_DISABLE_PROJECT_CONFIG=1 \
@@ -415,7 +417,9 @@ run_agent() {
       --title dependency-repair "$prompt" < /dev/null
   ) || status=$?
   rm -rf "$agent_state"
-  [ "$status" -ne 124 ] || refuse "the model run did not finish in ${TIMEOUT} seconds"
+  # A run that timed out says nothing about the plan: an unreachable provider
+  # ends the same way. It is operational, so the plan is tried again.
+  [ "$status" -ne 124 ] || die "the model run did not finish in ${TIMEOUT} seconds"
   [ "$status" -eq 0 ] || die "the model run failed with status ${status}"
 }
 

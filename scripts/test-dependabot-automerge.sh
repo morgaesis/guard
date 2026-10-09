@@ -58,12 +58,26 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 if [ "$method" != "GET" ]; then
+  body=""
+  [ "$input" -eq 0 ] || body=$(jq -c .)
+  # A scratch branch has a name made per invocation. Its request is recorded
+  # under one name, and the name itself beside it.
+  scratch=$(printf '%s' "$path" | sed -n 's#.*/git/refs/heads/dependency-refresh/\(.*\)$#\1#p')
+  if [ -n "$scratch" ]; then
+    printf '%s\n' "$scratch" >> "$FIXTURES/scratch-$method"
+    path="${path%"$scratch"}SCRATCH"
+  fi
   printf 'api %s %s\n' "$method" "$path" >> "$FIXTURES/writes"
-  [ "$input" -eq 0 ] || jq -c . >> "$FIXTURES/bodies"
+  [ -z "$body" ] || printf '%s\n' "$body" >> "$FIXTURES/bodies"
   [ ! -e "$FIXTURES/refuse-writes" ] || exit 1
   file="$FIXTURES/$(key "$method $path")"
   [ -f "$file" ] || exit 1
-  cat "$file"
+  # A created ref is reported as requested unless the fixture says otherwise.
+  if [ "$method" = "POST" ] && [ "${path##*/git/}" = "refs" ]; then
+    jq --argjson body "$body" '.ref //= $body.ref | .object.sha //= $body.sha' "$file"
+  else
+    cat "$file"
+  fi
   exit
 fi
 file="$FIXTURES/$(key "$path")"
@@ -171,9 +185,12 @@ new_case() {
   job_attempt 2 failure
 }
 
-# job_attempt <run attempt> <conclusion>: Actions job and workflow-run fixtures.
+# job_attempt <run attempt> <conclusion> [previous]: Actions job and
+# workflow-run fixtures. From the second attempt on, the attempt before holds a
+# job of the same name under its own ID with the previous conclusion (default
+# "failure"); "absent" leaves that job out and "unreadable" omits the attempt.
 job_attempt() {
-  local check id run_id job
+  local check id run_id job previous="${3:-failure}"
   JOB_ATTEMPT="$1"
   JOB_CONCLUSION="$2"
   [ -n "${CHECK_SHA:-}" ] || return 0
@@ -194,6 +211,15 @@ job_attempt() {
       | fixture "$api/actions/runs/$run_id"
     jq -n --argjson job "$job" '{total_count: 1, jobs: [$job]}' \
       | fixture "$api/actions/runs/$run_id/attempts/$1/jobs?per_page=100"
+    [ "$1" -ge 2 ] || continue
+    rm -f "$(fixture_path "$api/actions/runs/$run_id/attempts/$(($1 - 1))/jobs?per_page=100")"
+    [ "$previous" != "unreadable" ] || continue
+    jq -n --argjson job "$job" --arg previous "$previous" --argjson id "$((1000 + id))" \
+      --arg repo "$GITHUB_REPOSITORY" '{jobs: (if $previous == "absent" then [] else [$job + {
+        id: $id, conclusion: $previous,
+        check_run_url: ("https://api.github.com/repos/" + $repo + "/check-runs/" + ($id | tostring))
+      }] end)} | .total_count = (.jobs | length)' \
+      | fixture "$api/actions/runs/$run_id/attempts/$(($1 - 1))/jobs?per_page=100"
   done < <(jq -c '.check_runs[] | select(.status == "completed")' \
     "$(fixture_path "$api/commits/$CHECK_SHA/check-runs?filter=latest&per_page=100")")
 }
@@ -861,8 +887,9 @@ expect_writes "no merge when main moves during evaluation" ""
 
 refresh_message=$'chore(deps): merge main into dependency update\n\nDependency-Repair: refresh\n[dependabot skip]'
 
-# refresh_result <number> [verified] [author] [committer] [first parent]
+# refresh_result <number> [verified] [author] [committer] [first parent] [branch]
 refresh_result() {
+  echo '{}' | fixture "POST $api/git/refs"
   jq -n --arg sha "$(sha_for refreshed)" '{sha: $sha}' | fixture "POST $api/merges"
   jq -n --argjson verified "${2:-true}" --arg author "${3:-$repair_bot}" \
     --arg committer "${4:-web-flow}" --arg head "${5:-$(sha_for "$1")}" --arg main "$main_sha" '{
@@ -870,6 +897,26 @@ refresh_result() {
       commit: {verification: {verified: $verified}},
       parents: [{sha: $head}, {sha: $main}]
     }' | fixture "$api/commits/$(sha_for refreshed)"
+  echo '{}' | fixture "PATCH $api/git/refs/heads/${6:-$cargo_ref}"
+  : | fixture "DELETE $api/git/refs/heads/dependency-refresh/SCRATCH"
+}
+
+scratch_created="api POST $api/git/refs"
+scratch_merged="api POST $api/merges"
+scratch_removed="api DELETE $api/git/refs/heads/dependency-refresh/SCRATCH"
+
+# refresh_calls [branch]: the write requests of one completed refresh.
+refresh_calls() {
+  printf '%s\n%s\napi PATCH %s/git/refs/heads/%s\n%s' \
+    "$scratch_created" "$scratch_merged" "$api" "${1:-$cargo_ref}" "$scratch_removed"
+}
+
+# The write requests of a refresh that stopped after the merge.
+refresh_abandoned=$(printf '%s\n%s\n%s' "$scratch_created" "$scratch_merged" "$scratch_removed")
+
+# Succeeds when no request advanced or removed a pull request branch.
+branches_unchanged() {
+  ! grep -qE '^api (PATCH|PUT|DELETE) .*/git/refs/heads/dependabot/' "$FIXTURES/writes"
 }
 
 new_case
@@ -877,22 +924,34 @@ P_CONTAINS=diverged eligible_pull 1
 checks 1
 refresh_result 1
 open_pulls 1
-"$subject" reconcile > /dev/null || fail "stale head: reconcile failed"
-expect_writes "a green head without the main commit is refreshed, not merged" "api POST $api/merges"
-if jq -s -e --arg ref "$cargo_ref" --arg main "$main_sha" --arg message "$refresh_message" \
-    '. == [{base: $ref, head: $main, commit_message: $message}]' "$FIXTURES/bodies" > /dev/null; then
+GITHUB_RUN_ID=4242 "$subject" reconcile > /dev/null || fail "stale head: reconcile failed"
+expect_writes "a green head without the main commit is refreshed, not merged" "$(refresh_calls)"
+if jq -s -e --arg head "$(sha_for 1)" --arg main "$main_sha" --arg message "$refresh_message" \
+    --arg commit "$(sha_for refreshed)" '
+      (.[0].ref | ltrimstr("refs/heads/")) as $scratch
+      | ($scratch | test("^dependency-refresh/1-4242-[0-9a-f]{16}$"))
+        and . == [
+          {ref: ("refs/heads/" + $scratch), sha: $head},
+          {base: $scratch, head: $main, commit_message: $message},
+          {sha: $commit, force: false}
+        ]' "$FIXTURES/bodies" > /dev/null; then
   pass
 else
-  fail "the refresh merges the exact main commit with the Dependabot marker"
+  fail "the refresh merges the exact main commit on a scratch branch at the head, then fast-forwards"
+fi
+if [ "dependency-refresh/$(cat "$FIXTURES/scratch-DELETE")" = "$(jq -r '.ref | ltrimstr("refs/heads/")' "$FIXTURES/bodies" | head -n 1)" ]; then
+  pass
+else
+  fail "the refresh removes exactly the scratch branch that it created"
 fi
 
 new_case
 P_CONTAINS=behind pull 1 "$actions_ref" "$(message actions/checkout:7.0.2:patch)" .github/workflows/ci.yml
 checks 1
-refresh_result 1
+refresh_result 1 true "$repair_bot" web-flow "$(sha_for 1)" "$actions_ref"
 open_pulls 1
 "$subject" reconcile > /dev/null || fail "stale workflow update: reconcile failed"
-expect_writes "a stale workflow update is refreshed" "api POST $api/merges"
+expect_writes "a stale workflow update is refreshed" "$(refresh_calls "$actions_ref")"
 
 new_case
 P_CONTAINS=diverged eligible_pull 1
@@ -900,7 +959,7 @@ checks 1 "Test & Lint=failure"
 refresh_result 1
 open_pulls 1
 "$subject" reconcile > /dev/null || fail "stale failing head: reconcile failed"
-expect_writes "a failing head without the main commit is refreshed before anything else" "api POST $api/merges"
+expect_writes "a failing head without the main commit is refreshed before anything else" "$(refresh_calls)"
 
 new_case
 P_CONTAINS=diverged eligible_pull 1
@@ -910,7 +969,7 @@ checks 2
 refresh_result 1
 open_pulls 1 2
 "$subject" reconcile > /dev/null || fail "two stale heads: reconcile failed"
-expect_writes "one branch is refreshed per run" "api POST $api/merges"
+expect_writes "one branch is refreshed per run" "$(refresh_calls)"
 
 new_case
 P_CONTAINS=diverged eligible_pull 1
@@ -921,7 +980,7 @@ refresh_result 1
 open_pulls 1 2
 "$subject" reconcile > /dev/null || fail "stale and current heads: reconcile failed"
 expect_writes "a current green head still merges after a refresh" \
-  "$(printf 'api POST %s/merges\n%s' "$api" "$(merge_call 2)")"
+  "$(printf '%s\n%s' "$(refresh_calls)" "$(merge_call 2)")"
 
 for ref in "$cargo_ref" "$actions_ref"; do
   new_case
@@ -949,6 +1008,42 @@ checks 1
 open_pulls 1
 touch "$FIXTURES/refuse-writes"
 expect_status "a refused refresh fails the run" fail "$subject" reconcile
+expect_writes "a refresh whose scratch branch was refused writes nothing else" "$scratch_created"
+
+# A name that is taken refuses the creation. The existing branch is neither
+# merged into nor removed.
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+refresh_result 1
+rm "$(fixture_path "POST $api/git/refs")"
+open_pulls 1
+expect_status "a scratch branch name that is taken fails the run" fail "$subject" reconcile
+expect_writes "a scratch branch that this run did not create is never merged into or removed" "$scratch_created"
+
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+refresh_result 1
+jq -n '{ref: "refs/heads/dependency-refresh/another"}' | fixture "POST $api/git/refs"
+open_pulls 1
+expect_status "a scratch branch reported under another name fails the run" fail "$subject" reconcile
+expect_writes "a scratch branch reported under another name is not merged into" \
+  "$(printf '%s\n%s' "$scratch_created" "$scratch_removed")"
+if [ "refs/heads/dependency-refresh/$(cat "$FIXTURES/scratch-DELETE")" = "$(jq -r '.ref' "$FIXTURES/bodies")" ]; then
+  pass
+else
+  fail "only the requested scratch branch name is removed"
+fi
+
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+refresh_result 1
+rm "$(fixture_path "POST $api/merges")"
+open_pulls 1
+expect_status "a refused merge on the scratch branch fails the run" fail "$subject" reconcile
+expect_writes "a refused merge leaves the pull request branch unchanged" "$refresh_abandoned"
 
 for fault in "false $repair_bot web-flow" "true contributor web-flow" "true $repair_bot contributor" \
   "true $repair_bot web-flow $(sha_for elsewhere)"; do
@@ -959,14 +1054,165 @@ for fault in "false $repair_bot web-flow" "true contributor web-flow" "true $rep
   refresh_result 1 "${fields[@]}"
   open_pulls 1
   expect_status "a refresh commit that is not a verified repair [$fault] fails the run" fail "$subject" reconcile
+  expect_writes "a refresh commit that is not a verified repair [$fault] never reaches the pull request branch" \
+    "$refresh_abandoned"
+  if branches_unchanged; then
+    pass
+  else
+    fail "no write to the pull request branch when the refresh commit fails the predicate [$fault]"
+  fi
 done
 
 new_case
 P_CONTAINS=diverged eligible_pull 1
 checks 1
+refresh_result 1
+rm "$(fixture_path "$api/commits/$(sha_for refreshed)")"
+open_pulls 1
+expect_status "an unreadable refresh commit fails the run" fail "$subject" reconcile
+expect_writes "an unreadable refresh commit never reaches the pull request branch" "$refresh_abandoned"
+
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
 echo '' | fixture "POST $api/merges"
+echo '{}' | fixture "POST $api/git/refs"
+: | fixture "DELETE $api/git/refs/heads/dependency-refresh/SCRATCH"
 open_pulls 1
 expect_status "a refresh that finds nothing to merge is not an error" ok "$subject" reconcile
+expect_writes "a refresh that finds nothing to merge leaves the pull request branch unchanged" "$refresh_abandoned"
+
+# The pull request moves while the merge is computed.
+for moved in '.head.sha = "0000000000000000000000000000000000000000"' '.state = "closed"' \
+  '.head.ref = "dependabot/cargo/another"'; do
+  new_case
+  P_CONTAINS=diverged eligible_pull 1
+  checks 1
+  refresh_result 1
+  jq "$moved" "$(fixture_path "$api/pulls/1")" > "$(fixture_path "$api/pulls/1").again"
+  open_pulls 1
+  expect_status "a pull request that changed during the refresh is not an error [$moved]" ok "$subject" reconcile
+  expect_writes "a pull request that changed during the refresh keeps its branch [$moved]" "$refresh_abandoned"
+done
+
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+refresh_result 1
+rm "$(fixture_path "PATCH $api/git/refs/heads/$cargo_ref")"
+open_pulls 1
+expect_status "a branch that refuses the fast-forward fails the run" fail "$subject" reconcile
+expect_writes "a refused fast-forward is not forced and the scratch branch is removed" "$(refresh_calls)"
+if jq -s -e 'all(.[]; .force != true)' "$FIXTURES/bodies" > /dev/null; then
+  pass
+else
+  fail "no refresh request forces a ref"
+fi
+
+# An outcome that did not advance a branch does not use the one refresh of the
+# run: the next stale branch is tried.
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+P_CONTAINS=diverged pull 2 "$fuzz_ref" "$(message serde_json:1.0.151:patch)" fuzz/Cargo.lock
+checks 2
+refresh_result 2 true "$repair_bot" web-flow "$(sha_for 2)" "$fuzz_ref"
+open_pulls 1 2
+expect_status "a refresh that failed its predicate still fails the run when a later one succeeds" fail "$subject" reconcile
+expect_writes "the next stale branch is refreshed after the first refresh failed its predicate" \
+  "$(printf '%s\n%s' "$refresh_abandoned" "$(refresh_calls "$fuzz_ref")")"
+if [ "$(sort -u "$FIXTURES/scratch-DELETE" | wc -l)" -eq 2 ] \
+    && [ "$(jq -r 'select(.ref) | .ref | ltrimstr("refs/heads/dependency-refresh/")' "$FIXTURES/bodies")" = "$(cat "$FIXTURES/scratch-DELETE")" ] \
+    && [ "$(jq -c 'select(.force != null)' "$FIXTURES/bodies")" = "{\"sha\":\"$(sha_for refreshed)\",\"force\":false}" ]; then
+  pass
+else
+  fail "each refresh uses and removes its own scratch branch and only the verified commit is published"
+fi
+
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+P_CONTAINS=diverged pull 2 "$fuzz_ref" "$(message serde_json:1.0.151:patch)" fuzz/Cargo.lock
+checks 2
+refresh_result 2 true "$repair_bot" web-flow "$(sha_for 2)" "$fuzz_ref"
+jq '.head.sha = "0000000000000000000000000000000000000000"' "$(fixture_path "$api/pulls/1")" \
+  > "$(fixture_path "$api/pulls/1").again"
+jq -n --arg head "$(sha_for 1)" --arg main "$main_sha" --arg bot "$repair_bot" '{
+    author: {login: $bot}, committer: {login: "web-flow"},
+    commit: {verification: {verified: true}}, parents: [{sha: $head}, {sha: $main}]
+  }' | fixture "$api/commits/$(sha_for refreshed)"
+jq -n --arg head "$(sha_for 2)" --arg main "$main_sha" --arg bot "$repair_bot" '{
+    author: {login: $bot}, committer: {login: "web-flow"},
+    commit: {verification: {verified: true}}, parents: [{sha: $head}, {sha: $main}]
+  }' > "$(fixture_path "$api/commits/$(sha_for refreshed)").again"
+open_pulls 1 2
+expect_status "a pull request that moved does not use the refresh of the run" ok "$subject" reconcile
+expect_writes "the next stale branch is refreshed after the first pull request moved" \
+  "$(printf '%s\n%s' "$refresh_abandoned" "$(refresh_calls "$fuzz_ref")")"
+
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+P_CONTAINS=diverged pull 2 "$fuzz_ref" "$(message serde_json:1.0.151:patch)" fuzz/Cargo.lock
+checks 2
+refresh_result 1
+open_pulls 1 2
+rm "$(fixture_path "POST $api/git/refs")"
+expect_status "refused scratch branches fail the run" fail "$subject" reconcile
+expect_writes "every stale branch is tried when no refresh advanced one" \
+  "$(printf '%s\n%s' "$scratch_created" "$scratch_created")"
+
+# A scratch branch that cannot be removed is reported by name and left alone.
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+P_CONTAINS=diverged pull 2 "$fuzz_ref" "$(message serde_json:1.0.151:patch)" fuzz/Cargo.lock
+checks 2
+refresh_result 1
+rm "$(fixture_path "DELETE $api/git/refs/heads/dependency-refresh/SCRATCH")"
+open_pulls 1 2
+expect_status "a scratch branch that cannot be removed fails the run" fail "$subject" reconcile
+expect_writes "a completed refresh uses the refresh of the run even when its scratch branch remains" "$(refresh_calls)"
+if grep -qF "error, the scratch branch dependency-refresh/$(cat "$FIXTURES/scratch-DELETE") could not be removed and is left in place" "$tmp/output" \
+    && [ "$(wc -l < "$FIXTURES/scratch-DELETE")" -eq 1 ]; then
+  pass
+else
+  fail "a scratch branch that cannot be removed is reported by name and its removal is tried once"
+fi
+
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+refresh_result 1 false
+rm "$(fixture_path "DELETE $api/git/refs/heads/dependency-refresh/SCRATCH")"
+open_pulls 1
+expect_status "a failed predicate with a scratch branch that cannot be removed fails the run" fail "$subject" reconcile
+if grep -qF "the branch is unchanged" "$tmp/output" \
+    && grep -qF "dependency-refresh/$(cat "$FIXTURES/scratch-DELETE") could not be removed and is left in place" "$tmp/output" \
+    && branches_unchanged && [ "$(wc -l < "$FIXTURES/scratch-DELETE")" -eq 1 ]; then
+  pass
+else
+  fail "a remaining scratch branch of a failed refresh is reported and the pull request branch is unchanged"
+fi
+
+# Two runs at once each use a branch of their own.
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+refresh_result 1
+open_pulls 1
+"$subject" reconcile > /dev/null 2>&1 &
+first=$!
+"$subject" reconcile > /dev/null 2>&1 &
+second=$!
+wait "$first" || fail "concurrent refresh: the first run failed"
+wait "$second" || fail "concurrent refresh: the second run failed"
+if [ "$(sort -u "$FIXTURES/scratch-DELETE" | wc -l)" -eq 2 ] \
+    && [ "$(sort "$FIXTURES/scratch-DELETE")" = "$(jq -r 'select(.ref) | .ref | ltrimstr("refs/heads/dependency-refresh/")' "$FIXTURES/bodies" | sort)" ]; then
+  pass
+else
+  fail "concurrent runs create and remove distinct scratch branches"
+fi
 
 new_case
 eligible_pull 1
@@ -1082,6 +1328,46 @@ contains 1 ahead
 job_attempt 2 cancelled
 open_pulls 1
 expect_plan "cancelled checks alone are not repaired" '.repair' false
+
+# A failure is reproduced when the same job failed in the attempt before.
+for previous in failure timed_out; do
+  new_case
+  eligible_pull 1
+  checks 1 "Test & Lint=failure"
+  contains 1 ahead
+  job_attempt 2 failure "$previous"
+  open_pulls 1
+  expect_plan "a job that ended as [$previous] and then failed again is repaired" '.repair' true
+done
+
+new_case
+eligible_pull 1
+checks 1 "Test & Lint=failure"
+contains 1 ahead
+job_attempt 3 failure
+open_pulls 1
+expect_plan "a failure reproduced on a later attempt is repaired" '.repair' true
+
+for previous in cancelled success skipped absent unreadable; do
+  new_case
+  eligible_pull 1
+  checks 1 "Test & Lint=failure"
+  contains 1 ahead
+  job_attempt 2 failure "$previous"
+  open_pulls 1
+  expect_plan "a first failure on a rerun is not repaired when the attempt before was [$previous]" '.repair' false
+done
+
+new_case
+eligible_pull 1
+checks 1 "Test & Lint=failure"
+contains 1 ahead
+job_id=$(check_id_for "Test & Lint")
+jobs_fixture=$(jq '.jobs[0].name = "Another job"' \
+  "$(fixture_path "$api/actions/runs/$((500 + job_id))/attempts/1/jobs?per_page=100")")
+fixture "$api/actions/runs/$((500 + job_id))/attempts/1/jobs?per_page=100" <<< "$jobs_fixture"
+open_pulls 1
+expect_plan "a job that fails for the first time beside an earlier failure of another job is not repaired" '.repair' false
 
 new_case
 eligible_pull 1
@@ -1572,10 +1858,91 @@ for outcome in "failure 1" "cancelled 1" "cancelled 3" "timed_out 2" "startup_fa
   expect_writes "a pull request run that ended as [$outcome] is rerun" "$(rerun_call)"
 done
 
+# run_jobs <attempt> <name=conclusion>...: the jobs of one attempt of run 500.
+# Every attempt gives a job a new ID.
+run_jobs() {
+  local attempt="$1"
+  shift
+  printf '%s\n' "$@" | jq -R 'select(length > 0) | split("=")
+      | {name: .[0], conclusion: .[1], status: "completed", run_id: 500}' \
+    | jq -s --argjson attempt "$attempt" \
+      '{jobs: [to_entries[] | .value + {id: (9000 + $attempt * 100 + .key)}]} | .total_count = (.jobs | length)' \
+    | fixture "$api/actions/runs/500/attempts/$attempt/jobs?per_page=100"
+}
+
+# failed_runs <attempt>: every validation workflow run failed on that attempt.
+failed_runs() {
+  eligible_pull 1
+  open_pulls 1
+  for workflow in ci.yml audit.yml dependabot-automerge.yml; do
+    RUN_EVENT=pull_request RUN_CONCLUSION=failure RUN_ATTEMPT="$1" \
+      runs "$workflow" "$(sha_for 1)" "$cargo_ref" 1
+  done
+}
+
+for sequence in "failure" "timed_out"; do
+  new_case
+  failed_runs 2
+  run_jobs 1 "Test & Lint=$sequence" "Build=success"
+  run_jobs 2 "Test & Lint=failure" "Build=success"
+  "$subject" ensure-validation-runs > /dev/null || fail "$sequence then failure: command failed"
+  expect_writes "a job that ended as [$sequence] and failed again on the rerun is a finding" ""
+done
+
+new_case
+failed_runs 3
+run_jobs 2 "Test & Lint=failure"
+run_jobs 3 "Test & Lint=timed_out"
+"$subject" ensure-validation-runs > /dev/null || fail "reproduced on a later attempt: command failed"
+expect_writes "a failure reproduced on a later attempt is a finding" ""
+
+new_case
+failed_runs 2
+run_jobs 1 "Test & Lint=cancelled" "Build=cancelled"
+run_jobs 2 "Test & Lint=failure" "Build=success"
+"$subject" ensure-validation-runs > /dev/null || fail "cancelled then failure: command failed"
+if [ "$(grep -c '^run rerun 500 ' "$FIXTURES/writes")" -eq 3 ]; then
+  pass
+else
+  fail "a first failure after a cancelled attempt is rerun"
+fi
+
+new_case
+failed_runs 2
+run_jobs 1 "Test & Lint=failure" "Build=success"
+run_jobs 2 "Test & Lint=failure" "Build=failure"
+"$subject" ensure-validation-runs > /dev/null || fail "newly failing job: command failed"
+if [ "$(grep -c '^run rerun 500 ' "$FIXTURES/writes")" -eq 3 ]; then
+  pass
+else
+  fail "a job that fails for the first time on a rerun is rerun"
+fi
+
+new_case
+failed_runs 2
+run_jobs 1
+run_jobs 2 "Test & Lint=failure"
+"$subject" ensure-validation-runs > /dev/null || fail "job absent before: command failed"
+if [ "$(grep -c '^run rerun 500 ' "$FIXTURES/writes")" -eq 3 ]; then
+  pass
+else
+  fail "a failed job that the attempt before did not hold is rerun"
+fi
+
+for missing in 1 2; do
+  new_case
+  failed_runs 2
+  run_jobs "$((3 - missing))" "Test & Lint=failure"
+  expect_status "unreadable jobs of attempt $missing fail the run" fail "$subject" ensure-validation-runs
+  expect_writes "unreadable jobs of attempt $missing request no rerun" ""
+done
+
 for outcome in "failure 2" "success 1"; do
   new_case
   eligible_pull 1
   open_pulls 1
+  run_jobs 1 "Test & Lint=failure"
+  run_jobs 2 "Test & Lint=failure"
   for workflow in ci.yml audit.yml dependabot-automerge.yml; do
     RUN_EVENT=pull_request RUN_CONCLUSION=${outcome% *} RUN_ATTEMPT=${outcome#* } \
       runs "$workflow" "$(sha_for 1)" "$cargo_ref" 1
@@ -1617,8 +1984,18 @@ expect_status "a refused rerun fails the run" fail "$subject" ensure-validation-
 new_case
 RUN_CONCLUSION=cancelled runs ci.yml "$main_sha" main 1
 RUN_CONCLUSION=failure RUN_ATTEMPT=2 runs audit.yml "$main_sha" main 1
+run_jobs 1 "Security Audit (CVEs)=failure"
+run_jobs 2 "Security Audit (CVEs)=failure"
 "$subject" ensure-mainline-runs > /dev/null || fail "cancelled mainline: command failed"
 expect_writes "a cancelled mainline run is rerun and a reproduced failure is left alone" "$(rerun_call)"
+
+new_case
+runs ci.yml "$main_sha" main 1
+RUN_CONCLUSION=failure RUN_ATTEMPT=2 runs audit.yml "$main_sha" main 1
+run_jobs 1 "Security Audit (CVEs)=cancelled"
+run_jobs 2 "Security Audit (CVEs)=failure"
+"$subject" ensure-mainline-runs > /dev/null || fail "first mainline failure on a rerun: command failed"
+expect_writes "a first mainline failure after a cancelled attempt is rerun" "$(rerun_call)"
 
 new_case
 runs ci.yml "$main_sha" main 0
@@ -1673,6 +2050,7 @@ set -euo pipefail
 # Records what the model run could see, then performs the scripted edits. The
 # run has no inherited environment, so the record is found beside the stub.
 AGENT_RECORD="$(dirname "$0")/../agent-record"
+[ -z "${MODEL_KEY+set}" ] || touch "$AGENT_RECORD/internal-variable-inherited"
 if [ "${1:-}" = "--version" ]; then
   [ -z "${OPENROUTER_API_KEY:-}" ] || touch "$AGENT_RECORD/credential-seen-early"
   cat "$AGENT_RECORD/version"
@@ -1680,6 +2058,7 @@ if [ "${1:-}" = "--version" ]; then
 fi
 compgen -e | LC_ALL=C sort > "$AGENT_RECORD/environment"
 printf '%s' "$HOME" > "$AGENT_RECORD/home"
+printf '%s' "${TMPDIR:-}" > "$AGENT_RECORD/temporary"
 printf '%s' "$XDG_CONFIG_HOME" > "$AGENT_RECORD/state"
 printf '%s\n' "$@" > "$AGENT_RECORD/arguments"
 printf '%s' "$OPENCODE_CONFIG_CONTENT" > "$AGENT_RECORD/configuration"
@@ -1813,7 +2192,7 @@ if [ "$(cat "$OUT/generated/cargo-update")" = "rustls@0.23.42 0.23.45" ] \
 else
   fail "generate collects the request and exactly the edited file"
 fi
-if [ "$(grep -vxE 'PWD|SHLVL|OLDPWD|_' "$AGENT_RECORD/environment" | tr '\n' ' ')" = "HOME OPENCODE_CONFIG_CONTENT OPENCODE_DISABLE_AUTOUPDATE OPENCODE_DISABLE_CLAUDE_CODE OPENCODE_DISABLE_EXTERNAL_SKILLS OPENCODE_DISABLE_LSP_DOWNLOAD OPENCODE_DISABLE_PROJECT_CONFIG OPENROUTER_API_KEY PATH TERM XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME " ] \
+if [ "$(grep -vxE 'PWD|SHLVL|OLDPWD|_|TMPDIR' "$AGENT_RECORD/environment" | tr '\n' ' ')" = "HOME OPENCODE_CONFIG_CONTENT OPENCODE_DISABLE_AUTOUPDATE OPENCODE_DISABLE_CLAUDE_CODE OPENCODE_DISABLE_EXTERNAL_SKILLS OPENCODE_DISABLE_LSP_DOWNLOAD OPENCODE_DISABLE_PROJECT_CONFIG OPENROUTER_API_KEY PATH TERM XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME " ] \
     && [ "$(cat "$AGENT_RECORD/home")" = "$HOME" ] && [ "$(cat "$AGENT_RECORD/state")" != "$HOME/.config" ]; then
   pass
 else
@@ -1956,7 +2335,35 @@ expect_exit "a policy violation is a repair that cannot proceed" 3 generate
 new_repository
 "$engine" prepare "$REPO" "$OUT/plan.json"
 agent <<< "exit 124"
-expect_exit "a model run that timed out is a repair that cannot proceed" 3 generate
+expect_exit "a model run that timed out is an operational failure, not a repair that cannot proceed" 1 generate
+if grep -q 'did not finish' "$tmp/output" && [ ! -e "$OUT/generated/files" ]; then
+  pass
+else
+  fail "a model run that timed out reports the timeout and yields no candidate"
+fi
+
+# A provider that never answers ends at the time limit, like the retries that
+# OpenCode makes against an unreachable or failing endpoint.
+new_repository
+"$engine" prepare "$REPO" "$OUT/plan.json"
+agent <<< "exec sleep 30"
+DEPENDENCY_REPAIR_TIMEOUT=1 expect_exit "a model run that reaches the time limit is an operational failure" 1 generate
+
+new_repository
+"$engine" prepare "$REPO" "$OUT/plan.json"
+agent <<< "echo '// touched' >> src/main.rs"
+mkdir "$OUT/temporary"
+TMPDIR="$OUT/temporary" MODEL_KEY=inherited expect_status "generate runs with a temporary directory and an exported internal name" ok generate
+if [ "$(cat "$AGENT_RECORD/temporary")" = "$OUT/temporary" ] && [ -z "$(find "$OUT/temporary" -mindepth 1 -print -quit)" ]; then
+  pass
+else
+  fail "the model run keeps the temporary directory of the caller, and the engine leaves nothing in it"
+fi
+if [ ! -e "$AGENT_RECORD/internal-variable-inherited" ] && [ -e "$AGENT_RECORD/credential-seen" ]; then
+  pass
+else
+  fail "a caller that exports the internal credential variable name does not make it inherited"
+fi
 
 new_repository
 "$engine" prepare "$REPO" "$OUT/plan.json"
@@ -2257,12 +2664,21 @@ contract "release validation accepts dispatched mainline CI" \
 contract "release validation requires the main branch" \
   grep -q 'headBranch == \\"main\\"' "$workflows/release.yml"
 
-contract "the script writes only blobs, trees, commits, a fast-forward ref, and a branch merge" \
-  test "$(grep -cE 'api_write (POST|PATCH|PUT|DELETE)' "$subject")" -eq 5
+contract "the script writes only blobs, trees, commits, a scratch ref, fast-forward refs, and a branch merge" \
+  test "$(grep -cE 'api_write (POST|PATCH|PUT|DELETE)' "$subject")" -eq 7
 contract "the branch merge is the only write outside the Git database" \
-  test "$(grep -cE 'api_write (POST|PATCH) "repos/\$\{REPO\}/(git/|merges")' "$subject")" -eq 5
+  test "$(grep -cE 'api_write (POST|PATCH) "repos/\$\{REPO\}/(git/|merges")' "$subject")" -eq 7
 refute "the script never forces, bypasses, or arms a merge" \
-  grep -nE 'force: true|--admin|--auto|--force|api_write (PUT|DELETE)|gh api [^|]*(-X|--method) *(POST|PUT|PATCH|DELETE)' "$subject"
+  grep -nE 'force: true|--admin|--auto|--force|api_write (PUT|DELETE)|gh api [^|]*(-X|--method) *(POST|PUT|PATCH)' "$subject"
+# shellcheck disable=SC2016  # A literal line of the script.
+contract "the only removal is of a scratch branch that the run created" \
+  test "$(grep -E '(-X|--method) *DELETE|api_write DELETE' "$subject")" \
+    = '  if gh api --method DELETE "repos/${REPO}/git/refs/heads/dependency-refresh/${name}" > /dev/null; then'
+contract "every ref update is a fast-forward" \
+  test "$(grep -c "'{sha: \$sha, force: false}'" "$subject")" -eq "$(grep -c 'api_write PATCH' "$subject")"
+# shellcheck disable=SC2016  # A literal argument of the script.
+refute "the branch merge never targets a pull request branch" \
+  grep -nE -- '--arg base "\$ref"' "$subject"
 contract "the repair commit carries no custom author" \
   grep -q "'{message: \$message, tree: \$tree, parents: \$parents}'" "$subject"
 refute "the repair engine uses no repository token" grep -nE '\bgh |GH_TOKEN|GITHUB_TOKEN' "$engine"
