@@ -680,18 +680,42 @@ workflow_tree() {
     | jq -er '.[] | select(.name == "workflows" and .type == "dir") | .sha'
 }
 
-# Succeeds when a rerun reproduced the failed required checks: every failed
-# job ran at least twice and at least one of them failed on its own, as
-# opposed to being cancelled. Takes the failed context names.
+# Resolves a check run to its matching Actions job before using the job ID.
+verified_job_for_context() {
+  local context="$1" check job id
+  check=$(jq -ce --arg context "$context" \
+    'map(select(.name == $context)) | first | select(. != null)' "$work_dir/runs.json") || return 1
+  id=$(jq -er '.id | numbers | select(. > 0)' <<< "$check") || return 1
+  job=$(api "repos/${REPO}/actions/jobs/${id}") || return 1
+  jq -ce --argjson check "$check" --arg repo "$REPO" '
+    select(.id == $check.id
+      and (.check_run_url | strings | endswith("/repos/" + $repo + "/check-runs/" + ($check.id | tostring)))
+      and .head_sha == $check.head_sha and .name == $check.name
+      and .status == "completed" and .conclusion == $check.conclusion
+      and (.run_id | type == "number" and . > 0))
+  ' <<< "$job"
+}
+
+# Succeeds when every failed check belongs to the latest attempt of its run,
+# the attempt is at least two, and at least one job failed or timed out.
 failures_reproduced() {
-  local context job detail own=1
+  local context job run jobs run_id attempt own=1
   for context in "$@"; do
-    job=$(jq -r --arg context "$context" \
-      'map(select(.name == $context)) | first | .id // empty' "$work_dir/runs.json")
-    [[ "$job" =~ ^[0-9]+$ ]] || return 1
-    detail=$(api "repos/${REPO}/actions/jobs/${job}") || return 1
-    jq -e '(.run_attempt // 1) >= 2' <<< "$detail" > /dev/null || return 1
-    if jq -e '.conclusion == "failure" or .conclusion == "timed_out"' <<< "$detail" > /dev/null; then
+    job=$(verified_job_for_context "$context") || return 1
+    run_id=$(jq -er '.run_id' <<< "$job") || return 1
+    run=$(api "repos/${REPO}/actions/runs/${run_id}") || return 1
+    attempt=$(jq -er --argjson job "$job" '
+      select(.id == $job.run_id and .head_sha == $job.head_sha
+        and .status == "completed")
+      | .run_attempt | numbers | select(. >= 2 and floor == .)
+    ' <<< "$run") || return 1
+    jobs=$(api_pages "repos/${REPO}/actions/runs/${run_id}/attempts/${attempt}/jobs?per_page=100") || return 1
+    jq -se --argjson job "$job" '
+      [.[].jobs[] | select(.id == $job.id and .run_id == $job.run_id
+        and .head_sha == $job.head_sha and .conclusion == $job.conclusion)]
+      | length == 1
+    ' <<< "$jobs" > /dev/null || return 1
+    if jq -e '.conclusion == "failure" or .conclusion == "timed_out"' <<< "$job" > /dev/null; then
       own=0
     fi
   done
@@ -784,8 +808,7 @@ repair_plan() {
       fi
       while IFS= read -r context; do
         [ -n "$context" ] || continue
-        job=$(jq -r --arg context "$context" \
-          'map(select(.name == $context)) | first | .id // empty' "$work_dir/runs.json")
+        job=$(verified_job_for_context "$context" | jq -r '.id') || job=""
         echo "## ${context}"
         echo
         echo '```text'

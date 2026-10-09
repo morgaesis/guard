@@ -124,6 +124,7 @@ rules() {
 # CHECKS_STARTED sets the start time of every run.
 check_runs() {
   local sha="$1" context override conclusion
+  CHECK_SHA="$sha"
   shift
   required_contexts | while IFS= read -r context; do
     conclusion="success"
@@ -133,15 +134,16 @@ check_runs() {
     [ -n "$conclusion" ] || continue
     jq -n --arg name "$context" --arg sha "$sha" --arg conclusion "$conclusion" \
       --arg started "${CHECKS_STARTED:-2026-01-01T00:00:00Z}" '{
-        id: 77, name: $name, head_sha: $sha, started_at: $started,
+        name: $name, head_sha: $sha, started_at: $started,
         app: {id: (if $conclusion == "foreign" then 1 else 15368 end)},
         status: (if $conclusion == "pending" then "in_progress" else "completed" end),
         conclusion: (if $conclusion == "pending" then null
                      elif $conclusion == "foreign" then "success"
                      else $conclusion end)
       }'
-  done | jq -s '{check_runs: .}' \
+  done | jq -s '{check_runs: [to_entries[] | .value + {id: (77 + .key)}]}' \
     | fixture "$api/commits/$sha/check-runs?filter=latest&per_page=100"
+  job_attempt "$JOB_ATTEMPT" "$JOB_CONCLUSION"
 }
 
 checks() {
@@ -165,13 +167,40 @@ new_case() {
   rules
   jq -n '[{name: "workflows", type: "dir", sha: "workflows-tree"}]' \
     | fixture "$api/contents/.github?ref=$main_sha"
+  unset CHECK_SHA
   job_attempt 2 failure
 }
 
-# job_attempt <run attempt> <conclusion>: the job behind every check run.
+# job_attempt <run attempt> <conclusion>: Actions job and workflow-run fixtures.
 job_attempt() {
-  jq -n --argjson attempt "$1" --arg conclusion "$2" '{run_attempt: $attempt, conclusion: $conclusion}' \
-    | fixture "$api/actions/jobs/77"
+  local check id run_id job
+  JOB_ATTEMPT="$1"
+  JOB_CONCLUSION="$2"
+  [ -n "${CHECK_SHA:-}" ] || return 0
+  while IFS= read -r check; do
+    id=$(jq -r '.id' <<< "$check")
+    run_id=$((500 + id))
+    job=$(jq -n --argjson check "$check" --argjson run_id "$run_id" \
+      --arg conclusion "$2" --arg repo "$GITHUB_REPOSITORY" '{
+        id: $check.id, run_id: $run_id,
+        check_run_url: ("https://api.github.com/repos/" + $repo + "/check-runs/" + ($check.id | tostring)),
+        head_sha: $check.head_sha, name: $check.name, status: "completed",
+        conclusion: $conclusion
+      }')
+    fixture "$api/actions/jobs/$id" <<< "$job"
+    jq -n --argjson run_id "$run_id" --arg sha "$CHECK_SHA" \
+      --argjson attempt "$1" '{id: $run_id, head_sha: $sha,
+        status: "completed", run_attempt: $attempt}' \
+      | fixture "$api/actions/runs/$run_id"
+    jq -n --argjson job "$job" '{total_count: 1, jobs: [$job]}' \
+      | fixture "$api/actions/runs/$run_id/attempts/$1/jobs?per_page=100"
+  done < <(jq -c '.check_runs[] | select(.status == "completed")' \
+    "$(fixture_path "$api/commits/$CHECK_SHA/check-runs?filter=latest&per_page=100")")
+}
+
+check_id_for() {
+  jq -r --arg name "$1" '.check_runs[] | select(.name == $name) | .id' \
+    "$(fixture_path "$api/commits/$CHECK_SHA/check-runs?filter=latest&per_page=100")"
 }
 
 # message <name:version:update-type>...
@@ -1012,7 +1041,7 @@ checks 1 "Security Audit (CVEs)=failure" "License & Dependency Policy=failure"
 contains 1 ahead false "Security Audit (CVEs)" "License & Dependency Policy"
 open_pulls 1
 printf '2026-10-08T00:00:00.0000000Z error: 1 vulnerability found!\n' \
-  | fixture "$api/actions/jobs/77/logs"
+  | fixture "$api/actions/jobs/$(check_id_for "Security Audit (CVEs)")/logs"
 expect_plan "failing checks on a current branch plan a repair without a merge" \
   '[.repair, .number, .merge, .manifest, .updates[0].name, .updates[0].version, .attempt]' \
   "[true,1,false,\"Cargo.toml\",\"clap\",\"4.6.7\",\"$(record_name 1 false "Security Audit (CVEs)" "License & Dependency Policy")\"]"
@@ -1058,9 +1087,50 @@ new_case
 eligible_pull 1
 checks 1 "Test & Lint=failure"
 contains 1 ahead
-rm "$(fixture_path "$api/actions/jobs/77")"
+rm "$(fixture_path "$api/actions/jobs/$(check_id_for "Test & Lint")")"
 open_pulls 1
 expect_plan "an unreadable job is not repaired" '.repair' false
+
+new_case
+eligible_pull 1
+checks 1 "Test & Lint=failure"
+contains 1 ahead
+job_id=$(check_id_for "Test & Lint")
+job_fixture=$(jq '.check_run_url = "https://api.github.com/repos/example/guard/check-runs/999"' \
+  "$(fixture_path "$api/actions/jobs/$job_id")")
+fixture "$api/actions/jobs/$job_id" <<< "$job_fixture"
+open_pulls 1
+expect_plan "a check run with no matching Actions job is not repaired" '.repair' false
+
+new_case
+eligible_pull 1
+checks 1 "Test & Lint=failure"
+contains 1 ahead
+job_id=$(check_id_for "Test & Lint")
+rm "$(fixture_path "$api/actions/runs/$((500 + job_id))")"
+open_pulls 1
+expect_plan "an unreadable workflow run is not repaired" '.repair' false
+
+new_case
+eligible_pull 1
+checks 1 "Test & Lint=failure"
+contains 1 ahead
+job_id=$(check_id_for "Test & Lint")
+run_fixture=$(jq 'del(.run_attempt)' "$(fixture_path "$api/actions/runs/$((500 + job_id))")")
+fixture "$api/actions/runs/$((500 + job_id))" <<< "$run_fixture"
+open_pulls 1
+expect_plan "a missing workflow-run attempt is not repaired" '.repair' false
+
+new_case
+eligible_pull 1
+checks 1 "Test & Lint=failure"
+contains 1 ahead
+job_id=$(check_id_for "Test & Lint")
+jobs_fixture=$(jq '.jobs[0].id = 999' \
+  "$(fixture_path "$api/actions/runs/$((500 + job_id))/attempts/2/jobs?per_page=100")")
+fixture "$api/actions/runs/$((500 + job_id))/attempts/2/jobs?per_page=100" <<< "$jobs_fixture"
+open_pulls 1
+expect_plan "a job mismatched to the rerun attempt is not repaired" '.repair' false
 
 new_case
 eligible_pull 1
