@@ -30,8 +30,13 @@ never checks out or runs pull request content with a repository token.
 - A major Cargo update, an unclassified update, or any other ecosystem fails
   the required `Classify dependency update` check until a repository owner,
   member, or collaborator approves the exact head commit.
-- One update merges per run. Further merges wait until the required checks
-  completed for the new `main` commit.
+- An update merges only when its head commit contains the current `main`
+  commit, so its checks ran on the tree that the merge produces. One update
+  merges per run, and one branch that lacks the `main` commit is refreshed per
+  run by merging `main` into it. A conflicting workflow update waits for the
+  rebase that Dependabot performs on a conflict.
+- A workflow run that was cancelled, or that failed once, is rerun. A failure
+  counts as a defect of the update once a rerun reproduced it.
 
 A Cargo update whose required checks fail, or whose branch conflicts with
 `main`, is repaired by `scripts/dependency-repair.sh`. A language model reads
@@ -39,20 +44,24 @@ the failure logs and edits files without the ability to run commands; Cargo
 then applies the requested lockfile updates in a job that holds neither the
 model credential nor a repository token. A separate job commits the result to
 the pull request branch as a signed commit, limited to the Cargo manifests,
-lockfiles, and Rust source of that update. A repair confined to the lockfile
-keeps the update routine. A repair that changes a manifest or source needs an
-approving review before it merges. Workflow updates are not repaired.
+lockfiles, and Rust source of that update. The repaired update merges under
+the same conditions as any other: a patch or minor update stays routine, and a
+major update still needs its approving review. The model runs once for a given
+Dependabot commit, `main` commit, and set of failing checks. Workflow updates
+are not repaired.
 
-The same repair runs locally against the current checkout and leaves its result
-uncommitted. The context file holds the failing check output:
+The same repair runs locally against the current checkout, including a linked
+worktree, and leaves its result uncommitted. The context file holds the
+failing check output:
 
 ```bash
 scripts/dependency-repair.sh candidate context.md
 ```
 
-The model credential is read from `OPENROUTER_API_KEY` and reaches only the
-model process. The repository variable `DEPENDENCY_REPAIR_MODEL` selects the
-model in CI.
+The model credential is read from `OPENROUTER_API_KEY`, removed from the
+script's environment, and handed to the model process alone. The model and
+the OpenCode release are fixed in the script, and `opencode` on `PATH` must be
+that release.
 
 ## Building
 

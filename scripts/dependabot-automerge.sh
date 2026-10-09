@@ -45,9 +45,9 @@ set -euo pipefail
 #     full commit SHA, whatever the update type.
 # Major Cargo updates, unclassified updates, and other ecosystems need review.
 #
-# A repaired update stays eligible only when the repair is confined to the
-# lockfile: every other changed file carries exactly the lines the Dependabot
-# commit changed. A repair that changes a manifest or Rust source needs review.
+# A repaired update stays eligible when its repair is confined to the same
+# manifest set and that crate's Rust source. Its required checks, the resolved
+# review threads, and the integration evidence below are what admit it.
 #
 # An approving review counts when a repository owner, member, or collaborator
 # approved the exact head commit and no such reviewer requests changes.
@@ -57,34 +57,44 @@ set -euo pipefail
 # update.
 #
 # reconcile merges at most one pull request per run. It merges only when the
-# effective branch rules match the declared required checks, every required
-# check succeeded for the exact head commit, every review thread is resolved,
-# and the classification is unchanged immediately before the merge. It holds
-# all merges until the required mainline checks completed for the current main
-# commit. While main fails those checks, only an update whose checks started
-# after that commit can merge.
+# effective branch rules match the declared required checks, the head commit
+# contains the current main commit, every required check succeeded for that
+# exact head commit, every review thread is resolved, and the classification
+# is unchanged immediately before the merge. A head that contains main has the
+# tree that the squash merge produces, so its checks are the integration
+# evidence. reconcile refreshes at most one branch per run that lacks the main
+# commit and does not conflict with it, through the branch merge API. The
+# refresh commit carries the marker that lets Dependabot keep rebasing the
+# branch. A conflicting Cargo update is left to repair-plan; a conflicting
+# workflow update is left to the rebase that Dependabot performs on a conflict.
 #
 # repair-plan selects at most one Cargo update whose required checks failed or
-# whose branch conflicts with main, and writes plan.json and context.md. It
-# plans at most three repair commits per pull request, and skips a pull
-# request head and main commit whose repair made no progress. That record is a
-# workflow artifact that expires after a day; a failed model run or a failed
-# job leaves no record and is tried again on the next run.
+# whose branch conflicts with main, and writes plan.json and context.md. A
+# failed check counts once a rerun reproduced it. Each plan has a record name
+# derived from the Dependabot commit, the main commit, and the failing checks.
+# The workflow stores a record under that name when a repair was published or
+# cannot proceed, and repair-plan skips a plan whose record exists, so the
+# model runs again only after one of the three changed. An operational failure
+# leaves no record and is tried again on the next run.
 #
 # publish-repair commits validated repair files to the pull request branch
 # through the Git database API. GitHub signs a commit created this way without
-# custom author information, and the branch advances only after the signature
-# is confirmed, as a fast-forward. It exits with status 3 when the candidate
-# made no progress: it changes nothing, violates the policy, or was refused.
+# custom author information, and the branch advances only after the commit
+# meets everything classify requires of a repair, as a fast-forward. It exits
+# with status 3 when the candidate made no progress: it changes nothing,
+# violates the policy, or was refused. It exits with status 4 when the pull
+# request changed and the candidate was dropped.
 #
-# ensure-validation-runs dispatches the required workflows on a repaired head.
-# A branch update made with the Actions token leaves pull request workflows
-# waiting for approval, and workflow_dispatch is the supported event that the
-# same token can raise. Dispatch is refused unless the branch workflows equal
-# the main workflows.
+# ensure-validation-runs dispatches the required workflows on a head that this
+# automation committed. A branch update made with the Actions token leaves
+# pull request workflows waiting for approval, and workflow_dispatch is the
+# supported event that the same token can raise. Dispatch is refused unless
+# the branch workflows equal the main workflows, or differ from them only by
+# an eligible workflow update on a head that contains main. It also reruns a
+# workflow run that was cancelled, or that failed and has not been rerun yet.
 #
 # ensure-mainline-runs dispatches the push-triggered mainline workflows for the
-# current main commit when no run exists for it.
+# current main commit when no run exists for it, and reruns them the same way.
 
 BOT_LOGIN="dependabot[bot]"
 REPAIR_LOGIN="github-actions[bot]"
@@ -94,10 +104,9 @@ BRANCH="main"
 APP_ID=15368
 MAINLINE_WORKFLOWS=(ci.yml audit.yml)
 VALIDATION_WORKFLOWS=(ci.yml audit.yml dependabot-automerge.yml)
-# Required contexts that report only for a pull request.
-PULL_REQUEST_CONTEXTS=("Classify dependency update" "Dependency Review")
 GATE_CONTEXT="Classify dependency update"
-MAX_REPAIRS=3
+# The bracketed marker lets Dependabot force push over the commit.
+REFRESH_MESSAGE=$'chore(deps): merge main into dependency update\n\nDependency-Repair: refresh\n[dependabot skip]'
 LOG_TAIL_LINES=120
 DISPATCH_POLLS="${DISPATCH_POLLS:-6}"
 DISPATCH_POLL_SECONDS="${DISPATCH_POLL_SECONDS:-5}"
@@ -159,7 +168,7 @@ is_ancestor() {
 # Prints the classification object. Returns nonzero only when metadata is
 # unreadable.
 classify() {
-  local number="$1" dir first parent merges_ok=true repairs fingerprint
+  local number="$1" dir parent merges_ok=true repairs fingerprint
   [[ "$number" =~ ^[1-9][0-9]*$ ]] || {
     echo "error: pull request number is malformed" >&2
     return 2
@@ -188,15 +197,9 @@ classify() {
         submitted_at: (.submitted_at // "")
       }]' > "$dir/reviews.json" || return 2
 
-  # A repaired pull request needs the Dependabot commit's own changes, and
-  # proof that every merged commit is part of main.
-  echo '[]' > "$dir/original.json"
+  # Every commit that a repair merged must be part of main.
   repairs=$(jq '[.[1:][]] | length' "$dir/commits.json")
   if [ "$repairs" -gt 0 ]; then
-    first=$(jq -r '.[0].sha // ""' "$dir/commits.json")
-    is_sha "$first" || return 2
-    api "repos/${REPO}/commits/${first}" \
-      | jq '[.files[]? | {filename, patch: (.patch // null)}]' > "$dir/original.json" || return 2
     while IFS= read -r parent; do
       is_sha "$parent" || return 2
       is_ancestor "$parent" "$BRANCH" || merges_ok=false
@@ -225,7 +228,6 @@ classify() {
     --slurpfile pull "$dir/pull.json" \
     --slurpfile commits "$dir/commits.json" \
     --slurpfile files "$dir/files.json" \
-    --slurpfile original "$dir/original.json" \
     --slurpfile reviews "$dir/reviews.json" '
     def metadata:
       split("\n") as $lines
@@ -265,8 +267,6 @@ classify() {
       else "other"
       end;
 
-    def is_lockfile: test("^(fuzz/)?Cargo\\.lock$");
-
     def is_source($class):
       if $class == "cargo-root"
       then test("^(src|tests|benches)/([A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\\.rs$")
@@ -299,9 +299,8 @@ classify() {
           "the pull request does not target the protected branch"
         elif $p.head.repo.full_name != $repo or (($p.head.ref // "") | startswith("dependabot/") | not) then
           "the head branch is not a Dependabot branch in this repository"
-        elif ($c | length) == 0 or ($c | length) > 8 or $p.commits != ($c | length)
-          or $c[-1].sha != $p.head.sha then
-          "the commit list is empty, too long, or does not end at the head"
+        elif ($c | length) == 0 or $p.commits != ($c | length) or $c[-1].sha != $p.head.sha then
+          "the commit list is empty, incomplete, or does not end at the head"
         elif $c[0].author != $bot or $c[0].committer != "web-flow" or $c[0].verified != true then
           "the first commit is not a verified Dependabot commit"
         elif any(range(1; $c | length); . as $i
@@ -347,13 +346,6 @@ classify() {
                   {class: $class, reason: "an update has no recognized type or version"}
                 elif $class != "github-actions" and any($items[] | level; . == "major") then
                   {class: $class, reason: "the update includes a major version"}
-                elif $repaired and (($outside | length) > 0 or any($f[];
-                    (.filename | is_lockfile | not)
-                    and (. as $file
-                      | ($original[0] | map(select(.filename == $file.filename)) | first) as $before
-                      | $before == null or $before.patch == null or $file.patch == null
-                        or ($before.patch | changed_lines) != ($file.patch | changed_lines)))) then
-                  {class: $class, reason: "the repair changes a manifest or source file"}
                 else
                   {class: $class, reason: null}
                 end
@@ -379,13 +371,14 @@ classify() {
                    elif $policy.reason == null then "eligible"
                    else "review" end),
         reason: ($policy.reason // (if ($c | length) > 1
-          then "the update is routine and its repair is confined to the lockfile"
+          then "the update is routine and its repair stays inside its manifest set and Rust source"
           else "the update is routine" end)),
         approved: approved,
         number: $number,
         ecosystem: $policy.class,
         head_sha: ($pull[0].head.sha // ""),
         head_ref: ($pull[0].head.ref // ""),
+        update_sha: ($c[0].sha // ""),
         mergeable_state: ($pull[0].mergeable_state // "unknown"),
         repairs: ([$c[1:][]] | length),
         updates: (if $distrust != null then [] else
@@ -486,38 +479,9 @@ required_contexts() {
   printf '%s\n' "${contexts[@]}"
 }
 
-mainline_contexts() {
-  local context skip exempt
-  required_contexts | while IFS= read -r context; do
-    skip=0
-    for exempt in "${PULL_REQUEST_CONTEXTS[@]}"; do
-      [ "$context" = "$exempt" ] && skip=1
-    done
-    [ "$skip" -eq 1 ] || printf '%s\n' "$context"
-  done
-}
-
 main_head() {
   api "repos/${REPO}/git/ref/heads/${BRANCH}" \
     | jq -er '.object.sha | strings | select(test("^[0-9a-f]{40}$"))'
-}
-
-# Prints validated, pending, or failed for the required mainline checks of a
-# main commit.
-mainline_state() {
-  local sha="$1" states
-  local -a contexts
-  mapfile -t contexts < <(mainline_contexts)
-  [ "${#contexts[@]}" -gt 0 ] || return 2
-  read_check_runs "$sha" "$work_dir/main-runs.json" || return 2
-  states=$(context_states "$work_dir/main-runs.json" "${contexts[@]}") || return 2
-  if grep -qE '^(missing|pending)'$'\t' <<< "$states"; then
-    echo pending
-  elif grep -q '^failed'$'\t' <<< "$states"; then
-    echo failed
-  else
-    echo validated
-  fi
 }
 
 # Succeeds when every review thread is resolved and the thread list was read in
@@ -553,30 +517,51 @@ open_dependabot_pulls() {
     | jq -s -r --arg bot "$BOT_LOGIN" '.[][] | select(.user.login == $bot) | .number'
 }
 
+# Succeeds when the commit meets what classify requires of a repair commit
+# with the given parents. Reads the commit JSON on standard input.
+repair_commit_verified() {
+  jq -e --arg bot "$REPAIR_LOGIN" --argjson parents "$1" '
+    .commit.verification.verified == true
+    and .author.login == $bot
+    and (.committer.login == "web-flow" or .committer.login == $bot)
+    and ([.parents[]?.sha] == $parents)' > /dev/null
+}
+
+# Merges the main commit into a pull request branch. GitHub computes the merge
+# and creates the commit; nothing is checked out.
+refresh_branch() {
+  local number="$1" ref="$2" sha="$3" main="$4" response commit
+  if ! [[ "$ref" =~ ^dependabot/[A-Za-z0-9._/+-]+$ ]]; then
+    report "#${number}: error, the head branch name is malformed"
+    return 1
+  fi
+  if ! response=$(jq -n --arg base "$ref" --arg head "$main" --arg message "$REFRESH_MESSAGE" \
+      '{base: $base, head: $head, commit_message: $message}' \
+      | api_write POST "repos/${REPO}/merges"); then
+    report "#${number}: error, the refresh of ${ref} with ${main} was refused"
+    return 1
+  fi
+  commit=$(jq -r '.sha // ""' <<< "$response")
+  if ! is_sha "$commit"; then
+    report "#${number}: the branch already contains ${main}, or moved during the refresh"
+    return 0
+  fi
+  if ! api "repos/${REPO}/commits/${commit}" \
+      | repair_commit_verified "$(jq -n --arg head "$sha" --arg main "$main" '[$head, $main]')"; then
+    report "#${number}: error, the refresh commit ${commit} is not a verified ${REPAIR_LOGIN} merge of ${main} into ${sha}"
+    return 1
+  fi
+  report "#${number}: refreshed with ${main} as ${commit}; it merges once its checks pass"
+}
+
 reconcile() {
-  local numbers number result decision approved reason sha state states unmet main main_state
-  local main_date="" problem again failures=0
+  local numbers number result decision approved reason sha state states unmet main ecosystem
+  local problem again refreshed=0 failures=0
 
   main=$(main_head) || {
     report "error, the ${BRANCH} head commit is unreadable"
     return 1
   }
-  main_state=$(mainline_state "$main") || {
-    report "error, the mainline checks are unreadable for ${main}"
-    return 1
-  }
-  if [ "$main_state" = "pending" ]; then
-    report "holding merges until the required mainline checks complete for ${main}"
-    return 0
-  fi
-  if [ "$main_state" = "failed" ]; then
-    main_date=$(api "repos/${REPO}/commits/${main}" | jq -er '.commit.committer.date | strings') || {
-      report "error, the ${BRANCH} head commit date is unreadable"
-      return 1
-    }
-    report "${BRANCH} fails its required checks at ${main}; only an update validated after it can merge"
-  fi
-
   numbers=$(open_dependabot_pulls) || {
     report "error, open pull requests are unreadable"
     return 1
@@ -593,6 +578,7 @@ reconcile() {
     reason=$(jq -r '.reason' <<< "$result")
     sha=$(jq -r '.head_sha' <<< "$result")
     state=$(jq -r '.mergeable_state' <<< "$result")
+    ecosystem=$(jq -r '.ecosystem' <<< "$result")
 
     if [ "$decision" = "manual" ]; then
       report "#${number}: manual, ${reason}"
@@ -614,6 +600,24 @@ reconcile() {
       continue
     fi
 
+    # Checks on a head without the main commit say nothing about the tree
+    # that a merge would produce.
+    if ! is_ancestor "$main" "$sha"; then
+      if [ "$state" = "dirty" ]; then
+        case "$ecosystem" in
+          cargo-*) report "#${number}: waiting, the branch conflicts with ${BRANCH}; a repair resolves it" ;;
+          *) report "#${number}: waiting, the branch conflicts with ${BRANCH}; Dependabot rebases it" ;;
+        esac
+      elif [ "$refreshed" -eq 1 ]; then
+        report "#${number}: waiting, the branch lacks ${main}; one branch is refreshed per run"
+      else
+        refreshed=1
+        refresh_branch "$number" "$(jq -r '.head_ref' <<< "$result")" "$sha" "$main" \
+          || failures=$((failures + 1))
+      fi
+      continue
+    fi
+
     mapfile -t contexts < <(required_contexts)
     if ! read_check_runs "$sha" "$work_dir/runs.json" \
         || ! states=$(context_states "$work_dir/runs.json" "${contexts[@]}"); then
@@ -624,15 +628,6 @@ reconcile() {
     unmet=$(grep -v '^success'$'\t' <<< "$states" | head -n 1 | cut -f 2- || true)
     if [ -n "$unmet" ]; then
       report "#${number}: waiting, required check has not succeeded: ${unmet}"
-      continue
-    fi
-    if [ -n "$main_date" ] && ! jq -e --arg date "$main_date" --argjson contexts \
-        "$(printf '%s\n' "${contexts[@]}" | jq -R . | jq -s .)" '
-          . as $runs | all($contexts[]; . as $context
-            | $runs | map(select(.name == $context)) | first
-            | (.started_at // "") > $date)
-        ' "$work_dir/runs.json" > /dev/null; then
-      report "#${number}: waiting, its checks predate the failing ${BRANCH} commit"
       continue
     fi
 
@@ -660,7 +655,7 @@ reconcile() {
 
     if gh pr merge "$number" --repo "$REPO" --squash --match-head-commit "$sha"; then
       report "#${number}: merged at ${sha}"
-      report "further merges wait for the mainline checks of the new ${BRANCH} commit"
+      report "every other update now lacks the new ${BRANCH} commit and is refreshed first"
       break
     else
       report "#${number}: error, merge was refused at ${sha}"
@@ -685,10 +680,29 @@ workflow_tree() {
     | jq -er '.[] | select(.name == "workflows" and .type == "dir") | .sha'
 }
 
+# Succeeds when a rerun reproduced the failed required checks: every failed
+# job ran at least twice and at least one of them failed on its own, as
+# opposed to being cancelled. Takes the failed context names.
+failures_reproduced() {
+  local context job detail own=1
+  for context in "$@"; do
+    job=$(jq -r --arg context "$context" \
+      'map(select(.name == $context)) | first | .id // empty' "$work_dir/runs.json")
+    [[ "$job" =~ ^[0-9]+$ ]] || return 1
+    detail=$(api "repos/${REPO}/actions/jobs/${job}") || return 1
+    jq -e '(.run_attempt // 1) >= 2' <<< "$detail" > /dev/null || return 1
+    if jq -e '.conclusion == "failure" or .conclusion == "timed_out"' <<< "$detail" > /dev/null; then
+      own=0
+    fi
+  done
+  return "$own"
+}
+
 # Selects one pull request to repair and writes plan.json and context.md.
 repair_plan() {
-  local out="$1" numbers number result decision sha state states failed main merge behind
+  local out="$1" numbers number result decision sha state states failed main merge
   local ecosystem manifest job context attempt
+  local -a failed_contexts
   mkdir -p "$out"
   echo '{"repair": false}' > "$out/plan.json"
   : > "$out/context.md"
@@ -724,36 +738,27 @@ repair_plan() {
     states=$(grep -vF $'\t'"$GATE_CONTEXT" <<< "$states" || true)
     failed=$(grep '^failed'$'\t' <<< "$states" | cut -f 2- || true)
 
-    behind=false
-    is_ancestor "$main" "$sha" || behind=true
     merge=false
     if [ "$state" = "dirty" ]; then
       merge=true
-    elif grep -q '^pending'$'\t' <<< "$states"; then
+    elif grep -q '^pending'$'\t' <<< "$states" || [ -z "$failed" ]; then
       continue
-    elif [ -n "$failed" ]; then
-      merge=$behind
-    elif grep -q '^missing'$'\t' <<< "$states" && [ "$(jq -r '.repairs' <<< "$result")" -gt 0 ] \
-        && [ "$(workflow_tree "$sha")" != "$(workflow_tree "$main")" ]; then
-      # A repaired head whose workflows differ from main cannot be validated
-      # by dispatch until main is merged into it.
-      merge=true
     else
-      continue
+      mapfile -t failed_contexts <<< "$failed"
+      if ! failures_reproduced "${failed_contexts[@]}"; then
+        report "#${number}: waiting, the failed checks at ${sha} have not been reproduced by a rerun"
+        continue
+      fi
+      is_ancestor "$main" "$sha" || merge=true
     fi
 
-    if [ "$(jq -r '.repairs' <<< "$result")" -ge "$MAX_REPAIRS" ]; then
-      report "#${number}: repair budget of ${MAX_REPAIRS} commits is spent; manual attention needed"
-      continue
-    fi
-
-    # The workflow records a repair that made no progress as an artifact of
-    # this name, so the same head and main commit are not generated again
-    # until the record expires.
-    attempt="repair-attempt-${number}-${sha}-${main}"
+    # The workflow stores a record under this name once a repair for this
+    # plan was published or cannot proceed.
+    attempt="repair-attempt-${number}-$(printf '%s\n' "$(jq -r '.update_sha' <<< "$result")" \
+      "$main" "$merge" "$failed" | sha256sum | cut -d ' ' -f 1)"
     if ! api "repos/${REPO}/actions/artifacts?name=${attempt}&per_page=100" \
         | jq -e '[.artifacts[]? | select(.expired == false)] | length == 0' > /dev/null; then
-      report "#${number}: the last repair at ${sha} on ${main} made no progress, or its record is unreadable"
+      report "#${number}: a repair for the same update, ${BRANCH} commit, and failing checks was already made, or its record is unreadable"
       continue
     fi
 
@@ -775,7 +780,7 @@ repair_plan() {
       echo "# Failing required checks"
       echo
       if [ -z "$failed" ]; then
-        echo "None reported. The branch conflicts with or lags behind ${BRANCH}."
+        echo "None reported. The branch conflicts with ${BRANCH}."
       fi
       while IFS= read -r context; do
         [ -n "$context" ] || continue
@@ -823,16 +828,15 @@ publish_repair() {
   ref=$(jq -r '.head_ref' <<< "$result")
   ecosystem=$(jq -r '.ecosystem' <<< "$result")
   if [ "$(jq -r '.decision' <<< "$result")" = "manual" ] \
-      || [ "$(jq -r '.head_sha' <<< "$result")" != "$head" ] \
-      || [ "$(jq -r '.repairs' <<< "$result")" -ge "$MAX_REPAIRS" ]; then
+      || [ "$(jq -r '.head_sha' <<< "$result")" != "$head" ]; then
     report "#${number}: repair dropped, the pull request changed or is no longer repairable"
-    return 0
+    return 4
   fi
   case "$ecosystem" in
     cargo-root|cargo-fuzz) ;;
     *)
       report "#${number}: repair dropped, the ecosystem is not repairable"
-      return 0
+      return 4
       ;;
   esac
 
@@ -905,8 +909,7 @@ publish_repair() {
       report "#${number}: error, the commit could not be created"
       return 1
     }
-  if ! is_sha "$commit" || ! api "repos/${REPO}/commits/${commit}" | jq -e --arg bot "$REPAIR_LOGIN" \
-      '.commit.verification.verified == true and .author.login == $bot' > /dev/null; then
+  if ! is_sha "$commit" || ! api "repos/${REPO}/commits/${commit}" | repair_commit_verified "$parents"; then
     report "#${number}: error, the repair commit is not a verified ${REPAIR_LOGIN} commit; the branch is unchanged"
     return 3
   fi
@@ -921,24 +924,51 @@ publish_repair() {
   fi
 }
 
-# Succeeds when a run of the workflow exists for the commit on the branch.
-run_exists() {
+# Prints "<state> <run id>" for the newest run of a workflow for a commit on a
+# branch, among runs raised by the given events (a JSON array). The state is:
+#   missing  no such run exists;
+#   active   the run has not completed;
+#   passed   the run succeeded;
+#   failed   the run failed again after a rerun, which makes it a finding;
+#   retry    the run was cancelled, or failed and has not been rerun.
+run_state() {
   api "repos/${REPO}/actions/workflows/${1}/runs?head_sha=${2}&per_page=100" \
-    | jq -e --arg head "$2" --arg branch "$3" '
+    | jq -er --arg head "$2" --arg branch "$3" --argjson events "$4" '
         [.workflow_runs[] | select(.head_sha == $head and .head_branch == $branch
-          and (.event == "push" or .event == "workflow_dispatch"))] | length'
+          and (.event as $event | $events | index($event) != null))]
+        | sort_by(.run_started_at // "", .id) | last
+        | if . == null then "missing 0"
+          elif .status != "completed" then "active \(.id)"
+          elif .conclusion == "success" then "passed \(.id)"
+          elif .conclusion == "failure" and (.run_attempt // 1) >= 2 then "failed \(.id)"
+          else "retry \(.id)"
+          end'
+}
+
+# Reruns the jobs of a run that did not succeed.
+rerun() {
+  local workflow="$1" run="$2" sha="$3"
+  [[ "$run" =~ ^[1-9][0-9]*$ ]] || return 1
+  # A cancelled run may hold no failed job, which the first form refuses.
+  if gh run rerun "$run" --repo "$REPO" --failed || gh run rerun "$run" --repo "$REPO"; then
+    report "${workflow}: rerun requested for run ${run} at ${sha}"
+  else
+    report "${workflow}: error, the rerun of run ${run} at ${sha} was refused"
+    return 1
+  fi
 }
 
 # Dispatches a workflow and confirms that a run exists for the intended commit.
 dispatch_and_confirm() {
-  local workflow="$1" ref="$2" sha="$3" count attempt
+  local workflow="$1" ref="$2" sha="$3" state attempt
   shift 3
   if ! gh workflow run "$workflow" --repo "$REPO" --ref "$ref" "$@"; then
     report "${workflow}: error, dispatch failed for ${sha}"
     return 1
   fi
   for ((attempt = 0; attempt < DISPATCH_POLLS; attempt++)); do
-    if count=$(run_exists "$workflow" "$sha" "$ref") && [ "$count" -gt 0 ]; then
+    if state=$(run_state "$workflow" "$sha" "$ref" '["push", "workflow_dispatch"]') \
+        && [ "${state%% *}" != "missing" ]; then
       report "${workflow}: dispatched for ${sha} on ${ref}"
       return 0
     fi
@@ -949,7 +979,7 @@ dispatch_and_confirm() {
 }
 
 ensure_validation_runs() {
-  local numbers number result sha ref main workflow count failures=0
+  local numbers number result sha ref main workflow state events dispatchable failures=0
   local -a inputs
 
   main=$(main_head) || return 2
@@ -957,24 +987,49 @@ ensure_validation_runs() {
   for number in $numbers; do
     result=$(classify "$number") || continue
     [ "$(jq -r '.decision' <<< "$result")" != "manual" ] || continue
-    [ "$(jq -r '.repairs' <<< "$result")" -gt 0 ] || continue
     sha=$(jq -r '.head_sha' <<< "$result")
     ref=$(jq -r '.head_ref' <<< "$result")
     [[ "$ref" =~ ^dependabot/[A-Za-z0-9._/+-]+$ ]] || continue
 
-    # The dispatched run executes the branch copy of each workflow.
-    if [ "$(workflow_tree "$sha")" != "$(workflow_tree "$main")" ]; then
-      report "#${number}: validation not dispatched, the branch workflows differ from ${BRANCH}"
-      continue
+    # Dependabot's own push starts pull request runs. A head that this
+    # automation committed has none that count, and is validated by dispatch.
+    if [ "$(jq -r '.repairs' <<< "$result")" -gt 0 ]; then
+      events='["push", "workflow_dispatch"]'
+    else
+      events='["pull_request", "pull_request_review", "push", "workflow_dispatch"]'
     fi
+    dispatchable=""
 
     for workflow in "${VALIDATION_WORKFLOWS[@]}"; do
-      if ! count=$(run_exists "$workflow" "$sha" "$ref"); then
+      if ! state=$(run_state "$workflow" "$sha" "$ref" "$events"); then
         report "#${number}: error, ${workflow} runs are unreadable for ${sha}"
         failures=$((failures + 1))
         continue
       fi
-      [ "$count" -eq 0 ] || continue
+      case "${state%% *}" in
+        retry)
+          rerun "$workflow" "${state##* }" "$sha" || failures=$((failures + 1))
+          continue
+          ;;
+        missing) [ "$(jq -r '.repairs' <<< "$result")" -gt 0 ] || continue ;;
+        *) continue ;;
+      esac
+
+      # The dispatched run executes the branch copy of each workflow. That
+      # copy is the main copy, or the main copy with an eligible update whose
+      # added lines are all actions pinned to a commit.
+      if [ -z "$dispatchable" ]; then
+        dispatchable=false
+        if [ "$(workflow_tree "$sha")" = "$(workflow_tree "$main")" ] \
+            || { [ "$(jq -r '.ecosystem + " " + .decision' <<< "$result")" = "github-actions eligible" ] \
+              && is_ancestor "$main" "$sha"; }; then
+          dispatchable=true
+        fi
+      fi
+      if [ "$dispatchable" = "false" ]; then
+        report "#${number}: validation not dispatched, the branch workflows differ from ${BRANCH}"
+        break
+      fi
       if [ "$(api "repos/${REPO}/pulls/${number}" | jq -r '.head.sha')" != "$sha" ]; then
         report "#${number}: the head moved past ${sha}; the next run covers the new head"
         break
@@ -992,7 +1047,7 @@ ensure_validation_runs() {
 }
 
 ensure_mainline_runs() {
-  local head workflow count failures=0
+  local head workflow state failures=0
 
   head=$(main_head) || {
     echo "error: the ${BRANCH} head commit is unreadable" >&2
@@ -1000,15 +1055,22 @@ ensure_mainline_runs() {
   }
 
   for workflow in "${MAINLINE_WORKFLOWS[@]}"; do
-    if ! count=$(run_exists "$workflow" "$head" "$BRANCH"); then
+    if ! state=$(run_state "$workflow" "$head" "$BRANCH" '["push", "workflow_dispatch"]'); then
       report "${workflow}: error, runs are unreadable for ${head}"
       failures=$((failures + 1))
       continue
     fi
-    if [ "$count" -gt 0 ]; then
-      report "${workflow}: a run exists for ${head}"
-      continue
-    fi
+    case "${state%% *}" in
+      retry)
+        rerun "$workflow" "${state##* }" "$head" || failures=$((failures + 1))
+        continue
+        ;;
+      missing) ;;
+      *)
+        report "${workflow}: a run exists for ${head}"
+        continue
+        ;;
+    esac
     if [ "$(main_head)" != "$head" ]; then
       report "${workflow}: ${BRANCH} moved past ${head}; the next reconcile covers the new head"
       continue

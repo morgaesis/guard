@@ -16,7 +16,7 @@ trap 'rm -rf "$tmp"' EXIT
 export GITHUB_REPOSITORY="example/guard"
 export DISPATCH_POLLS=2 DISPATCH_POLL_SECONDS=0
 unset GITHUB_STEP_SUMMARY GH_TOKEN GITHUB_TOKEN EXPECTED_HEAD OPENROUTER_API_KEY \
-  DEPENDENCY_REPAIR_MODEL DEPENDENCY_REPAIR_AUDIT_LOG AGENT_AUDIT_LOG_CLI || true
+  DEPENDENCY_REPAIR_AUDIT_LOG AGENT_AUDIT_LOG_CLI || true
 bot="dependabot[bot]"
 repair_bot="github-actions[bot]"
 failures=0
@@ -154,7 +154,8 @@ main_ref() {
   jq -n --arg sha "$1" '{object: {sha: $sha}}' | fixture "$api/git/ref/heads/main"
 }
 
-# Starts a case with a validated main commit and the declared branch rules.
+# Starts a case with the declared branch rules and failed jobs that a rerun
+# reproduced.
 new_case() {
   FIXTURES=$(mktemp -d "$tmp/case.XXXXXX")
   export FIXTURES
@@ -162,10 +163,15 @@ new_case() {
   : > "$FIXTURES/bodies"
   main_ref "$main_sha"
   rules
-  check_runs "$main_sha" "Classify dependency update=" "Dependency Review="
-  jq -n '{commit: {committer: {date: "2026-02-01T00:00:00Z"}}}' | fixture "$api/commits/$main_sha"
   jq -n '[{name: "workflows", type: "dir", sha: "workflows-tree"}]' \
     | fixture "$api/contents/.github?ref=$main_sha"
+  job_attempt 2 failure
+}
+
+# job_attempt <run attempt> <conclusion>: the job behind every check run.
+job_attempt() {
+  jq -n --argjson attempt "$1" --arg conclusion "$2" '{run_attempt: $attempt, conclusion: $conclusion}' \
+    | fixture "$api/actions/jobs/77"
 }
 
 # message <name:version:update-type>...
@@ -207,12 +213,12 @@ files_json() {
 
 # Writes fixtures for one pull request. Arguments: number, head ref, commit
 # message, then changed files. Overrides come from the P_* variables:
-#   P_REPAIRS         later commits, each "update" or "merge";
-#   P_ORIGINAL        files the Dependabot commit changed (default: all files);
-#   P_PATCH           patch of every changed file ("none" omits it);
-#   P_ORIGINAL_PATCH  patch of every file in the Dependabot commit.
+#   P_REPAIRS   later commits, each "update" or "merge";
+#   P_PATCH     patch of every changed file ("none" omits it);
+#   P_CONTAINS  comparison of main with the head (default "ahead": the head
+#               contains main).
 pull() {
-  local number="$1" ref="$2" text="$3" sha first previous index=0 kind commits original
+  local number="$1" ref="$2" text="$3" sha first previous index=0 kind commits
   local -a repairs
   shift 3
   sha=$(sha_for "$number")
@@ -262,13 +268,10 @@ pull() {
   jq -n --arg status "${P_MERGED_STATUS:-ahead}" '{status: $status}' \
     | fixture "$api/compare/$(sha_for merged)...main"
 
+  jq -n --arg status "${P_CONTAINS:-ahead}" '{status: $status}' \
+    | fixture "$api/compare/$main_sha...$sha"
+
   files_json "${P_PATCH:-}" "$@" | fixture "$api/pulls/$number/files?per_page=100"
-  if [ -n "${P_ORIGINAL:-}" ]; then
-    read -r -a original <<< "$P_ORIGINAL"
-  else
-    original=("$@")
-  fi
-  files_json "${P_ORIGINAL_PATCH:-}" "${original[@]}" | jq '{files: .}' | fixture "$api/commits/$first"
 
   echo '[]' | fixture "$api/pulls/$number/reviews?per_page=100"
   threads "$number" true
@@ -524,10 +527,6 @@ P_REPAIRS=update pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.toml Ca
 expect_decision "lockfile repair on top of the Dependabot commit" eligible 1
 
 new_case
-P_REPAIRS=update P_ORIGINAL=Cargo.toml pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.toml Cargo.lock
-expect_decision "repair that adds the lockfile to the update" eligible 1
-
-new_case
 P_REPAIRS="merge update" pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.toml Cargo.lock
 expect_decision "merge of main followed by a lockfile repair" eligible 1
 
@@ -552,29 +551,33 @@ P_REPAIRS=update P_REPAIR_PARENT=$(sha_for elsewhere) pull 1 "$cargo_ref" "$(mes
 expect_decision "repair that is not on top of the Dependabot commit" manual 1
 
 new_case
-P_REPAIRS=update P_ORIGINAL_PATCH=$'@@ -1 +1 @@\n-clap = "4.6.6"\n+clap = "4.6.7"' \
-  pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.toml Cargo.lock
-expect_decision "repair that changes the manifest" review 1
+P_REPAIRS=update pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.toml Cargo.lock src/server/execute.rs tests/cli_output.rs
+expect_decision "repair that changes the manifest and Rust source" eligible 1
 
 new_case
-P_REPAIRS=update P_ORIGINAL=Cargo.lock pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.toml Cargo.lock
-expect_decision "repair that adds the manifest to the update" review 1
+P_REPAIRS=update pull 1 "$fuzz_ref" "$(message serde_json:1.0.151:patch)" fuzz/Cargo.lock fuzz/fuzz_targets/parse.rs
+expect_decision "fuzz repair that changes a fuzz target" eligible 1
 
 new_case
-P_REPAIRS=update P_ORIGINAL=Cargo.lock pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.lock src/server/execute.rs
-expect_decision "repair that changes Rust source" review 1
+P_REPAIRS=update pull 1 "$fuzz_ref" "$(message serde_json:1.0.151:patch)" fuzz/Cargo.lock src/main.rs
+expect_decision "fuzz repair that changes root source" review 1
 
 new_case
-P_REPAIRS=update P_ORIGINAL=Cargo.lock pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.lock build.rs
+P_REPAIRS=update pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.lock build.rs
 expect_decision "repair that changes a build script" review 1
 
 new_case
-P_REPAIRS=update P_ORIGINAL=Cargo.lock pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.lock scripts/dependabot-automerge.sh
+P_REPAIRS=update pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.lock scripts/dependabot-automerge.sh
 expect_decision "repair that changes the automation" review 1
 
 new_case
-P_REPAIRS=update P_PATCH=none pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.toml Cargo.lock
-expect_decision "repaired manifest without a readable patch" review 1
+P_REPAIRS=update pull 1 "$actions_ref" "$(message actions/checkout:7.0.2:patch)" .github/workflows/ci.yml src/main.rs
+expect_decision "workflow update that carries Rust source" review 1
+
+new_case
+P_REPAIRS="update update update update update update update update update" \
+  pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.lock src/main.rs
+expect_decision "the number of repairs does not end automation" eligible 1
 
 new_case
 P_REPAIRS=update pull 1 "$cargo_ref" "$(message dirs:7.0.0:major)" Cargo.toml Cargo.lock
@@ -825,39 +828,128 @@ main_ref "$main_sha"
 "$subject" reconcile > /dev/null || fail "moved main: reconcile failed"
 expect_writes "no merge when main moves during evaluation" ""
 
-# Mainline validation of the integrated commit.
+# Integration evidence: the head must contain the current main commit.
+
+refresh_message=$'chore(deps): merge main into dependency update\n\nDependency-Repair: refresh\n[dependabot skip]'
+
+# refresh_result <number> [verified] [author] [committer] [first parent]
+refresh_result() {
+  jq -n --arg sha "$(sha_for refreshed)" '{sha: $sha}' | fixture "POST $api/merges"
+  jq -n --argjson verified "${2:-true}" --arg author "${3:-$repair_bot}" \
+    --arg committer "${4:-web-flow}" --arg head "${5:-$(sha_for "$1")}" --arg main "$main_sha" '{
+      author: {login: $author}, committer: {login: $committer},
+      commit: {verification: {verified: $verified}},
+      parents: [{sha: $head}, {sha: $main}]
+    }' | fixture "$api/commits/$(sha_for refreshed)"
+}
 
 new_case
-check_runs "$main_sha" "Classify dependency update=" "Dependency Review=" "Test & Lint=pending"
-eligible_pull 1
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+refresh_result 1
+open_pulls 1
+"$subject" reconcile > /dev/null || fail "stale head: reconcile failed"
+expect_writes "a green head without the main commit is refreshed, not merged" "api POST $api/merges"
+if jq -s -e --arg ref "$cargo_ref" --arg main "$main_sha" --arg message "$refresh_message" \
+    '. == [{base: $ref, head: $main, commit_message: $message}]' "$FIXTURES/bodies" > /dev/null; then
+  pass
+else
+  fail "the refresh merges the exact main commit with the Dependabot marker"
+fi
+
+new_case
+P_CONTAINS=behind pull 1 "$actions_ref" "$(message actions/checkout:7.0.2:patch)" .github/workflows/ci.yml
+checks 1
+refresh_result 1
+open_pulls 1
+"$subject" reconcile > /dev/null || fail "stale workflow update: reconcile failed"
+expect_writes "a stale workflow update is refreshed" "api POST $api/merges"
+
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1 "Test & Lint=failure"
+refresh_result 1
+open_pulls 1
+"$subject" reconcile > /dev/null || fail "stale failing head: reconcile failed"
+expect_writes "a failing head without the main commit is refreshed before anything else" "api POST $api/merges"
+
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+P_CONTAINS=diverged eligible_pull 2
+checks 2
+refresh_result 1
+open_pulls 1 2
+"$subject" reconcile > /dev/null || fail "two stale heads: reconcile failed"
+expect_writes "one branch is refreshed per run" "api POST $api/merges"
+
+new_case
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+eligible_pull 2
+checks 2
+refresh_result 1
+open_pulls 1 2
+"$subject" reconcile > /dev/null || fail "stale and current heads: reconcile failed"
+expect_writes "a current green head still merges after a refresh" \
+  "$(printf 'api POST %s/merges\n%s' "$api" "$(merge_call 2)")"
+
+for ref in "$cargo_ref" "$actions_ref"; do
+  new_case
+  if [ "$ref" = "$cargo_ref" ]; then
+    P_CONTAINS=diverged P_MERGEABLE=dirty eligible_pull 1
+  else
+    P_CONTAINS=diverged P_MERGEABLE=dirty pull 1 "$ref" "$(message actions/checkout:7.0.2:patch)" .github/workflows/ci.yml
+  fi
+  checks 1
+  open_pulls 1
+  "$subject" reconcile > /dev/null || fail "conflicting head: reconcile failed"
+  expect_writes "a conflicting branch on $ref is neither refreshed nor merged" ""
+done
+
+new_case
+P_CONTAINS=diverged pull 1 "$cargo_ref" "$(message dirs:7.0.0:major)" Cargo.toml Cargo.lock
 checks 1
 open_pulls 1
-"$subject" reconcile > /dev/null || fail "main pending: reconcile failed"
-expect_writes "no merge while the mainline checks are running" ""
+"$subject" reconcile > /dev/null || fail "stale unapproved major: reconcile failed"
+expect_writes "an update that awaits review is not refreshed" ""
 
 new_case
-check_runs "$main_sha" "Classify dependency update=" "Dependency Review=" "CodeQL (rust)="
-eligible_pull 1
+P_CONTAINS=diverged eligible_pull 1
 checks 1
 open_pulls 1
-"$subject" reconcile > /dev/null || fail "main unvalidated: reconcile failed"
-expect_writes "no merge while a mainline check is missing" ""
+touch "$FIXTURES/refuse-writes"
+expect_status "a refused refresh fails the run" fail "$subject" reconcile
+
+for fault in "false $repair_bot web-flow" "true contributor web-flow" "true $repair_bot contributor" \
+  "true $repair_bot web-flow $(sha_for elsewhere)"; do
+  new_case
+  P_CONTAINS=diverged eligible_pull 1
+  checks 1
+  read -r -a fields <<< "$fault"
+  refresh_result 1 "${fields[@]}"
+  open_pulls 1
+  expect_status "a refresh commit that is not a verified repair [$fault] fails the run" fail "$subject" reconcile
+done
 
 new_case
-check_runs "$main_sha" "Classify dependency update=" "Dependency Review=" "Security Audit (CVEs)=failure"
+P_CONTAINS=diverged eligible_pull 1
+checks 1
+echo '' | fixture "POST $api/merges"
+open_pulls 1
+expect_status "a refresh that finds nothing to merge is not an error" ok "$subject" reconcile
+
+new_case
 eligible_pull 1
 checks 1
+rm "$(fixture_path "$api/compare/$main_sha...$(sha_for 1)")"
 open_pulls 1
-"$subject" reconcile > /dev/null || fail "main failed, stale checks: reconcile failed"
-expect_writes "no merge of stale checks onto a failing main" ""
-
-new_case
-check_runs "$main_sha" "Classify dependency update=" "Dependency Review=" "Security Audit (CVEs)=failure"
-eligible_pull 1
-CHECKS_STARTED=2026-02-02T00:00:00Z checks 1
-open_pulls 1
-"$subject" reconcile > /dev/null || fail "main failed, fresh checks: reconcile failed"
-expect_writes "an update validated after a failing main commit merges" "$(merge_call 1)"
+"$subject" reconcile > /dev/null 2>&1 || true
+if grep -q '^pr merge' "$FIXTURES/writes"; then
+  fail "an unreadable comparison with main allowed a merge"
+else
+  pass
+fi
 
 new_case
 main_ref "not-a-commit"
@@ -888,25 +980,42 @@ expect_plan() {
   fi
 }
 
-# contains <number> <status>: whether the head contains the main commit. No
-# repair was attempted yet unless ATTEMPTS says otherwise.
+# record_name <number> <merge> [failed context]...: the record name of the plan
+# for a pull request whose Dependabot commit is its head.
+record_name() {
+  local number="$1" merge="$2" failed=""
+  shift 2
+  [ "$#" -eq 0 ] || failed=$(required_contexts | grep -xFf <(printf '%s\n' "$@"))
+  printf 'repair-attempt-%s-%s' "$number" \
+    "$(printf '%s\n' "$(sha_for "$number")" "$main_sha" "$merge" "$failed" | sha256sum | cut -d ' ' -f 1)"
+}
+
+# contains <number> <status> [merge] [failed context]...: whether the head
+# contains the main commit, and the plan whose record is looked up (default:
+# no merge, "Test & Lint" failed; "-" for no failed check). No record exists
+# unless ATTEMPTS says otherwise.
 contains() {
-  jq -n --arg status "$2" '{status: $status}' \
-    | fixture "$api/compare/$main_sha...$(sha_for "$1")"
+  local number="$1" status="$2" merge="${3:-false}"
+  shift 2
+  [ "$#" -eq 0 ] || shift
+  [ "$#" -gt 0 ] || set -- "Test & Lint"
+  [ "$1" != "-" ] || set --
+  jq -n --arg status "$status" '{status: $status}' \
+    | fixture "$api/compare/$main_sha...$(sha_for "$number")"
   jq -n "{artifacts: ${ATTEMPTS:-[]}}" \
-    | fixture "$api/actions/artifacts?name=repair-attempt-$1-$(sha_for "$1")-$main_sha&per_page=100"
+    | fixture "$api/actions/artifacts?name=$(record_name "$number" "$merge" "$@")&per_page=100"
 }
 
 new_case
 eligible_pull 1
 checks 1 "Security Audit (CVEs)=failure" "License & Dependency Policy=failure"
-contains 1 ahead
+contains 1 ahead false "Security Audit (CVEs)" "License & Dependency Policy"
 open_pulls 1
 printf '2026-10-08T00:00:00.0000000Z error: 1 vulnerability found!\n' \
   | fixture "$api/actions/jobs/77/logs"
 expect_plan "failing checks on a current branch plan a repair without a merge" \
   '[.repair, .number, .merge, .manifest, .updates[0].name, .updates[0].version, .attempt]' \
-  "[true,1,false,\"Cargo.toml\",\"clap\",\"4.6.7\",\"repair-attempt-1-$(sha_for 1)-$main_sha\"]"
+  "[true,1,false,\"Cargo.toml\",\"clap\",\"4.6.7\",\"$(record_name 1 false "Security Audit (CVEs)" "License & Dependency Policy")\"]"
 if grep -q '^## Security Audit (CVEs)$' "$FIXTURES/plan/context.md" \
     && grep -q '^error: 1 vulnerability found!$' "$FIXTURES/plan/context.md"; then
   pass
@@ -919,7 +1028,39 @@ eligible_pull 1
 checks 1 "Test & Lint=failure"
 ATTEMPTS='[{expired: false}]' contains 1 ahead
 open_pulls 1
-expect_plan "a repair without progress is not generated again for the same commits" '.repair' false
+expect_plan "a recorded repair is not generated again for the same update, main commit, and failing checks" '.repair' false
+
+new_case
+eligible_pull 1
+checks 1 "Test & Lint=failure" "Security Audit (CVEs)=failure"
+ATTEMPTS='[{expired: false}]' contains 1 ahead
+contains 1 ahead false "Test & Lint" "Security Audit (CVEs)"
+open_pulls 1
+expect_plan "a different set of failing checks is repaired again" '.repair' true
+
+new_case
+eligible_pull 1
+checks 1 "Test & Lint=failure"
+contains 1 ahead
+job_attempt 1 failure
+open_pulls 1
+expect_plan "a failure that no rerun reproduced is not repaired" '.repair' false
+
+new_case
+eligible_pull 1
+checks 1 "Test & Lint=cancelled"
+contains 1 ahead
+job_attempt 2 cancelled
+open_pulls 1
+expect_plan "cancelled checks alone are not repaired" '.repair' false
+
+new_case
+eligible_pull 1
+checks 1 "Test & Lint=failure"
+contains 1 ahead
+rm "$(fixture_path "$api/actions/jobs/77")"
+open_pulls 1
+expect_plan "an unreadable job is not repaired" '.repair' false
 
 new_case
 eligible_pull 1
@@ -932,14 +1073,14 @@ new_case
 eligible_pull 1
 checks 1 "Test & Lint=failure"
 contains 1 ahead
-rm "$(fixture_path "$api/actions/artifacts?name=repair-attempt-1-$(sha_for 1)-$main_sha&per_page=100")"
+rm "$(fixture_path "$api/actions/artifacts?name=$(record_name 1 false "Test & Lint")&per_page=100")"
 open_pulls 1
 expect_plan "unreadable attempt records stop the repair" '.repair' false
 
 new_case
 eligible_pull 1
 checks 1 "Test & Lint=failure"
-contains 1 diverged
+contains 1 diverged true
 open_pulls 1
 expect_plan "failing checks on a stale branch plan a merge" '[.repair, .merge, .main_sha]' \
   "[true,true,\"$main_sha\"]"
@@ -947,7 +1088,7 @@ expect_plan "failing checks on a stale branch plan a merge" '[.repair, .merge, .
 new_case
 P_MERGEABLE=dirty eligible_pull 1
 checks 1
-contains 1 diverged
+contains 1 diverged true -
 open_pulls 1
 expect_plan "a conflicting branch plans a merge" '[.repair, .merge]' '[true,true]'
 
@@ -1002,22 +1143,13 @@ open_pulls 1
 expect_plan "an unrecognized pull request is not repaired" '.repair' false
 
 new_case
-P_REPAIRS="update update update" eligible_pull 1
+P_REPAIRS="update update update update" eligible_pull 1
 checks 1 "Test & Lint=failure"
 contains 1 ahead
+jq -n '{artifacts: []}' | fixture "$api/actions/artifacts?name=repair-attempt-1-$(printf '%s\n' \
+  "$(sha_for 1-first)" "$main_sha" false "Test & Lint" | sha256sum | cut -d ' ' -f 1)&per_page=100"
 open_pulls 1
-expect_plan "a spent repair budget stops further repairs" '.repair' false
-
-new_case
-P_REPAIRS=update eligible_pull 1
-required_contexts | sed 's/$/=/' > "$FIXTURES/none"
-mapfile -t none < "$FIXTURES/none"
-check_runs "$(sha_for 1)" "${none[@]}"
-contains 1 diverged
-jq -n '[{name: "workflows", type: "dir", sha: "older-workflows-tree"}]' \
-  | fixture "$api/contents/.github?ref=$(sha_for 1)"
-open_pulls 1
-expect_plan "a repaired head with outdated workflows plans a merge" '[.repair, .merge]' '[true,true]'
+expect_plan "earlier repairs do not stop a repair for a new failure record" '.repair' true
 
 # --- Repair publication ------------------------------------------------------
 
@@ -1038,7 +1170,7 @@ candidate() {
 
 # Fixtures for the Git database requests of one publication.
 git_database() {
-  local number="$1" verified="${2:-true}" author="${3:-$repair_bot}"
+  local number="$1" verified="${2:-true}" author="${3:-$repair_bot}" committer="${4:-web-flow}"
   jq -n '{tree: {sha: "head-tree"}}' | fixture "$api/git/commits/$(sha_for "$number")"
   jq -n '{tree: {sha: "main-tree"}}' | fixture "$api/git/commits/$main_sha"
   for tree in head-tree main-tree; do
@@ -1053,9 +1185,12 @@ git_database() {
   jq -n '{sha: "new-blob"}' | fixture "POST $api/git/blobs"
   jq -n '{sha: "new-tree"}' | fixture "POST $api/git/trees"
   jq -n --arg sha "$(sha_for repaired)" '{sha: $sha}' | fixture "POST $api/git/commits"
-  jq -n --arg author "$author" --argjson verified "$verified" \
-    '{author: {login: $author}, commit: {verification: {verified: $verified}}}' \
-    | fixture "$api/commits/$(sha_for repaired)"
+  jq -n --arg author "$author" --argjson verified "$verified" --arg committer "$committer" \
+    --arg head "${REPAIR_PARENT:-$(sha_for "$number")}" --arg main "$main_sha" --argjson merge "${REPAIR_MERGE:-false}" '{
+      author: {login: $author}, committer: {login: $committer},
+      commit: {verification: {verified: $verified}},
+      parents: ([{sha: $head}] + (if $merge then [{sha: $main}] else [] end))
+    }' | fixture "$api/commits/$(sha_for repaired)"
   echo '{}' | fixture "PATCH $api/git/refs/heads/$cargo_ref"
 }
 
@@ -1083,7 +1218,7 @@ fi
 
 new_case
 eligible_pull 1
-git_database 1
+REPAIR_MERGE=true git_database 1
 candidate 1 true Cargo.lock
 expect_status "a merge repair is published" ok "$subject" publish-repair "$CANDIDATE"
 if jq -s -e --arg head "$(sha_for 1)" --arg main "$main_sha" \
@@ -1123,28 +1258,52 @@ expect_status "a repair commit by another author fails publication" fail "$subje
 expect_writes "a repair commit by another author never reaches the branch" \
   "$(head -n 3 <<< "$publication")"
 
+for fault in "committer:1 true $repair_bot contributor" "parent:1 true $repair_bot web-flow"; do
+  new_case
+  eligible_pull 1
+  read -r -a fields <<< "${fault#*:}"
+  if [ "${fault%%:*}" = "parent" ]; then
+    REPAIR_PARENT=$(sha_for elsewhere) git_database "${fields[@]}"
+  else
+    git_database "${fields[@]}"
+  fi
+  candidate 1 false Cargo.lock
+  expect_status "a repair commit with another ${fault%%:*} fails publication" fail "$subject" publish-repair "$CANDIDATE"
+  expect_writes "a repair commit with another ${fault%%:*} never reaches the branch" \
+    "$(head -n 3 <<< "$publication")"
+done
+
+# expect_dropped <name>: the candidate is dropped with status 4 and no write.
+expect_dropped() {
+  local status=0
+  "$subject" publish-repair "$CANDIDATE" > /dev/null 2>&1 || status=$?
+  if [ "$status" -eq 4 ]; then
+    pass
+  else
+    fail "$1: expected status 4, got $status"
+  fi
+  expect_writes "no write when $1" ""
+}
+
 new_case
 eligible_pull 1
 git_database 1
 candidate 1 false Cargo.lock
 jq --arg head "$(sha_for stale)" '.head_sha = $head' "$CANDIDATE/manifest.json" > "$CANDIDATE/m" \
   && mv "$CANDIDATE/m" "$CANDIDATE/manifest.json"
-expect_status "a repair for a head that moved is dropped" ok "$subject" publish-repair "$CANDIDATE"
-expect_writes "no write for a head that moved" ""
+expect_dropped "a repair is for a head that moved"
 
 new_case
 P_USER=contributor P_TYPE=User pull 1 "$cargo_ref" "$(message clap:4.6.7:patch)" Cargo.lock
 git_database 1
 candidate 1 false Cargo.lock
-expect_status "a repair for an unrecognized pull request is dropped" ok "$subject" publish-repair "$CANDIDATE"
-expect_writes "no write for an unrecognized pull request" ""
+expect_dropped "a repair is for an unrecognized pull request"
 
 new_case
 pull 1 "$actions_ref" "$(message actions/checkout:7.0.2:patch)" .github/workflows/ci.yml
 git_database 1
 candidate 1 false Cargo.lock
-expect_status "a repair for a workflow update is dropped" ok "$subject" publish-repair "$CANDIDATE"
-expect_writes "no write for a workflow update" ""
+expect_dropped "a repair is for a workflow update"
 
 for file in README.md build.rs .github/workflows/ci.yml scripts/dependabot-automerge.sh \
   fuzz/Cargo.lock src/main.txt .cargo/config.toml deny.toml; do
@@ -1209,19 +1368,24 @@ fi
 expect_writes "no commit for a repair without a change" "$(head -n 2 <<< "$publication")"
 
 new_case
-P_REPAIRS="update update update" eligible_pull 1
+P_REPAIRS="update update update update" eligible_pull 1
 git_database 1
-candidate 1 false Cargo.lock
-expect_status "a repair beyond the budget is dropped" ok "$subject" publish-repair "$CANDIDATE"
-expect_writes "no write beyond the repair budget" ""
+candidate 1 false Cargo.lock src/main.rs
+expect_status "a further source repair on a repaired update is published" ok "$subject" publish-repair "$CANDIDATE"
 
 # --- Workflow runs -----------------------------------------------------------
 
-# runs <workflow> <sha> <branch> <count> [fixture suffix]
+# runs <workflow> <sha> <branch> <count> [fixture suffix]. RUN_EVENT,
+# RUN_STATUS, RUN_CONCLUSION, and RUN_ATTEMPT describe every run.
 runs() {
-  jq -n --arg sha "$2" --arg branch "$3" --argjson count "$4" --arg event "${RUN_EVENT:-push}" '{
-    workflow_runs: [range(0; $count) | {head_sha: $sha, head_branch: $branch, event: $event}]
-  }' > "$(fixture_path "$api/actions/workflows/$1/runs?head_sha=$2&per_page=100")${5:-}"
+  jq -n --arg sha "$2" --arg branch "$3" --argjson count "$4" --arg event "${RUN_EVENT:-push}" \
+    --arg status "${RUN_STATUS:-completed}" --arg conclusion "${RUN_CONCLUSION:-success}" \
+    --argjson attempt "${RUN_ATTEMPT:-1}" '{
+      workflow_runs: [range(0; $count) | {
+        id: (500 + .), head_sha: $sha, head_branch: $branch, event: $event, status: $status,
+        conclusion: (if $status == "completed" then $conclusion else null end),
+        run_attempt: $attempt, run_started_at: "2026-01-01T00:00:0\(.)Z"}]
+    }' > "$(fixture_path "$api/actions/workflows/$1/runs?head_sha=$2&per_page=100")${5:-}"
 }
 
 repaired_pull() {
@@ -1273,14 +1437,118 @@ fi
 
 new_case
 repaired_pull branch-workflows-tree
+for workflow in ci.yml audit.yml dependabot-automerge.yml; do
+  runs "$workflow" "$(sha_for 1)" "$cargo_ref" 0
+done
 "$subject" ensure-validation-runs > /dev/null || fail "differing workflows: command failed"
 expect_writes "no dispatch when the branch workflows differ from main" ""
+
+# A refreshed workflow update differs from main by its own pinned actions.
+refreshed_actions_pull() {
+  P_REPAIRS=merge pull 1 "$actions_ref" "$1" .github/workflows/ci.yml
+  jq -n '[{name: "workflows", type: "dir", sha: "branch-workflows-tree"}]' \
+    | fixture "$api/contents/.github?ref=$(sha_for 1)"
+  open_pulls 1
+  for workflow in ci.yml audit.yml dependabot-automerge.yml; do
+    runs "$workflow" "$(sha_for 1)" "$actions_ref" 0
+    RUN_EVENT=workflow_dispatch runs "$workflow" "$(sha_for 1)" "$actions_ref" 1 .dispatched
+  done
+}
+
+new_case
+refreshed_actions_pull "$(message actions/checkout:8:major)"
+expect_status "validation is dispatched for a refreshed workflow update" ok "$subject" ensure-validation-runs
+if [ "$(grep -c '^workflow run ' "$FIXTURES/writes")" -eq 3 ]; then
+  pass
+else
+  fail "a refreshed, eligible workflow update gets every required workflow by dispatch"
+fi
+
+new_case
+P_PATCH=$'@@ -1 +1 @@\n-    run: old\n+    run: new' refreshed_actions_pull "$(message actions/checkout:7.0.2:patch)"
+"$subject" ensure-validation-runs > /dev/null || fail "ineligible workflow change: command failed"
+expect_writes "no dispatch for a workflow change that is not a pinned action" ""
+
+new_case
+P_CONTAINS=diverged refreshed_actions_pull "$(message actions/checkout:8:major)"
+"$subject" ensure-validation-runs > /dev/null || fail "stale workflow update: command failed"
+expect_writes "no dispatch for a workflow update that lacks the main commit" ""
 
 new_case
 eligible_pull 1
 open_pulls 1
+for workflow in ci.yml audit.yml dependabot-automerge.yml; do
+  runs "$workflow" "$(sha_for 1)" "$cargo_ref" 0
+done
 "$subject" ensure-validation-runs > /dev/null || fail "unrepaired: command failed"
 expect_writes "no dispatch for a head that Dependabot pushed" ""
+
+# Recovery of runs that did not succeed.
+
+rerun_call() {
+  printf 'run rerun 500 --repo %s --failed' "$GITHUB_REPOSITORY"
+}
+
+for outcome in "failure 1" "cancelled 1" "cancelled 3" "timed_out 2" "startup_failure 1"; do
+  new_case
+  eligible_pull 1
+  open_pulls 1
+  for workflow in ci.yml audit.yml dependabot-automerge.yml; do
+    RUN_EVENT=pull_request runs "$workflow" "$(sha_for 1)" "$cargo_ref" 1
+  done
+  RUN_EVENT=pull_request RUN_CONCLUSION=${outcome% *} RUN_ATTEMPT=${outcome#* } \
+    runs ci.yml "$(sha_for 1)" "$cargo_ref" 1
+  "$subject" ensure-validation-runs > /dev/null || fail "$outcome: command failed"
+  expect_writes "a pull request run that ended as [$outcome] is rerun" "$(rerun_call)"
+done
+
+for outcome in "failure 2" "success 1"; do
+  new_case
+  eligible_pull 1
+  open_pulls 1
+  for workflow in ci.yml audit.yml dependabot-automerge.yml; do
+    RUN_EVENT=pull_request RUN_CONCLUSION=${outcome% *} RUN_ATTEMPT=${outcome#* } \
+      runs "$workflow" "$(sha_for 1)" "$cargo_ref" 1
+  done
+  "$subject" ensure-validation-runs > /dev/null || fail "$outcome: command failed"
+  expect_writes "a run that ended as [$outcome] is left alone" ""
+done
+
+new_case
+eligible_pull 1
+open_pulls 1
+for workflow in ci.yml audit.yml dependabot-automerge.yml; do
+  RUN_EVENT=pull_request RUN_STATUS=in_progress runs "$workflow" "$(sha_for 1)" "$cargo_ref" 1
+done
+"$subject" ensure-validation-runs > /dev/null || fail "running: command failed"
+expect_writes "a run in progress is left alone" ""
+
+new_case
+repaired_pull
+for workflow in ci.yml audit.yml dependabot-automerge.yml; do
+  RUN_EVENT=workflow_dispatch RUN_CONCLUSION=cancelled runs "$workflow" "$(sha_for 1)" "$cargo_ref" 1
+done
+"$subject" ensure-validation-runs > /dev/null || fail "cancelled dispatch: command failed"
+if [ "$(grep -c '^run rerun 500 ' "$FIXTURES/writes")" -eq 3 ] && ! grep -q '^workflow run ' "$FIXTURES/writes"; then
+  pass
+else
+  fail "a cancelled dispatched run is rerun, not counted as validation and not dispatched twice"
+fi
+
+new_case
+eligible_pull 1
+open_pulls 1
+for workflow in ci.yml audit.yml dependabot-automerge.yml; do
+  RUN_EVENT=pull_request RUN_CONCLUSION=failure runs "$workflow" "$(sha_for 1)" "$cargo_ref" 1
+done
+touch "$FIXTURES/refuse-writes"
+expect_status "a refused rerun fails the run" fail "$subject" ensure-validation-runs
+
+new_case
+RUN_CONCLUSION=cancelled runs ci.yml "$main_sha" main 1
+RUN_CONCLUSION=failure RUN_ATTEMPT=2 runs audit.yml "$main_sha" main 1
+"$subject" ensure-mainline-runs > /dev/null || fail "cancelled mainline: command failed"
+expect_writes "a cancelled mainline run is rerun and a reproduced failure is left alone" "$(rerun_call)"
 
 new_case
 runs ci.yml "$main_sha" main 0
@@ -1324,12 +1592,22 @@ expect_writes "no dispatch when the main head is unreadable" ""
 # in the repository.
 credential=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')
 
+# Fixture commits are signed with a key made for this run.
+ssh-keygen -q -t ed25519 -N '' -C dependency-automation-test -f "$tmp/signing-key"
+printf 'test@example.invalid %s\n' "$(cat "$tmp/signing-key.pub")" > "$tmp/allowed-signers"
+pinned_opencode=$(sed -n 's/^OPENCODE_VERSION="\(.*\)"$/\1/p' "$engine")
+
 cat > "$tmp/bin/opencode" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 # Records what the model run could see, then performs the scripted edits. The
 # run has no inherited environment, so the record is found beside the stub.
 AGENT_RECORD="$(dirname "$0")/../agent-record"
+if [ "${1:-}" = "--version" ]; then
+  [ -z "${OPENROUTER_API_KEY:-}" ] || touch "$AGENT_RECORD/credential-seen-early"
+  cat "$AGENT_RECORD/version"
+  exit
+fi
 compgen -e | LC_ALL=C sort > "$AGENT_RECORD/environment"
 printf '%s' "$HOME" > "$AGENT_RECORD/home"
 printf '%s' "$XDG_CONFIG_HOME" > "$AGENT_RECORD/state"
@@ -1343,14 +1621,29 @@ STUB
 cat > "$tmp/bin/cargo" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+# Cargo runs with a reduced environment, so the record is found beside the stub.
+CARGO_RECORD="$(dirname "$0")/../cargo-record"
 printf '%s\n' "$*" >> "$CARGO_RECORD/calls"
+compgen -e | LC_ALL=C sort > "$CARGO_RECORD/environment"
 [ -z "${OPENROUTER_API_KEY:-}" ] || touch "$CARGO_RECORD/credential-seen"
 case "$*" in
-  *"--package"*) printf '# %s\n' "$*" >> "${CARGO_LOCKFILE:-Cargo.lock}" ;;
+  *"--package"*)
+    printf '# %s\n' "$*" >> Cargo.lock
+    [ ! -e "$CARGO_RECORD/lock-entry" ] || cat "$CARGO_RECORD/lock-entry" >> Cargo.lock
+    ;;
 esac
 [ ! -e "$CARGO_RECORD/fail" ]
 STUB
-chmod +x "$tmp/bin/opencode" "$tmp/bin/cargo"
+cat > "$tmp/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+# Serves the crates.io index entry that the test wrote for the requested path.
+CARGO_RECORD="$(dirname "$0")/../cargo-record"
+for argument in "$@"; do url="$argument"; done
+printf '%s\n' "$url" >> "$CARGO_RECORD/index-requests"
+cat "$CARGO_RECORD/index/$(basename "$url")"
+STUB
+chmod +x "$tmp/bin/opencode" "$tmp/bin/cargo" "$tmp/bin/curl"
 
 registry='source = "registry+https://github.com/rust-lang/crates.io-index"'
 
@@ -1361,9 +1654,10 @@ new_repository() {
   AGENT_RECORD=$(mktemp -d "$tmp/agent.XXXXXX")
   CARGO_RECORD=$(mktemp -d "$tmp/cargo.XXXXXX")
   OUT=$(mktemp -d "$tmp/out.XXXXXX")
-  export CARGO_RECORD
   ln -sfn "$AGENT_RECORD" "$tmp/agent-record"
+  ln -sfn "$CARGO_RECORD" "$tmp/cargo-record"
   printf '%s' "$credential" > "$AGENT_RECORD/credential"
+  printf '%s\n' "$pinned_opencode" > "$AGENT_RECORD/version"
   : > "$CARGO_RECORD/calls"
   echo ':' > "$AGENT_RECORD/script"
   (
@@ -1371,7 +1665,10 @@ new_repository() {
     git init --quiet --initial-branch main
     git config user.name test
     git config user.email test@example.invalid
-    git config commit.gpgsign false
+    git config gpg.format ssh
+    git config user.signingkey "$tmp/signing-key.pub"
+    git config gpg.ssh.allowedSignersFile "$tmp/allowed-signers"
+    git config commit.gpgsign true
     mkdir -p src fuzz/fuzz_targets .github/workflows
     printf '[package]\nname = "guard"\n' > Cargo.toml
     printf 'name = "clap"\nversion = "4.6.6"\n%s\n' "$registry" > Cargo.lock
@@ -1391,6 +1688,18 @@ new_repository() {
   REPO_HEAD=$(git -C "$REPO" rev-parse update)
   REPO_MAIN=$(git -C "$REPO" rev-parse main)
   repair_plan false
+}
+
+# expect_exit <name> <status> <command>...
+expect_exit() {
+  local name="$1" expected="$2" status=0
+  shift 2
+  "$@" > "$tmp/output" 2>&1 || status=$?
+  if [ "$status" -eq "$expected" ]; then
+    pass
+  else
+    fail "$name: expected status $expected, got $status: $(tail -n 3 "$tmp/output")"
+  fi
 }
 
 repair_plan() {
@@ -1415,6 +1724,12 @@ apply() {
 }
 
 new_repository
+if git -C "$REPO" verify-commit "$REPO_HEAD" > /dev/null 2>&1 && git -C "$REPO" verify-commit "$REPO_MAIN" > /dev/null 2>&1 \
+    && [ "$(git -C "$REPO" config --get commit.gpgsign)" = "true" ]; then
+  pass
+else
+  fail "fixture commits are signed and verify against the key made for this run"
+fi
 "$engine" prepare "$REPO" "$OUT/plan.json"
 agent <<'EOF'
 echo 'rustls@0.23.42 0.23.45' > .dependency-repair/cargo-update
@@ -1434,8 +1749,10 @@ if [ "$(grep -vxE 'PWD|SHLVL|OLDPWD|_' "$AGENT_RECORD/environment" | tr '\n' ' '
 else
   fail "the model run sees only its own environment: $(tr '\n' ' ' < "$AGENT_RECORD/environment")"
 fi
-if [ -e "$AGENT_RECORD/credential-seen" ] && ! grep -qF "$credential" "$AGENT_RECORD/arguments" \
-    && grep -qx -- '--pure' "$AGENT_RECORD/arguments"; then
+if [ -e "$AGENT_RECORD/credential-seen" ] && [ ! -e "$AGENT_RECORD/credential-seen-early" ] \
+    && ! grep -qF "$credential" "$AGENT_RECORD/arguments" \
+    && grep -qx -- '--pure' "$AGENT_RECORD/arguments" \
+    && grep -qx -- 'openrouter/anthropic/claude-sonnet-5.5' "$AGENT_RECORD/arguments"; then
   pass
 else
   fail "the credential reaches the model run through the environment only"
@@ -1495,7 +1812,46 @@ if [ -e "$CARGO_RECORD/credential-seen" ]; then
 else
   pass
 fi
-OPENROUTER_API_KEY="$credential" expect_status "apply refuses to run beside the model credential" fail apply
+OPENROUTER_API_KEY="$credential" expect_exit "apply refuses to run beside the model credential" 1 apply
+git -C "$REPO" reset --quiet --hard
+: > "$CARGO_RECORD/calls"
+DEPLOY_PROBE="$credential" GH_PROBE="$credential" expect_status "apply runs beside unrelated variables" ok apply
+if [ "$(grep -vxE 'PWD|SHLVL|OLDPWD|_|TMPDIR' "$CARGO_RECORD/environment" | tr '\n' ' ')" = "HOME PATH " ]; then
+  pass
+else
+  fail "Cargo sees a reduced environment: $(tr '\n' ' ' < "$CARGO_RECORD/environment")"
+fi
+
+# Publication age of versions that the repair locks.
+
+# age_case <publication time>: a repair that locks fresh 1.2.3.
+age_case() {
+  new_repository
+  "$engine" prepare "$REPO" "$OUT/plan.json"
+  agent <<< "echo 'fresh' > .dependency-repair/cargo-update"
+  generate > /dev/null 2>&1
+  git -C "$REPO" reset --quiet --hard
+  printf 'name = "fresh"\nversion = "1.2.3"\n%s\n' "$registry" > "$CARGO_RECORD/lock-entry"
+  mkdir "$CARGO_RECORD/index"
+  jq -cn --arg time "$1" '{name: "fresh", vers: "1.2.2", pubtime: "2020-01-01T00:00:00Z"},
+    ({name: "fresh", vers: "1.2.3"} + (if $time == "" then {} else {pubtime: $time} end))' \
+    > "$CARGO_RECORD/index/fresh"
+}
+
+age_case "$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+expect_exit "apply refuses a version published within the hour, as an operational failure" 1 apply
+if [ "$(cat "$CARGO_RECORD/index-requests")" = "https://index.crates.io/fr/es/fresh" ]; then
+  pass
+else
+  fail "apply reads the index entry of exactly the newly locked package"
+fi
+age_case "$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+expect_status "apply accepts a version published more than an hour ago" ok apply
+age_case ""
+expect_status "apply accepts an index entry from before publication times were recorded" ok apply
+age_case "$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+rm "$CARGO_RECORD/index/fresh"
+expect_exit "apply fails when the index is unreadable" 1 apply
 
 for edit in \
   "echo changed >> README.md" \
@@ -1506,14 +1862,51 @@ for edit in \
   "ln -sf /etc/hostname src/main.rs" \
   "echo 'rustls; curl example.invalid' > .dependency-repair/cargo-update" \
   "echo 'rustls --config build.rustc-wrapper=x' > .dependency-repair/cargo-update" \
-  "seq 1 30 | sed 's/^/crate/' > .dependency-repair/cargo-update" \
+  "printf '[core]\n\tfsmonitor = touch %s/executed\n' \"\$(dirname \"\$0\")\" >> .git/config" \
+  "mkdir -p .git/hooks && echo planted > .git/hooks/post-index-change" \
+  "echo planted > .gitattributes" \
+  "chmod +x src/main.rs" \
+  "rm .dependency-repair/cargo-update && ln -s ../Cargo.toml .dependency-repair/cargo-update" \
   "printf '# %s\n' \"\$OPENROUTER_API_KEY\" >> Cargo.toml" \
   "exit 3"; do
   new_repository
   "$engine" prepare "$REPO" "$OUT/plan.json"
   agent <<< "$edit"
   expect_status "generate refuses [$edit]" fail generate
+  if [ -e "$tmp/bin/executed" ]; then
+    fail "a command planted in Git metadata ran after [$edit]"
+  fi
 done
+
+new_repository
+"$engine" prepare "$REPO" "$OUT/plan.json"
+agent <<< "echo changed >> README.md"
+expect_exit "a policy violation is a repair that cannot proceed" 3 generate
+
+new_repository
+"$engine" prepare "$REPO" "$OUT/plan.json"
+agent <<< "exit 124"
+expect_exit "a model run that timed out is a repair that cannot proceed" 3 generate
+
+new_repository
+"$engine" prepare "$REPO" "$OUT/plan.json"
+agent <<< "exit 7"
+expect_exit "a failed model run is an operational failure" 1 generate
+
+new_repository
+"$engine" prepare "$REPO" "$OUT/plan.json"
+agent <<< "echo project > .git/opencode; echo '// touched' >> src/main.rs"
+expect_status "generate accepts the project identifier that OpenCode stores" ok generate
+
+new_repository
+"$engine" prepare "$REPO" "$OUT/plan.json"
+agent <<< "touch src/main.rs"
+expect_status "generate accepts a file that was rewritten without a change" ok generate
+if [ -z "$(find "$OUT/generated/files" -type f)" ]; then
+  pass
+else
+  fail "a file rewritten without a change is not part of the repair"
+fi
 
 new_repository
 "$engine" prepare "$REPO" "$OUT/plan.json"
@@ -1557,7 +1950,14 @@ else
 fi
 
 new_repository
-DEPENDENCY_REPAIR_MODEL="anthropic/model; id" expect_status "generate refuses a malformed model identifier" fail generate
+"$engine" prepare "$REPO" "$OUT/plan.json"
+echo "0.0.1" > "$AGENT_RECORD/version"
+expect_exit "generate refuses another OpenCode release" 1 generate
+if [ -e "$AGENT_RECORD/arguments" ]; then
+  fail "the model ran with another OpenCode release"
+else
+  pass
+fi
 
 # Merge with a lockfile conflict.
 
@@ -1566,7 +1966,7 @@ repair_plan true
 expect_status "prepare merges main" ok "$engine" prepare "$REPO" "$OUT/plan.json"
 if [ "$(git -C "$REPO" rev-parse HEAD)" = "$REPO_HEAD" ] \
     && [ "$(git -C "$REPO" show "$REPO_MAIN:Cargo.lock")" = "$(cat "$REPO/Cargo.lock")" ] \
-    && [ "$(cat "$REPO/.git/dependency-repair/lock-conflicts")" = "Cargo.lock" ] \
+    && [ "$(cat "$(git -C "$REPO" rev-parse --path-format=absolute --git-path dependency-repair)/lock-conflicts")" = "Cargo.lock" ] \
     && [ "$(cat "$REPO/src/main.rs")" = "fn main() { run() }" ]; then
   pass
 else
@@ -1629,6 +2029,58 @@ else
 fi
 expect_status "a local candidate refuses a checkout with uncommitted changes" fail \
   env -C "$REPO" OPENROUTER_API_KEY="$credential" TMPDIR="$OUT" "$engine" candidate "$OUT/context.md"
+
+new_repository
+git -C "$REPO" checkout --quiet update
+agent <<< "printf '[core]\n\tfsmonitor = touch %s/executed\n' \"\$(dirname \"\$0\")\" >> .git/config"
+expect_exit "a local candidate stops when the model run changed Git metadata" 3 \
+  env -C "$REPO" OPENROUTER_API_KEY="$credential" TMPDIR="$OUT" "$engine" candidate "$OUT/context.md"
+if [ -e "$tmp/bin/executed" ] || [ -s "$CARGO_RECORD/calls" ]; then
+  fail "a local candidate ran Git or Cargo after the model changed Git metadata"
+else
+  pass
+fi
+
+# Linked worktree: its Git directory is not <worktree>/.git.
+
+new_repository
+LINKED="$OUT/linked"
+git -C "$REPO" worktree add --quiet --detach "$LINKED" update
+if [ -f "$LINKED/.git" ]; then
+  pass
+else
+  fail "the linked worktree fixture has a .git file"
+fi
+agent <<< "echo 'rustls@0.23.42 0.23.45' > .dependency-repair/cargo-update; echo 'fn main() { linked() }' > src/main.rs"
+expect_status "a local candidate runs in a linked worktree" ok \
+  env -C "$LINKED" OPENROUTER_API_KEY="$credential" TMPDIR="$OUT" "$engine" candidate "$OUT/context.md"
+if [ "$(git -C "$LINKED" status --porcelain)" = " M Cargo.lock
+ M src/main.rs" ] && [ -z "$(git -C "$REPO" status --porcelain)" ]; then
+  pass
+else
+  fail "a linked worktree candidate changes only that worktree: $(git -C "$LINKED" status --porcelain)"
+fi
+git -C "$LINKED" reset --quiet --hard
+repair_plan true
+expect_status "prepare merges main in a linked worktree" ok "$engine" prepare "$LINKED" "$OUT/plan.json"
+if [ "$(cat "$(git -C "$LINKED" rev-parse --path-format=absolute --git-path dependency-repair)/lock-conflicts")" = "Cargo.lock" ] \
+    && [ ! -e "$REPO/.git/dependency-repair" ]; then
+  pass
+else
+  fail "prepare keeps its state in the Git directory of the linked worktree"
+fi
+agent <<< ":"
+expect_status "generate runs in a linked worktree" ok \
+  env OPENROUTER_API_KEY="$credential" "$engine" generate "$LINKED" "$OUT/plan.json" "$OUT/context.md" "$OUT/generated"
+git -C "$LINKED" reset --quiet --hard
+"$engine" prepare "$LINKED" "$OUT/plan.json"
+expect_status "apply runs in a linked worktree" ok \
+  "$engine" apply "$LINKED" "$OUT/plan.json" "$OUT/generated" "$OUT/candidate"
+if [ "$(cd "$OUT/candidate/files" && find . -type f | tr '\n' ' ')" = "./Cargo.lock " ]; then
+  pass
+else
+  fail "a linked worktree merge candidate holds only the lockfile"
+fi
 
 # --- Workflow and configuration contract -------------------------------------
 
@@ -1735,8 +2187,10 @@ contract "release validation accepts dispatched mainline CI" \
 contract "release validation requires the main branch" \
   grep -q 'headBranch == \\"main\\"' "$workflows/release.yml"
 
-contract "the script writes only blobs, trees, commits, and a fast-forward ref" \
-  test "$(grep -cE 'api_write (POST|PATCH|PUT|DELETE)' "$subject")" -eq 4
+contract "the script writes only blobs, trees, commits, a fast-forward ref, and a branch merge" \
+  test "$(grep -cE 'api_write (POST|PATCH|PUT|DELETE)' "$subject")" -eq 5
+contract "the branch merge is the only write outside the Git database" \
+  test "$(grep -cE 'api_write (POST|PATCH) "repos/\$\{REPO\}/(git/|merges")' "$subject")" -eq 5
 refute "the script never forces, bypasses, or arms a merge" \
   grep -nE 'force: true|--admin|--auto|--force|api_write (PUT|DELETE)|gh api [^|]*(-X|--method) *(POST|PUT|PATCH|DELETE)' "$subject"
 contract "the repair commit carries no custom author" \
@@ -1749,8 +2203,20 @@ contract "the repair engine runs OpenCode by name with its isolation switches" \
   grep -q 'exec timeout "\$TIMEOUT" opencode run --pure ' "$engine"
 refute "the repair engine resolves no executable path and sets no home directory" \
   grep -nE 'command -v [^>]*\)|export [^#]*\bHOME=' "$engine"
-contract "a repair without progress is recorded for one day" \
-  grep -q 'retention-days: 1$' <(job "$reconcile" publish)
+for name in generate apply publish; do
+  # shellcheck disable=SC2016  # A literal workflow expression.
+  contract "the $name job records a repair under the name of its plan" \
+    grep -qF 'name: ${{ needs.plan.outputs.attempt }}' <(job "$reconcile" "$name")
+done
+refute "the model is not selectable" grep -rn 'DEPENDENCY_REPAIR_MODEL' "$engine" "$workflows"
+contract "the workflow installs the OpenCode release that the engine requires" \
+  grep -qx "  OPENCODE_VERSION: \"$pinned_opencode\"" "$reconcile"
+refute "the engine runs no Git command on a tree after the model edited it" \
+  grep -nE '(^|[ (|;&])git +(-C|[a-z])' <(sed -n '/^# Copies every file that differs from the snapshot/,/^prepare() {/p; /From here on the checkout is model-edited/,/^# Runs the lockfile operations/p; /^apply() {/,/^candidate() {/p' "$engine")
+refute "the engine exports the credential only to the model process" \
+  grep -nE '^(export )?OPENROUTER_API_KEY=' "$engine"
+contract "the engine drops the credential from its environment at entry" \
+  grep -qx 'unset OPENROUTER_API_KEY' "$engine"
 
 dependabot="$root/.github/dependabot.yml"
 contract "every update entry keeps its cooldown" \

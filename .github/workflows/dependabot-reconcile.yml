@@ -1,8 +1,9 @@
 name: Dependabot reconcile
 
-# Merges eligible Dependabot pull requests, repairs Cargo updates whose
-# required checks fail or whose branch conflicts with main, and keeps workflow
-# runs present for the commits this automation creates.
+# Merges eligible Dependabot pull requests, refreshes branches that lack the
+# main commit, repairs Cargo updates whose required checks fail or whose branch
+# conflicts with main, and keeps workflow runs present and rerun for the
+# commits this automation creates.
 #
 # The workflow has no pull request trigger and runs only the default-branch
 # copies of its scripts. Three boundaries keep the model credential, dependency
@@ -17,8 +18,13 @@ name: Dependabot reconcile
 #     credential nor a write token.
 #
 # publish commits only files that pass the path and content policy, through
-# the Git database API, which GitHub signs. A repaired head gets its required
-# checks by dispatch, and merges like any other update once they pass.
+# the Git database API, which GitHub signs. A repaired or refreshed head gets
+# its required checks by dispatch, and merges like any other update once they
+# pass.
+#
+# A repair that was published, or that cannot proceed, is recorded as an
+# artifact named after its plan. The planner skips a plan whose record exists.
+# An operational failure leaves no record and is tried again on the next run.
 #
 # The schedule covers every open Dependabot pull request, including ones that
 # were opened before this workflow existed.
@@ -47,7 +53,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       checks: read  # Reads required check results for pull request head commits.
-      contents: write  # Merges eligible pull requests.
+      contents: write  # Merges eligible pull requests and refreshes their branches.
       pull-requests: write  # Merges eligible pull requests.
     steps:
       - name: Check out the default-branch policy
@@ -93,7 +99,7 @@ jobs:
           {
             echo "repair=$(jq -r '.repair' "$RUNNER_TEMP/plan/plan.json")"
             echo "head_sha=$(jq -r '.head_sha // "" | select(test("^[0-9a-f]{40}$"))' "$RUNNER_TEMP/plan/plan.json")"
-            echo "attempt=$(jq -r '.attempt // "" | select(test("^repair-attempt-[0-9]+-[0-9a-f]{40}-[0-9a-f]{40}$"))' "$RUNNER_TEMP/plan/plan.json")"
+            echo "attempt=$(jq -r '.attempt // "" | select(test("^repair-attempt-[0-9]+-[0-9a-f]{64}$"))' "$RUNNER_TEMP/plan/plan.json")"
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload the plan
@@ -146,19 +152,40 @@ jobs:
           echo "$RUNNER_TEMP/opencode" >> "$GITHUB_PATH"
 
       - name: Prepare the repair tree
-        run: trusted/scripts/dependency-repair.sh prepare work "$RUNNER_TEMP/plan/plan.json"
+        id: prepare
+        run: |
+          status=0
+          trusted/scripts/dependency-repair.sh prepare work "$RUNNER_TEMP/plan/plan.json" || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "record=true" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
 
       # The only step that holds the model credential. Nothing from the pull
       # request has been executed in this job, and nothing is executed here:
-      # the model has read and edit tools only.
+      # the model has read and edit tools only. The script takes the
+      # credential out of its environment and hands it to the model process
+      # alone.
       - name: Generate the repair
+        id: generate
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          DEPENDENCY_REPAIR_MODEL: ${{ vars.DEPENDENCY_REPAIR_MODEL || 'openrouter/anthropic/claude-sonnet-5.5' }}
-        run: >-
-          trusted/scripts/dependency-repair.sh generate work
-          "$RUNNER_TEMP/plan/plan.json" "$RUNNER_TEMP/plan/context.md"
-          "$RUNNER_TEMP/generated"
+        run: |
+          status=0
+          trusted/scripts/dependency-repair.sh generate work \
+            "$RUNNER_TEMP/plan/plan.json" "$RUNNER_TEMP/plan/context.md" \
+            "$RUNNER_TEMP/generated" || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "record=true" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+      - name: Record a repair that cannot proceed
+        if: ${{ !cancelled() && (steps.prepare.outputs.record == 'true' || steps.generate.outputs.record == 'true') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ needs.plan.outputs.attempt }}
+          path: ${{ runner.temp }}/plan/plan.json
 
       - name: Upload the generated repair
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -203,11 +230,23 @@ jobs:
           path: ${{ runner.temp }}/generated
 
       - name: Apply the repair without credentials
+        id: apply
         run: |
-          set -euo pipefail
-          trusted/scripts/dependency-repair.sh prepare work "$RUNNER_TEMP/plan/plan.json"
-          trusted/scripts/dependency-repair.sh apply work "$RUNNER_TEMP/plan/plan.json" \
-            "$RUNNER_TEMP/generated" "$RUNNER_TEMP/candidate"
+          status=0
+          trusted/scripts/dependency-repair.sh prepare work "$RUNNER_TEMP/plan/plan.json" \
+            && trusted/scripts/dependency-repair.sh apply work "$RUNNER_TEMP/plan/plan.json" \
+              "$RUNNER_TEMP/generated" "$RUNNER_TEMP/candidate" || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "record=true" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+      - name: Record a repair that cannot proceed
+        if: ${{ !cancelled() && steps.apply.outputs.record == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ needs.plan.outputs.attempt }}
+          path: ${{ runner.temp }}/plan/plan.json
 
       - name: Upload the repair candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -245,21 +284,19 @@ jobs:
         run: |
           status=0
           scripts/dependabot-automerge.sh publish-repair "$RUNNER_TEMP/candidate" || status=$?
-          if [ "$status" -eq 3 ]; then
-            echo "no_progress=true" >> "$GITHUB_OUTPUT"
-          fi
+          # Status 4: the pull request changed and the candidate was dropped.
+          case "$status" in
+            0|3) echo "record=true" >> "$GITHUB_OUTPUT" ;;
+            4) status=0 ;;
+          esac
           exit "$status"
 
-      # The planner skips this pull request head and main commit while the
-      # record exists. A failed model run or job leaves no record, so it is
-      # tried again on the next run.
-      - name: Record a repair without progress
-        if: ${{ !cancelled() && steps.publish.outputs.no_progress == 'true' }}
+      - name: Record a repair that was published or made no progress
+        if: ${{ !cancelled() && steps.publish.outputs.record == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ${{ needs.plan.outputs.attempt }}
           path: ${{ runner.temp }}/candidate/manifest.json
-          retention-days: 1
 
   runs:
     name: Ensure workflow runs
@@ -268,7 +305,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      actions: write  # Lists workflow runs and dispatches missing runs.
+      actions: write  # Lists workflow runs, dispatches missing runs, and reruns failed runs.
       contents: read
       pull-requests: read
     steps:
@@ -278,12 +315,12 @@ jobs:
           persist-credentials: false
           sparse-checkout: scripts
 
-      - name: Dispatch validation for repaired pull requests
+      - name: Dispatch and rerun validation for pull requests
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/dependabot-automerge.sh ensure-validation-runs
 
-      - name: Dispatch missing mainline runs
+      - name: Dispatch and rerun mainline runs
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}

@@ -13,8 +13,8 @@ name: Dependabot review gate
 #
 # Merging is the separate, privileged dependabot-reconcile.yml workflow, which
 # repeats the classification itself. That workflow dispatches this one on a
-# repaired branch, because a branch update made with the Actions token leaves
-# pull request workflows waiting for approval.
+# branch that it repaired or refreshed, because a branch update made with the
+# Actions token leaves pull request workflows waiting for approval.
 
 "on":
   pull_request:
