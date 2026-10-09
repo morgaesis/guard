@@ -1889,6 +1889,34 @@ for sequence in "failure" "timed_out"; do
   expect_writes "a job that ended as [$sequence] and failed again on the rerun is a finding" ""
 done
 
+for latest in empty nonfailing; do
+  new_case
+  failed_runs 2
+  run_jobs 1 "Test & Lint=failure"
+  if [ "$latest" = empty ]; then
+    run_jobs 2
+  else
+    run_jobs 2 "Test & Lint=success" "Build=skipped" "Cleanup=cancelled"
+  fi
+  "$subject" ensure-validation-runs > /dev/null || fail "$latest latest attempt: command failed"
+  expected_reruns=$(printf '%s\n%s\n%s' "$(rerun_call)" "$(rerun_call)" "$(rerun_call)")
+  expect_writes "a failed run with a [$latest] latest attempt is rerun without a repair write" "$expected_reruns"
+done
+
+for response in empty malformed; do
+  new_case
+  failed_runs 2
+  run_jobs 1 "Test & Lint=failure"
+  if [ "$response" = empty ]; then
+    : > "$(fixture_path "$api/actions/runs/500/attempts/2/jobs?per_page=100")"
+  else
+    printf '%s\n' '{"total_count": 0}' \
+      | fixture "$api/actions/runs/500/attempts/2/jobs?per_page=100"
+  fi
+  expect_status "$response current-attempt response fails the run" fail "$subject" ensure-validation-runs
+  expect_writes "$response current-attempt response requests no API write" ""
+done
+
 new_case
 failed_runs 3
 run_jobs 2 "Test & Lint=failure"

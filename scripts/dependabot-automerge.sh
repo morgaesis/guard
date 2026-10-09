@@ -789,7 +789,15 @@ verified_job_for_context() {
 # workflow run as one JSON array.
 attempt_jobs() {
   api_pages "repos/${REPO}/actions/runs/${1}/attempts/${2}/jobs?per_page=100" \
-    | jq -se '[.[].jobs[]]' > "$3"
+    | jq -se '
+        if length > 0 and all(.[]; type == "object"
+          and (.total_count | type == "number" and . >= 0 and floor == .)
+          and (.jobs | type == "array")
+          and all(.jobs[]; type == "object"))
+        then [.[].jobs[]]
+        else error("invalid attempt jobs response")
+        end
+      ' > "$3"
 }
 
 # Succeeds when a job of the given name failed or timed out in the attempt
@@ -1092,6 +1100,10 @@ run_state() {
     attempt=$(jq -er '.attempt | numbers | select(floor == .)' <<< "$run") || return 1
     [[ "$id" =~ ^[1-9][0-9]*$ ]] || return 1
     attempt_jobs "$id" "$attempt" "$work_dir/run-jobs.json" || return 1
+    if ! jq -e 'any(.[]; .conclusion == "failure" or .conclusion == "timed_out")' \
+        "$work_dir/run-jobs.json" > /dev/null; then
+      state="retry"
+    fi
     while IFS= read -r name; do
       status=0
       failed_in_previous_attempt "$id" "$attempt" "$name" || status=$?
