@@ -62,9 +62,11 @@ jobs:
             echo "release commit signature is not verified"
             exit 1
           }
-          ci_run_id=$(gh run list --workflow CI --commit "$tag_commit" --event push --limit 10 \
-            --json databaseId,headSha \
-            --jq "map(select(.headSha == \"${tag_commit}\")) | first | .databaseId // empty")
+          # A commit merged with the Actions token starts no push workflow; its
+          # mainline run is dispatched on main instead.
+          ci_run_id=$(gh run list --workflow CI --commit "$tag_commit" --branch main --limit 20 \
+            --json databaseId,headSha,headBranch,event \
+            --jq "map(select(.headSha == \"${tag_commit}\" and .headBranch == \"main\" and (.event == \"push\" or .event == \"workflow_dispatch\"))) | first | .databaseId // empty")
           test -n "$ci_run_id" || {
             echo "mainline CI run was not found for the release commit"
             exit 1

@@ -6,6 +6,9 @@ updates:
       interval: "daily"
     cooldown:
       default-days: 7
+    # Lockfile-only dependencies are updated too.
+    allow:
+      - dependency-type: "all"
     labels:
       - "dependencies"
       - "rust"
@@ -35,6 +38,23 @@ updates:
       - "github-actions"
     commit-message:
       prefix: "chore(ci)"
+    groups:
+      # The CodeQL actions share one bundle version and fail when only some of
+      # them move, so they always update together.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
+      github-actions-safe-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      github-actions-major-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
 
   - package-ecosystem: "cargo"
     directory: "/fuzz"

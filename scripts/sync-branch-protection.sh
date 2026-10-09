@@ -12,6 +12,9 @@ set -euo pipefail
 #                                                exit 2 when rules are unreadable.
 #   scripts/sync-branch-protection.sh --apply    Print the diff, then apply the
 #                                                intended list via the API.
+#   scripts/sync-branch-protection.sh --list     Print the declared contexts, one
+#                                                per line, without reading live
+#                                                repository state.
 #
 # Environment:
 #   REPO    owner/name (default: derived from the current directory's remote)
@@ -36,7 +39,6 @@ set -euo pipefail
 #     would have no status and could never merge.
 
 BRANCH="${BRANCH:-main}"
-REPO="${REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
 
 # app_id 15368 is GitHub Actions; pinning it prevents other apps from
 # satisfying these contexts.
@@ -63,11 +65,17 @@ case "${1:-}" in
   "") ;;
   --check) mode="check" ;;
   --apply) mode="apply" ;;
+  --list)
+    printf '%s\n' "${REQUIRED_CONTEXTS[@]}"
+    exit 0
+    ;;
   *)
-    echo "usage: $0 [--check|--apply]" >&2
+    echo "usage: $0 [--check|--apply|--list]" >&2
     exit 64
     ;;
 esac
+
+REPO="${REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
 
 current_contexts() {
   local rules rule

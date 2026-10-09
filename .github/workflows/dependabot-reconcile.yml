@@ -1,0 +1,327 @@
+name: Dependabot reconcile
+
+# Merges eligible Dependabot pull requests, refreshes branches that lack the
+# main commit, repairs Cargo updates whose required checks fail or whose branch
+# conflicts with main, and keeps workflow runs present and rerun for the
+# commits this automation creates.
+#
+# The workflow has no pull request trigger and runs only the default-branch
+# copies of its scripts. Three boundaries keep the model credential, dependency
+# code, and repository write access apart:
+#
+#   - merge, plan, publish, and runs hold repository tokens. They decide from
+#     GitHub API metadata and never check out or execute pull request content.
+#   - generate holds the model credential and no write token. The model reads
+#     and edits files; it cannot run commands, so no dependency code runs
+#     beside the credential.
+#   - apply runs Cargo on the repaired tree. It holds neither the model
+#     credential nor a write token.
+#
+# publish commits only files that pass the path and content policy, through
+# the Git database API, which GitHub signs. A repaired or refreshed head gets
+# its required checks by dispatch, and merges like any other update once they
+# pass.
+#
+# A repair that was published, or that cannot proceed, is recorded as an
+# artifact named after its plan. The planner skips a plan whose record exists.
+# An operational failure leaves no record and is tried again on the next run.
+#
+# The schedule covers every open Dependabot pull request, including ones that
+# were opened before this workflow existed.
+
+"on":
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: dependabot-reconcile
+  cancel-in-progress: false
+
+env:
+  # OpenCode release used for the repair, pinned by digest.
+  OPENCODE_VERSION: "1.18.33"
+  OPENCODE_SHA256: e546123213ae47909a4268692aa4b94950d011afe9cac9938753a2194f1c16d5
+
+jobs:
+  merge:
+    name: Merge eligible dependency updates
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      checks: read  # Reads required check results for pull request head commits.
+      contents: write  # Merges eligible pull requests and refreshes their branches.
+      pull-requests: write  # Merges eligible pull requests.
+    steps:
+      - name: Check out the default-branch policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Merge eligible pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/dependabot-automerge.sh reconcile
+
+  plan:
+    name: Plan a dependency repair
+    needs: merge
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read  # Reads the logs of failed required checks.
+      checks: read  # Reads required check results for pull request head commits.
+      contents: read
+      pull-requests: read
+    outputs:
+      repair: ${{ steps.plan.outputs.repair }}
+      head_sha: ${{ steps.plan.outputs.head_sha }}
+      attempt: ${{ steps.plan.outputs.attempt }}
+    steps:
+      - name: Check out the default-branch policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Select a pull request to repair
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/dependabot-automerge.sh repair-plan "$RUNNER_TEMP/plan"
+          {
+            echo "repair=$(jq -r '.repair' "$RUNNER_TEMP/plan/plan.json")"
+            echo "head_sha=$(jq -r '.head_sha // "" | select(test("^[0-9a-f]{40}$"))' "$RUNNER_TEMP/plan/plan.json")"
+            echo "attempt=$(jq -r '.attempt // "" | select(test("^repair-attempt-[0-9]+-[0-9a-f]{64}$"))' "$RUNNER_TEMP/plan/plan.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload the plan
+        if: steps.plan.outputs.repair == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: repair-plan
+          path: ${{ runner.temp }}/plan
+          retention-days: 7
+
+  generate:
+    name: Generate a dependency repair
+    needs: plan
+    if: needs.plan.outputs.repair == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the default-branch repair engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+          path: trusted
+
+      - name: Fetch the pull request head as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: work
+
+      - name: Download the plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: repair-plan
+          path: ${{ runner.temp }}/plan
+
+      - name: Install the pinned OpenCode release
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/opencode.tar.gz"
+          curl --fail --silent --show-error --location --output "$archive" \
+            "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
+          echo "${OPENCODE_SHA256}  ${archive}" | sha256sum --check
+          mkdir "$RUNNER_TEMP/opencode"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/opencode"
+          echo "$RUNNER_TEMP/opencode" >> "$GITHUB_PATH"
+
+      - name: Prepare the repair tree
+        id: prepare
+        run: |
+          status=0
+          trusted/scripts/dependency-repair.sh prepare work "$RUNNER_TEMP/plan/plan.json" || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "record=true" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+      # The only step that holds the model credential. Nothing from the pull
+      # request has been executed in this job, and nothing is executed here:
+      # the model has read and edit tools only. The script takes the
+      # credential out of its environment and hands it to the model process
+      # alone.
+      - name: Generate the repair
+        id: generate
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          status=0
+          trusted/scripts/dependency-repair.sh generate work \
+            "$RUNNER_TEMP/plan/plan.json" "$RUNNER_TEMP/plan/context.md" \
+            "$RUNNER_TEMP/generated" || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "record=true" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+      - name: Record a repair that cannot proceed
+        if: ${{ !cancelled() && (steps.prepare.outputs.record == 'true' || steps.generate.outputs.record == 'true') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ needs.plan.outputs.attempt }}
+          path: ${{ runner.temp }}/plan/plan.json
+
+      - name: Upload the generated repair
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: repair-generated
+          path: ${{ runner.temp }}/generated
+          retention-days: 7
+
+  apply:
+    name: Apply a dependency repair
+    needs: [plan, generate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the default-branch repair engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+          path: trusted
+
+      - name: Fetch the pull request head as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: work
+
+      - name: Download the plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: repair-plan
+          path: ${{ runner.temp }}/plan
+
+      - name: Download the generated repair
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: repair-generated
+          path: ${{ runner.temp }}/generated
+
+      - name: Apply the repair without credentials
+        id: apply
+        run: |
+          status=0
+          trusted/scripts/dependency-repair.sh prepare work "$RUNNER_TEMP/plan/plan.json" \
+            && trusted/scripts/dependency-repair.sh apply work "$RUNNER_TEMP/plan/plan.json" \
+              "$RUNNER_TEMP/generated" "$RUNNER_TEMP/candidate" || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "record=true" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+      - name: Record a repair that cannot proceed
+        if: ${{ !cancelled() && steps.apply.outputs.record == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ needs.plan.outputs.attempt }}
+          path: ${{ runner.temp }}/plan/plan.json
+
+      - name: Upload the repair candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: repair-candidate
+          path: ${{ runner.temp }}/candidate
+          retention-days: 7
+
+  publish:
+    name: Publish a dependency repair
+    needs: [plan, apply]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write  # Commits the validated repair to the pull request branch.
+      pull-requests: read
+    steps:
+      - name: Check out the default-branch policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Download the repair candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: repair-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Publish the validated repair
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status=0
+          scripts/dependabot-automerge.sh publish-repair "$RUNNER_TEMP/candidate" || status=$?
+          # Status 4: the pull request changed and the candidate was dropped.
+          case "$status" in
+            0|3) echo "record=true" >> "$GITHUB_OUTPUT" ;;
+            4) status=0 ;;
+          esac
+          exit "$status"
+
+      - name: Record a repair that was published or made no progress
+        if: ${{ !cancelled() && steps.publish.outputs.record == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ needs.plan.outputs.attempt }}
+          path: ${{ runner.temp }}/candidate/manifest.json
+
+  runs:
+    name: Ensure workflow runs
+    needs: [merge, publish]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write  # Lists workflow runs, dispatches missing runs, and reruns failed runs.
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the default-branch policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Dispatch and rerun validation for pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/dependabot-automerge.sh ensure-validation-runs
+
+      - name: Dispatch and rerun mainline runs
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/dependabot-automerge.sh ensure-mainline-runs

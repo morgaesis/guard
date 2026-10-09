@@ -6,6 +6,9 @@ name: CI
     branches: [main]
   pull_request:
     branches: [main]
+  # Raised for a main commit that the Actions token merged, because such a
+  # merge starts no push workflow.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -77,6 +80,11 @@ jobs:
           cp /tmp/guard-release-test/SHA256SUMS /tmp/guard-release-test/verify/
           (cd /tmp/guard-release-test/verify && sha256sum --check SHA256SUMS)
           rm -rf /tmp/guard-release-test
+
+      - name: Test dependency automation policy
+        if: runner.os == 'Linux'
+        shell: bash
+        run: ./scripts/test-dependabot-automerge.sh
 
       - name: Exercise packaged systemd argument expansion
         if: runner.os == 'Linux'

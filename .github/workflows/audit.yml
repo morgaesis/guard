@@ -3,6 +3,13 @@ name: Security & Dependency Audit
 on:
   branch_protection_rule:
   workflow_dispatch:
+    inputs:
+      dependency_review_base:
+        description: >-
+          Base commit for Dependency Review when validating a repaired
+          dependency update branch. Empty for a mainline run.
+        required: false
+        type: string
   schedule:
     - cron: '0 0 * * *'  # Run daily at midnight
   push:
@@ -154,7 +161,12 @@ jobs:
   dependency_review:
     name: Dependency Review
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # A repaired dependency update is validated by dispatch on its branch,
+    # because a branch update made with the Actions token leaves pull request
+    # workflows waiting for approval. The dispatch names the base commit.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.dependency_review_base != '')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -162,6 +174,9 @@ jobs:
 
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294  # v5.0.0
+        with:
+          base-ref: ${{ inputs.dependency_review_base || github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
   codeql:
     name: CodeQL (${{ matrix.language }})
@@ -208,7 +223,7 @@ jobs:
 
   ossf_scorecard:
     name: OSSF Scorecard
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && inputs.dependency_review_base == ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
