@@ -49,7 +49,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 /// the inert pre-handoff provisional state and classifies ambiguous v13 API
 /// dispatch rows before older binaries can interpret their rollback authority.
 /// Version 15 retains typed execution failures alongside session admission.
-const SCHEMA_VERSION: i64 = 15;
+/// Version 16 fences digest-bearing replayable argv from older sanitizers.
+const SCHEMA_VERSION: i64 = 16;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
@@ -4654,7 +4655,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            15
+            SCHEMA_VERSION
         );
         assert_eq!(authority_rows(&conn), authority);
         let failure: Option<String> = conn
@@ -4757,6 +4758,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pending_approval_accepts_a_generated_body_digest() {
+        use sha2::Digest;
+
+        let digest = sha2::Sha256::digest(b"generated-approval-body");
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut approval = pending_approval("generated-digest-approval");
+        approval.snapshot.args = vec![format!("body_sha256={digest}")];
+        assert!(validate_persisted_approval(&approval).is_ok());
+    }
+
     fn provisional_row(handle: &str, status: ProvisionalStatus) -> Provisional {
         Provisional {
             handle: handle.to_string(),
@@ -4789,6 +4804,89 @@ mod tests {
             revert_exit: None,
             revert_detail: None,
         }
+    }
+
+    #[tokio::test]
+    async fn digest_argv_survives_approval_and_provisional_restarts() {
+        use sha2::Digest;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let digest = sha2::Sha256::digest(b"generated-durable-body")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let values = [digest.clone(), format!("body_sha256={digest}")];
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        for (index, value) in values.iter().enumerate() {
+            let mut approval = pending_approval(&format!("digest-approval-{index}"));
+            approval.snapshot.args = vec![value.clone()];
+            store.save_approval(approval).await.unwrap();
+
+            let mut provisional = provisional_row(
+                &format!("digest-provisional-{index}"),
+                ProvisionalStatus::Armed,
+            );
+            provisional.args = vec![value.clone()];
+            provisional.revert_args = vec![value.clone()];
+            store.save_provisional(provisional).await.unwrap();
+        }
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 15).unwrap();
+        drop(connection);
+
+        for _ in 0..2 {
+            let reopened = SessionStore::open(path.clone(), 3600).await.unwrap();
+            let approvals = reopened.load_approvals().await.unwrap();
+            let provisionals = reopened.load_provisionals().await.unwrap();
+            assert_eq!(approvals.len(), values.len());
+            assert_eq!(provisionals.len(), values.len());
+            for (index, value) in values.iter().enumerate() {
+                let approval = approvals
+                    .iter()
+                    .find(|row| row.handle == format!("digest-approval-{index}"))
+                    .unwrap();
+                let provisional = provisionals
+                    .iter()
+                    .find(|row| row.handle == format!("digest-provisional-{index}"))
+                    .unwrap();
+                assert_eq!(
+                    approval.snapshot.args.as_slice(),
+                    std::slice::from_ref(value)
+                );
+                assert_eq!(provisional.args.as_slice(), std::slice::from_ref(value));
+                assert_eq!(
+                    provisional.revert_args.as_slice(),
+                    std::slice::from_ref(value)
+                );
+            }
+            drop(reopened);
+        }
+    }
+
+    #[tokio::test]
+    async fn digest_argv_schema_exceeds_the_schema_15_reader_ceiling() {
+        use sha2::Digest;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let digest = sha2::Sha256::digest(b"generated-rollback-body")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut approval = pending_approval("digest-rollback-approval");
+        approval.snapshot.args = vec![digest];
+        store.save_approval(approval).await.unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(ensure_supported_schema_version(version, 15).is_err());
     }
 
     fn exact_rule_grant(rules: Vec<SessionExactRule>) -> SessionGrant {

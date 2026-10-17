@@ -348,13 +348,15 @@ admin envelope accepts only the current operation and field grammar, so removed
 or malformed authority operations fail closed instead of selecting a
 compatibility path.
 
-The state database uses schema version 15. Startup migrates an older database in
+The state database uses schema version 16. Startup migrates an older database in
 place. Treat the installed binary, configuration, API-revert body tree, and
-complete SQLite file set as one rollback unit. Schema 15 adds nullable execution-failure
-details to session history; rows without these details carry no launch-stage or
-start-state evidence. An older reader refuses the migrated database. Rollback
-requires the matching stopped binary and its consistent pre-upgrade snapshot,
-not an older binary pointed at the migrated database. Before the first schema-15
+complete SQLite file set as one rollback unit. Schema 16 fences the argv digest
+classifier so older readers cannot sanitize digest-bearing holds. Session history
+contains nullable execution-failure details; rows without these details carry no
+launch-stage or start-state evidence. An older reader refuses the migrated
+database. Rollback requires the matching stopped binary and its consistent
+pre-upgrade snapshot,
+not an older binary pointed at the migrated database. Before the first schema-16
 startup, resolve armed provisionals where practical, stop the service, verify
 that it is inactive, and create a consistent SQLite backup with the SQLite
 backup API. Copying only `state.db` while a process can write it can omit
@@ -462,6 +464,19 @@ installer `--check --update-binaries --service "$guard_unit"` with zero planned
 changes for the existing deployment. Only then mark the rollback action
 successful and disarm its timer.
 
+Before rollback, inspect `guard provisionals` and `guard provisionals show
+<handle>` while the current daemon is available. Revert armed actions with
+`sudo guard-operator revert <handle>` and verify their effects. Resolve any
+`reverting`, `revert_failed`, or `needs_operator_decision` row against its
+recorded forward outcome and revert action. A restored pre-upgrade snapshot
+does not know about provisionals created after that snapshot, so it cannot
+automatically revert them. Stop the daemon and inspect the final database
+state before restoring. The restore block refuses outstanding rows, including
+`staged` and `dispatching`; reconcile them with the matching current binary
+before retrying. If the daemon cannot serve the list, leave it stopped and
+read the handle and status columns from a consistent SQLite copy of its
+complete state before deciding each action.
+
 Rollback requires another stop and a verified matching snapshot. Preserve the
 entire displaced migrated state, including WAL, SHM and rollback-journal files,
 by renaming the directory into a fresh archive on the same filesystem. Preserve
@@ -479,6 +494,11 @@ guard_unit=${2:?recorded service required}
 case "$guard_unit" in guard.service|guard-exec-as-caller.service) ;; *) exit 1 ;; esac
 systemctl stop "$guard_unit"
 test "$(systemctl is-active "$guard_unit" || true)" = inactive
+sqlite3 -readonly /var/lib/guard/state.db \
+  "SELECT handle, status FROM gating_provisional WHERE status NOT IN ('confirmed', 'reverted');"
+outstanding="$(sqlite3 -readonly /var/lib/guard/state.db \
+  "SELECT COUNT(*) FROM gating_provisional WHERE status NOT IN ('confirmed', 'reverted');")"
+test "$outstanding" = 0
 (cd "$backup_dir" && sha256sum --check --status SHA256SUMS)
 test "$(cat "$backup_dir/service-unit")" = "$guard_unit"
 archive_path() {
@@ -519,7 +539,7 @@ A mount-point rename or failed snapshot verification requires a filesystem-aware
 restore plan; leave the service stopped instead of copying over live state.
 Restore separately managed clients to the same binary version, repeat the
 process-digest and endpoint checks against the snapshot, and retain the displaced
-archives. Do not point an older binary at the schema-15 database.
+archives. Do not point an older binary at the schema-16 database.
 
 On Windows, verify the release archive checksum, extract it into an
 Administrators-and-SYSTEM only directory, and rerun `install-guard.ps1` from an

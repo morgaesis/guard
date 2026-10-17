@@ -1251,6 +1251,34 @@ fn named_secret_value_start(argument: &str) -> Option<usize> {
     is_secret_bearing_name(name).then_some(index)
 }
 
+fn argv_hex_digest_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$").unwrap())
+}
+
+fn argv_hex_digest_exemption(argument: &str) -> bool {
+    if argv_hex_digest_pattern().is_match(argument) {
+        return true;
+    }
+    let Some((name, value)) = argument.split_once('=') else {
+        return false;
+    };
+    let digest_name = matches!(
+        name.to_ascii_uppercase().as_str(),
+        "BODY_SHA256"
+            | "SHA"
+            | "SHA1"
+            | "SHA256"
+            | "SHA512"
+            | "DIGEST"
+            | "CHECKSUM"
+            | "FINGERPRINT"
+            | "ETAG"
+            | "REVISION"
+    );
+    digest_name && argv_hex_digest_pattern().is_match(value)
+}
+
 fn redact_suffix(argument: &str, value_start: usize) -> String {
     let separator = argument[value_start..].chars().next();
     match separator {
@@ -1338,8 +1366,16 @@ fn classify_command(binary: &str, args: &[String]) -> ClassifiedCommand {
         }
 
         let redacted = redact_output_text(argument);
-        sensitive |= redacted != *argument;
-        redacted_args.push(redacted);
+        // Check exact secrets after output redaction so a scope registered
+        // during that pass cannot be bypassed by the digest exemption.
+        let exact_sensitive = redact_registered_exact_secrets(argument) != *argument;
+        let digest = argv_hex_digest_exemption(argument);
+        sensitive |= exact_sensitive || (redacted != *argument && !digest);
+        redacted_args.push(if digest && !exact_sensitive {
+            argument.clone()
+        } else {
+            redacted
+        });
     }
 
     ClassifiedCommand {
@@ -1680,6 +1716,201 @@ impl ExactSecretStreamRedactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use proptest::prelude::*;
+    use sha2::Digest;
+
+    fn generated_uuid(seed: u64) -> String {
+        format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            seed as u32, seed as u16, seed as u16, seed as u16, seed
+        )
+    }
+
+    fn generated_digest(bytes: impl AsRef<[u8]>) -> String {
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn replayable_argv_accepts_identifier_shapes() {
+        let uuid = generated_uuid(0x2ee3f225);
+        let digest64 = generated_digest(b"generated-content-address");
+        let digest40 = digest64[..40].to_string();
+        let names = [
+            format!("csi-vol-{uuid}"),
+            uuid,
+            digest40.clone(),
+            digest64.clone(),
+            "long-kebab-case-storage-image-name-with-many-components-and-numbers-123".to_string(),
+            format!("body_sha256={digest64}"),
+            format!("--checksum={digest64}"),
+            format!("--sha256={digest64}"),
+            digest40.to_ascii_uppercase(),
+            digest64.to_ascii_uppercase(),
+        ];
+        let mut rejected = Vec::new();
+        for (index, name) in names.into_iter().enumerate() {
+            let args = vec![name.clone()];
+            if command_contains_sensitive_literals("inspect", &args) {
+                rejected.push(index);
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "rejected identifier cases: {rejected:?}"
+        );
+    }
+
+    #[test]
+    fn digest_exemption_does_not_override_credential_options() {
+        let digest = generated_digest(b"generated-option-value");
+        for (binary, option) in [
+            ("inspect", "--password"),
+            ("redis-cli", "-a"),
+            ("sshpass", "-p"),
+            ("inspect", "--token"),
+        ] {
+            let args = vec![option.to_string(), digest.clone()];
+            assert!(command_contains_sensitive_literals(binary, &args));
+            assert!(!redact_command_line(binary, &args).contains(&digest));
+        }
+    }
+
+    #[test]
+    fn digest_display_preserves_approved_value_without_changing_output_redaction() {
+        let digest = generated_digest(b"generated-display-value");
+        for argument in [digest.clone(), format!("body_sha256={digest}")] {
+            let args = vec![argument];
+            assert!(!command_contains_sensitive_literals("inspect", &args));
+            assert!(redact_command_line("inspect", &args).contains(&digest));
+            assert!(
+                !redact_command_line_with_exact_secrets("inspect", &args, &[&digest])
+                    .contains(&digest)
+            );
+        }
+        assert!(!redact_output_text(&digest).contains(&digest));
+    }
+
+    #[test]
+    fn replayable_argv_rejects_generated_credential_shapes() {
+        let key = format!(
+            "{}{}",
+            "sk-",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(sha2::Sha256::digest(b"generated-api-key"))
+        );
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"sub":"generated-test-principal"}"#);
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(b"generated-jwt-signature"));
+        let jwt = format!("{header}.{payload}.{signature}");
+        let pem = format!(
+            "-----BEGIN {}-----\n{}\n-----END {}-----",
+            "PRIVATE KEY",
+            base64::engine::general_purpose::STANDARD
+                .encode(sha2::Sha256::digest(b"generated-private-key-material")),
+            "PRIVATE KEY"
+        );
+        let base64 = (0_u64..1024)
+            .map(|seed| {
+                base64::engine::general_purpose::STANDARD
+                    .encode(sha2::Sha256::digest(seed.to_le_bytes()))
+            })
+            .find(|value| value.contains('+') && value.contains('/'))
+            .expect("generated base64 includes both separators");
+        let digest = generated_digest(b"generated-nonsecret-assignment-value");
+        let uuid = generated_uuid(0x3141_5926);
+        let userinfo = format!("https://reader:{}@example.invalid?body_sha256", digest);
+        for name in [&key, &jwt, &userinfo] {
+            for value in [&digest, &uuid] {
+                let argument = format!("{name}={value}");
+                assert!(command_contains_sensitive_literals(
+                    "inspect",
+                    std::slice::from_ref(&argument)
+                ));
+                assert!(!redact_command_line("inspect", &[argument]).contains(name));
+            }
+        }
+        let mixed_prefix = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(b"generated-mixed-prefix"));
+        let mixed_prefix = format!("{mixed_prefix}-{}", generated_uuid(0x2718_2818));
+        assert!(command_contains_sensitive_literals(
+            "inspect",
+            std::slice::from_ref(&mixed_prefix)
+        ));
+        assert!(
+            !redact_command_line("inspect", std::slice::from_ref(&mixed_prefix))
+                .contains(&mixed_prefix)
+        );
+        let generated_suffix = [
+            b"generated-prefix-suffix-one".as_slice(),
+            b"generated-prefix-suffix-two".as_slice(),
+        ]
+        .into_iter()
+        .map(|seed| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(seed))
+        })
+        .collect::<String>();
+        let prefixed = [
+            format!("xoxp-{generated_suffix}-{generated_suffix}"),
+            format!("ghp_{generated_suffix}"),
+            format!("gho_{generated_suffix}"),
+            format!("ghs_{generated_suffix}"),
+            format!("glpat-{generated_suffix}"),
+            format!("ATATT{generated_suffix}"),
+            format!("ATCTT{generated_suffix}"),
+            format!("npm_{generated_suffix}"),
+            format!("storage-xoxp-{generated_suffix}-{generated_suffix}"),
+            format!("AKIA{:016X}", 0x1842_7356_90AB_CDEF_u64),
+        ];
+        for value in [key, jwt, pem, base64].into_iter().chain(prefixed) {
+            let args = vec![value.clone()];
+            assert!(command_contains_sensitive_literals("inspect", &args));
+            assert!(!redact_command_line("inspect", &args).contains(&value));
+        }
+        for name in ["SESSION_ID", "X_CT0", "--session", "--cookie"] {
+            let argument = format!("{name}={digest}");
+            assert!(command_contains_sensitive_literals("inspect", &[argument]));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { failure_persistence: None, .. ProptestConfig::default() })]
+        #[test]
+        fn registered_secret_and_named_context_override_identifier_shape(seed in any::<u64>()) {
+            let uuid = generated_uuid(seed);
+            let digest = generated_digest(seed.to_le_bytes());
+            let values = [
+                uuid.clone(),
+                format!("csi-vol-{uuid}"),
+                digest[..40].to_string(),
+                digest,
+                format!("storage-image-{seed:x}-with-a-long-lowercase-kebab-identifier"),
+            ];
+            for value in values {
+                let bare = vec![value.clone()];
+                let named = vec![format!("--api-token={value}")];
+                prop_assert!(command_contains_sensitive_literals("inspect", &named));
+                let credential_name = format!("{}{}", "sk-", generated_digest(seed.to_be_bytes()));
+                let credential_assignment = vec![format!("{credential_name}={value}")];
+                prop_assert!(command_contains_sensitive_literals("inspect", &credential_assignment));
+                prop_assert!(!redact_command_line("inspect", &credential_assignment).contains(&credential_name));
+                let first = command_contains_sensitive_literals("inspect", &bare);
+                prop_assert_eq!(first, command_contains_sensitive_literals("inspect", &bare));
+                let scope = register_trusted_exact_secrets(std::slice::from_ref(&value)).unwrap();
+                prop_assert!(command_contains_sensitive_literals("inspect", &bare));
+                prop_assert!(command_contains_sensitive_literals("inspect", &named));
+                prop_assert!(!redact_command_line("inspect", &bare).contains(&value));
+                drop(scope);
+                prop_assert_eq!(first, command_contains_sensitive_literals("inspect", &bare));
+            }
+        }
+    }
 
     #[test]
     fn audit_escape_passes_plain_text_through_borrowed() {
