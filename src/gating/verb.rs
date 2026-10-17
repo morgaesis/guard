@@ -7512,6 +7512,49 @@ verbs:
     }
 
     #[test]
+    fn trusted_remote_script_verb_with_quoted_placeholders_matches_its_rendered_command() {
+        // A remote log read whose script quotes two caller values on separate
+        // lines, the shape that otherwise falls through to the evaluator on
+        // every call.
+        let cat = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: edge-access-log-read
+    binary: ssh
+    args:
+      - "{host}"
+      - "set -u\nfor p in $(kubectl -n edge get pods -o name); do\n  kubectl -n edge logs \"$p\" --since-time='{since}' \\\n    | grep -F '\"RouterName\":\"edge-{router}-https' \\\n    | head -n 6000\ndone\n"
+    params:
+      host: { pattern: "^edge0[13]$", required: true }
+      router: { pattern: "^(sky|auth|auth-login)$", required: true }
+      since: { pattern: "^2026-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", required: true }
+    consequence: reversible
+    trusted: true
+"#,
+        )
+        .unwrap();
+
+        let values = params(&[
+            ("host", "edge01"),
+            ("router", "auth-login"),
+            ("since", "2026-10-17T20:26:36Z"),
+        ]);
+        let rendered = cat.render("edge-access-log-read", &values).unwrap();
+        let matches = cat.match_command_all(&rendered.binary, &rendered.args);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].rendered.params, values);
+        assert_eq!(matches[0].action, CoverageAction::Preauthorized);
+
+        // A value that closes the quote and appends a command fails the
+        // router pattern, so the observed script matches no binding.
+        let injected = vec![
+            "edge01".to_string(),
+            rendered.args[1].replace("edge-auth-login-https", "edge-sky'; id; echo '-https"),
+        ];
+        assert!(cat.match_command_all("ssh", &injected).is_empty());
+    }
+
+    #[test]
     fn typed_coverage_matches_conjunctive_command_dimensions() {
         let inventory = if cfg!(windows) {
             r"C:\guard\inventory\prod"
