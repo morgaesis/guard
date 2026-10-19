@@ -223,7 +223,7 @@ async fn write_redacted_json_line<W: AsyncWrite + Unpin, T: serde::Serialize>(
 #[cfg(test)]
 mod admin_response_lease_tests {
     use super::*;
-    use guard::gating::approval::{Approval, ApprovalSnapshot};
+    use guard::gating::approval::{Approval, ApprovalSnapshot, SnapshotOrigin};
     use guard::gating::Reversibility;
     use std::collections::BTreeMap;
     use std::pin::Pin;
@@ -234,6 +234,7 @@ mod admin_response_lease_tests {
             execution_failure: None,
             handle: "lease-test".to_string(),
             snapshot: ApprovalSnapshot {
+                origin: SnapshotOrigin::Command,
                 binary: "true".to_string(),
                 args: Vec::new(),
                 cwd: None,

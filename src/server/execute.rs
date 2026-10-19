@@ -1591,6 +1591,19 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         ));
     }
 
+    if super::gate_runtime::is_api_proxy_sentinel(&request.binary) {
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                "API proxy sentinel names are reserved for internal holds".to_string(),
+            )
+            .await,
+        ));
+    }
+
     // Reject NUL bytes in argv at the boundary; the check itself lives in
     // `guard::wire` (the fuzzed parsing surface) next to the binary-name rule.
     if let Err(reason) = guard::wire::validate_args(&request.args) {

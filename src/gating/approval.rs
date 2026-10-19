@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,14 +55,22 @@ pub struct ToolSecretBinding {
     pub hash: String,
 }
 
-/// The immutable execution inputs an approval is bound to. Stored at enqueue and
-/// replayed verbatim at approve time. Secret *values* are never stored - only the
-/// env-var -> secret-key mappings for environment and file injection, resolved
-/// at exec under the original caller's namespace, plus an optional salted-hash
-/// [`SecretBinding`] used to detect a value swap between hold and approval.
-/// `BTreeMap` gives a stable order for a stable fingerprint.
+/// How a held snapshot entered the approval queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum SnapshotOrigin {
+    #[default]
+    Command,
+    ApiProxy,
+}
+
+/// Immutable inputs bound to an approval. Command inputs replay verbatim;
+/// API inputs describe a parked request. Secret values are never stored: only
+/// names, environment and file mappings, and an optional value digest are.
+/// Ordered maps keep fingerprints stable. The daemon assigns the origin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct ApprovalSnapshot {
+    #[serde(default)]
+    pub origin: SnapshotOrigin,
     pub binary: String,
     pub args: Vec<String>,
     /// Canonical working directory for execution. Absent on rows written before
@@ -144,6 +152,39 @@ impl ApprovalSnapshot {
     }
 
     pub fn contains_sensitive_literals(&self) -> bool {
+        if self.origin == SnapshotOrigin::ApiProxy {
+            // Only the daemon's descriptive API hold carries this digest. A
+            // command snapshot, even one naming the sentinel, takes the normal
+            // credential path. Malformed metadata never gains the exception.
+            if self.binary != "(api-proxy)" {
+                return true;
+            }
+            let mut digest_index = None;
+            for (index, arg) in self.args.iter().enumerate() {
+                if arg.starts_with("body_sha256") {
+                    let Some(digest) = arg.strip_prefix("body_sha256=") else {
+                        return true;
+                    };
+                    if digest_index.replace(index).is_some()
+                        || digest.len() != 64
+                        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        || crate::redact::redact_registered_exact_secrets(arg) != *arg
+                    {
+                        return true;
+                    }
+                }
+            }
+            let Some(digest_index) = digest_index else {
+                return true;
+            };
+            let other_args = self
+                .args
+                .iter()
+                .enumerate()
+                .filter_map(|(index, arg)| (index != digest_index).then_some(arg.clone()))
+                .collect::<Vec<_>>();
+            return crate::redact::command_contains_sensitive_literals(&self.binary, &other_args);
+        }
         crate::redact::command_contains_sensitive_literals(&self.binary, &self.args)
     }
 
@@ -300,6 +341,7 @@ impl Approval {
 pub struct ApprovalRegistry {
     items: HashMap<String, Approval>,
     notifiers: HashMap<String, Arc<Notify>>,
+    proxy_waiters: HashSet<String>,
     leases: Arc<WaiterLeaseState>,
 }
 
@@ -433,6 +475,7 @@ impl ApprovalRegistry {
             Self {
                 items,
                 notifiers: HashMap::new(),
+                proxy_waiters: HashSet::new(),
                 leases: Arc::new(WaiterLeaseState::default()),
             },
             recovered,
@@ -447,6 +490,18 @@ impl ApprovalRegistry {
             .insert(approval.handle.clone(), notify.clone());
         self.items.insert(approval.handle.clone(), approval);
         notify
+    }
+
+    pub fn mark_proxy_waiter(&mut self, handle: &str) {
+        self.proxy_waiters.insert(handle.to_string());
+    }
+
+    pub fn clear_proxy_waiter(&mut self, handle: &str) {
+        self.proxy_waiters.remove(handle);
+    }
+
+    pub fn has_proxy_waiter(&self, handle: &str) -> bool {
+        self.proxy_waiters.contains(handle)
     }
 
     /// Register a waiter before an approval mutation. The notifier and lease
@@ -750,6 +805,7 @@ mod tests {
 
     fn snap(binary: &str) -> ApprovalSnapshot {
         ApprovalSnapshot {
+            origin: SnapshotOrigin::Command,
             binary: binary.to_string(),
             args: vec!["-rf".into(), "/data".into()],
             cwd: None,
@@ -791,6 +847,62 @@ mod tests {
             result_stderr: None,
             notes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn api_digest_exception_requires_origin_and_exact_metadata() {
+        use sha2::Digest;
+
+        let digest = sha2::Sha256::digest(b"approval digest fixture")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut snapshot = snap("(api-proxy)");
+        snapshot.args = vec![format!("body_sha256={digest}")];
+        assert!(snapshot.contains_sensitive_literals());
+        snapshot.origin = SnapshotOrigin::ApiProxy;
+        assert!(!snapshot.contains_sensitive_literals());
+        snapshot
+            .args
+            .push("body_shape={\"body_sha256\":\"string\"}".to_string());
+        assert!(!snapshot.contains_sensitive_literals());
+        snapshot.args.pop();
+
+        for args in [
+            vec![digest.clone()],
+            vec![format!("body_sha256={}", &digest[..63])],
+            vec![
+                format!("body_sha256={digest}"),
+                format!("body_sha256={digest}"),
+            ],
+            vec![format!("body_sha256:{digest}")],
+            vec![
+                format!("body_sha256={digest}"),
+                format!("password={digest}"),
+            ],
+        ] {
+            snapshot.args = args;
+            assert!(snapshot.contains_sensitive_literals());
+        }
+        snapshot.args = vec![format!("body_sha256={digest}")];
+        snapshot.binary = "sh".to_string();
+        assert!(snapshot.contains_sensitive_literals());
+        snapshot.binary = "(api-proxy)".to_string();
+
+        let scope = crate::redact::register_trusted_exact_secrets(&[digest]).unwrap();
+        assert!(snapshot.contains_sensitive_literals());
+        drop(scope);
+        let scope =
+            crate::redact::register_trusted_exact_secrets(std::slice::from_ref(&snapshot.args[0]))
+                .unwrap();
+        assert!(snapshot.contains_sensitive_literals());
+        drop(scope);
+
+        let mut legacy = serde_json::to_value(&snapshot).unwrap();
+        legacy.as_object_mut().unwrap().remove("origin");
+        let legacy: ApprovalSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.origin, SnapshotOrigin::Command);
+        assert!(legacy.contains_sensitive_literals());
     }
 
     #[test]

@@ -5,7 +5,7 @@ pub(super) use guard::env::now_unix;
 use guard::audit::{AuditEvent, AuditKind};
 
 use guard::gating::approval::{
-    bound_approval_transcript, Approval, ApprovalSnapshot, ApprovalStatus,
+    bound_approval_transcript, Approval, ApprovalSnapshot, ApprovalStatus, SnapshotOrigin,
 };
 use guard::gating::provisional::{
     ApiRevertPlan, Provisional, ProvisionalRegistry, ProvisionalStatus, REVERT_BODY_CLEANUP_PREFIX,
@@ -697,26 +697,27 @@ struct ProxyHoldOrphanGuard {
 
 impl Drop for ProxyHoldOrphanGuard {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
         let server = self.server.clone();
         let handle = self.handle.clone();
+        let armed = self.armed;
         tokio::spawn(async move {
-            let now = now_unix();
-            {
-                let mut reg = server.state.approvals.write().await;
-                match reg.get(&handle).map(|a| a.status) {
-                    Some(s) if s.is_pending() => {}
-                    _ => return,
-                }
-                reg.set_exec_failed(
-                    &handle,
-                    now,
-                    "requester disconnected before a decision; the held API request is gone"
-                        .to_string(),
-                );
+            let mut reg = server.state.approvals.write().await;
+            reg.clear_proxy_waiter(&handle);
+            if !armed {
+                return;
             }
+            let now = now_unix();
+            match reg.get(&handle).map(|a| a.status) {
+                Some(s) if s.is_pending() => {}
+                _ => return,
+            }
+            reg.set_exec_failed(
+                &handle,
+                now,
+                "requester disconnected before a decision; the held API request is gone"
+                    .to_string(),
+            );
+            drop(reg);
             let session_fingerprint =
                 if let Some(a) = server.state.approvals.read().await.get(&handle).cloned() {
                     let session_fingerprint = a.snapshot.session_fingerprint.clone();
@@ -1218,6 +1219,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .collect::<Vec<_>>()
             .join(",");
         let snapshot = ApprovalSnapshot {
+            origin: SnapshotOrigin::ApiProxy,
             binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![
                 api_snapshot.label.clone(),
@@ -1283,13 +1285,12 @@ impl guard::proxy::GateSink for DaemonGateSink {
                 handle: None,
             };
         }
-        let notify = self
-            .server
-            .state
-            .approvals
-            .write()
-            .await
-            .enqueue(approval.clone());
+        let notify = {
+            let mut approvals = self.server.state.approvals.write().await;
+            let notify = approvals.enqueue(approval.clone());
+            approvals.mark_proxy_waiter(&handle);
+            notify
+        };
         #[cfg(test)]
         signal_approval_lifecycle(&self.server, false);
         self.server.emit_audit_ungated(
@@ -2735,6 +2736,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         _ => Vec::new(),
     };
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: request.binary.clone(),
         args: request.args.clone(),
         cwd: request.cwd.clone(),
