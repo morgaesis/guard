@@ -4,6 +4,7 @@
 !Cargo.lock
 !build.rs
 !deny.toml
+!DEPLOYMENT.md
 
 !src/
 !src/**

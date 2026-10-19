@@ -15,7 +15,8 @@ ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 # integration test binaries (e.g. mcp_integration) - without it the suite
 # silently covers only the lib/bin unit tests. `examples/` is required because
 # policy_tests embeds example policy files via include_str!("../examples/...").
-COPY Cargo.toml Cargo.lock build.rs deny.toml ./
+# Session-store tests embed DEPLOYMENT.md to check the documented rollback SQL.
+COPY Cargo.toml Cargo.lock build.rs deny.toml DEPLOYMENT.md ./
 COPY src ./src
 COPY config ./config
 COPY tests ./tests
