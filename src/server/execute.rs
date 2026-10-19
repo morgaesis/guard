@@ -4351,7 +4351,7 @@ fn bounded_error_detail(error: impl std::fmt::Display) -> String {
 }
 
 fn reserve_bounded_output(total: &AtomicUsize, amount: usize) -> Result<(), BoundedOutputError> {
-    let reserved = total.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let reserved = total.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         current
             .checked_add(amount)
             .filter(|next| *next <= MAX_OUTPUT_BYTES)
@@ -5007,7 +5007,7 @@ async fn forward_stream_chunks<R>(
             Ok(0) => break,
             Ok(read) => {
                 stream_bytes = stream_bytes.saturating_add(read);
-                let reserved = total.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                let reserved = total.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current
                         .checked_add(read)
                         .filter(|next| *next <= MAX_OUTPUT_BYTES)

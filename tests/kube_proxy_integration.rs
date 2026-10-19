@@ -349,7 +349,7 @@ impl ApiSessionSink for BudgetSessionSink {
         }
         let admitted = self
             .remaining_resolutions
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 (remaining > 0).then(|| remaining - 1)
             })
             .is_ok();
