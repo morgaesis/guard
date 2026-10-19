@@ -470,16 +470,17 @@ successful and disarm its timer.
 Before downgrade, resolve pending API and command holds and every armed or
 incomplete provisional with the running daemon. Verify their final effects;
 a restored snapshot cannot release an API request or revert an action that it
-does not contain. Inspect holds with `guard approval show <handle>` and deny
-unneeded holds with `guard access deny <handle>`. Inspect containment with
-`guard provisionals show <handle>`; after checking the actual effect, use
-`guard confirm <handle>` to keep it or `guard revert <handle>` to undo it.
+does not contain. Inspect holds with `sudo guard-operator approval show <handle>`
+and deny unneeded holds with `sudo guard-operator access deny <handle>`. Inspect
+containment with `sudo guard-operator provisionals show <handle>`; after checking
+the actual effect, use `sudo guard-operator confirm <handle>` to keep it or
+`sudo guard-operator revert <handle>` to undo it.
 Sanitized rollback arguments cannot be replayed; restore the intended effect
 through a separately authorized action before confirming that recovery.
 If the daemon cannot resolve outstanding work, keep it stopped and preserve
 the complete current state directory and associated files. Resolve the effects
-with a recovery plan before restoring a snapshot. Rollback requires another stop and a verified matching
-snapshot. Preserve the entire displaced migrated state, including WAL, SHM and
+with a recovery plan before restoring a snapshot. Rollback requires another stop
+and a verified matching snapshot. Preserve the entire displaced migrated state, including WAL, SHM and
 rollback-journal files, by renaming the directory into a fresh archive on the
 same filesystem. Preserve configuration and packaged files separately before
 restoration. No unique state
