@@ -3541,6 +3541,8 @@ fn migrate_v13_dispatch_rows(conn: &Connection) -> Result<()> {
 }
 
 fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
+    let mut recovered_approvals = Vec::new();
+    let mut recovered_provisionals = Vec::new();
     let (exact_authority_changed, exact_revision_updates) =
         repair_sensitive_session_exact_authority(conn)?;
     {
@@ -3728,6 +3730,7 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                 )
             {
                 approval.status = ApprovalStatus::ExecFailed;
+                recovered_approvals.push(approval.handle.clone());
                 approval.decided_unix = Some(guard::env::now_unix());
                 approval.decided_reason = Some(if sensitive_snapshot || exact_contamination {
                     SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string()
@@ -3830,6 +3833,9 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                 scrub_registered_exact_literals(&mut provisional)?;
             }
             provisional.sanitize_explanatory_text();
+            if provisional.status != original_status {
+                recovered_provisionals.push(provisional.handle.clone());
+            }
             let sanitized_json = serde_json::to_string(&provisional)?;
             conn.execute(
                 "UPDATE gating_provisional
@@ -3850,6 +3856,15 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
             "UPDATE state_metadata SET value = value + 1 WHERE key = ?1",
             params![REGISTRY_GENERATION_KEY],
         )?;
+    }
+    if !recovered_approvals.is_empty() || !recovered_provisionals.is_empty() {
+        tracing::warn!(
+            approvals = recovered_approvals.len(),
+            approval_handles = ?recovered_approvals,
+            provisionals = recovered_provisionals.len(),
+            provisional_handles = ?recovered_provisionals,
+            "credential sanitization staged lifecycle recovery; inspect these handles after startup"
+        );
     }
     Ok(())
 }

@@ -470,7 +470,15 @@ successful and disarm its timer.
 Before downgrade, resolve pending API and command holds and every armed or
 incomplete provisional with the running daemon. Verify their final effects;
 a restored snapshot cannot release an API request or revert an action that it
-does not contain. Rollback requires another stop and a verified matching
+does not contain. Inspect holds with `guard approval show <handle>` and deny
+unneeded holds with `guard access deny <handle>`. Inspect containment with
+`guard provisionals show <handle>`; after checking the actual effect, use
+`guard confirm <handle>` to keep it or `guard revert <handle>` to undo it.
+Sanitized rollback arguments cannot be replayed; restore the intended effect
+through a separately authorized action before confirming that recovery.
+If the daemon cannot resolve outstanding work, keep it stopped and preserve
+the complete current state directory and associated files. Resolve the effects
+with a recovery plan before restoring a snapshot. Rollback requires another stop and a verified matching
 snapshot. Preserve the entire displaced migrated state, including WAL, SHM and
 rollback-journal files, by renaming the directory into a fresh archive on the
 same filesystem. Preserve configuration and packaged files separately before
@@ -489,11 +497,20 @@ case "$guard_unit" in guard.service|guard-exec-as-caller.service) ;; *) exit 1 ;
 outstanding_query="SELECT (SELECT COUNT(*) FROM gating_approval WHERE status IN ('pending', 'approving')) +
   (SELECT COUNT(*) FROM gating_provisional WHERE status NOT IN ('confirmed', 'reverted', 'revert_failed'));"
 outstanding="$(sqlite3 -readonly /var/lib/guard/state.db "$outstanding_query")"
-test "$outstanding" = 0
+show_outstanding() {
+  sqlite3 -readonly -header -column /var/lib/guard/state.db "SELECT handle, status FROM gating_approval WHERE status IN ('pending', 'approving');
+    SELECT handle, status FROM gating_provisional WHERE status NOT IN ('confirmed', 'reverted', 'revert_failed');" >&2
+}
+if ! test "$outstanding" = 0; then
+  echo "Rollback blocked by $outstanding unfinished actions; inspect and resolve these handles before retrying." >&2
+  show_outstanding
+  exit 1
+fi
 systemctl stop "$guard_unit"
 test "$(systemctl is-active "$guard_unit" || true)" = inactive
 if ! outstanding="$(sqlite3 -readonly /var/lib/guard/state.db "$outstanding_query")" || [ "$outstanding" != 0 ]; then
-  systemctl start "$guard_unit"
+  echo "Rollback stopped: outstanding work changed or could not be read. Preserve the current state and resolve recovery before restarting." >&2
+  show_outstanding
   exit 1
 fi
 (cd "$backup_dir" && sha256sum --check --status SHA256SUMS)
