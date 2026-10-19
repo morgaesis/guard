@@ -52,6 +52,8 @@ use super::wire::{
     CONSEQUENCE_GRANT, CONSEQUENCE_RELEASE, SESSION_PRINCIPAL_MISMATCH, SESSION_UNOWNED_REFUSED,
 };
 use super::{is_valid_secret_key, ServerContext};
+#[cfg(test)]
+use guard::gating::approval::SnapshotOrigin;
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 
 pub(super) const MAX_GRANT_REQUESTS: usize = 1024;
@@ -190,6 +192,7 @@ mod regeneration_proposal_tests {
             execution_failure: None,
             handle: handle.to_string(),
             snapshot: guard::gating::approval::ApprovalSnapshot {
+                origin: SnapshotOrigin::Command,
                 binary: "host-maintain".to_string(),
                 args: Vec::new(),
                 cwd: None,
@@ -355,6 +358,7 @@ mod regeneration_proposal_tests {
         registry.grant("origin".to_string(), access_grant(owner.clone(), 10));
         registry.grant("other".to_string(), access_grant(owner, 20));
         let snapshot = guard::gating::approval::ApprovalSnapshot {
+            origin: SnapshotOrigin::Command,
             binary: "host-inspect".to_string(),
             args: Vec::new(),
             cwd: None,

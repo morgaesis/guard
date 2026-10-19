@@ -6,6 +6,8 @@ use crate::session::{
     SessionGrant, SessionInteraction, SessionOwner, SessionRegistry, StoredSessionInteraction,
 };
 use anyhow::{Context, Result};
+#[cfg(test)]
+use guard::gating::approval::SnapshotOrigin;
 use guard::gating::approval::{Approval, ApprovalStatus};
 use guard::gating::provisional::{Provisional, ProvisionalStatus, REVERT_BODY_CLEANUP_PREFIX};
 use guard::gating::read_grant::ReadGrant;
@@ -49,7 +51,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 /// the inert pre-handoff provisional state and classifies ambiguous v13 API
 /// dispatch rows before older binaries can interpret their rollback authority.
 /// Version 15 retains typed execution failures alongside session admission.
-const SCHEMA_VERSION: i64 = 15;
+/// Version 16 fences API hold digests from older startup sanitizers.
+const SCHEMA_VERSION: i64 = 16;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
@@ -3538,6 +3541,8 @@ fn migrate_v13_dispatch_rows(conn: &Connection) -> Result<()> {
 }
 
 fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
+    let mut recovered_approvals = Vec::new();
+    let mut recovered_provisionals = Vec::new();
     let (exact_authority_changed, exact_revision_updates) =
         repair_sensitive_session_exact_authority(conn)?;
     {
@@ -3725,6 +3730,7 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                 )
             {
                 approval.status = ApprovalStatus::ExecFailed;
+                recovered_approvals.push(approval.handle.clone());
                 approval.decided_unix = Some(guard::env::now_unix());
                 approval.decided_reason = Some(if sensitive_snapshot || exact_contamination {
                     SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string()
@@ -3827,6 +3833,9 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                 scrub_registered_exact_literals(&mut provisional)?;
             }
             provisional.sanitize_explanatory_text();
+            if provisional.status != original_status {
+                recovered_provisionals.push(provisional.handle.clone());
+            }
             let sanitized_json = serde_json::to_string(&provisional)?;
             conn.execute(
                 "UPDATE gating_provisional
@@ -3847,6 +3856,15 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
             "UPDATE state_metadata SET value = value + 1 WHERE key = ?1",
             params![REGISTRY_GENERATION_KEY],
         )?;
+    }
+    if !recovered_approvals.is_empty() || !recovered_provisionals.is_empty() {
+        tracing::warn!(
+            approvals = recovered_approvals.len(),
+            approval_handles = ?recovered_approvals,
+            provisionals = recovered_provisionals.len(),
+            provisional_handles = ?recovered_provisionals,
+            "credential sanitization staged lifecycle recovery; inspect these handles after startup"
+        );
     }
     Ok(())
 }
@@ -4654,7 +4672,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            15
+            SCHEMA_VERSION
         );
         assert_eq!(authority_rows(&conn), authority);
         let failure: Option<String> = conn
@@ -4721,6 +4739,7 @@ mod tests {
             execution_failure: None,
             handle: handle.to_string(),
             snapshot: guard::gating::approval::ApprovalSnapshot {
+                origin: SnapshotOrigin::Command,
                 binary: "fixture-command".to_string(),
                 args: Vec::new(),
                 cwd: None,
@@ -4789,6 +4808,166 @@ mod tests {
             revert_exit: None,
             revert_detail: None,
         }
+    }
+
+    #[test]
+    fn documented_rollback_query_counts_only_unfinished_lifecycles() {
+        let deployment = include_str!("../DEPLOYMENT.md");
+        let rollback = deployment.split("<<'GUARD_ROLLBACK'").nth(1).unwrap();
+        let query = rollback
+            .split("outstanding_query=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert!(
+            rollback.find("test \"$outstanding\" = 0").unwrap()
+                < rollback.find("systemctl stop").unwrap()
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gating_approval (status TEXT); CREATE TABLE gating_provisional (status TEXT);",
+        )
+        .unwrap();
+        for status in [
+            ApprovalStatus::Pending,
+            ApprovalStatus::Approving,
+            ApprovalStatus::Approved,
+            ApprovalStatus::Denied,
+            ApprovalStatus::Expired,
+            ApprovalStatus::ExecFailed,
+        ] {
+            conn.execute("INSERT INTO gating_approval VALUES (?1)", [status.as_str()])
+                .unwrap();
+            let count: i64 = conn.query_row(query, [], |row| row.get(0)).unwrap();
+            assert_eq!(count, i64::from(status.is_pending()), "{status:?}");
+            conn.execute("DELETE FROM gating_approval", []).unwrap();
+        }
+        for status in [
+            ProvisionalStatus::Staged,
+            ProvisionalStatus::Dispatching,
+            ProvisionalStatus::Armed,
+            ProvisionalStatus::Reverting,
+            ProvisionalStatus::Confirmed,
+            ProvisionalStatus::Reverted,
+            ProvisionalStatus::RevertFailed,
+            ProvisionalStatus::NeedsOperatorDecision,
+        ] {
+            conn.execute(
+                "INSERT INTO gating_provisional VALUES (?1)",
+                [status.as_str()],
+            )
+            .unwrap();
+            let count: i64 = conn.query_row(query, [], |row| row.get(0)).unwrap();
+            assert_eq!(count, i64::from(!status.is_lifecycle_final()), "{status:?}");
+            conn.execute("DELETE FROM gating_provisional", []).unwrap();
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(8))]
+        #[test]
+        fn api_digest_persistence_reopens_and_exact_secrets_win(
+            seed in proptest::array::uniform32(proptest::num::u8::ANY),
+            reopen_count in 1usize..4,
+        ) {
+            use sha2::Digest;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all().build().unwrap();
+            runtime.block_on(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let path = tmp.path().join("state.db");
+                let digest = sha2::Sha256::digest(seed)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let mut approval = pending_approval("api-digest");
+                approval.snapshot.origin = SnapshotOrigin::ApiProxy;
+                approval.snapshot.binary = "(api-proxy)".to_string();
+                approval.snapshot.args = vec![format!("body_sha256={digest}")];
+                let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+                store.save_approval(approval.clone()).await.unwrap();
+                drop(store);
+
+                for _ in 0..reopen_count {
+                    let reopened = SessionStore::open(path.clone(), 3600).await.unwrap();
+                    let rows = reopened.load_approvals().await.unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].status, ApprovalStatus::Pending);
+                    assert_eq!(rows[0].snapshot, approval.snapshot);
+                    drop(reopened);
+                }
+                let conn = Connection::open(&path).unwrap();
+                let before: String = conn.query_row(
+                    "SELECT json FROM gating_approval WHERE handle = 'api-digest'",
+                    [], |row| row.get(0),
+                ).unwrap();
+                let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+                assert_eq!(version, 16);
+                assert!(ensure_supported_schema_version(version, 15).is_err());
+                let after: String = conn.query_row(
+                    "SELECT json FROM gating_approval WHERE handle = 'api-digest'",
+                    [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(before, after);
+                drop(conn);
+
+                let scope = guard::redact::register_trusted_exact_secrets(std::slice::from_ref(&digest)).unwrap();
+                assert!(validate_persisted_approval(&approval).is_err());
+                drop(scope);
+                for (index, args) in [vec![digest.clone()], vec![format!("body_sha256={digest}")]].into_iter().enumerate() {
+                    let mut command = pending_approval(&format!("command-{index}"));
+                    command.snapshot.args = args;
+                    assert!(validate_persisted_approval(&command).is_err());
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_psk_argv_is_terminalized_without_persisted_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        drop(SessionStore::open(path.clone(), 3600).await.unwrap());
+        let value = format!("v{}", std::process::id());
+        let mut approval = pending_approval("legacy-psk");
+        approval.snapshot.args = vec![format!("ipsecpsk={value}")];
+        let mut provisional = provisional_row("legacy-psk-provisional", ProvisionalStatus::Armed);
+        provisional.revert_args = vec![format!("ipsecpsk={value}")];
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO gating_approval (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+            params![approval.handle, serde_json::to_string(&approval).unwrap(), approval.status.as_str(), encode_u64(approval.created_unix).unwrap()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO gating_provisional (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+            params![provisional.handle, serde_json::to_string(&provisional).unwrap(), provisional.status.as_str(), encode_u64(provisional.created_unix).unwrap()],
+        ).unwrap();
+        conn.pragma_update(None, "user_version", 15).unwrap();
+        drop(conn);
+
+        let reopened = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let row = reopened.load_approvals().await.unwrap().pop().unwrap();
+        assert_eq!(row.status, ApprovalStatus::ExecFailed);
+        assert!(row.snapshot.args.is_empty());
+        assert_eq!(
+            row.decided_reason.as_deref(),
+            Some(SENSITIVE_ARGV_REPLAY_GUIDANCE)
+        );
+        let provisional = reopened.load_provisionals().await.unwrap().pop().unwrap();
+        assert_eq!(provisional.status, ProvisionalStatus::NeedsOperatorDecision);
+        assert!(provisional.revert_args.is_empty());
+        drop(reopened);
+        let conn = Connection::open(path).unwrap();
+        let json: String = conn
+            .query_row("SELECT json FROM gating_approval", [], |row| row.get(0))
+            .unwrap();
+        assert!(!json.contains(&value));
+        let json: String = conn
+            .query_row("SELECT json FROM gating_provisional", [], |row| row.get(0))
+            .unwrap();
+        assert!(!json.contains(&value));
     }
 
     fn exact_rule_grant(rules: Vec<SessionExactRule>) -> SessionGrant {
@@ -7649,6 +7828,7 @@ mod tests {
             execution_failure: None,
             handle: "ap-shared-claim".to_string(),
             snapshot: guard::gating::approval::ApprovalSnapshot {
+                origin: SnapshotOrigin::Command,
                 binary: "fixture-command".to_string(),
                 args: Vec::new(),
                 cwd: None,

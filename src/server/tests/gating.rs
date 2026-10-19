@@ -5,6 +5,8 @@ use crate::server::admin::{
 };
 use crate::server::execute::audit_session_fingerprint;
 #[cfg(unix)]
+use crate::server::execute::execute_command;
+#[cfg(unix)]
 use crate::server::execute::pause_command_initiation_for_test;
 use crate::server::gate_runtime::{
     approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval_with_authority,
@@ -36,7 +38,7 @@ use crate::session::{AccessUseGrant, IssuedGrantScope, SessionOwner};
 use crate::session_store::SessionStore;
 #[cfg(unix)]
 use guard::evaluate::{EvalConfig, Evaluator};
-use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
+use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus, SnapshotOrigin};
 #[cfg(unix)]
 use guard::gating::approval::{SecretBinding, ToolSecretBinding};
 #[cfg(unix)]
@@ -111,6 +113,29 @@ fn gating_config(
     let operator = CallerIdentity::UnixAdmin { uid: operator_uid };
     let agent = CallerIdentity::Unix { uid: agent_uid };
     (cfg, operator, agent)
+}
+
+#[cfg(unix)]
+fn generated_body_digest() -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(b"held API request fixture")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn raw_api_sentinel_is_rejected_before_a_hold() {
+    let (cfg, _operator, agent) = gating_config(7013, 1000);
+    for binary in ["(api-proxy)", "(kube-proxy)"] {
+        let result = execute_command(held_request(binary, Vec::new(), None), &cfg, &agent).await;
+        assert!(matches!(result.exec, ExecOutcome::NotAttempted));
+        assert!(result
+            .policy_reason()
+            .contains("reserved for internal holds"));
+    }
+    assert!(cfg.state.approvals.read().await.list().is_empty());
 }
 
 /// A request with a structured revert, used to drive `arm_containment_with_authority`.
@@ -3854,6 +3879,7 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
         execution_failure: None,
         handle: handle.clone(),
         snapshot: ApprovalSnapshot {
+            origin: SnapshotOrigin::Command,
             binary: "true".to_string(),
             args: Vec::new(),
             cwd: None,
@@ -4509,6 +4535,7 @@ async fn exhausted_multi_verb_hold_requests_every_required_scope() {
 async fn held_access_replay_fails_if_staged_session_was_revoked() {
     let (cfg, _operator, agent) = gating_config(7006, 1000);
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: "true".to_string(),
         args: Vec::new(),
         cwd: None,
@@ -4559,6 +4586,7 @@ async fn approved_replay_still_respects_explicit_static_deny() {
         Evaluator::new(EvalConfig::default().llm_enabled(false).policy_path(policy)).unwrap(),
     );
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: "true".to_string(),
         args: vec!["--blocked".to_string()],
         cwd: None,
@@ -4623,6 +4651,7 @@ async fn approved_replay_preempts_matching_learned_deny() {
         .unwrap(),
     );
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: "true".to_string(),
         args: vec!["--check".to_string()],
         cwd: None,
@@ -5053,7 +5082,7 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         };
         let snapshot = guard::proxy::ApiHoldSnapshot {
             label: "delete namespaces/prod".to_string(),
-            body_sha256: "body-digest".to_string(),
+            body_sha256: generated_body_digest(),
             redacted_body_shape: "(no body)".to_string(),
             redacted_query: String::new(),
             authority_selectors: Default::default(),
@@ -5144,7 +5173,7 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     let waiter = tokio::spawn(async move {
         let snapshot = guard::proxy::ApiHoldSnapshot {
             label: "delete namespaces/prod".to_string(),
-            body_sha256: "body-digest".to_string(),
+            body_sha256: generated_body_digest(),
             redacted_body_shape: "(no body)".to_string(),
             redacted_query: String::new(),
             authority_selectors: Default::default(),
@@ -5199,7 +5228,7 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     let waiter = tokio::spawn(async move {
         let snapshot = guard::proxy::ApiHoldSnapshot {
             label: "delete namespaces/prod".to_string(),
-            body_sha256: "body-digest".to_string(),
+            body_sha256: generated_body_digest(),
             redacted_body_shape: "(no body)".to_string(),
             redacted_query: String::new(),
             authority_selectors: Default::default(),
@@ -5969,6 +5998,7 @@ fn held_verb_approval(
         execution_failure: None,
         handle: handle.to_string(),
         snapshot: ApprovalSnapshot {
+            origin: SnapshotOrigin::Command,
             binary: "true".to_string(),
             args: vec!["fixture".to_string()],
             cwd: None,
@@ -6275,7 +6305,11 @@ async fn lost_one_rpc_response_leaves_one_durable_mutation() {
 #[cfg(unix)]
 #[tokio::test]
 async fn one_rpc_release_wait_returns_approved_outcome() {
-    let (cfg, operator, _agent) = gating_config(7013, 1000);
+    let state = tempfile::tempdir().unwrap();
+    let database = state.path().join("state.db");
+    let store = SessionStore::open(database.clone(), 3600).await.unwrap();
+    let (mut cfg, operator, _agent) = gating_config(7013, 1000);
+    cfg.state.session_store = Some(store.clone());
     let sink = Arc::new(DaemonGateSink {
         server: cfg.clone(),
         endpoint: "default".to_string(),
@@ -6288,7 +6322,7 @@ async fn one_rpc_release_wait_returns_approved_outcome() {
     let waiter = tokio::spawn(async move {
         let snapshot = guard::proxy::ApiHoldSnapshot {
             label: "release operation".to_string(),
-            body_sha256: "body-digest".to_string(),
+            body_sha256: generated_body_digest(),
             redacted_body_shape: "(no body)".to_string(),
             redacted_query: String::new(),
             authority_selectors: Default::default(),
@@ -6296,6 +6330,21 @@ async fn one_rpc_release_wait_returns_approved_outcome() {
         guard::proxy::GateSink::hold_request(&*sink, &snapshot, "release review", None).await
     });
     let handle = pending_hold_after(&cfg, &lifecycle).await;
+    let durable = store.load_approvals().await.unwrap();
+    assert_eq!(durable.len(), 1);
+    assert_eq!(durable[0].status, ApprovalStatus::Pending);
+    assert_eq!(durable[0].snapshot.origin, SnapshotOrigin::ApiProxy);
+    assert_eq!(
+        durable[0].snapshot.args[1],
+        format!("body_sha256={}", generated_body_digest())
+    );
+    assert!(!durable[0].snapshot.contains_sensitive_literals());
+    let reopened = SessionStore::open(database, 3600).await.unwrap();
+    assert_eq!(
+        reopened.load_approvals().await.unwrap()[0].status,
+        ApprovalStatus::Pending
+    );
+    drop(reopened);
     let owned = handle_admin_request_owned(
         &cfg,
         &operator,
@@ -6835,6 +6884,7 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
     let (mut cfg, _, agent) = gating_config(7015, 1000);
     cfg.config.allowed_binaries = Some(vec!["echo".to_string()]);
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: "sh".to_string(),
         args: vec!["-c".to_string(), "true".to_string()],
         cwd: None,
@@ -7129,6 +7179,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
 
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: "true".to_string(),
         args: Vec::new(),
         cwd: None,
@@ -7275,6 +7326,7 @@ async fn approved_snapshot_rejects_changed_session_revision() {
         .effective_revision_key(token)
         .unwrap();
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: "true".to_string(),
         args: Vec::new(),
         cwd: None,
@@ -7308,6 +7360,7 @@ async fn approved_snapshot_rejects_changed_session_revision() {
 async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
     let (cfg, _, agent) = gating_config(7018, 1000);
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: "sh".to_string(),
         args: vec!["-c".to_string(), "printf should-not-run".to_string()],
         cwd: None,
@@ -7350,6 +7403,7 @@ async fn approved_snapshot_executes_in_snapshotted_cwd() {
     let (cfg, _, agent) = gating_config(7016, 1000);
     let temp = tempfile::tempdir().unwrap();
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: "sh".to_string(),
         args: vec![
             "-c".to_string(),
@@ -7396,6 +7450,7 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().to_path_buf();
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: "sh".to_string(),
         args: vec!["-c".to_string(), "printf approved".to_string()],
         cwd: Some(cwd.clone()),
@@ -7447,6 +7502,7 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
     std::fs::create_dir(&retargeted).unwrap();
     let cwd = approved.canonicalize().unwrap();
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: "sh".to_string(),
         args: vec!["-c".to_string(), "printf approved".to_string()],
         cwd: Some(cwd.clone()),

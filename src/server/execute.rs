@@ -1591,6 +1591,19 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         ));
     }
 
+    if super::gate_runtime::is_api_proxy_sentinel(&request.binary) {
+        return Err(Box::new(
+            deny_and_record(
+                phase,
+                request,
+                SessionDecisionSource::Validation,
+                None,
+                "API proxy sentinel names are reserved for internal holds".to_string(),
+            )
+            .await,
+        ));
+    }
+
     // Reject NUL bytes in argv at the boundary; the check itself lives in
     // `guard::wire` (the fuzzed parsing surface) next to the binary-name rule.
     if let Err(reason) = guard::wire::validate_args(&request.args) {
@@ -4338,7 +4351,7 @@ fn bounded_error_detail(error: impl std::fmt::Display) -> String {
 }
 
 fn reserve_bounded_output(total: &AtomicUsize, amount: usize) -> Result<(), BoundedOutputError> {
-    let reserved = total.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let reserved = total.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         current
             .checked_add(amount)
             .filter(|next| *next <= MAX_OUTPUT_BYTES)
@@ -4994,7 +5007,7 @@ async fn forward_stream_chunks<R>(
             Ok(0) => break,
             Ok(read) => {
                 stream_bytes = stream_bytes.saturating_add(read);
-                let reserved = total.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                let reserved = total.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current
                         .checked_add(read)
                         .filter(|next| *next <= MAX_OUTPUT_BYTES)

@@ -5,7 +5,7 @@ pub(super) use guard::env::now_unix;
 use guard::audit::{AuditEvent, AuditKind};
 
 use guard::gating::approval::{
-    bound_approval_transcript, Approval, ApprovalSnapshot, ApprovalStatus,
+    bound_approval_transcript, Approval, ApprovalSnapshot, ApprovalStatus, SnapshotOrigin,
 };
 use guard::gating::provisional::{
     ApiRevertPlan, Provisional, ProvisionalRegistry, ProvisionalStatus, REVERT_BODY_CLEANUP_PREFIX,
@@ -1218,6 +1218,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .collect::<Vec<_>>()
             .join(",");
         let snapshot = ApprovalSnapshot {
+            origin: SnapshotOrigin::ApiProxy,
             binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![
                 api_snapshot.label.clone(),
@@ -2735,6 +2736,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         _ => Vec::new(),
     };
     let snapshot = ApprovalSnapshot {
+        origin: SnapshotOrigin::Command,
         binary: request.binary.clone(),
         args: request.args.clone(),
         cwd: request.cwd.clone(),

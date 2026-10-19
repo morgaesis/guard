@@ -929,32 +929,7 @@ impl VerbCatalog {
             };
             let re = compile_anchored(spec.pattern_text())
                 .with_context(|| format!("invalid pattern for param '{}'", pname))?;
-            if !re.is_match(&value) {
-                bail!(
-                    "value for '{}' does not match required pattern {}",
-                    pname,
-                    spec.pattern_text()
-                );
-            }
-            if spec
-                .max_length()
-                .is_some_and(|maximum| value.chars().count() > maximum)
-            {
-                bail!(
-                    "value for '{}' exceeds its maximum length of {} characters",
-                    pname,
-                    spec.max_length().unwrap_or_default()
-                );
-            }
-            if spec.value_type() == ParamValueType::SingleArgv {
-                validate_single_argv_value(pname, &value)?;
-            }
-            if !spec.allow_dash && value.starts_with('-') {
-                bail!(
-                    "value for '{}' may not begin with '-' (would be parsed as an option)",
-                    pname
-                );
-            }
+            validate_param_value(pname, spec, &re, &value)?;
             resolved.insert(pname.clone(), value);
         }
 
@@ -1077,7 +1052,7 @@ impl VerbCatalog {
             let captured = if verb.args.is_empty() && !verb.coverage.is_empty() {
                 BTreeMap::new()
             } else {
-                let Some(captured) = match_args_template(&verb.args, args) else {
+                let Some(captured) = match_verb_args(verb, args) else {
                     continue;
                 };
                 captured
@@ -1088,6 +1063,8 @@ impl VerbCatalog {
             if verb.args.is_empty() && !verb.coverage.is_empty() {
                 rendered.binary = binary.to_string();
                 rendered.args = args.to_vec();
+            } else if rendered.args != args {
+                continue;
             }
             if validate_known_file_arguments(
                 verb,
@@ -4012,7 +3989,7 @@ pub fn validate_auto_promoted_verb_durable_safety(verb: &Verb) -> Result<()> {
 /// only by `validate_auto_promoted_verb_safety` to prove the template it is
 /// about to trust actually round-trips its own evidence.
 fn render_map_for(verb: &Verb, sample: &[String]) -> Result<BTreeMap<String, String>> {
-    let rendered = match_args_template(&verb.args, sample).ok_or_else(|| {
+    let rendered = match_verb_args(verb, sample).ok_or_else(|| {
         anyhow::anyhow!("evidence sample {:?} does not match the template", sample)
     })?;
     Ok(rendered)
@@ -4522,57 +4499,335 @@ fn render_args(
         .collect()
 }
 
+/// Check one parameter value against its declared constraints. `pattern` is the
+/// compiled, fully anchored form of `spec.pattern_text()`.
+fn validate_param_value(pname: &str, spec: &ParamSpec, pattern: &Regex, value: &str) -> Result<()> {
+    if !pattern.is_match(value) {
+        bail!(
+            "value for '{}' does not match required pattern {}",
+            pname,
+            spec.pattern_text()
+        );
+    }
+    if spec
+        .max_length()
+        .is_some_and(|maximum| value.chars().count() > maximum)
+    {
+        bail!(
+            "value for '{}' exceeds its maximum length of {} characters",
+            pname,
+            spec.max_length().unwrap_or_default()
+        );
+    }
+    if spec.value_type() == ParamValueType::SingleArgv {
+        validate_single_argv_value(pname, value)?;
+    }
+    if !spec.allow_dash && value.starts_with('-') {
+        bail!(
+            "value for '{}' may not begin with '-' (would be parsed as an option)",
+            pname
+        );
+    }
+    Ok(())
+}
+
+/// One piece of a template token, split exactly where `render_token`
+/// substitutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateSegment<'a> {
+    Literal(&'a str),
+    Placeholder(&'a str),
+}
+
+fn template_segments(token: &str) -> Vec<TemplateSegment<'_>> {
+    let mut segments = Vec::new();
+    let mut rest = token;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            // No closing brace remains, so `render_token` copies the rest of
+            // the token literally.
+            break;
+        };
+        if open > 0 {
+            segments.push(TemplateSegment::Literal(&rest[..open]));
+        }
+        segments.push(TemplateSegment::Placeholder(&after[..close]));
+        rest = &after[close + 1..];
+    }
+    if !rest.is_empty() {
+        segments.push(TemplateSegment::Literal(rest));
+    }
+    segments
+}
+
+/// Upper bound on placeholder value candidates tried while reverse-matching
+/// one argv. Exceeding it declines the match rather than guessing.
+const MAX_REVERSE_MATCH_CANDIDATES: usize = 4096;
+const MAX_REVERSE_MATCH_WORK: usize = 1024 * 1024;
+const MAX_REVERSE_MATCH_DEPTH: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReverseMatchDecline {
+    NoMatch,
+    Ambiguous,
+    BudgetExceeded,
+    DepthExceeded,
+    RepeatedValueMismatch,
+}
+
+impl ReverseMatchDecline {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoMatch => "no match",
+            Self::Ambiguous => "ambiguous binding",
+            Self::BudgetExceeded => "search budget exceeded",
+            Self::DepthExceeded => "template depth exceeded",
+            Self::RepeatedValueMismatch => "repeated parameter mismatch",
+        }
+    }
+}
+
+struct ReverseMatchSearch<'a, F> {
+    templates: Vec<Vec<TemplateSegment<'a>>>,
+    observed: &'a [String],
+    accept: F,
+    remaining_candidates: usize,
+    remaining_work: usize,
+    decline: ReverseMatchDecline,
+    found: Option<BTreeMap<String, String>>,
+}
+
+enum SearchFlow {
+    Continue,
+    Stop,
+}
+
+impl<'a, F: FnMut(&str, &str) -> bool> ReverseMatchSearch<'a, F> {
+    fn charge(&mut self, work: usize) -> bool {
+        if let Some(remaining) = self.remaining_work.checked_sub(work) {
+            self.remaining_work = remaining;
+            true
+        } else {
+            self.decline = ReverseMatchDecline::BudgetExceeded;
+            false
+        }
+    }
+
+    fn search(
+        &mut self,
+        token: usize,
+        segment: usize,
+        offset: usize,
+        params: &mut BTreeMap<String, String>,
+    ) -> SearchFlow {
+        let Some(segments) = self.templates.get(token) else {
+            return match &self.found {
+                None => {
+                    self.found = Some(params.clone());
+                    SearchFlow::Continue
+                }
+                Some(found) if found == params => SearchFlow::Continue,
+                // Two different parameter bindings render the same argv: the
+                // binding the caller meant cannot be known.
+                Some(_) => {
+                    self.found = None;
+                    self.decline = ReverseMatchDecline::Ambiguous;
+                    SearchFlow::Stop
+                }
+            };
+        };
+        let value = self.observed[token].as_str();
+        let rest = &value[offset..];
+        let Some(current) = segments.get(segment).copied() else {
+            return if rest.is_empty() {
+                self.search(token + 1, 0, 0, params)
+            } else {
+                SearchFlow::Continue
+            };
+        };
+        let name = match current {
+            TemplateSegment::Literal(literal) => {
+                if !self.charge(literal.len().saturating_add(1)) {
+                    return SearchFlow::Stop;
+                }
+                return if rest.starts_with(literal) {
+                    self.search(token, segment + 1, offset + literal.len(), params)
+                } else {
+                    SearchFlow::Continue
+                };
+            }
+            TemplateSegment::Placeholder(name) => name,
+        };
+        if let Some(bound) = params.get(name).cloned() {
+            if !self.charge(bound.len().saturating_add(1)) {
+                return SearchFlow::Stop;
+            }
+            return if rest.starts_with(bound.as_str()) {
+                self.search(token, segment + 1, offset + bound.len(), params)
+            } else {
+                self.decline = ReverseMatchDecline::RepeatedValueMismatch;
+                SearchFlow::Continue
+            };
+        }
+
+        let tail = &segments[segment + 1..];
+        let final_placeholder = tail
+            .iter()
+            .all(|piece| matches!(piece, TemplateSegment::Literal(_)));
+        let next_literal = match tail.first().copied() {
+            Some(TemplateSegment::Literal(literal)) => literal,
+            _ => "",
+        };
+        let mut next_end = if final_placeholder {
+            // The last placeholder in the token: the trailing literal text
+            // fixes where its value ends.
+            let suffix_len: usize = tail
+                .iter()
+                .map(|piece| match piece {
+                    TemplateSegment::Literal(literal) => literal.len(),
+                    TemplateSegment::Placeholder(_) => 0,
+                })
+                .sum();
+            match rest.len().checked_sub(suffix_len) {
+                Some(end) if rest.is_char_boundary(end) => Some(end),
+                _ => None,
+            }
+        } else {
+            Some(0)
+        };
+
+        // Visit split points incrementally, charging even those that do not
+        // precede the next literal. No list grows with the observed argument.
+        while let Some(end) = next_end {
+            let next_character = rest[end..].chars().next();
+            let scanned = next_character.map_or(1, char::len_utf8);
+            if !self.charge(next_literal.len().saturating_add(scanned)) {
+                return SearchFlow::Stop;
+            }
+            next_end = if final_placeholder {
+                None
+            } else {
+                next_character.map(|c| end + c.len_utf8())
+            };
+            if !rest[end..].starts_with(next_literal) {
+                continue;
+            }
+            if self.remaining_candidates == 0 {
+                self.found = None;
+                self.decline = ReverseMatchDecline::BudgetExceeded;
+                return SearchFlow::Stop;
+            }
+            self.remaining_candidates -= 1;
+            let candidate = &rest[..end];
+            if !self.charge(candidate.len().saturating_add(1)) {
+                return SearchFlow::Stop;
+            }
+            if !(self.accept)(name, candidate) {
+                continue;
+            }
+            params.insert(name.to_string(), candidate.to_string());
+            let flow = self.search(token, segment + 1, offset + end, params);
+            params.remove(name);
+            if let SearchFlow::Stop = flow {
+                return SearchFlow::Stop;
+            }
+        }
+        SearchFlow::Continue
+    }
+}
+
 /// Reverse-match a concrete argv against a verb's template tokens, extracting
-/// parameter values. Requires the exact same arity (no variadic templates): a
-/// template token with no placeholder must equal the observed token exactly;
-/// one with a single placeholder yields a value by stripping the template's
-/// literal prefix/suffix from the observed token. A token with more than one
-/// placeholder is not reverse-matchable and always fails the match (it
-/// remains invocable normally via an explicit `--verb` call, which resolves
-/// params by name rather than by position). The same parameter name appearing
-/// in more than one token must extract the same value everywhere, or the
-/// match fails.
+/// parameter values. Requires the exact same arity (no variadic templates).
+/// Literal template text must appear verbatim in the observed token. A token
+/// may hold several placeholders, and one name may repeat within a token or
+/// across tokens; a repeated name must bind the same value everywhere.
+///
+/// Every candidate value must pass `accept`, which applies the parameter's
+/// declared validation; no regular expression is built from template text.
+/// The match succeeds only when exactly one parameter binding renders the
+/// observed argv. Several valid bindings, or a search exceeding
+/// `MAX_REVERSE_MATCH_CANDIDATES`, decline the match.
+#[cfg(test)]
 fn match_args_template(
     templates: &[String],
     observed: &[String],
+    accept: impl FnMut(&str, &str) -> bool,
 ) -> Option<BTreeMap<String, String>> {
+    match_args_template_result(templates, observed, accept).ok()
+}
+
+fn match_args_template_result(
+    templates: &[String],
+    observed: &[String],
+    accept: impl FnMut(&str, &str) -> bool,
+) -> std::result::Result<BTreeMap<String, String>, ReverseMatchDecline> {
     if templates.len() != observed.len() {
-        return None;
+        return Err(ReverseMatchDecline::NoMatch);
     }
-    let mut params: BTreeMap<String, String> = BTreeMap::new();
-    for (template, value) in templates.iter().zip(observed.iter()) {
-        let names = placeholders(template);
-        match names.len() {
-            0 => {
-                if template != value {
-                    return None;
-                }
-            }
-            1 => {
-                let name = &names[0];
-                let marker = format!("{{{name}}}");
-                let idx = template.find(marker.as_str())?;
-                let prefix = &template[..idx];
-                let suffix = &template[idx + marker.len()..];
-                if value.len() < prefix.len() + suffix.len() {
-                    return None;
-                }
-                if !value.starts_with(prefix) || !value.ends_with(suffix) {
-                    return None;
-                }
-                let extracted = &value[prefix.len()..value.len() - suffix.len()];
-                match params.get(name) {
-                    Some(existing) if existing != extracted => return None,
-                    Some(_) => {}
-                    None => {
-                        params.insert(name.clone(), extracted.to_string());
-                    }
-                }
-            }
-            _ => return None,
+    let segments: Vec<_> = templates
+        .iter()
+        .map(|token| template_segments(token))
+        .collect();
+    if segments.iter().map(Vec::len).sum::<usize>() + templates.len() > MAX_REVERSE_MATCH_DEPTH {
+        return Err(ReverseMatchDecline::DepthExceeded);
+    }
+    let mut search = ReverseMatchSearch {
+        templates: segments,
+        observed,
+        accept,
+        remaining_candidates: MAX_REVERSE_MATCH_CANDIDATES,
+        remaining_work: MAX_REVERSE_MATCH_WORK,
+        decline: ReverseMatchDecline::NoMatch,
+        found: None,
+    };
+    let mut params = BTreeMap::new();
+    match search.search(0, 0, 0, &mut params) {
+        SearchFlow::Continue => search.found.ok_or(search.decline),
+        SearchFlow::Stop => Err(search.decline),
+    }
+}
+
+/// Reverse-match `observed` against `verb.args`, validating every candidate
+/// value against the verb's declared parameter constraints.
+fn match_verb_args(verb: &Verb, observed: &[String]) -> Option<BTreeMap<String, String>> {
+    for (template, value) in verb.args.iter().zip(observed) {
+        let maximum = template_segments(template)
+            .iter()
+            .try_fold(0usize, |sum, segment| {
+                let length = match segment {
+                    TemplateSegment::Literal(literal) => literal.len(),
+                    TemplateSegment::Placeholder(name) => verb
+                        .params
+                        .get(*name)?
+                        .max_length()
+                        .unwrap_or(MAX_REVERSE_MATCH_WORK)
+                        .saturating_mul(4),
+                };
+                Some(sum.saturating_add(length))
+            });
+        if maximum.is_some_and(|maximum| value.len() > maximum) {
+            return None;
         }
     }
-    Some(params)
+    let mut patterns: BTreeMap<String, Option<Regex>> = BTreeMap::new();
+    let result = match_args_template_result(&verb.args, observed, |name, value| {
+        let Some(spec) = verb.params.get(name) else {
+            return false;
+        };
+        let pattern = patterns
+            .entry(name.to_string())
+            .or_insert_with(|| compile_anchored(spec.pattern_text()).ok());
+        pattern
+            .as_ref()
+            .is_some_and(|pattern| validate_param_value(name, spec, pattern, value).is_ok())
+    });
+    if let Err(reason) = result.as_ref() {
+        if *reason != ReverseMatchDecline::NoMatch {
+            tracing::warn!(verb = %verb.name, reason = reason.as_str(), "verb reverse match declined");
+        }
+    }
+    result.ok()
 }
 
 impl VerbCatalog {
@@ -7146,37 +7401,333 @@ verbs:
             .is_some());
     }
 
+    fn match_any(templates: &[&str], observed: &[&str]) -> Option<BTreeMap<String, String>> {
+        let templates: Vec<String> = templates.iter().map(|t| t.to_string()).collect();
+        match_args_template(&templates, &args_vec(observed), |_, _| true)
+    }
+
     #[test]
     fn match_args_template_extracts_single_placeholder_with_prefix_and_suffix() {
-        let templates = vec!["café-{n}-suffix".to_string()];
-        let observed = args_vec(&["café-7-suffix"]);
-        let captured = match_args_template(&templates, &observed).unwrap();
-        assert_eq!(captured.get("n").map(String::as_str), Some("7"));
+        let captured = match_any(&["café-{n}-suffix"], &["café-7-suffix"]).unwrap();
+        assert_eq!(captured, params(&[("n", "7")]));
 
         // A value not honoring the literal prefix/suffix does not unify.
-        assert!(match_args_template(&templates, &args_vec(&["nope"])).is_none());
+        assert!(match_any(&["café-{n}-suffix"], &["nope"]).is_none());
     }
 
     #[test]
     fn match_args_template_requires_consistent_value_for_a_repeated_name() {
-        let templates = vec!["{x}".to_string(), "{x}".to_string()];
-        assert!(match_args_template(&templates, &args_vec(&["a", "a"])).is_some());
-        assert!(match_args_template(&templates, &args_vec(&["a", "b"])).is_none());
+        assert!(match_any(&["{x}", "{x}"], &["a", "a"]).is_some());
+        assert!(match_any(&["{x}", "{x}"], &["a", "b"]).is_none());
     }
 
     #[test]
-    fn match_args_template_declines_a_token_with_multiple_placeholders() {
-        let templates = vec!["{a}-{b}".to_string()];
-        // Ambiguous split point: not reverse-matchable, even though it would
-        // still be invocable via an explicit `--verb` call.
-        assert!(match_args_template(&templates, &args_vec(&["x-y"])).is_none());
+    fn match_args_template_splits_a_token_with_several_placeholders() {
+        let captured = match_any(
+            &["/usr/local/sbin/mailbox-read {to} {since}"],
+            &["/usr/local/sbin/mailbox-read ops 2026-10-01"],
+        )
+        .unwrap();
+        assert_eq!(captured, params(&[("to", "ops"), ("since", "2026-10-01")]));
+
+        let captured = match_any(&["--range={start}..{end}/x"], &["--range=1..9/x"]).unwrap();
+        assert_eq!(captured, params(&[("start", "1"), ("end", "9")]));
+
+        // Each literal between placeholders must still appear verbatim.
+        assert!(match_any(&["{a} {b}"], &["ab"]).is_none());
+        assert!(match_any(&["--range={start}..{end}/x"], &["--range=1..9/y"]).is_none());
+    }
+
+    #[test]
+    fn match_args_template_binds_a_placeholder_repeated_in_one_token() {
+        let template = ["backup-{asset} --tag backup-{asset}"];
+        let captured = match_any(&template, &["backup-db1 --tag backup-db1"]).unwrap();
+        assert_eq!(captured, params(&[("asset", "db1")]));
+        assert!(match_any(&template, &["backup-db1 --tag backup-db2"]).is_none());
+
+        let multiline = ["set -eu\nLIST={list}\necho {list} >&2\ntest \"$LIST\" = {list}"];
+        let captured = match_any(
+            &multiline,
+            &["set -eu\nLIST=dbx\necho dbx >&2\ntest \"$LIST\" = dbx"],
+        )
+        .unwrap();
+        assert_eq!(captured, params(&[("list", "dbx")]));
+        assert!(match_any(
+            &multiline,
+            &["set -eu\nLIST=dbx\necho db >&2\ntest \"$LIST\" = dbx"],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn match_args_template_binds_a_name_shared_by_split_and_whole_tokens() {
+        let templates = ["{host}", "{host}:{port}"];
+        let captured = match_any(&templates, &["web", "web:8443"]).unwrap();
+        assert_eq!(captured, params(&[("host", "web"), ("port", "8443")]));
+        assert!(match_any(&templates, &["web", "db:8443"]).is_none());
+
+        // A later whole token fixes a value an earlier split left open.
+        let templates = ["{a}-{b}", "{a}"];
+        let captured = match_any(&templates, &["x-y-z", "x-y"]).unwrap();
+        assert_eq!(captured, params(&[("a", "x-y"), ("b", "z")]));
+    }
+
+    #[test]
+    fn match_args_template_declines_an_ambiguous_split() {
+        // Two bindings render the same argv, so neither is chosen.
+        assert!(match_any(&["{a}-{b}"], &["x-y-z"]).is_none());
+        assert!(match_any(&["{a}{b}"], &["xy"]).is_none());
+        assert!(match_any(&["{a} {b} {c}"], &["1 2 3 4"]).is_none());
+    }
+
+    #[test]
+    fn match_args_template_uses_declared_validation_to_split() {
+        let accept = |name: &str, value: &str| match name {
+            "word" => !value.is_empty() && value.bytes().all(|b| b.is_ascii_lowercase()),
+            "rest" => !value.is_empty() && !value.contains(' '),
+            _ => false,
+        };
+        let templates = vec!["{word}-{rest}".to_string()];
+        let captured =
+            match_args_template(&templates, &args_vec(&["alpha-beta-9"]), accept).unwrap();
+        assert_eq!(captured, params(&[("word", "alpha"), ("rest", "beta-9")]));
+
+        let templates = vec!["{word}{rest}".to_string()];
+        let accept_digits = |name: &str, value: &str| match name {
+            "word" => !value.is_empty() && value.bytes().all(|b| b.is_ascii_lowercase()),
+            "rest" => !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
+            _ => false,
+        };
+        let captured =
+            match_args_template(&templates, &args_vec(&["abc123"]), accept_digits).unwrap();
+        assert_eq!(captured, params(&[("word", "abc"), ("rest", "123")]));
+
+        // No candidate passes validation.
+        let reject_all = |_: &str, _: &str| false;
+        assert!(match_args_template(&templates, &args_vec(&["abc123"]), reject_all).is_none());
+    }
+
+    #[test]
+    fn match_args_template_treats_template_text_as_literal() {
+        // Regular-expression syntax in literal text matches only itself.
+        let captured = match_any(&["{a}.*{b}"], &["x.*y"]).unwrap();
+        assert_eq!(captured, params(&[("a", "x"), ("b", "y")]));
+        assert!(match_any(&["{a}.*{b}"], &["xZZy"]).is_none());
+        assert!(match_any(&["^{a}|{b}$"], &["^x|y$"]).is_some());
+        assert!(match_any(&["^{a}|{b}$"], &["x"]).is_none());
+    }
+
+    #[test]
+    fn match_args_template_declines_when_the_search_exceeds_its_bound() {
+        let long = "a".repeat(MAX_REVERSE_MATCH_CANDIDATES + 8);
+        let templates = vec!["{a}{b}".to_string()];
+        let target = long.len() - 1;
+        // Only one split is valid, but reaching it needs more candidates than
+        // the bound allows.
+        let accept = |name: &str, value: &str| name == "b" || value.len() == target;
+        assert!(match_args_template(&templates, &args_vec(&[&long]), accept).is_none());
+
+        let short = "a".repeat(64);
+        let target = short.len() - 1;
+        let accept = |name: &str, value: &str| name == "b" || value.len() == target;
+        assert!(match_args_template(&templates, &args_vec(&[&short]), accept).is_some());
     }
 
     #[test]
     fn match_args_template_requires_exact_arity() {
-        let templates = vec!["a".to_string(), "b".to_string()];
-        assert!(match_args_template(&templates, &args_vec(&["a"])).is_none());
-        assert!(match_args_template(&templates, &args_vec(&["a", "b", "c"])).is_none());
+        assert!(match_any(&["a", "b"], &["a"]).is_none());
+        assert!(match_any(&["a", "b"], &["a", "b", "c"]).is_none());
+    }
+
+    #[test]
+    fn reverse_match_bounds_scanning_and_template_depth() {
+        let observed = vec!["x".repeat(1024 * 1024)];
+        let mut candidates = 0usize;
+        let result = match_args_template_result(&args_vec(&["{a}|{b}"]), &observed, |_, _| {
+            candidates += 1;
+            true
+        });
+        assert_eq!(result, Err(ReverseMatchDecline::BudgetExceeded));
+        assert_eq!(
+            candidates, 0,
+            "absent separator must consume only scan work"
+        );
+
+        let templates = vec!["{x}".to_string(); MAX_REVERSE_MATCH_DEPTH];
+        let observed = vec!["value".to_string(); templates.len()];
+        assert_eq!(
+            match_args_template_result(&templates, &observed, |_, _| true),
+            Err(ReverseMatchDecline::DepthExceeded)
+        );
+    }
+
+    #[test]
+    fn reverse_match_logs_why_trusted_authority_declines() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = Capture(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let catalog = VerbCatalog::from_yaml(
+            "verbs:\n  - name: ambiguous-read\n    binary: echo\n    args: ['{a}-{b}']\n    params:\n      a: {pattern: '^[a-z-]+$'}\n      b: {pattern: '^[a-z-]+$'}\n    trusted: true\n    consequence: reversible\n",
+        ).unwrap();
+        assert!(catalog
+            .match_command("echo", &args_vec(&["x-y-z"]))
+            .is_none());
+        let bytes = captured.lock().unwrap();
+        let log = std::str::from_utf8(&bytes).unwrap();
+        assert!(log.contains("ambiguous-read"), "missing verb identity");
+        assert!(log.contains("ambiguous binding"), "missing decline reason");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn trusted_multi_placeholder_render_round_trips(
+            first in "[a-zéδ漢]{1,12}", second in "[0-9]{1,12}", repeat_first in proptest::bool::ANY,
+        ) {
+            let repeated = if repeat_first { "{a}" } else { "{b}" };
+            let yaml = format!(
+                "verbs:\n  - name: generated-read\n    binary: echo\n    args: ['prefix:{{a}}|{{b}}:{repeated}', '{{a}}']\n    params:\n      a: {{pattern: '^[a-zéδ漢]+$'}}\n      b: {{pattern: '^[0-9]+$'}}\n    trusted: true\n    consequence: reversible\n"
+            );
+            let catalog = VerbCatalog::from_yaml(&yaml).unwrap();
+            let values = params(&[("a", &first), ("b", &second)]);
+            let rendered = catalog.render("generated-read", &values).unwrap();
+            let matched = catalog.match_command("echo", &rendered.args).unwrap();
+            proptest::prop_assert_eq!(matched.args, rendered.args);
+            proptest::prop_assert_eq!(matched.params, values);
+            proptest::prop_assert!(matched.trusted);
+        }
+    }
+
+    #[test]
+    fn trusted_verb_with_several_placeholders_per_argument_matches_its_rendered_command() {
+        let cat = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: mailbox-read
+    binary: ansible
+    args: ["mail", "-b", "-m", "command", "-a", "/usr/local/sbin/mailbox-read {to} {since}"]
+    params:
+      to: { pattern: "^[a-z][a-z0-9-]{0,31}$", required: true }
+      since: { pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", required: true }
+    consequence: reversible
+    trusted: true
+  - name: list-install
+    binary: ssh
+    args: ["{host}", "set -eu\nLIST={list}\ncase \"$LIST\" in {list}) echo {list} ;; esac"]
+    params:
+      host: { pattern: "^store0[5-8]$", required: true }
+      list: { pattern: "^(db|dbx)$", required: true }
+    consequence: irreversible
+    trusted: true
+"#,
+        )
+        .unwrap();
+
+        for (name, values) in [
+            (
+                "mailbox-read",
+                params(&[("to", "ops"), ("since", "2026-10-01")]),
+            ),
+            (
+                "list-install",
+                params(&[("host", "store06"), ("list", "dbx")]),
+            ),
+        ] {
+            let rendered = cat.render(name, &values).unwrap();
+            let matches = cat.match_command_all(&rendered.binary, &rendered.args);
+            assert_eq!(matches.len(), 1, "{name} should reverse-match");
+            assert_eq!(matches[0].rendered.name, name);
+            assert_eq!(matches[0].rendered.params, values);
+            assert_eq!(matches[0].action, CoverageAction::Preauthorized);
+        }
+
+        // A value outside its declared pattern never matches, even when the
+        // literal text lines up.
+        let bad_since = args_vec(&[
+            "mail",
+            "-b",
+            "-m",
+            "command",
+            "-a",
+            "/usr/local/sbin/mailbox-read ops 2026-10-01 --all",
+        ]);
+        assert!(cat.match_command_all("ansible", &bad_since).is_empty());
+        let dash_to = args_vec(&[
+            "mail",
+            "-b",
+            "-m",
+            "command",
+            "-a",
+            "/usr/local/sbin/mailbox-read -ops 2026-10-01",
+        ]);
+        assert!(cat.match_command_all("ansible", &dash_to).is_empty());
+
+        // A repeated placeholder must carry the same value at every site.
+        let mixed = args_vec(&[
+            "store06",
+            "set -eu\nLIST=db\ncase \"$LIST\" in dbx) echo dbx ;; esac",
+        ]);
+        assert!(cat.match_command_all("ssh", &mixed).is_empty());
+    }
+
+    #[test]
+    fn trusted_remote_script_verb_with_quoted_placeholders_matches_its_rendered_command() {
+        // A remote log read whose script quotes two caller values on separate
+        // lines, the shape that otherwise falls through to the evaluator on
+        // every call.
+        let cat = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: edge-access-log-read
+    binary: ssh
+    args:
+      - "{host}"
+      - "set -u\nfor p in $(kubectl -n edge get pods -o name); do\n  kubectl -n edge logs \"$p\" --since-time='{since}' \\\n    | grep -F '\"RouterName\":\"edge-{router}-https' \\\n    | head -n 6000\ndone\n"
+    params:
+      host: { pattern: "^edge0[13]$", required: true }
+      router: { pattern: "^(sky|auth|auth-login)$", required: true }
+      since: { pattern: "^2026-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", required: true }
+    consequence: reversible
+    trusted: true
+"#,
+        )
+        .unwrap();
+
+        let values = params(&[
+            ("host", "edge01"),
+            ("router", "auth-login"),
+            ("since", "2026-10-17T20:26:36Z"),
+        ]);
+        let rendered = cat.render("edge-access-log-read", &values).unwrap();
+        let matches = cat.match_command_all(&rendered.binary, &rendered.args);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].rendered.params, values);
+        assert_eq!(matches[0].action, CoverageAction::Preauthorized);
+
+        // A value that closes the quote and appends a command fails the
+        // router pattern, so the observed script matches no binding.
+        let injected = vec![
+            "edge01".to_string(),
+            rendered.args[1].replace("edge-auth-login-https", "edge-sky'; id; echo '-https"),
+        ];
+        assert!(cat.match_command_all("ssh", &injected).is_empty());
     }
 
     #[test]

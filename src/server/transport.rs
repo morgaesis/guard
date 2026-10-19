@@ -223,7 +223,7 @@ async fn write_redacted_json_line<W: AsyncWrite + Unpin, T: serde::Serialize>(
 #[cfg(test)]
 mod admin_response_lease_tests {
     use super::*;
-    use guard::gating::approval::{Approval, ApprovalSnapshot};
+    use guard::gating::approval::{Approval, ApprovalSnapshot, SnapshotOrigin};
     use guard::gating::Reversibility;
     use std::collections::BTreeMap;
     use std::pin::Pin;
@@ -234,6 +234,7 @@ mod admin_response_lease_tests {
             execution_failure: None,
             handle: "lease-test".to_string(),
             snapshot: ApprovalSnapshot {
+                origin: SnapshotOrigin::Command,
                 binary: "true".to_string(),
                 args: Vec::new(),
                 cwd: None,
@@ -279,6 +280,76 @@ mod admin_response_lease_tests {
             response: AdminResponse::Ok,
             waiter_lease: Some(lease),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_hydration_retires_api_holds_before_listener_publication() {
+        use sha2::Digest;
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        let socket = temp.path().join("guard.sock");
+        let seed = SessionStore::open(database.clone(), 3600).await.unwrap();
+        let mut context = crate::server::tests::config_for_proposal_test();
+        context.config.gate = GateMode::Consequence;
+        context.config.socket_path = Some(socket.clone());
+        context.config.state_db_path = Some(database.clone());
+        let digest = sha2::Sha256::digest(b"held API request fixture")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut row = approval();
+        row.handle = "startup-api-hold".to_string();
+        row.created_unix = now_unix();
+        row.snapshot.origin = SnapshotOrigin::ApiProxy;
+        row.snapshot.binary = "(api-proxy)".to_string();
+        row.snapshot.args = vec![format!("body_sha256={digest}")];
+        row.snapshot.principal = Some(context.config.daemon_principal.clone());
+        seed.save_approval(row).await.unwrap();
+        drop(seed);
+
+        let store = SessionStore::open_for_daemon(database, 3600).await.unwrap();
+        assert!(store
+            .load_approvals()
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.status == ApprovalStatus::Pending));
+        context.state.session_store = Some(store.clone());
+        let server = Server { context };
+        server.startup_gating().await.unwrap();
+        assert!(!socket.exists());
+
+        let rows = store.load_approvals().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.status, ApprovalStatus::ExecFailed);
+        assert_eq!(
+            row.decided_reason.as_deref(),
+            Some("daemon restarted; the held API request is gone")
+        );
+        assert!(row.result_exit.is_none());
+        let response = handle_admin_request_owned(
+            &server.context,
+            &CallerIdentity::UnixAdmin {
+                uid: server.context.config.daemon_uid,
+            },
+            AdminRequest::Approve {
+                handle: row.handle.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            response.response,
+            AdminResponse::Error { ref message } if message.contains("already exec_failed")
+        ));
+        assert!(store
+            .load_approvals()
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.status == ApprovalStatus::ExecFailed && row.result_exit.is_none()));
     }
 
     struct FailedWriter;

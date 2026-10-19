@@ -78,8 +78,9 @@ inputs. Guard preserves argv, exit behavior, and tool semantics.
 Secret values are resolved after authorization. Environment delivery clears the
 child environment first. Secret-file delivery creates a daemon-only lease for
 the child lifetime. Holds store names and salted value hashes. Audit and session
-history store secret names only. Output redaction covers exact resolved values
-and credential-shaped text.
+history store secret names only. Output redaction covers exact resolved values,
+credential-shaped text, and any value under a secret-bearing field name such as
+`password`, `secretkey`, `privatekey` or `ipsecpsk`.
 
 Execution identity and credential delivery have different compromise bounds:
 

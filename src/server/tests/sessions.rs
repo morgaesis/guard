@@ -21,7 +21,7 @@ use crate::session::{
 };
 use crate::session_store::SessionStore;
 use guard::evaluate::{EvalConfig, Evaluator};
-use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
+use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus, SnapshotOrigin};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::{GateMode, Reversibility};
 use guard::principal::PrincipalKey;
@@ -3135,6 +3135,7 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
         execution_failure: None,
         handle: handle.to_string(),
         snapshot: ApprovalSnapshot {
+            origin: SnapshotOrigin::Command,
             binary: "true".to_string(),
             args: Vec::new(),
             cwd: None,
