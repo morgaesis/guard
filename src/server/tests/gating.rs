@@ -6372,52 +6372,6 @@ async fn one_rpc_release_wait_returns_approved_outcome() {
     ));
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn reloaded_api_hold_without_parked_request_fails_approval() {
-    let state = tempfile::tempdir().unwrap();
-    let database = state.path().join("state.db");
-    let store = SessionStore::open(database.clone(), 3600).await.unwrap();
-    let mut approval = held_verb_approval("reloaded-api-hold", None, None, None);
-    approval.snapshot.origin = SnapshotOrigin::ApiProxy;
-    approval.snapshot.binary = "(api-proxy)".to_string();
-    approval.snapshot.args = vec![format!("body_sha256={}", generated_body_digest())];
-    approval.snapshot.principal = Some(PrincipalKey::from_uid(7013));
-    approval.snapshot.verb_name = None;
-    approval.status = ApprovalStatus::Pending;
-    store.save_approval(approval).await.unwrap();
-    drop(store);
-
-    let reopened = SessionStore::open(database, 3600).await.unwrap();
-    let (mut restarted, operator, _agent) = gating_config(7013, 1000);
-    let (registry, recovered) = guard::gating::approval::ApprovalRegistry::from_rows(
-        reopened.load_approvals().await.unwrap(),
-        now_unix(),
-    );
-    assert!(recovered.is_empty());
-    restarted.state.session_store = Some(reopened.clone());
-    *restarted.state.approvals.write().await = registry;
-    let response = handle_admin_request_for_test(
-        &restarted,
-        &operator,
-        AdminRequest::Approve {
-            handle: "reloaded-api-hold".to_string(),
-        },
-    )
-    .await;
-    assert!(
-        matches!(response, AdminResponse::Error { ref message } if message.contains("parked API request is unavailable"))
-    );
-    let row = reopened.load_approvals().await.unwrap().pop().unwrap();
-    assert_eq!(row.status, ApprovalStatus::ExecFailed);
-    assert!(row
-        .decided_reason
-        .as_deref()
-        .unwrap()
-        .contains("parked API request is unavailable"));
-    assert!(row.result_exit.is_none());
-}
-
 /// approve of a legacy row (no stored verb digest) after the verb catalog
 /// version changed is voided: without a digest the whole-catalog version is
 /// the only binding, so the approved artifact may no longer mean what the

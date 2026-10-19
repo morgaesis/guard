@@ -697,27 +697,26 @@ struct ProxyHoldOrphanGuard {
 
 impl Drop for ProxyHoldOrphanGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let server = self.server.clone();
         let handle = self.handle.clone();
-        let armed = self.armed;
         tokio::spawn(async move {
-            let mut reg = server.state.approvals.write().await;
-            reg.clear_proxy_waiter(&handle);
-            if !armed {
-                return;
-            }
             let now = now_unix();
-            match reg.get(&handle).map(|a| a.status) {
-                Some(s) if s.is_pending() => {}
-                _ => return,
+            {
+                let mut reg = server.state.approvals.write().await;
+                match reg.get(&handle).map(|a| a.status) {
+                    Some(s) if s.is_pending() => {}
+                    _ => return,
+                }
+                reg.set_exec_failed(
+                    &handle,
+                    now,
+                    "requester disconnected before a decision; the held API request is gone"
+                        .to_string(),
+                );
             }
-            reg.set_exec_failed(
-                &handle,
-                now,
-                "requester disconnected before a decision; the held API request is gone"
-                    .to_string(),
-            );
-            drop(reg);
             let session_fingerprint =
                 if let Some(a) = server.state.approvals.read().await.get(&handle).cloned() {
                     let session_fingerprint = a.snapshot.session_fingerprint.clone();
@@ -1285,12 +1284,13 @@ impl guard::proxy::GateSink for DaemonGateSink {
                 handle: None,
             };
         }
-        let notify = {
-            let mut approvals = self.server.state.approvals.write().await;
-            let notify = approvals.enqueue(approval.clone());
-            approvals.mark_proxy_waiter(&handle);
-            notify
-        };
+        let notify = self
+            .server
+            .state
+            .approvals
+            .write()
+            .await
+            .enqueue(approval.clone());
         #[cfg(test)]
         signal_approval_lifecycle(&self.server, false);
         self.server.emit_audit_ungated(

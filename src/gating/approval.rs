@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -341,7 +341,6 @@ impl Approval {
 pub struct ApprovalRegistry {
     items: HashMap<String, Approval>,
     notifiers: HashMap<String, Arc<Notify>>,
-    proxy_waiters: HashSet<String>,
     leases: Arc<WaiterLeaseState>,
 }
 
@@ -475,7 +474,6 @@ impl ApprovalRegistry {
             Self {
                 items,
                 notifiers: HashMap::new(),
-                proxy_waiters: HashSet::new(),
                 leases: Arc::new(WaiterLeaseState::default()),
             },
             recovered,
@@ -490,18 +488,6 @@ impl ApprovalRegistry {
             .insert(approval.handle.clone(), notify.clone());
         self.items.insert(approval.handle.clone(), approval);
         notify
-    }
-
-    pub fn mark_proxy_waiter(&mut self, handle: &str) {
-        self.proxy_waiters.insert(handle.to_string());
-    }
-
-    pub fn clear_proxy_waiter(&mut self, handle: &str) {
-        self.proxy_waiters.remove(handle);
-    }
-
-    pub fn has_proxy_waiter(&self, handle: &str) -> bool {
-        self.proxy_waiters.contains(handle)
     }
 
     /// Register a waiter before an approval mutation. The notifier and lease

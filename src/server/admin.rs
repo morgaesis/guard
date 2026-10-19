@@ -7672,24 +7672,6 @@ pub(super) async fn handle_approve_claimed(
     // daemon's own gate sink.
     if is_release_class(server, &snapshot) {
         let now = now_unix();
-        if !server.state.approvals.read().await.has_proxy_waiter(handle) {
-            let detail = "the parked API request is unavailable; approval cannot release it";
-            let Some(expected) = server.state.approvals.read().await.get(handle).cloned() else {
-                return AdminResponse::Error {
-                    message: format!("approval {handle} disappeared before terminal persistence"),
-                };
-            };
-            let next = match approval_exec_failed_row(expected.clone(), now, detail.to_string()) {
-                Ok(next) => next,
-                Err(message) => return AdminResponse::Error { message },
-            };
-            if let Err(message) = commit_terminal_approval(server, expected, next).await {
-                return AdminResponse::Error { message };
-            }
-            return AdminResponse::Error {
-                message: detail.to_string(),
-            };
-        }
         // The APPROVED record must be durable BEFORE the parked API request is
         // released to the proxy waiter; fail closed otherwise.
         if !server.emit_audit(
