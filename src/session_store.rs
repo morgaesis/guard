@@ -4795,6 +4795,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn documented_rollback_query_counts_only_unfinished_lifecycles() {
+        let deployment = include_str!("../DEPLOYMENT.md");
+        let rollback = deployment.split("<<'GUARD_ROLLBACK'").nth(1).unwrap();
+        let query = rollback
+            .split("outstanding_query=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert!(
+            rollback.find("test \"$outstanding\" = 0").unwrap()
+                < rollback.find("systemctl stop").unwrap()
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gating_approval (status TEXT); CREATE TABLE gating_provisional (status TEXT);",
+        )
+        .unwrap();
+        for status in [
+            ApprovalStatus::Pending,
+            ApprovalStatus::Approving,
+            ApprovalStatus::Approved,
+            ApprovalStatus::Denied,
+            ApprovalStatus::Expired,
+            ApprovalStatus::ExecFailed,
+        ] {
+            conn.execute("INSERT INTO gating_approval VALUES (?1)", [status.as_str()])
+                .unwrap();
+            let count: i64 = conn.query_row(query, [], |row| row.get(0)).unwrap();
+            assert_eq!(count, i64::from(status.is_pending()), "{status:?}");
+            conn.execute("DELETE FROM gating_approval", []).unwrap();
+        }
+        for status in [
+            ProvisionalStatus::Staged,
+            ProvisionalStatus::Dispatching,
+            ProvisionalStatus::Armed,
+            ProvisionalStatus::Reverting,
+            ProvisionalStatus::Confirmed,
+            ProvisionalStatus::Reverted,
+            ProvisionalStatus::RevertFailed,
+            ProvisionalStatus::NeedsOperatorDecision,
+        ] {
+            conn.execute(
+                "INSERT INTO gating_provisional VALUES (?1)",
+                [status.as_str()],
+            )
+            .unwrap();
+            let count: i64 = conn.query_row(query, [], |row| row.get(0)).unwrap();
+            assert_eq!(count, i64::from(!status.is_lifecycle_final()), "{status:?}");
+            conn.execute("DELETE FROM gating_provisional", []).unwrap();
+        }
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config::with_cases(8))]
         #[test]

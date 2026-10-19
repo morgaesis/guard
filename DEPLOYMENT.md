@@ -486,12 +486,16 @@ set -euo pipefail
 backup_dir=${1:?verified matching snapshot path required}
 guard_unit=${2:?recorded service required}
 case "$guard_unit" in guard.service|guard-exec-as-caller.service) ;; *) exit 1 ;; esac
+outstanding_query="SELECT (SELECT COUNT(*) FROM gating_approval WHERE status IN ('pending', 'approving')) +
+  (SELECT COUNT(*) FROM gating_provisional WHERE status NOT IN ('confirmed', 'reverted', 'revert_failed'));"
+outstanding="$(sqlite3 -readonly /var/lib/guard/state.db "$outstanding_query")"
+test "$outstanding" = 0
 systemctl stop "$guard_unit"
 test "$(systemctl is-active "$guard_unit" || true)" = inactive
-outstanding="$(sqlite3 -readonly /var/lib/guard/state.db \
-  "SELECT (SELECT COUNT(*) FROM gating_approval WHERE status IN ('pending', 'approving')) + \
-          (SELECT COUNT(*) FROM gating_provisional WHERE status NOT IN ('confirmed', 'reverted'));")"
-test "$outstanding" = 0
+if ! outstanding="$(sqlite3 -readonly /var/lib/guard/state.db "$outstanding_query")" || [ "$outstanding" != 0 ]; then
+  systemctl start "$guard_unit"
+  exit 1
+fi
 (cd "$backup_dir" && sha256sum --check --status SHA256SUMS)
 test "$(cat "$backup_dir/service-unit")" = "$guard_unit"
 archive_path() {
