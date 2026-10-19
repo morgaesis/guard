@@ -163,6 +163,14 @@ async fn start_daemon_with_gate(
     tmp: &TempDir,
     consequence_gate: bool,
 ) -> (DaemonGuard, std::path::PathBuf) {
+    start_daemon_with_catalog(tmp, consequence_gate, VERBS_YAML).await
+}
+
+async fn start_daemon_with_catalog(
+    tmp: &TempDir,
+    consequence_gate: bool,
+    catalog: &str,
+) -> (DaemonGuard, std::path::PathBuf) {
     // The daemon refuses to open its state database when any ancestor
     // directory is group- or other-writable (see validate_state_ancestor in
     // src/session_store.rs). tempfile::tempdir() inherits the process umask,
@@ -176,7 +184,7 @@ async fn start_daemon_with_gate(
     let policy_path = tmp.path().join("policy.yaml");
     let verbs_path = tmp.path().join("verbs.yaml");
     std::fs::write(&policy_path, POLICY_YAML).expect("write policy yaml");
-    std::fs::write(&verbs_path, VERBS_YAML).expect("write verbs yaml");
+    std::fs::write(&verbs_path, catalog).expect("write verbs yaml");
     std::fs::set_permissions(&verbs_path, std::fs::Permissions::from_mode(0o600))
         .expect("restrict verb catalog permissions");
     let test_secret_env = format!("GUARD_SECRET_U{}_mcp-test-placeholder", current_uid());
@@ -225,6 +233,70 @@ fn current_uid() -> u32 {
         .expect("real uid field present")
         .parse()
         .expect("uid parses")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trusted_multi_placeholder_commands_execute_without_an_evaluator() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let catalog = r#"verbs:
+  - name: trusted-echo
+    binary: echo
+    args: ["{word}:{stamp}:{word}"]
+    params:
+      word: {pattern: "^[a-z]+$"}
+      stamp: {pattern: "^[0-9]+$"}
+    trusted: true
+    baseline: true
+    consequence: reversible
+"#;
+    let (_daemon, socket_path) = start_daemon_with_catalog(&tmp, true, catalog).await;
+    // Each changing timestamp must use catalog authority, without depending on
+    // an evaluator verdict or its argv-specific cache.
+    for stamp in ["100", "101", "102"] {
+        let value = format!("alpha:{stamp}:alpha");
+        let mut command = Command::new(GUARD_BIN);
+        if stamp == "101" {
+            command
+                .args([
+                    "verb",
+                    "run",
+                    "trusted-echo",
+                    "--param",
+                    "word=alpha",
+                    "--param",
+                ])
+                .arg(format!("stamp={stamp}"))
+                .args(["--json", "--socket"])
+                .arg(&socket_path);
+        } else {
+            command
+                .args(["run", "--json", "--socket"])
+                .arg(&socket_path)
+                .args(["echo", &value]);
+        }
+        let output = timeout(
+            Duration::from_secs(10),
+            command
+                .env("HOME", tmp.path())
+                .env("XDG_CONFIG_HOME", tmp.path())
+                .env_remove("GUARD_SESSION")
+                .output(),
+        )
+        .await
+        .expect("trusted command timed out")
+        .expect("execute trusted command");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let result = &envelope["response"];
+        assert_eq!(result["allowed"], true);
+        assert_eq!(result["reason"], "trusted verb 'trusted-echo'");
+        assert_eq!(result["decision_source"], "static_policy");
+        assert_eq!(result["stdout"].as_str().unwrap().trim(), value);
+    }
 }
 
 struct McpClient {

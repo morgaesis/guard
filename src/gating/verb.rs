@@ -1063,6 +1063,8 @@ impl VerbCatalog {
             if verb.args.is_empty() && !verb.coverage.is_empty() {
                 rendered.binary = binary.to_string();
                 rendered.args = args.to_vec();
+            } else if rendered.args != args {
+                continue;
             }
             if validate_known_file_arguments(
                 verb,
@@ -4562,12 +4564,37 @@ fn template_segments(token: &str) -> Vec<TemplateSegment<'_>> {
 /// Upper bound on placeholder value candidates tried while reverse-matching
 /// one argv. Exceeding it declines the match rather than guessing.
 const MAX_REVERSE_MATCH_CANDIDATES: usize = 4096;
+const MAX_REVERSE_MATCH_WORK: usize = 1024 * 1024;
+const MAX_REVERSE_MATCH_DEPTH: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReverseMatchDecline {
+    NoMatch,
+    Ambiguous,
+    BudgetExceeded,
+    DepthExceeded,
+    RepeatedValueMismatch,
+}
+
+impl ReverseMatchDecline {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoMatch => "no match",
+            Self::Ambiguous => "ambiguous binding",
+            Self::BudgetExceeded => "search budget exceeded",
+            Self::DepthExceeded => "template depth exceeded",
+            Self::RepeatedValueMismatch => "repeated parameter mismatch",
+        }
+    }
+}
 
 struct ReverseMatchSearch<'a, F> {
     templates: Vec<Vec<TemplateSegment<'a>>>,
     observed: &'a [String],
     accept: F,
     remaining_candidates: usize,
+    remaining_work: usize,
+    decline: ReverseMatchDecline,
     found: Option<BTreeMap<String, String>>,
 }
 
@@ -4577,6 +4604,16 @@ enum SearchFlow {
 }
 
 impl<'a, F: FnMut(&str, &str) -> bool> ReverseMatchSearch<'a, F> {
+    fn charge(&mut self, work: usize) -> bool {
+        if let Some(remaining) = self.remaining_work.checked_sub(work) {
+            self.remaining_work = remaining;
+            true
+        } else {
+            self.decline = ReverseMatchDecline::BudgetExceeded;
+            false
+        }
+    }
+
     fn search(
         &mut self,
         token: usize,
@@ -4595,6 +4632,7 @@ impl<'a, F: FnMut(&str, &str) -> bool> ReverseMatchSearch<'a, F> {
                 // binding the caller meant cannot be known.
                 Some(_) => {
                     self.found = None;
+                    self.decline = ReverseMatchDecline::Ambiguous;
                     SearchFlow::Stop
                 }
             };
@@ -4610,6 +4648,9 @@ impl<'a, F: FnMut(&str, &str) -> bool> ReverseMatchSearch<'a, F> {
         };
         let name = match current {
             TemplateSegment::Literal(literal) => {
+                if !self.charge(literal.len().saturating_add(1)) {
+                    return SearchFlow::Stop;
+                }
                 return if rest.starts_with(literal) {
                     self.search(token, segment + 1, offset + literal.len(), params)
                 } else {
@@ -4619,18 +4660,26 @@ impl<'a, F: FnMut(&str, &str) -> bool> ReverseMatchSearch<'a, F> {
             TemplateSegment::Placeholder(name) => name,
         };
         if let Some(bound) = params.get(name).cloned() {
+            if !self.charge(bound.len().saturating_add(1)) {
+                return SearchFlow::Stop;
+            }
             return if rest.starts_with(bound.as_str()) {
                 self.search(token, segment + 1, offset + bound.len(), params)
             } else {
+                self.decline = ReverseMatchDecline::RepeatedValueMismatch;
                 SearchFlow::Continue
             };
         }
 
         let tail = &segments[segment + 1..];
-        let ends: Vec<usize> = if tail
+        let final_placeholder = tail
             .iter()
-            .all(|piece| matches!(piece, TemplateSegment::Literal(_)))
-        {
+            .all(|piece| matches!(piece, TemplateSegment::Literal(_)));
+        let next_literal = match tail.first().copied() {
+            Some(TemplateSegment::Literal(literal)) => literal,
+            _ => "",
+        };
+        let mut next_end = if final_placeholder {
             // The last placeholder in the token: the trailing literal text
             // fixes where its value ends.
             let suffix_len: usize = tail
@@ -4641,28 +4690,39 @@ impl<'a, F: FnMut(&str, &str) -> bool> ReverseMatchSearch<'a, F> {
                 })
                 .sum();
             match rest.len().checked_sub(suffix_len) {
-                Some(end) if rest.is_char_boundary(end) => vec![end],
-                _ => Vec::new(),
+                Some(end) if rest.is_char_boundary(end) => Some(end),
+                _ => None,
             }
         } else {
-            let next_literal = match tail.first() {
-                Some(TemplateSegment::Literal(literal)) => *literal,
-                _ => "",
-            };
-            rest.char_indices()
-                .map(|(index, _)| index)
-                .chain(std::iter::once(rest.len()))
-                .filter(|&index| rest[index..].starts_with(next_literal))
-                .collect()
+            Some(0)
         };
 
-        for end in ends {
+        // Visit split points incrementally, charging even those that do not
+        // precede the next literal. No list grows with the observed argument.
+        while let Some(end) = next_end {
+            let next_character = rest[end..].chars().next();
+            let scanned = next_character.map_or(1, char::len_utf8);
+            if !self.charge(next_literal.len().saturating_add(scanned)) {
+                return SearchFlow::Stop;
+            }
+            next_end = if final_placeholder {
+                None
+            } else {
+                next_character.map(|c| end + c.len_utf8())
+            };
+            if !rest[end..].starts_with(next_literal) {
+                continue;
+            }
             if self.remaining_candidates == 0 {
                 self.found = None;
+                self.decline = ReverseMatchDecline::BudgetExceeded;
                 return SearchFlow::Stop;
             }
             self.remaining_candidates -= 1;
             let candidate = &rest[..end];
+            if !self.charge(candidate.len().saturating_add(1)) {
+                return SearchFlow::Stop;
+            }
             if !(self.accept)(name, candidate) {
                 continue;
             }
@@ -4688,36 +4748,70 @@ impl<'a, F: FnMut(&str, &str) -> bool> ReverseMatchSearch<'a, F> {
 /// The match succeeds only when exactly one parameter binding renders the
 /// observed argv. Several valid bindings, or a search exceeding
 /// `MAX_REVERSE_MATCH_CANDIDATES`, decline the match.
+#[cfg(test)]
 fn match_args_template(
     templates: &[String],
     observed: &[String],
     accept: impl FnMut(&str, &str) -> bool,
 ) -> Option<BTreeMap<String, String>> {
+    match_args_template_result(templates, observed, accept).ok()
+}
+
+fn match_args_template_result(
+    templates: &[String],
+    observed: &[String],
+    accept: impl FnMut(&str, &str) -> bool,
+) -> std::result::Result<BTreeMap<String, String>, ReverseMatchDecline> {
     if templates.len() != observed.len() {
-        return None;
+        return Err(ReverseMatchDecline::NoMatch);
+    }
+    let segments: Vec<_> = templates
+        .iter()
+        .map(|token| template_segments(token))
+        .collect();
+    if segments.iter().map(Vec::len).sum::<usize>() + templates.len() > MAX_REVERSE_MATCH_DEPTH {
+        return Err(ReverseMatchDecline::DepthExceeded);
     }
     let mut search = ReverseMatchSearch {
-        templates: templates
-            .iter()
-            .map(|template| template_segments(template))
-            .collect(),
+        templates: segments,
         observed,
         accept,
         remaining_candidates: MAX_REVERSE_MATCH_CANDIDATES,
+        remaining_work: MAX_REVERSE_MATCH_WORK,
+        decline: ReverseMatchDecline::NoMatch,
         found: None,
     };
     let mut params = BTreeMap::new();
     match search.search(0, 0, 0, &mut params) {
-        SearchFlow::Continue => search.found,
-        SearchFlow::Stop => None,
+        SearchFlow::Continue => search.found.ok_or(search.decline),
+        SearchFlow::Stop => Err(search.decline),
     }
 }
 
 /// Reverse-match `observed` against `verb.args`, validating every candidate
 /// value against the verb's declared parameter constraints.
 fn match_verb_args(verb: &Verb, observed: &[String]) -> Option<BTreeMap<String, String>> {
+    for (template, value) in verb.args.iter().zip(observed) {
+        let maximum = template_segments(template)
+            .iter()
+            .try_fold(0usize, |sum, segment| {
+                let length = match segment {
+                    TemplateSegment::Literal(literal) => literal.len(),
+                    TemplateSegment::Placeholder(name) => verb
+                        .params
+                        .get(*name)?
+                        .max_length()
+                        .unwrap_or(MAX_REVERSE_MATCH_WORK)
+                        .saturating_mul(4),
+                };
+                Some(sum.saturating_add(length))
+            });
+        if maximum.is_some_and(|maximum| value.len() > maximum) {
+            return None;
+        }
+    }
     let mut patterns: BTreeMap<String, Option<Regex>> = BTreeMap::new();
-    match_args_template(&verb.args, observed, |name, value| {
+    let result = match_args_template_result(&verb.args, observed, |name, value| {
         let Some(spec) = verb.params.get(name) else {
             return false;
         };
@@ -4727,7 +4821,13 @@ fn match_verb_args(verb: &Verb, observed: &[String]) -> Option<BTreeMap<String, 
         pattern
             .as_ref()
             .is_some_and(|pattern| validate_param_value(name, spec, pattern, value).is_ok())
-    })
+    });
+    if let Err(reason) = result.as_ref() {
+        if *reason != ReverseMatchDecline::NoMatch {
+            tracing::warn!(verb = %verb.name, reason = reason.as_str(), "verb reverse match declined");
+        }
+    }
+    result.ok()
 }
 
 impl VerbCatalog {
@@ -7437,6 +7537,82 @@ verbs:
     fn match_args_template_requires_exact_arity() {
         assert!(match_any(&["a", "b"], &["a"]).is_none());
         assert!(match_any(&["a", "b"], &["a", "b", "c"]).is_none());
+    }
+
+    #[test]
+    fn reverse_match_bounds_scanning_and_template_depth() {
+        let observed = vec!["x".repeat(1024 * 1024)];
+        let mut candidates = 0usize;
+        let result = match_args_template_result(&args_vec(&["{a}|{b}"]), &observed, |_, _| {
+            candidates += 1;
+            true
+        });
+        assert_eq!(result, Err(ReverseMatchDecline::BudgetExceeded));
+        assert_eq!(
+            candidates, 0,
+            "absent separator must consume only scan work"
+        );
+
+        let templates = vec!["{x}".to_string(); MAX_REVERSE_MATCH_DEPTH];
+        let observed = vec!["value".to_string(); templates.len()];
+        assert_eq!(
+            match_args_template_result(&templates, &observed, |_, _| true),
+            Err(ReverseMatchDecline::DepthExceeded)
+        );
+    }
+
+    #[test]
+    fn reverse_match_logs_why_trusted_authority_declines() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = Capture(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let catalog = VerbCatalog::from_yaml(
+            "verbs:\n  - name: ambiguous-read\n    binary: echo\n    args: ['{a}-{b}']\n    params:\n      a: {pattern: '^[a-z-]+$'}\n      b: {pattern: '^[a-z-]+$'}\n    trusted: true\n    consequence: reversible\n",
+        ).unwrap();
+        assert!(catalog
+            .match_command("echo", &args_vec(&["x-y-z"]))
+            .is_none());
+        let bytes = captured.lock().unwrap();
+        let log = std::str::from_utf8(&bytes).unwrap();
+        assert!(log.contains("ambiguous-read"), "missing verb identity");
+        assert!(log.contains("ambiguous binding"), "missing decline reason");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn trusted_multi_placeholder_render_round_trips(
+            first in "[a-zéδ漢]{1,12}", second in "[0-9]{1,12}", repeat_first in proptest::bool::ANY,
+        ) {
+            let repeated = if repeat_first { "{a}" } else { "{b}" };
+            let yaml = format!(
+                "verbs:\n  - name: generated-read\n    binary: echo\n    args: ['prefix:{{a}}|{{b}}:{repeated}', '{{a}}']\n    params:\n      a: {{pattern: '^[a-zéδ漢]+$'}}\n      b: {{pattern: '^[0-9]+$'}}\n    trusted: true\n    consequence: reversible\n"
+            );
+            let catalog = VerbCatalog::from_yaml(&yaml).unwrap();
+            let values = params(&[("a", &first), ("b", &second)]);
+            let rendered = catalog.render("generated-read", &values).unwrap();
+            let matched = catalog.match_command("echo", &rendered.args).unwrap();
+            proptest::prop_assert_eq!(matched.args, rendered.args);
+            proptest::prop_assert_eq!(matched.params, values);
+            proptest::prop_assert!(matched.trusted);
+        }
     }
 
     #[test]
