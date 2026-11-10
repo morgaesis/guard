@@ -8,8 +8,8 @@ use crate::session_store::SessionStore;
 use crate::tool_config::{ResolvedToolEnv, ToolRegistry};
 use anyhow::{bail, Context, Result};
 use guard::gating::coverage::{
-    baseline_override_applies, resolve_scoped_matches, LearnedDenyMatchPolicy, ScopedCoverageMatch,
-    VerbDecision, VerbResolution,
+    baseline_override_applies, resolve_scoped_matches_for, LearnedDenyMatchPolicy,
+    ScopedCoverageMatch, VerbDecision, VerbResolution,
 };
 use guard::gating::verb::{CoverageAction, VerbCatalog};
 use guard::gating::{Coverage, DecisionTrace};
@@ -1245,8 +1245,14 @@ async fn acquire_command_initiation_lease(
         authorization.and_then(|authority| authority.verb.as_ref()),
         verb.as_ref(),
     ) {
-        let current =
-            compose_verb_authority_with_session(server, request, lease, session.as_deref()).await;
+        let current = compose_verb_authority_with_session(
+            server,
+            request,
+            lease,
+            session.as_deref(),
+            Some(expected.name.as_str()),
+        )
+        .await;
         let Some(context) = current.context.as_ref() else {
             return Err("composed verb authority no longer allows this command".to_string());
         };
@@ -1394,6 +1400,28 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             .expect("gated reverse matching holds catalog authority"),
     )
     .await;
+    if let Some(reason) = resolution.named_verb_refusal.as_ref() {
+        let name = request
+            .verb
+            .as_ref()
+            .map(|invocation| invocation.name.as_str())
+            .unwrap_or_default();
+        server.audit_deny(
+            phase.caller,
+            phase.session_token.as_deref(),
+            name,
+            &[],
+            reason,
+        );
+        let _ = write_policy_decision(
+            phase.stream_output,
+            &mut *phase.stream_writer,
+            false,
+            reason,
+        )
+        .await;
+        return Err(ExecuteResult::denied(reason.clone()).into());
+    }
     if resolution.matches.is_empty() {
         return Ok(VerbResolution::none());
     }
@@ -1414,7 +1442,11 @@ async fn compose_verb_authority(
     request: &ExecuteRequest,
     catalog: &VerbCatalog,
 ) -> VerbResolution {
-    compose_verb_authority_with_session(server, request, catalog, None).await
+    let requested = request
+        .verb
+        .as_ref()
+        .map(|invocation| invocation.name.as_str());
+    compose_verb_authority_with_session(server, request, catalog, None, requested).await
 }
 
 async fn compose_verb_authority_with_session(
@@ -1422,6 +1454,7 @@ async fn compose_verb_authority_with_session(
     request: &ExecuteRequest,
     catalog: &VerbCatalog,
     sessions: Option<&SessionRegistry>,
+    requested_verb: Option<&str>,
 ) -> VerbResolution {
     let plain = request
         .env
@@ -1446,6 +1479,18 @@ async fn compose_verb_authority_with_session(
         &secret_files,
         request.cwd.as_deref(),
     );
+    if let Some(requested) = requested_verb {
+        if !raw_matches
+            .iter()
+            .any(|matched| matched.rendered.name == requested)
+        {
+            let mut refused = VerbResolution::none();
+            refused.named_verb_refusal = Some(format!(
+                "verb error: verb '{requested}' does not cover the command it rendered; nothing ran"
+            ));
+            return refused;
+        }
+    }
     if raw_matches.is_empty() {
         return VerbResolution::none();
     }
@@ -1514,7 +1559,7 @@ async fn compose_verb_authority_with_session(
             overridden,
         });
     }
-    let mut resolution = resolve_scoped_matches(scoped, catalog.version());
+    let mut resolution = resolve_scoped_matches_for(scoped, catalog.version(), requested_verb);
     if let Some(context) = resolution.context.as_mut() {
         context.verb_digest = definition_digests.get(&context.name).cloned();
         let selected_definitions = resolution

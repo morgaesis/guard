@@ -104,6 +104,9 @@ pub struct VerbResolution {
     /// Revert plan of the selected coverage, set exactly when `context` is.
     /// The caller applies it to the pending request.
     pub revert: Option<(String, Vec<String>)>,
+    /// Set when the caller named a verb that does not cover the command it
+    /// rendered. The command is refused rather than bound to another verb.
+    pub named_verb_refusal: Option<String>,
 }
 
 impl VerbResolution {
@@ -116,6 +119,7 @@ impl VerbResolution {
             conflict_prompt: None,
             unresolved_plan: false,
             revert: None,
+            named_verb_refusal: None,
         }
     }
 }
@@ -142,8 +146,23 @@ pub fn baseline_override_applies(
 }
 
 pub fn resolve_scoped_matches(
+    scoped: Vec<ScopedCoverageMatch>,
+    catalog_version: u64,
+) -> VerbResolution {
+    resolve_scoped_matches_for(scoped, catalog_version, None)
+}
+
+/// Resolve applicable coverage for a command, binding the context to
+/// `requested_verb` when the caller named that verb and it is among the
+/// selected (maximal) matches. Equally specific verbs then compose exactly as
+/// for an unnamed command (most conservative class, any hold, conflicts), and
+/// only the context's name, parameters, digest and revert plan follow the
+/// caller's choice instead of name order. A named verb that a more specific or
+/// session cell shadows does not take the context.
+pub fn resolve_scoped_matches_for(
     mut scoped: Vec<ScopedCoverageMatch>,
     catalog_version: u64,
+    requested_verb: Option<&str>,
 ) -> VerbResolution {
     if scoped.is_empty() {
         return VerbResolution::none();
@@ -226,13 +245,17 @@ pub fn resolve_scoped_matches(
             conflict_prompt: None,
             unresolved_plan: false,
             revert: None,
+            named_verb_refusal: None,
         };
     }
 
-    let selected = maximal
+    let mut selected = maximal
         .iter()
         .map(|index| &scoped[*index])
         .collect::<Vec<_>>();
+    if let Some(requested) = requested_verb {
+        selected.sort_by_key(|matched| matched.matched.rendered.name != requested);
+    }
     let actions = selected
         .iter()
         .map(|matched| matched.effective_action)
@@ -266,6 +289,7 @@ pub fn resolve_scoped_matches(
             conflict_prompt: None,
             unresolved_plan: false,
             revert: None,
+            named_verb_refusal: None,
         };
     }
 
@@ -350,6 +374,7 @@ pub fn resolve_scoped_matches(
         conflict_prompt,
         unresolved_plan: plan_conflict,
         revert,
+        named_verb_refusal: None,
     }
 }
 
@@ -585,6 +610,106 @@ mod verb_resolution_tests {
         assert_eq!(resolution.context.unwrap().name, "session-apply");
         assert!(!resolution.matches[0].selected);
         assert!(resolution.matches[1].selected);
+    }
+
+    fn equally_specific_pair() -> Vec<ScopedCoverageMatch> {
+        let mut general = scoped(
+            "apply-general",
+            "legacy-template",
+            VerbMatchScope::Baseline,
+            CoverageAction::Preauthorized,
+            &[],
+            Reversibility::Irreversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        general
+            .matched
+            .rendered
+            .params
+            .insert("tags".to_string(), "collector".to_string());
+        let mut pinned = scoped(
+            "apply-pinned",
+            "legacy-template",
+            VerbMatchScope::Baseline,
+            CoverageAction::Preauthorized,
+            &[],
+            Reversibility::Irreversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        pinned.matched.rendered.hold = true;
+        pinned
+            .matched
+            .rendered
+            .params
+            .insert("commit".to_string(), "abc".to_string());
+        vec![pinned, general]
+    }
+
+    #[test]
+    fn a_named_verb_binds_the_context_over_an_earlier_sorted_equal_match() {
+        let named = resolve_scoped_matches_for(equally_specific_pair(), 17, Some("apply-pinned"));
+        let unnamed = resolve_scoped_matches(equally_specific_pair(), 17);
+
+        let context = named.context.expect("named verb resolves a context");
+        assert_eq!(context.name, "apply-pinned");
+        assert_eq!(
+            context.params.get("commit").map(String::as_str),
+            Some("abc")
+        );
+        assert!(context.hold);
+        assert_eq!(named.decision, unnamed.decision);
+        assert_eq!(named.matches, unnamed.matches);
+        assert!(named.matches.iter().all(|matched| matched.selected));
+    }
+
+    #[test]
+    fn an_unnamed_command_keeps_name_order_among_equal_matches() {
+        let resolution = resolve_scoped_matches(equally_specific_pair(), 17);
+        let context = resolution
+            .context
+            .expect("unnamed command resolves a context");
+        assert_eq!(context.name, "apply-general");
+        assert!(context.hold, "any matching hold still holds");
+        assert!(resolution.matches.iter().all(|matched| matched.selected));
+        let unknown = resolve_scoped_matches_for(equally_specific_pair(), 17, Some("absent"));
+        assert_eq!(unknown.context.unwrap().name, "apply-general");
+    }
+
+    #[test]
+    fn a_named_verb_shadowed_by_a_more_specific_cell_does_not_take_the_context() {
+        let broad = scoped(
+            "broad",
+            "any",
+            VerbMatchScope::Baseline,
+            CoverageAction::Preauthorized,
+            &[],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        let narrow = scoped(
+            "narrow",
+            "check",
+            VerbMatchScope::Baseline,
+            CoverageAction::Evaluate,
+            &["required:--check"],
+            Reversibility::Reversible,
+            None,
+            None,
+            None,
+            false,
+        );
+        let resolution = resolve_scoped_matches_for(vec![broad, narrow], 17, Some("broad"));
+        assert_eq!(resolution.decision, VerbDecision::Evaluate);
+        assert_eq!(resolution.context.unwrap().name, "narrow");
     }
 
     #[test]

@@ -2614,3 +2614,168 @@ async fn gate_feedback_threads_into_the_next_synthesis_request() {
         "the corrected candidate must reflect the threaded gate feedback"
     );
 }
+
+#[cfg(unix)]
+const OVERLAPPING_APPLY_VERBS: &str = r#"
+verbs:
+  - name: apply-general
+    binary: "true"
+    args: ["--commit={commit}", "{tags}"]
+    params:
+      commit: { pattern: "^[0-9a-f]{6,12}$", required: true }
+      tags: { pattern: "^[a-z_]+$", required: true }
+    consequence: irreversible
+    trusted: true
+  - name: apply-pinned
+    binary: "true"
+    args: ["--commit={commit}", "collector"]
+    params:
+      commit: { pattern: "^[0-9a-f]{6,12}$", required: true }
+    consequence: irreversible
+    trusted: true
+"#;
+
+#[cfg(unix)]
+fn overlapping_apply_server() -> ServerContext {
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.config.daemon_uid = 777;
+    server.config.daemon_principal = PrincipalKey::from_uid(777);
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(OVERLAPPING_APPLY_VERBS).unwrap(),
+    ));
+    server
+}
+
+#[cfg(unix)]
+async fn held_verb_name(server: &ServerContext, handle: &str) -> Option<String> {
+    server
+        .state
+        .approvals
+        .read()
+        .await
+        .get(handle)
+        .unwrap()
+        .snapshot
+        .verb_name
+        .clone()
+}
+
+/// Two equally specific verbs cover one rendered command. The verb the caller
+/// names binds the hold, and the armed hold resumes under that same verb,
+/// although the other verb sorts first.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_verb_binds_its_hold_over_an_earlier_sorted_equal_verb() {
+    let server = overlapping_apply_server();
+    let mut request = raw_request("", &[], None);
+    request.verb = Some(VerbInvocation {
+        name: "apply-pinned".to_string(),
+        params: [("commit".to_string(), "173d35e8".to_string())]
+            .into_iter()
+            .collect(),
+    });
+    let held = execute_command(request, &server, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert_eq!(held.status, Some(GateStatus::Held));
+    let handle = held.handle.expect("held command has an approval handle");
+    assert_eq!(
+        held_verb_name(&server, &handle).await.as_deref(),
+        Some("apply-pinned")
+    );
+
+    assert!(matches!(
+        handle_admin_request_for_test(
+            &server,
+            &CallerIdentity::UnixAdmin { uid: 777 },
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await,
+        AdminResponse::GateAction { .. }
+    ));
+    let resumed = resume_approval(&server, &CallerIdentity::Unix { uid: 1000 }, &handle).await;
+    assert!(
+        matches!(
+            resumed.exec,
+            crate::server::wire::ExecOutcome::Completed { .. }
+        ),
+        "the armed hold resumes under the named verb: {:?}",
+        resumed.exec
+    );
+}
+
+/// The same rendered command sent raw keeps name order among equal verbs.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unnamed_command_binds_its_hold_by_name_order_among_equal_verbs() {
+    let server = overlapping_apply_server();
+    let mut request = raw_request("true", &["--commit=173d35e8", "collector"], None);
+    request.require_approval = Some(true);
+    let held = execute_command(request, &server, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert_eq!(held.status, Some(GateStatus::Held));
+    let handle = held.handle.expect("held command has an approval handle");
+    assert_eq!(
+        held_verb_name(&server, &handle).await.as_deref(),
+        Some("apply-general")
+    );
+}
+
+/// A named verb whose rendered command it does not itself cover is refused,
+/// never bound to another verb that covers the command.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_named_verb_that_does_not_cover_its_command_is_refused() {
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: host-uptime
+    binary: ssh
+    args: ["{host}", "uptime"]
+    params:
+      host: { pattern: "^node0[1-3]$", required: true }
+    consequence: irreversible
+    trusted: true
+  - name: host-uptime-with-options
+    binary: ssh
+    args: ["-o", "{first}", "-o", "{second}", "{host}", "uptime"]
+    params:
+      first: { pattern: "^[A-Za-z]+=[a-z-]+$", required: true }
+      second: { pattern: "^[A-Za-z]+=[a-z-]+$", required: true }
+      host: { pattern: "^node0[1-3]$", required: true }
+    consequence: irreversible
+    trusted: true
+"#,
+        )
+        .unwrap(),
+    ));
+    let mut request = raw_request("", &[], None);
+    request.ssh_hostkey = Some(crate::server::wire::SshHostKeyMode::AcceptNew);
+    request.verb = Some(VerbInvocation {
+        name: "host-uptime".to_string(),
+        params: [("host".to_string(), "node01".to_string())]
+            .into_iter()
+            .collect(),
+    });
+    let response = execute_command(request, &server, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    assert!(response.exit_code.is_none());
+    assert!(response.handle.is_none(), "no hold is minted");
+    assert!(
+        response
+            .reason
+            .contains("verb 'host-uptime' does not cover the command it rendered"),
+        "{}",
+        response.reason
+    );
+    assert!(server.state.approvals.read().await.list().is_empty());
+}
