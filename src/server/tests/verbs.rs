@@ -2779,3 +2779,44 @@ verbs:
     );
     assert!(server.state.approvals.read().await.list().is_empty());
 }
+
+/// A named hold whose verb is amended after arming refuses at resume and
+/// runs nothing, as an unnamed hold does.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_hold_refuses_to_resume_after_its_verb_is_amended() {
+    let server = overlapping_apply_server();
+    let mut request = raw_request("", &[], None);
+    request.verb = Some(VerbInvocation {
+        name: "apply-pinned".to_string(),
+        params: [("commit".to_string(), "173d35e8".to_string())]
+            .into_iter()
+            .collect(),
+    });
+    let held = execute_command(request, &server, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    let handle = held.handle.expect("held command has an approval handle");
+    assert!(matches!(
+        handle_admin_request_for_test(
+            &server,
+            &CallerIdentity::UnixAdmin { uid: 777 },
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await,
+        AdminResponse::GateAction { .. }
+    ));
+    let amended = OVERLAPPING_APPLY_VERBS.replace(
+        "name: apply-pinned\n    binary: \"true\"",
+        "name: apply-pinned\n    binary: \"true\"\n    description: amended",
+    );
+    assert_ne!(amended, OVERLAPPING_APPLY_VERBS);
+    *server.state.verbs.write().await = VerbCatalog::from_yaml(&amended).unwrap();
+    let resumed = resume_approval(&server, &CallerIdentity::Unix { uid: 1000 }, &handle).await;
+    assert!(!matches!(
+        resumed.exec,
+        crate::server::wire::ExecOutcome::Completed { .. }
+    ));
+}

@@ -253,9 +253,6 @@ pub fn resolve_scoped_matches_for(
         .iter()
         .map(|index| &scoped[*index])
         .collect::<Vec<_>>();
-    if let Some(requested) = requested_verb {
-        selected.sort_by_key(|matched| matched.matched.rendered.name != requested);
-    }
     let actions = selected
         .iter()
         .map(|matched| matched.effective_action)
@@ -305,6 +302,11 @@ pub fn resolve_scoped_matches_for(
     let conflict_prompt = matches!(decision, VerbDecision::Evaluate | VerbDecision::Conflict)
         .then(|| canonical_conflict_prompt(&scoped, &matches, plan_conflict, action_conflict));
 
+    // Only the context's identity follows the caller's choice; every value
+    // composed above is order independent or read before this point.
+    if let Some(requested) = requested_verb {
+        selected.sort_by_key(|matched| matched.matched.rendered.name != requested);
+    }
     let (context, revert) = if !plan_conflict {
         let first = selected[0];
         let access_evaluation_override_eligible = decision == VerbDecision::Evaluate
@@ -1227,6 +1229,109 @@ mod verb_resolution_properties {
                 // the evaluator, and it can never vanish entirely.
                 prop_assert_ne!(resolution.decision, VerbDecision::Preauthorized);
                 prop_assert_ne!(resolution.decision, VerbDecision::None);
+            }
+        }
+
+        /// Naming a verb changes only which selected verb labels the context:
+        /// every composed authority field equals the unnamed resolution, the
+        /// named verb takes the context exactly when it is selected, and the
+        /// result does not depend on input order.
+        #[test]
+        fn a_named_verb_changes_only_the_context_identity(
+            raw in proptest::collection::vec(
+                (raw_match(), 0u8..3, any::<bool>(), proptest::option::of(0u64..4), 0u8..2),
+                1..6,
+            ),
+            granted_mask in 0u8..4,
+            requested_index in 0usize..7,
+            rotate in 0usize..6,
+        ) {
+            let granted_markers: BTreeSet<String> = MARKER_POOL
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| granted_mask & (1 << bit) != 0)
+                .map(|(_, marker)| marker.to_string())
+                .collect();
+            let scoped: Vec<ScopedCoverageMatch> = raw
+                .iter()
+                .enumerate()
+                .map(|(index, (spec, class, hold, timeout, revert))| {
+                    let mut matched = build_match(index, *spec, &granted_markers);
+                    matched.matched.rendered.consequence = match class {
+                        0 => Reversibility::Reversible,
+                        1 => Reversibility::Recoverable,
+                        _ => Reversibility::Irreversible,
+                    };
+                    matched.matched.rendered.hold = *hold;
+                    matched.matched.rendered.exec_timeout_secs = *timeout;
+                    matched.matched.rendered.revert = (*revert == 1)
+                        .then(|| ("kubectl".to_string(), vec!["rollback".to_string()]));
+                    matched
+                        .matched
+                        .rendered
+                        .params
+                        .insert(format!("p{index}"), index.to_string());
+                    matched
+                })
+                .collect();
+            let requested = format!("verb-{requested_index}");
+            let mut rotated = scoped.clone();
+            let len = rotated.len();
+            rotated.rotate_left(rotate % len);
+
+            let unnamed = resolve_scoped_matches(scoped.clone(), 17);
+            let named = resolve_scoped_matches_for(scoped, 17, Some(&requested));
+            let named_rotated = resolve_scoped_matches_for(rotated, 17, Some(&requested));
+
+            prop_assert_eq!(named.decision, unnamed.decision);
+            prop_assert_eq!(&named.matches, &unnamed.matches);
+            prop_assert_eq!(&named.guidance, &unnamed.guidance);
+            prop_assert_eq!(&named.conflict_prompt, &unnamed.conflict_prompt);
+            prop_assert_eq!(named.unresolved_plan, unnamed.unresolved_plan);
+            prop_assert_eq!(&named.revert, &unnamed.revert);
+            prop_assert!(named.named_verb_refusal.is_none());
+            prop_assert_eq!(named.context.is_some(), unnamed.context.is_some());
+            prop_assert_eq!(named_rotated.decision, named.decision);
+            prop_assert_eq!(
+                named_rotated.context.as_ref().map(|context| context.name.clone()),
+                named.context.as_ref().map(|context| context.name.clone())
+            );
+            if let (Some(named_context), Some(unnamed_context)) =
+                (named.context.as_ref(), unnamed.context.as_ref())
+            {
+                prop_assert_eq!(named_context.class, unnamed_context.class);
+                prop_assert_eq!(named_context.hold, unnamed_context.hold);
+                prop_assert_eq!(named_context.trusted, unnamed_context.trusted);
+                prop_assert_eq!(
+                    named_context.exec_timeout_secs,
+                    unnamed_context.exec_timeout_secs
+                );
+                prop_assert_eq!(
+                    named_context.access_evaluation_override_eligible,
+                    unnamed_context.access_evaluation_override_eligible
+                );
+                prop_assert_eq!(
+                    named_context.learned_deny_match_policy,
+                    unnamed_context.learned_deny_match_policy
+                );
+                let requested_selected = named
+                    .matches
+                    .iter()
+                    .any(|matched| matched.selected && matched.verb == requested);
+                if requested_selected {
+                    prop_assert_eq!(&named_context.name, &requested);
+                    let expected_params: BTreeMap<String, String> =
+                        [(format!("p{requested_index}"), requested_index.to_string())]
+                            .into_iter()
+                            .collect();
+                    prop_assert_eq!(&named_context.params, &expected_params);
+                } else {
+                    prop_assert_eq!(&named_context.name, &unnamed_context.name);
+                }
+                prop_assert!(named
+                    .matches
+                    .iter()
+                    .any(|matched| matched.selected && matched.verb == named_context.name));
             }
         }
     }
