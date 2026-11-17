@@ -7651,7 +7651,10 @@ async fn arm_held_command(
         policy: None,
         execution_failure: None,
         decision_source: None,
-        message: format!("approved held command {handle}; awaiting requester-bound resume"),
+        message: format!(
+            "approved held command {handle} ({}); awaiting requester-bound resume",
+            held_command_label(&armed.snapshot)
+        ),
         exit_code: None,
         stdout: None,
         stderr: None,
@@ -7726,7 +7729,10 @@ pub(super) async fn handle_approve_claimed(
             policy: None,
             execution_failure: None,
             decision_source: None,
-            message: format!("approved held API request {handle}; the proxy is forwarding it"),
+            message: format!(
+                "approved held API request {handle} ({}); the proxy is forwarding it",
+                held_command_label(&snapshot)
+            ),
             exit_code: None,
             stdout: None,
             stderr: None,
@@ -8010,6 +8016,136 @@ fn approval_not_found_message(handle: &str) -> String {
     format!("no approval with handle '{handle}'")
 }
 
+/// Shortest hold-handle prefix accepted in place of the full handle.
+const MIN_APPROVAL_HANDLE_PREFIX: usize = 8;
+
+/// Longest held-command label a decision message carries.
+const HELD_COMMAND_LABEL_CHARS: usize = 120;
+
+/// One-line name of a held command for decision messages: the verb name for a
+/// verb hold, otherwise the redacted command line, escaped and shortened.
+fn held_command_label(snapshot: &ApprovalSnapshot) -> String {
+    if let Some(verb) = &snapshot.verb_name {
+        return format!("verb {verb}");
+    }
+    let line: String = snapshot.command_line().escape_debug().collect();
+    if line.chars().count() <= HELD_COMMAND_LABEL_CHARS {
+        return line;
+    }
+    let mut short: String = line.chars().take(HELD_COMMAND_LABEL_CHARS).collect();
+    short.push_str("...");
+    short
+}
+
+/// Resolve a hold reference given as a unique prefix of a full handle.
+///
+/// A reference that is an exact handle, shorter than the minimum, or not
+/// lowercase hex is returned unchanged, as is a prefix that matches no hold, so
+/// the handler reports it exactly as before. Only holds the caller may read are
+/// candidates, so a prefix never reveals another principal's hold. A prefix
+/// that matches several is refused with the full handles; one is never chosen.
+async fn resolve_approval_reference(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    reference: &str,
+) -> Result<String, String> {
+    if reference.len() < MIN_APPROVAL_HANDLE_PREFIX
+        || !reference
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Ok(reference.to_string());
+    }
+    let approvals = server.state.approvals.read().await;
+    if approvals.get(reference).is_some() {
+        return Ok(reference.to_string());
+    }
+    let (is_operator, caller_key) = caller_scope(server, caller);
+    let matches: Vec<&str> = approvals
+        .with_handle_prefix(reference)
+        .into_iter()
+        .filter(|approval| is_operator || scope_eq(&approval.snapshot.principal, &caller_key))
+        .map(|approval| approval.handle.as_str())
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(reference.to_string()),
+        [handle] => Ok((*handle).to_string()),
+        several => Err(format!(
+            "handle prefix '{reference}' matches {} holds: {}; give the full handle",
+            several.len(),
+            several.join(", ")
+        )),
+    }
+}
+
+async fn resolve_approval_references(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    references: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let mut resolved = Vec::with_capacity(references.len());
+    for reference in references {
+        resolved.push(resolve_approval_reference(server, caller, &reference).await?);
+    }
+    Ok(resolved)
+}
+
+/// Replace each hold reference in a request with the full handle it names.
+/// Grant-request and session references are never lowercase hex and pass
+/// through unchanged; a hex session label passes unless it prefixes a hold the
+/// caller can read, which `access show` already prefers over a session.
+async fn resolve_request_approval_references(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    request: AdminRequest,
+) -> Result<AdminRequest, String> {
+    Ok(match request {
+        AdminRequest::Approve { handle } => AdminRequest::Approve {
+            handle: resolve_approval_reference(server, caller, &handle).await?,
+        },
+        AdminRequest::Resume { handle } => AdminRequest::Resume {
+            handle: resolve_approval_reference(server, caller, &handle).await?,
+        },
+        AdminRequest::Deny { handle } => AdminRequest::Deny {
+            handle: resolve_approval_reference(server, caller, &handle).await?,
+        },
+        AdminRequest::ApprovalShow { handle } => AdminRequest::ApprovalShow {
+            handle: resolve_approval_reference(server, caller, &handle).await?,
+        },
+        AdminRequest::ApprovalWait {
+            handle,
+            timeout_secs,
+        } => AdminRequest::ApprovalWait {
+            handle: resolve_approval_reference(server, caller, &handle).await?,
+            timeout_secs,
+        },
+        AdminRequest::ApprovalNote { handle, text } => AdminRequest::ApprovalNote {
+            handle: resolve_approval_reference(server, caller, &handle).await?,
+            text,
+        },
+        AdminRequest::ApprovalWithdraw { handle } => AdminRequest::ApprovalWithdraw {
+            handle: resolve_approval_reference(server, caller, &handle).await?,
+        },
+        AdminRequest::AccessShow { reference } => AdminRequest::AccessShow {
+            reference: resolve_approval_reference(server, caller, &reference).await?,
+        },
+        AdminRequest::AccessApprove {
+            handles,
+            uses,
+            wait_secs,
+        } => AdminRequest::AccessApprove {
+            handles: resolve_approval_references(server, caller, handles).await?,
+            uses,
+            wait_secs,
+        },
+        AdminRequest::AccessDeny { handles, reason } => AdminRequest::AccessDeny {
+            handles: resolve_approval_references(server, caller, handles).await?,
+            reason,
+        },
+        other => other,
+    })
+}
+
 /// Resolve one hold for a scoped reader, returning the row and whether the
 /// caller holds operator authority. The handle is an unguessable bearer secret:
 /// its owning principal may read its status and result, and the operator may
@@ -8063,6 +8199,16 @@ async fn handle_resume(
     caller: &CallerIdentity,
     handle: &str,
 ) -> AdminResponse {
+    // Read before the resume consumes the row; echoed only once the resume
+    // proved ownership by attempting the command.
+    let label = server
+        .state
+        .approvals
+        .read()
+        .await
+        .get(handle)
+        .map(|approval| held_command_label(&approval.snapshot))
+        .unwrap_or_default();
     let result = resume_approval(server, caller, handle).await;
     let policy = Some(result.policy_decision());
     let execution_failure = result.execution_failure().cloned();
@@ -8076,7 +8222,7 @@ async fn handle_resume(
             policy,
             execution_failure,
             decision_source,
-            message: format!("resumed held command {handle} (exit {exit_code:?})"),
+            message: format!("resumed held command {handle} ({label}) (exit {exit_code:?})"),
             exit_code,
             stdout,
             stderr,
@@ -8085,7 +8231,7 @@ async fn handle_resume(
             policy,
             execution_failure,
             decision_source,
-            message: reason,
+            message: format!("resumed held command {handle} ({label}): {reason}"),
             exit_code: Some(crate::EXIT_GUARD_ERROR),
             stdout: None,
             stderr: None,
@@ -8260,7 +8406,10 @@ async fn handle_deny(
         policy: None,
         execution_failure: None,
         decision_source: None,
-        message: reason.to_string(),
+        message: format!(
+            "denied held command {handle} ({}): {reason}",
+            held_command_label(&next.snapshot)
+        ),
         exit_code: None,
         stdout: None,
         stderr: None,
@@ -8317,6 +8466,15 @@ pub(super) async fn handle_admin_request_owned(
     caller: &CallerIdentity,
     request: AdminRequest,
 ) -> OwnedAdminResponse {
+    let request = match resolve_request_approval_references(server, caller, request).await {
+        Ok(request) => request,
+        Err(message) => {
+            return OwnedAdminResponse {
+                response: AdminResponse::Error { message },
+                waiter_lease: None,
+            }
+        }
+    };
     if let AdminRequest::ApprovalWait {
         handle,
         timeout_secs,

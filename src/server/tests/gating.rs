@@ -5962,7 +5962,8 @@ async fn approval_note_operator_and_owner_post_others_refused() {
         )
         .await,
         AdminResponse::GateAction { message, .. }
-            if message == "requester withdrew held command"
+            if message.starts_with(&format!("denied held command {handle} ("))
+                && message.ends_with("): requester withdrew held command")
     ));
     assert!(
         matches!(
@@ -8117,6 +8118,246 @@ async fn confirmation_check_audits_launch_failure_separately_and_preserves_rollb
         assert_eq!(
             store.load_provisionals().await.unwrap()[0].status,
             ProvisionalStatus::Reverted
+        );
+    }
+}
+
+/// Seed `handles` as pending verb holds of `owner` under the held-verb catalog.
+async fn seed_prefix_holds(cfg: &ServerContext, owner: &CallerIdentity, handles: &[&str]) {
+    let catalog = VerbCatalog::from_yaml(HELD_VERB_YAML).unwrap();
+    let version = catalog.version();
+    let digest = catalog.verb_definition_digest("restart-service").unwrap();
+    *cfg.state.verbs.write().await = catalog;
+    let mut approvals = cfg.state.approvals.write().await;
+    for handle in handles {
+        approvals.enqueue(held_verb_approval(
+            handle,
+            Some(version),
+            Some(digest.clone()),
+            owner.principal(),
+        ));
+    }
+}
+
+async fn show_handle(cfg: &ServerContext, caller: &CallerIdentity, reference: &str) -> String {
+    match handle_admin_request_for_test(
+        cfg,
+        caller,
+        AdminRequest::ApprovalShow {
+            handle: reference.to_string(),
+        },
+    )
+    .await
+    {
+        AdminResponse::ApprovalShow { item } => item.handle,
+        AdminResponse::Error { message } => format!("error: {message}"),
+        other => panic!("unexpected show response: {other:?}"),
+    }
+}
+
+const PREFIX_HOLD: &str = "8ac0b783314b1f812fbc44707b88de21";
+const TWIN_A: &str = "abcdef01aaaaaaaaaaaaaaaaaaaaaaaa";
+const TWIN_B: &str = "abcdef01bbbbbbbbbbbbbbbbbbbbbbbb";
+
+#[tokio::test]
+async fn unique_handle_prefix_resolves_for_owner_and_operator_only() {
+    let (cfg, operator, agent) = gating_config(7101, 1000);
+    seed_prefix_holds(&cfg, &agent, &[PREFIX_HOLD, TWIN_A]).await;
+
+    assert_eq!(show_handle(&cfg, &agent, "8ac0b783").await, PREFIX_HOLD);
+    assert_eq!(show_handle(&cfg, &operator, "8ac0b783").await, PREFIX_HOLD);
+    assert_eq!(show_handle(&cfg, &agent, PREFIX_HOLD).await, PREFIX_HOLD);
+
+    let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::AccessShow {
+            reference: "8ac0b783314b".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("operator access show must resolve a unique prefix")
+    };
+    assert_eq!(item.reference, PREFIX_HOLD);
+
+    // Another principal's hold is not a candidate: the answer is the same
+    // NotFound an unknown handle gets.
+    let stranger = CallerIdentity::Unix { uid: 1001 };
+    assert_eq!(
+        show_handle(&cfg, &stranger, "8ac0b783").await,
+        "error: no approval with handle '8ac0b783'"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_handle_prefix_is_refused_with_every_match() {
+    let (cfg, operator, agent) = gating_config(7102, 1000);
+    seed_prefix_holds(&cfg, &agent, &[TWIN_A, TWIN_B]).await;
+
+    let refusal = format!(
+        "error: handle prefix 'abcdef01' matches 2 holds: {TWIN_A}, {TWIN_B}; give the full handle"
+    );
+    assert_eq!(show_handle(&cfg, &agent, "abcdef01").await, refusal);
+    assert_eq!(show_handle(&cfg, &operator, "abcdef01").await, refusal);
+    assert_eq!(show_handle(&cfg, &agent, "abcdef01a").await, TWIN_A);
+
+    // A state change on an ambiguous prefix decides nothing.
+    for request in [
+        AdminRequest::Deny {
+            handle: "abcdef01".to_string(),
+        },
+        AdminRequest::AccessDeny {
+            handles: vec!["abcdef01".to_string()],
+            reason: None,
+        },
+        AdminRequest::AccessApprove {
+            handles: vec![TWIN_A.to_string(), "abcdef01".to_string()],
+            uses: Some(1),
+            wait_secs: None,
+        },
+    ] {
+        let response = handle_admin_request_for_test(&cfg, &operator, request).await;
+        assert!(
+            matches!(&response, AdminResponse::Error { message } if message.contains("matches 2 holds")),
+            "got {response:?}"
+        );
+    }
+    let approvals = cfg.state.approvals.read().await;
+    for handle in [TWIN_A, TWIN_B] {
+        let approval = approvals.get(handle).unwrap();
+        assert_eq!(approval.status, ApprovalStatus::Pending);
+        assert!(!approval_is_armed(approval));
+    }
+    drop(approvals);
+
+    // A stranger's own hold is the only candidate it sees.
+    let stranger = CallerIdentity::Unix { uid: 1001 };
+    let own = "abcdef01cccccccccccccccccccccccc";
+    cfg.state
+        .approvals
+        .write()
+        .await
+        .enqueue(held_verb_approval(own, None, None, stranger.principal()));
+    assert_eq!(show_handle(&cfg, &stranger, "abcdef01").await, own);
+}
+
+#[tokio::test]
+async fn short_or_non_hex_handle_prefix_is_not_resolved() {
+    let (cfg, operator, agent) = gating_config(7103, 1000);
+    seed_prefix_holds(&cfg, &agent, &[PREFIX_HOLD]).await;
+
+    for reference in ["8ac0b78", "8AC0B783", "8ac0b783-", " 8ac0b783"] {
+        assert_eq!(
+            show_handle(&cfg, &operator, reference).await,
+            format!("error: no approval with handle '{reference}'")
+        );
+    }
+}
+
+#[tokio::test]
+async fn prefix_decisions_echo_the_full_handle_and_command() {
+    let (cfg, operator, agent) = gating_config(7104, 1000);
+    let denied = "11111111aaaaaaaaaaaaaaaaaaaaaaaa";
+    let withdrawn = "22222222aaaaaaaaaaaaaaaaaaaaaaaa";
+    let access_denied = "33333333aaaaaaaaaaaaaaaaaaaaaaaa";
+    seed_prefix_holds(
+        &cfg,
+        &agent,
+        &[PREFIX_HOLD, denied, withdrawn, access_denied],
+    )
+    .await;
+
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec!["8ac0b783".to_string()],
+            uses: Some(1),
+            wait_secs: None,
+        },
+    )
+    .await
+    else {
+        panic!("approve by prefix must decide")
+    };
+    assert!(items[0].success, "{:?}", items[0]);
+    assert_eq!(items[0].request, PREFIX_HOLD);
+    assert_eq!(
+        items[0].message,
+        format!(
+            "approved held command {PREFIX_HOLD} (verb restart-service); awaiting requester-bound resume"
+        )
+    );
+
+    #[cfg(unix)]
+    {
+        let response = handle_admin_request_for_test(
+            &cfg,
+            &agent,
+            AdminRequest::Resume {
+                handle: "8ac0b783".to_string(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(&response, AdminResponse::GateAction { message, .. }
+                if message.starts_with(&format!("resumed held command {PREFIX_HOLD} (verb restart-service)"))),
+            "got {response:?}"
+        );
+    }
+
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::Deny {
+            handle: "11111111".to_string(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(&response, AdminResponse::GateAction { message, .. }
+            if *message == format!("denied held command {denied} (verb restart-service): operator denied")),
+        "got {response:?}"
+    );
+
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &agent,
+        AdminRequest::ApprovalWithdraw {
+            handle: "22222222".to_string(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(&response, AdminResponse::GateAction { message, .. }
+            if *message == format!("denied held command {withdrawn} (verb restart-service): requester withdrew held command")),
+        "got {response:?}"
+    );
+
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::AccessDeny {
+            handles: vec!["33333333".to_string()],
+            reason: None,
+        },
+    )
+    .await
+    else {
+        panic!("access deny by prefix must decide")
+    };
+    assert_eq!(items[0].request, access_denied);
+    assert_eq!(
+        items[0].message,
+        format!("denied held command {access_denied} (verb restart-service): denied by operator")
+    );
+
+    let approvals = cfg.state.approvals.read().await;
+    for handle in [denied, withdrawn, access_denied] {
+        assert_eq!(
+            approvals.get(handle).unwrap().status,
+            ApprovalStatus::Denied
         );
     }
 }

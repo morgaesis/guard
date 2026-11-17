@@ -559,6 +559,17 @@ impl ApprovalRegistry {
         )
     }
 
+    /// Holds whose handle starts with `prefix`, sorted by handle.
+    pub fn with_handle_prefix<'a>(&'a self, prefix: &'a str) -> Vec<&'a Approval> {
+        let mut found: Vec<_> = self
+            .items
+            .values()
+            .filter(|approval| approval.handle.starts_with(prefix))
+            .collect();
+        found.sort_by(|a, b| a.handle.cmp(&b.handle));
+        found
+    }
+
     /// All holds, newest first.
     pub fn list(&self) -> Vec<Approval> {
         let mut v: Vec<_> = self.items.values().cloned().collect();

@@ -116,6 +116,12 @@ note` or cancel an unexecuted hold with `guard approval withdraw`. Ordinary and
 N-use approval apply to authority requests created from denied or proactive
 access intent, not to held execution snapshots.
 
+Wherever these commands take a hold handle, a lowercase hex prefix of at least
+8 characters names the one hold the caller can read that starts with it. A
+prefix that matches several holds is refused with their full handles, and
+nothing is decided. Approve, deny, withdraw and resume print the full handle
+and the held command (a verb hold shows its verb name) they acted on.
+
 `guard access approve --wait=<seconds> <request>` accepts one hold and a bound
 from 1 through 3600 seconds. It checks daemon capability before mutation, then
 sends one approval RPC that registers the waiter before changing the hold.

@@ -1070,6 +1070,11 @@ pub(crate) async fn handle_resume(
                     cli_print!("{stdout}");
                     crate::cli_output::stdout().flush()?;
                 }
+                // The daemon names the full handle and command it ran; a
+                // refusal before any attempt is reported as DENIED below.
+                if policy.as_ref().is_none_or(|policy| policy.allowed) {
+                    eprintln!("{message}");
+                }
                 if let Some(stderr) = stderr.as_deref() {
                     eprint!("{stderr}");
                     if !stderr.ends_with('\n') {
@@ -3058,14 +3063,16 @@ async fn handle_access_approve_interactive(
         for line in consequence_block(&item, effective_uses, class) {
             eprintln!("{line}");
         }
+        // Decide the item the card showed, by its full reference, even when
+        // the operator typed a handle prefix.
         let decision = match prompt_access_review_choice(&reference, colors)? {
             AccessReviewChoice::Approve => Some(server::AdminRequest::AccessApprove {
-                handles: vec![reference.clone()],
+                handles: vec![item.reference.clone()],
                 uses: effective_uses,
                 wait_secs: wait,
             }),
             AccessReviewChoice::Deny => Some(server::AdminRequest::AccessDeny {
-                handles: vec![reference.clone()],
+                handles: vec![item.reference.clone()],
                 reason: prompt_access_deny_reason()?,
             }),
             AccessReviewChoice::Skip => None,
