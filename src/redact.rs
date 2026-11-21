@@ -317,9 +317,13 @@ fn secret_name_pattern() -> &'static Regex {
 /// leaking its tail (`password: "abc def"` must not become
 /// `password: "[REDACTED] def"`), and the unterminated alternatives cover a
 /// quoted multi-line value whose first line -- open quote, no close --
-/// arrives alone through the per-line output path.
+/// arrives alone through the per-line output path. An unquoted run takes a
+/// backslash only together with the character it escapes, and never one
+/// that escapes a quote: inside a JSON string (`"match":
+/// "...sessionkey=x\",..."`, or an annotation holding JSON) that backslash
+/// belongs to the closing quote, and consuming it would leave invalid JSON.
 const SECRET_VALUE_SUBPATTERN: &str =
-    r#"(?:"(?:\\.|[^"\\\n])*"|'(?:''|[^'\n])*'|"[^\n]*|'[^\n]*|[^"'\s}{,]+)"#;
+    r#"(?:"(?:\\.|[^"\\\n])*"|'(?:''|[^'\n])*'|"[^\n]*|'[^\n]*|(?:[^"'\s}{,\\]|\\[^"'\s])+)"#;
 
 /// Name-based secret redaction: a key name ending in a secret-bearing word,
 /// followed by `=`/`:` (or their URL-encoded forms `%3D`/`%3A`, so query
@@ -2741,6 +2745,123 @@ mod tests {
         let output = redact_output_text(input);
         assert!(!output.contains("efgh"), "tail leaked: {output}");
         assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    /// A session-key-shaped value built at run time, so no literal key sits in
+    /// the source.
+    fn session_key_fixture() -> String {
+        let alphabet = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_";
+        alphabet
+            .chars()
+            .cycle()
+            .skip(7)
+            .step_by(5)
+            .take(27)
+            .collect()
+    }
+
+    /// `kubectl get ingressroute -o json` output whose match rule names
+    /// `sessionkey=` both in the object and in its last-applied annotation,
+    /// where the rule sits one JSON-string level deeper.
+    fn ingressroute_list(cookie_value: &str) -> String {
+        let route = serde_json::json!({
+            "kind": "Rule",
+            "match": format!("Host(`portal.example.test`) && !HeaderRegexp(`Cookie`, `(^|;)\\s*sessionkey={cookie_value}`)"),
+            "middlewares": [{"name": "ratelimit-baseline"}],
+        });
+        let spec = serde_json::json!({"routes": [route]});
+        let applied = serde_json::json!({"kind": "IngressRoute", "spec": spec});
+        let list = serde_json::json!({
+            "apiVersion": "v1",
+            "items": [{
+                "kind": "IngressRoute",
+                "metadata": {"annotations": {
+                    "kubectl.kubernetes.io/last-applied-configuration": format!("{applied}\n"),
+                }},
+                "spec": spec,
+            }],
+        });
+        serde_json::to_string_pretty(&list).unwrap()
+    }
+
+    fn annotation_of(list: &serde_json::Value) -> serde_json::Value {
+        let applied = list["items"][0]["metadata"]["annotations"]
+            ["kubectl.kubernetes.io/last-applied-configuration"]
+            .as_str()
+            .expect("annotation is a string");
+        serde_json::from_str(applied).expect("annotation still holds JSON")
+    }
+
+    #[test]
+    fn redacted_ingressroute_json_still_parses() {
+        let output = redact_output_text(&ingressroute_list("[^;\\s]"));
+        let list: serde_json::Value =
+            serde_json::from_str(&output).unwrap_or_else(|err| panic!("{err}: {output}"));
+        let applied = annotation_of(&list);
+        assert_eq!(
+            applied["spec"]["routes"][0]["middlewares"][0]["name"],
+            "ratelimit-baseline"
+        );
+        assert!(output.contains("sessionkey=[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn session_key_in_json_strings_is_masked_and_json_parses() {
+        let key = session_key_fixture();
+        let output = redact_output_text(&ingressroute_list(&key));
+        assert!(!output.contains(&key), "key leaked: {output}");
+        let list: serde_json::Value =
+            serde_json::from_str(&output).unwrap_or_else(|err| panic!("{err}: {output}"));
+        let applied = annotation_of(&list);
+        let rule = applied["spec"]["routes"][0]["match"].as_str().unwrap();
+        assert!(rule.ends_with("sessionkey=[REDACTED]"), "got: {rule}");
+    }
+
+    #[test]
+    fn session_key_in_a_log_line_is_masked() {
+        let key = session_key_fixture();
+        let line = format!(
+            "2026-11-19 18:02:11,345 DEBUG [c.c.a.ApiServlet] (qtp-17:ctx-3f) ===START=== GET /client/api?command=listVirtualMachines&response=json&sessionkey={key}&_=1763575331"
+        );
+        let output = redact_output_text(&line);
+        assert!(!output.contains(&key), "key leaked: {output}");
+        assert!(output.contains("sessionkey=[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn escaped_quote_inside_a_session_key_value_does_not_leak_its_tail() {
+        let key = session_key_fixture();
+        let (head, tail) = key.split_at(9);
+        let member = format!(r#"{{"sessionkey": "{head}\"{tail}", "next": 1}}"#);
+        let output = redact_output_text(&member);
+        assert!(
+            !output.contains(head) && !output.contains(tail),
+            "leaked: {output}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).unwrap_or_else(|err| panic!("{err}: {output}"));
+        assert_eq!(parsed["next"], 1);
+
+        let nested =
+            serde_json::json!({"log": format!("GET /client/api?sessionkey={head}\\\"{tail}")});
+        let output = redact_output_text(&nested.to_string());
+        assert!(!output.contains(head), "head leaked: {output}");
+        serde_json::from_str::<serde_json::Value>(&output)
+            .unwrap_or_else(|err| panic!("{err}: {output}"));
+    }
+
+    #[test]
+    fn unquoted_value_keeps_escaped_backslashes_whole() {
+        let key = session_key_fixture();
+        let (head, tail) = key.split_at(9);
+        let input = serde_json::json!({ "log": format!("sessionkey={head}\\{tail}") }).to_string();
+        let output = redact_output_text(&input);
+        assert!(
+            !output.contains(head) && !output.contains(tail),
+            "leaked: {output}"
+        );
+        serde_json::from_str::<serde_json::Value>(&output)
+            .unwrap_or_else(|err| panic!("{err}: {output}"));
     }
 
     #[test]
