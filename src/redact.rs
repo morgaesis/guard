@@ -2829,7 +2829,7 @@ mod tests {
     }
 
     #[test]
-    fn escaped_quote_inside_a_session_key_value_does_not_leak_its_tail() {
+    fn escaped_quote_inside_a_quoted_value_does_not_leak_its_tail() {
         let key = session_key_fixture();
         let (head, tail) = key.split_at(9);
         let member = format!(r#"{{"sessionkey": "{head}\"{tail}", "next": 1}}"#);
@@ -2841,13 +2841,28 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&output).unwrap_or_else(|err| panic!("{err}: {output}"));
         assert_eq!(parsed["next"], 1);
+    }
 
-        let nested =
-            serde_json::json!({"log": format!("GET /client/api?sessionkey={head}\\\"{tail}")});
+    /// A query or cookie value cannot hold a double quote, so inside a JSON
+    /// string an escaped quote ends an unquoted value; taking it would also
+    /// take the closing quote of a nested JSON string.
+    #[test]
+    fn escaped_quote_ends_an_unquoted_value_inside_a_json_string() {
+        let key = session_key_fixture();
+        let nested = serde_json::json!({
+            "log": format!("GET /client/api?sessionkey={key}\"&response=json")
+        });
         let output = redact_output_text(&nested.to_string());
-        assert!(!output.contains(head), "head leaked: {output}");
-        serde_json::from_str::<serde_json::Value>(&output)
-            .unwrap_or_else(|err| panic!("{err}: {output}"));
+        assert!(!output.contains(&key), "key leaked: {output}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).unwrap_or_else(|err| panic!("{err}: {output}"));
+        assert!(
+            parsed["log"]
+                .as_str()
+                .unwrap()
+                .ends_with("sessionkey=[REDACTED]\"&response=json"),
+            "got: {output}"
+        );
     }
 
     #[test]
